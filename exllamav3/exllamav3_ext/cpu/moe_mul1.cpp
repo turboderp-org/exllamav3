@@ -69,6 +69,17 @@ constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
 constexpr int MAX_M = 4;
 
+// int8 activations resolve a row in steps of 1/127 of its largest element. A row that is a few large
+// elements over many small ones (inputs with a dominant component shared by all tokens, which the
+// rotation confines to the blocks it lives in) loses the small ones altogether, and with them what
+// tells one token from the next. Such a row is carried as two int8 rows, the high and low part of a
+// 15-bit value, whose GEMV outputs add up (see prepare_rows, fold_rows). A chunk of MAX_M tokens
+// therefore takes up to MAX_SLOTS GEMV rows, the ones past MAX_M in a second pass over the weights
+constexpr int MAX_SLOTS = 2 * MAX_M;
+constexpr int WIDE_LEVELS = 127 * 128;
+// A row goes wide when more than 1 / WIDE_ZERO_DIV of its activations would round to zero
+constexpr int WIDE_ZERO_DIV = 16;
+
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
 #define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
@@ -304,13 +315,22 @@ struct PreparedIn
     // Bit-exact reassociation of the same integer sum: 4 ops/row + 4 shared, vs 16 (masked)
     // or 12 (activation-split). VNNI/VBMI ignore.
     int32_t* splat_dup;
-    float q[MAX_M];
-    int32_t sum_x8[MAX_M];
+    float q[MAX_SLOTS];
+    int32_t sum_x8[MAX_SLOTS];
+    // GEMV rows in use, and where each token's row (or pair of rows) starts
+    int rows;
+    uint8_t slot[MAX_M];
+    uint8_t wide[MAX_M];
 };
 
+// EXL3_MOE_CPU_WIDE=0: plain int8 activations for every row (testing)
+const bool g_wide_rows = []{
+    const char* e = std::getenv("EXL3_MOE_CPU_WIDE");
+    return !(e && e[0] == '0');
+}();
+
 M1_TARGET_AVX2
-void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
-    int k, float& q_out, int32_t& s_out)
+float row_absmax_avx2(const float* dst, int k)
 {
     __m256 vmax = _mm256_setzero_ps();
     const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -320,35 +340,86 @@ void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
     _mm256_store_ps(mx, vmax);
     float amax = 0.0f;
     for (int i = 0; i < 8; ++i) amax = std::max(amax, mx[i]);
+    return amax;
+}
+
+M1_TARGET_AVX2
+inline int32_t hsum_epi32_avx2(__m256i v)
+{
+    alignas(32) int32_t sm[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(sm), v);
+    return sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
+}
+
+// Both activation layouts of one int8 row (see PreparedIn)
+M1_TARGET_AVX2
+inline void store_x8_avx2(__m256i v, int32_t* splat, int32_t* splat_dup)
+{
+    const __m256i b = _mm256_and_si256(v, _mm256_set1_epi32(0xff));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat), _mm256_mullo_epi32(b, _mm256_set1_epi32(0x01010101)));
+    // x in both 16-bit slots: the low 16 bits of v are already the two's-complement i16
+    // activation; replicate into the high slot
+    if (splat_dup)
+    {
+        const __m256i low16 = _mm256_and_si256(v, _mm256_set1_epi32(0xffff));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat_dup),
+            _mm256_or_si256(low16, _mm256_slli_epi32(low16, 16)));
+    }
+}
+
+// A row as two int8 rows, k apart in splat / splat_dup: the value in steps of amax / WIDE_LEVELS,
+// split into a high part in steps of 128 and the remainder
+M1_TARGET_AVX2
+void quantize_row_wide_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+    int k, float amax, float* q_out, int32_t* s_out)
+{
+    const float q = amax * (1.0f / WIDE_LEVELS);
+    const __m256 rq = _mm256_set1_ps(static_cast<float>(WIDE_LEVELS) / amax);
+    const __m256i lo = _mm256_set1_epi32(-WIDE_LEVELS), hi = _mm256_set1_epi32(WIDE_LEVELS);
+    const __m256i half = _mm256_set1_epi32(64);
+    __m256i vsum_h = _mm256_setzero_si256(), vsum_l = _mm256_setzero_si256();
+    #pragma unroll
+    for (int i = 0; i < k; i += 8)
+    {
+        __m256i v = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(dst + i), rq));
+        v = _mm256_min_epi32(hi, _mm256_max_epi32(lo, v));
+        const __m256i vh = _mm256_srai_epi32(_mm256_add_epi32(v, half), 7);
+        const __m256i vl = _mm256_sub_epi32(v, _mm256_slli_epi32(vh, 7));
+        vsum_h = _mm256_add_epi32(vsum_h, vh);
+        vsum_l = _mm256_add_epi32(vsum_l, vl);
+        store_x8_avx2(vh, splat + i, splat_dup ? splat_dup + i : nullptr);
+        store_x8_avx2(vl, splat + k + i, splat_dup ? splat_dup + k + i : nullptr);
+    }
+    q_out[0] = q * 128.0f;
+    q_out[1] = q;
+    s_out[0] = hsum_epi32_avx2(vsum_h);
+    s_out[1] = hsum_epi32_avx2(vsum_l);
+}
+
+// Returns the number of activations that came out zero
+M1_TARGET_AVX2
+int quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+    int k, float amax, float& q_out, int32_t& s_out)
+{
     // Explicit scale / reciprocal order: the reassociation GCC emits under -Ofast, spelled
     // out so other builds quantize identically at the rounding boundaries
     const float q = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
     const __m256 rq = _mm256_set1_ps(amax > 0.0f ? 127.0f / amax : 1.0f);
     const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
-    const __m256i rep = _mm256_set1_epi32(0x01010101);
-    const __m256i mask8 = _mm256_set1_epi32(0xff);
     __m256i vsum = _mm256_setzero_si256();
+    __m256i vzero = _mm256_setzero_si256();
     #pragma unroll
     for (int i = 0; i < k; i += 8)
     {
         __m256i v = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(dst + i), rq));
         v = _mm256_min_epi32(hi, _mm256_max_epi32(lo, v));
         vsum = _mm256_add_epi32(vsum, v);
-        const __m256i b = _mm256_and_si256(v, mask8);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat + i), _mm256_mullo_epi32(b, rep));
-        // x in both 16-bit slots (see PreparedIn::splat_dup): the low 16 bits of v are already
-        // the two's-complement i16 activation; replicate into the high slot
-        if (splat_dup)
-        {
-            const __m256i low16 = _mm256_and_si256(v, _mm256_set1_epi32(0xffff));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat_dup + i),
-                _mm256_or_si256(low16, _mm256_slli_epi32(low16, 16)));
-        }
+        vzero = _mm256_sub_epi32(vzero, _mm256_cmpeq_epi32(v, _mm256_setzero_si256()));
+        store_x8_avx2(v, splat + i, splat_dup ? splat_dup + i : nullptr);
     }
-    alignas(32) int32_t sm[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(sm), vsum);
-    s_out = sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
+    s_out = hsum_epi32_avx2(vsum);
     q_out = q;
+    return hsum_epi32_avx2(vzero);
 }
 
 M1_TARGET_AVX2
@@ -389,9 +460,10 @@ void prepare_rows
 )
 {
     const int k = mat.k;
+    int slot = 0;
     for (int r = 0; r < m; ++r)
     {
-        float* dst = p.tin + static_cast<size_t>(r) * k;
+        float* dst = p.tin + static_cast<size_t>(slot) * k;
         const size_t src_off = static_cast<size_t>(token_idx[r]) * src_stride;
         if (g_isa != Isa::Scalar)
         {
@@ -416,16 +488,26 @@ void prepare_rows
             }
         }
 
-        // int8 quantization, one scale per row
-        int32_t* splat = p.splat32 + static_cast<size_t>(r) * k;
+        // int8 quantization, one scale per GEMV row; two rows for a token that goes wide
+        int32_t* splat = p.splat32 + static_cast<size_t>(slot) * k;
         // dup is only read by the AVX2/BW maddubs kernels; skip the stores on the VNNI/VBMI tiers
         int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
-            ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
+            ? p.splat_dup + static_cast<size_t>(slot) * k : nullptr;
+        p.slot[r] = static_cast<uint8_t>(slot);
+        p.wide[r] = 0;
         float q;
         int32_t s;
         if (g_isa != Isa::Scalar)
         {
-            quantize_row_avx2(dst, splat, splat_dup, k, q, s);
+            const float amax = row_absmax_avx2(dst, k);
+            const int zeros = quantize_row_avx2(dst, splat, splat_dup, k, amax, q, s);
+            if (g_wide_rows && amax > 0.0f && zeros * WIDE_ZERO_DIV > k)
+            {
+                quantize_row_wide_avx2(dst, splat, splat_dup, k, amax, p.q + slot, p.sum_x8 + slot);
+                p.wide[r] = 1;
+                slot += 2;
+                continue;
+            }
         }
         else
         {
@@ -442,9 +524,11 @@ void prepare_rows
                 splat[i] = static_cast<int32_t>(static_cast<uint8_t>(static_cast<int8_t>(v))) * 0x01010101;
             }
         }
-        p.q[r] = q;
-        p.sum_x8[r] = s;
+        p.q[slot] = q;
+        p.sum_x8[slot] = s;
+        ++slot;
     }
+    p.rows = slot;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2124,7 +2208,7 @@ struct ForwardCtx
 
     // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
     // allocations per call cost more in first-touch page faults than the small phases do work)
-    float* tout_g;       // chunks x m x I (quant space, then transformed in place)
+    float* tout_g;       // chunks x MAX_SLOTS x I (quant space, then folded and transformed in place)
     float* tout_u;
     float* tout_d;       // chunks x m x H
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
@@ -2190,6 +2274,41 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 }
 
 
+// The GEMV over every row of a chunk, MAX_M at a time
+inline void run_rows(const MoeCpuMatrix& mat, const PreparedIn& p, float* tout, int tn0, int tn1)
+{
+    run_tiles(mat, p, tout, std::min(p.rows, MAX_M), tn0, tn1);
+    if (p.rows <= MAX_M) return;
+    PreparedIn rest = p;
+    rest.tin += static_cast<size_t>(MAX_M) * mat.k;
+    rest.splat32 += static_cast<size_t>(MAX_M) * mat.k;
+    if (rest.splat_dup) rest.splat_dup += static_cast<size_t>(MAX_M) * mat.k;
+    for (int i = 0; i < MAX_M; ++i)
+    {
+        rest.q[i] = p.q[MAX_M + i];
+        rest.sum_x8[i] = p.sum_x8[MAX_M + i];
+    }
+    run_tiles(mat, rest, tout + static_cast<size_t>(MAX_M) * mat.n, p.rows - MAX_M, tn0, tn1);
+}
+
+// GEMV rows back to token rows, columns [c0, c1) of n: the two rows of a wide token add up
+inline void fold_rows(float* tout, const PreparedIn& p, int m, int n, int c0, int c1)
+{
+    for (int r = 0; r < m; ++r)
+    {
+        float* dst = tout + static_cast<size_t>(r) * n;
+        const float* a = tout + static_cast<size_t>(p.slot[r]) * n;
+        if (p.wide[r])
+        {
+            const float* b = a + n;
+            for (int col = c0; col < c1; ++col) dst[col] = a[col] + b[col];
+        }
+        else if (p.slot[r] != r)
+            std::memmove(dst + c0, a + c0, static_cast<size_t>(c1 - c0) * sizeof(float));
+    }
+}
+
+
 // Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
 // calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
 // once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
@@ -2251,8 +2370,8 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
-                run_tiles(mat, p, tout, ch.m, t0, t1);
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_SLOTS * I;
+                run_rows(mat, p, tout, t0, t1);
             });
             break;
         }
@@ -2264,9 +2383,14 @@ void forward_phase(void* vctx, int worker, int num_workers)
             const bool gated = !L.gates.empty();
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I;
-                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I;
-                if (gated) transform_out(L.gates[ch.expert], g, ch.m);
+                float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
+                float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
+                if (gated)
+                {
+                    fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
+                    transform_out(L.gates[ch.expert], g, ch.m);
+                }
+                fold_rows(u, c.prep_u[j], ch.m, I, 0, I);
                 transform_out(L.ups[ch.expert], u, ch.m);
                 const size_t count = static_cast<size_t>(ch.m) * I;
                 float* a = gated ? g : u;
@@ -2277,11 +2401,15 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 // offloaded experts diverge arbitrarily far from their GPU-resident twins
                 const float lim = L.act_limit != 0.0f
                     ? L.act_limit : std::numeric_limits<float>::infinity();
+                // The exponent is bounded: past 88.7 exp() overflows, and the division by infinity
+                // that follows does not survive the reciprocal the compiler makes of it (NaN out of
+                // a pre-activation that should give zero)
+                const float exp_max = 80.0f;
                 switch (L.activation) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
-                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
+                            const float av = std::min(gv / (1.0f + std::exp(std::min(-gv, exp_max))), lim);
                             g[i] = av * std::clamp(u[i], -lim, lim);
                         }
                         break;
@@ -2300,7 +2428,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = std::min(g[i], lim);
                             const float uv = std::clamp(u[i], -lim, lim);
-                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
+                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(std::min(-1.702f * gv, exp_max)));
                         }
                         break;
                     }
@@ -2311,7 +2439,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
                         }
                         break;
                 }
-                static const int idx4[MAX_M] = {0, 1, 2, 3};
+                static const int idx4[MAX_M] = {0, 1, 2, 3};   // (token rows, after the fold)
                 prepare_rows(L.downs[ch.expert], nullptr, a, I, idx4, ch.m, c.prep_d[j]);
             }
             break;
@@ -2323,8 +2451,8 @@ void forward_phase(void* vctx, int worker, int num_workers)
             assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
-                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                run_tiles(L.downs[ch.expert], c.prep_d[j], tout, ch.m, t0, t1);
+                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
+                run_rows(L.downs[ch.expert], c.prep_d[j], tout, t0, t1);
             });
             break;
         }
@@ -2342,12 +2470,14 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 {
                     const Chunk& ch = c.chunks[j];
                     const MoeCpuMatrix& mat = L.downs[ch.expert];
+                    fold_rows(c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H, c.prep_d[j], ch.m, H,
+                              b0 * 128, b1 * 128);
                     // Normally m == 1 here; retain repeated selections of the same expert
                     // too, which the raw API groups into a multi-row chunk.
                     for (int r = 0; r < ch.m; ++r)
                         for (int block = b0 * 128; block < b1 * 128; block += 128)
                         {
-                            float* v = c.tout_d + static_cast<size_t>(j) * MAX_M * H + r * H + block;
+                            float* v = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H + r * H + block;
                             MoeCpuMatrix part = mat;
                             part.n = 128;
                             part.svh += block;
@@ -2363,7 +2493,9 @@ void forward_phase(void* vctx, int worker, int num_workers)
             // over hidden columns so overlapping token rows are race-free
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                transform_out(L.downs[ch.expert], c.tout_d + static_cast<size_t>(j) * MAX_M * H, ch.m);
+                float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
+                fold_rows(d, c.prep_d[j], ch.m, H, 0, H);
+                transform_out(L.downs[ch.expert], d, ch.m);
             }
             break;
         }
@@ -2374,7 +2506,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
             const int c1 = H * (worker + 1) / num_workers;
             for (int j = 0; j < nc; ++j) {
                 const Chunk& ch = c.chunks[j];
-                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
                 for (int r = 0; r < ch.m; ++r) {
                     float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
                     const float* src = d + static_cast<size_t>(r) * H;
@@ -2672,18 +2804,18 @@ void exl3_moe_cpu_forward_raw(
     const int I = layer->interm_size;
     ForwardArena& ar = ForwardArena::get();
     auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-    grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
+    grow(ar.tin_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.tin_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.tin_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
+    grow(ar.splat_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.splat_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.splat_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
+    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
+    grow(ar.tout_g, static_cast<size_t>(nc) * MAX_SLOTS * I);
+    grow(ar.tout_u, static_cast<size_t>(nc) * MAX_SLOTS * I);
+    grow(ar.tout_d, static_cast<size_t>(nc) * MAX_SLOTS * H);
     grow(ar.prep_g, nc); grow(ar.prep_u, nc); grow(ar.prep_d, nc);
     ctx.tout_g = ar.tout_g.data();
     ctx.tout_u = ar.tout_u.data();
@@ -2691,15 +2823,15 @@ void exl3_moe_cpu_forward_raw(
     ctx.prep_g = ar.prep_g; ctx.prep_u = ar.prep_u; ctx.prep_d = ar.prep_d;
     for (int j = 0; j < nc; ++j)
     {
-        ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
-        ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
-        ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I,
-                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I,
-                          ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
+        ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
+                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
+                          ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
+        ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
+                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
+                          ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
+        ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I,
+                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I,
+                          ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I, {}, {} };
     }
 
     std::lock_guard<std::mutex> lock(g_pool_mutex);
