@@ -16,11 +16,11 @@ from exllamav3.util.misc import prepend_hf_chat_context
 
 DATASETS = {
     "wiki2": {
-        "path": "wikitext", "name": "wikitext-2-raw-v1", "split": "test",
+        "path": "Salesforce/wikitext", "name": "wikitext-2-raw-v1", "split": "test",
         "text_column": "text", "display_name": "wikitext2",
     },
     "wikitext2": {
-        "path": "wikitext", "name": "wikitext-2-raw-v1", "split": "test",
+        "path": "Salesforce/wikitext", "name": "wikitext-2-raw-v1", "split": "test",
         "text_column": "text", "display_name": "wikitext2",
     },
     "openwebtext10k": {
