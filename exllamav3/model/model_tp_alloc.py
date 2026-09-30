@@ -136,7 +136,7 @@ class TPAllocator:
                 for s, m in zip(split, mask)
             ]
             overhead = [
-                (c.overhead_per_device if m else 0)
+                (tokens * c.overhead_per_device if m else 0)
                 + tokens * c.overhead_to_split * s // channels
                 + c.recons_temp * s // channels
                 for s, m in zip(split, mask)
