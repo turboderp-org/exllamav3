@@ -95,7 +95,7 @@ def main(args):
     if args.cache_quant is not None:
         split = [int(bits) for bits in args.cache_quant.split(",")]
         if len(split) == 1:
-            sim_kvq = split + split
+            sim_kvq = tuple(split) + tuple(split)
         elif len(split) == 2:
             sim_kvq = tuple(split)
         else:
@@ -303,10 +303,10 @@ def main(args):
         if logits_layer:
             if args.save_logits_a:
                 print(f" -- Saving model A logits to: {args.save_logits_a}")
-                save_tensor(state_a, args.save_logits_a, "logits")
+                save_tensor(save_logits_a, args.save_logits_a, "logits")
             if args.save_logits_b:
                 print(f" -- Saving model B logits to: {args.save_logits_b}")
-                save_tensor(state_b, args.save_logits_b, "logits")
+                save_tensor(save_logits_b, args.save_logits_b, "logits")
 
         # Final ppl, kld
         if logits_layer:
