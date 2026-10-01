@@ -332,7 +332,7 @@ def main(args, job_state):
                         s = modules[0].prepare_for_device(states_q, params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
-                            cand_kld[k][i] = kldiv(s, new_states_ref) - base_kld
+                            cand_kld[k][-1] = kldiv(s, new_states_ref) - base_kld
                         else:
                             cand_states[k].append(s.cpu())
                         del s
