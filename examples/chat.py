@@ -252,6 +252,9 @@ def main(args):
 
                 # Edit last response
                 case "/e":
+                    if len(context) == 0:
+                        print_error(f"Context is empty, nothing to edit")
+                        continue
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
