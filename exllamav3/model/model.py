@@ -724,10 +724,6 @@ class Model(Model_TPMixin, Model_LSMixin):
             host.ensure_started()
 
 
-    def get_load_metrics(self):
-        return self.config.stc.get_metrics()
-
-
     def get_layout_tree(self, pre_indent: int) -> str:
         def get_branch(module, b_indent) -> str:
             nonlocal pre_indent
