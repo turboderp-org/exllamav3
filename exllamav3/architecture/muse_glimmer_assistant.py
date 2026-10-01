@@ -28,9 +28,6 @@ class MuseGlimmerAssistantConfig(DFlashConfig):
             **kwargs
         )
 
-        # HF mask keeps sliding_window including the query
-        self.sliding_window = self.sliding_window - 1
-
 
 class MuseGlimmerAssistantModel(DFlashModel):
     config_class = MuseGlimmerAssistantConfig
