@@ -331,6 +331,7 @@ class _HugeArena:
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
     WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
+    CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
     def __init__(self, shared = False, huge = "", conn = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
@@ -343,6 +344,13 @@ class _HugeArena:
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        # A private anonymous chunk (Linux, not shared) only takes RAM for the pages rehome()
+        # writes, and the last chunk of a load is usually mostly unused, so the host-memory
+        # guard runs on bytes written (in CHECK_STEP slices) rather than on whole chunks.
+        # Shared, hugetlb and Windows chunks are committed up front and keep the per-chunk check
+        self.lazy = not shared and os.name != "nt"
+        self.written = 0
+        self.checked = 0
         self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
         # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
         # attempt: the size the last chunk was served at, or below the smallest size that failed
@@ -351,8 +359,9 @@ class _HugeArena:
     def _new_chunk(self, min_bytes):
         import mmap, os
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
-        check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
-                                f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
+        if not self.lazy:
+            check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
+                                    f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
         if self.shared and os.name == "nt":
             # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
             # trips on the layer tensors' exports at worker exit). It charges commit and gets
@@ -502,6 +511,12 @@ class _HugeArena:
             return tensor
         nbytes = tensor.numel() * tensor.element_size()
         aligned = (nbytes + 63) & ~63
+        if self.lazy:
+            if self.written + aligned > self.checked:
+                step = max(aligned, self.CHECK_STEP)
+                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                self.checked = self.written + step
+            self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
             self._new_chunk(aligned)
         off = self.cur_off
