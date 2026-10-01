@@ -149,3 +149,70 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
     tq()
 
     xx = 0
+
+
+# (num_kv_heads, head_dim). The dequant kernel walks the sequence in 4-group chunks, a fixed number per thread
+# block, and with a sliding window skips the blocks below it. Widths whose chunks per token don't divide the block's
+# chunk count put a token across two blocks, which is the case the skip has to get right; the pow2 widths are the
+# aligned control
+window_geometries = [(8, 128), (4, 128), (8, 96), (6, 128), (12, 64), (3, 128), (5, 64)]
+window_sizes = [1, 64, 300]
+window_chunks_per_block = 256
+
+@pytest.mark.parametrize("device", devices)
+@pytest.mark.parametrize("geometry", window_geometries)
+@pytest.mark.parametrize("window", window_sizes)
+@pytest.mark.parametrize("bits", bitss)
+@torch.inference_mode()
+def test_kv_quant_sliding_window(device, geometry, window, bits):
+    """
+    With a sliding window, every token in [seqlen - window, seqlen) must be dequantized in full. The sequence
+    lengths are chosen to put the oldest in-window token on and around each thread block boundary.
+    """
+    num_kv_heads, head_dim = geometry
+    pages = 4
+    max_len = pages * page_size
+    groups = num_kv_heads * head_dim // 32
+    chunks_per_token = -(-groups // 4)
+
+    block_table = torch.arange(pages, dtype = torch.int, device = device).view(1, pages)
+    cache_seqlens = torch.zeros(size = (1,), dtype = torch.int, device = device)
+
+    gen = torch.Generator().manual_seed(1)
+    cache_shape = (pages, page_size, num_kv_heads, head_dim)
+    cache_k_tensor = torch.randn(cache_shape, generator = gen).half().to(device)
+    cache_v_tensor = torch.randn(cache_shape, generator = gen).half().to(device)
+    cache_k_q = torch.zeros((pages, page_size, groups * bits), dtype = torch.int, device = device)
+    cache_v_q = torch.zeros_like(cache_k_q)
+    cache_k_s = torch.zeros((pages, page_size, groups), dtype = torch.half, device = device)
+    cache_v_s = torch.zeros_like(cache_k_s)
+
+    ext.quant_cache_paged(
+        cache_k_tensor, cache_k_q, cache_k_s,
+        cache_v_tensor, cache_v_q, cache_v_s,
+        cache_seqlens, block_table, page_size, max_len, 0.0, False,
+    )
+
+    # Oldest in-window token = first token of each thread block, and its neighbours
+    oldest = set()
+    for chunk in range(window_chunks_per_block, max_len * chunks_per_token, window_chunks_per_block):
+        token = chunk // chunks_per_token
+        oldest.update((token - 1, token, token + 1))
+    seqlens = sorted(t + window for t in oldest if 0 <= t and t + window <= max_len)
+    assert seqlens
+
+    ref_k = cache_k_tensor.view(max_len, -1)
+    ref_v = cache_v_tensor.view(max_len, -1)
+    for seqlen in seqlens:
+        cache_seqlens[0] = seqlen
+        # Anything the kernel leaves unwritten inside the window stays NaN and fails the comparison
+        out_k = torch.full(cache_shape, float("nan"), dtype = torch.half, device = device)
+        out_v = torch.full(cache_shape, float("nan"), dtype = torch.half, device = device)
+        ext.dequant_cache_paged(
+            cache_k_q, cache_k_s, out_k,
+            cache_v_q, cache_v_s, out_v,
+            cache_seqlens, block_table, page_size, window, 0.0,
+        )
+        a, b = seqlen - window, seqlen
+        torch.testing.assert_close(out_k.view(max_len, -1)[a:b], ref_k[a:b], atol = 0.08, rtol = 0.05)
+        torch.testing.assert_close(out_v.view(max_len, -1)[a:b], ref_v[a:b], atol = 0.08, rtol = 0.05)

@@ -372,8 +372,8 @@ void dequant_cache_paged_kernel
     if (sliding_window > 0)
     {
         int nb_chunk_id = (blockDim.x / 32) * ((blockIdx.x + 1) * ITER_PER_TB);
-        int nb_token_idx = nb_chunk_id / chunks_per_token;
-        if (nb_token_idx <= max_token_idx - sliding_window)
+        int last_token_idx = (nb_chunk_id - 1) / chunks_per_token;
+        if (last_token_idx < max_token_idx - sliding_window)
             return;
     }
 
