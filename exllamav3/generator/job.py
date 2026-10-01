@@ -944,12 +944,18 @@ class Job:
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
-            self.held_tokens = self.checkpoint["held_tokens"]
-            self.held_probs = self.checkpoint["held_probs"]
-            self.held_k_tokens = self.checkpoint["held_k_tokens"]
-            self.held_k_probs = self.checkpoint["held_k_probs"]
-            self.held_logits = self.checkpoint["held_logits"]
+            self.held_tokens = self.checkpoint["held_tokens"].clone()
+            self.held_probs = self.checkpoint["held_probs"].clone()
+            self.held_k_tokens = self.checkpoint["held_k_tokens"].clone()
+            self.held_k_probs = self.checkpoint["held_k_probs"].clone()
+            self.held_logits = self.checkpoint["held_logits"].clone()
+            # The checkpoint stays in place (offset 0, explored tokens) in case the resampled token is
+            # rejected too. The caller emits the restored buffers right away, so what a second rewind
+            # must restore is the empty state after that emit, not the pre-match contents again
             self.checkpoint["offset"] = 0
+            self.checkpoint["held_text"] = ""
+            for k in ("held_tokens", "held_probs", "held_k_tokens", "held_k_probs", "held_logits"):
+                self.checkpoint[k].clear()
             return off_tokens, off_text
 
         if requeue_now:
