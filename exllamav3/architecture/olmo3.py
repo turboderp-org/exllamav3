@@ -35,7 +35,7 @@ class Olmo3Config(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        self.sliding_window = self.read_cfg(int, "text_config->sliding_window", 4096)
+        self.sliding_window = self.read_cfg(int, ["sliding_window", "text_config->sliding_window"], 4096)
         layer_types = self.read_cfg(list, "layer_types", None)
         if layer_types:
             assert len(layer_types) == self.num_hidden_layers
