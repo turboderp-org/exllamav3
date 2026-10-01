@@ -26,7 +26,8 @@ from .qwen3_5_mtp import Qwen3_5MTPModel, Qwen3_5MoeMTPModel
 
 
 def read_qwen3_5_layer_types(config: Config, text_config_path: str, num_layers: int, full_attention_interval: int) -> list[str]:
-    layer_types = config.read_cfg(list, f"{text_config_path}->layer_types", None)
+    key = f"{text_config_path}->layer_types" if text_config_path else "layer_types"
+    layer_types = config.read_cfg(list, key, None)
     if layer_types is not None:
         assert len(layer_types) == num_layers, \
             "Length of text_config->layer_types key doesn't match number of hidden layers"
