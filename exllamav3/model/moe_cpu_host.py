@@ -96,6 +96,11 @@ class MoeCpuTuning:
         # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
         # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
+        # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
+        # into loader tensors and then copied into the arena, so this bounds the transient host
+        # memory on top of the arena to a slice of a layer instead of the whole layer (~1.2 GiB
+        # per layer on a 512-expert model). 0 loads the whole layer in one pass
+        self.load_batch_experts = int(os.environ.get("EXL3_MOE_CPU_LOAD_BATCH", 32))
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
@@ -600,14 +605,23 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             msg = conn.recv()
             if msg[0] == "layer":
                 spec = msg[1]
-                stc.begin_deferred_load()
-                g = fetch(spec["gate_keys"])
-                u = fetch(spec["up_keys"])
-                d = fetch(spec["down_keys"])
-                stc.end_deferred_load()
-                # Copy into the hugepage-backed arena now that the deferred reads have actually
-                # populated these tensors
-                g, u, d, blocks = rehome_experts(g, u, d)
+                num_experts = len(spec["up_keys"])
+                batch = TUNING.load_batch_experts or num_experts
+                g, u, d, blocks = [], [], [], []
+                for e0 in range(0, num_experts, batch):
+                    sl = slice(e0, e0 + batch)
+                    stc.begin_deferred_load()
+                    bg = fetch(spec["gate_keys"][sl])
+                    bu = fetch(spec["up_keys"][sl])
+                    bd = fetch(spec["down_keys"][sl])
+                    stc.end_deferred_load()
+                    # Copy into the hugepage-backed arena now that the deferred reads have
+                    # actually populated these tensors; the loader tensors die with this batch
+                    bg, bu, bd, bb = rehome_experts(bg, bu, bd)
+                    g += bg
+                    u += bu
+                    d += bd
+                    blocks += bb
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
