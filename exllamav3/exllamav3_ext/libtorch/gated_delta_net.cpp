@@ -407,6 +407,12 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
+    // The o_proj bias add runs in place on y, which is a different tensor every call
+    if (o_proj->bias)
+    {
+        args.emplace_back(GP_add_x, (void*) y.data_ptr());
+        args.emplace_back(GP_add_z, (void*) y.data_ptr());
+    }
     s.graph->launch(args, stream);
 }
 
@@ -612,6 +618,15 @@ void BC_Mamba2::run_bszN
     if (s.yp)
         args.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     else
+    {
         args.emplace_back(GP_gemm_C, (void*) y.data_ptr());     // o_proj output
+        // The o_proj bias add runs in place on y, which is a different tensor every call (the
+        // padded path adds on the yp static instead)
+        if (o_proj->bias)
+        {
+            args.emplace_back(GP_add_x, (void*) y.data_ptr());
+            args.emplace_back(GP_add_z, (void*) y.data_ptr());
+        }
+    }
     s.graph->launch(args, stream);
 }
