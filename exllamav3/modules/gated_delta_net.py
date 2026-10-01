@@ -572,11 +572,11 @@ class GatedDeltaNet(Module):
         if conv1d_weight is not None:
             self.conv1d_weight = conv1d_weight
             self.conv1d_bias = conv1d_bias
-            self.key_conv1d_weight = None,
-            self.key_conv1d_bias = None,
-            self.key_conv1d_q_weight = None,
-            self.key_conv1d_k_weight = None,
-            self.key_conv1d_v_weight = None,
+            self.key_conv1d_weight = None
+            self.key_conv1d_bias = None
+            self.key_conv1d_q_weight = None
+            self.key_conv1d_k_weight = None
+            self.key_conv1d_v_weight = None
         else:
             self.key_conv1d_weight = f"{key}.{key_conv1d}.weight"
             self.key_conv1d_bias = f"{key}.{key_conv1d}.bias"
