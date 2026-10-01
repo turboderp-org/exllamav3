@@ -156,7 +156,7 @@ __device__ inline float block_reduce_sum_broadcast_f(float v, int num_threads)
     {
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
-        shared[0] = v;
+        if (lane_id == 0) shared[0] = v;
     }
     __syncthreads();
     v = shared[0];
