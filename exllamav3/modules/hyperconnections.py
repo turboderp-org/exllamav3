@@ -14,6 +14,70 @@ import math
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _gr_folded_epilogue_kernel(g_ptr, s_ptr, rstd_ptr, w_ptr, out_ptr, D, H: tl.constexpr, BLOCK: tl.constexpr):
+    # mixed[r, d] = mean_h sigmoid(g[r, h, d]) * s[r, h, d] * rstd[r, h] * w[h, d], all fp32
+    r = tl.program_id(0)
+    d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = d < D
+    acc = tl.zeros((BLOCK,), dtype = tl.float32)
+    for h in tl.static_range(H):
+        g = tl.load(g_ptr + (r * H + h) * D + d, mask = m, other = 0.0).to(tl.float32)
+        x = tl.load(s_ptr + (r * H + h) * D + d, mask = m, other = 0.0)
+        w = tl.load(w_ptr + h * D + d, mask = m, other = 0.0).to(tl.float32)
+        rs = tl.load(rstd_ptr + r * H + h)
+        acc += tl.sigmoid(g) * (x * rs * w)
+    tl.store(out_ptr + r * D + d, (acc / H).to(tl.float16), mask = m)
+
+
+@triton.jit
+def _gr_norm_split_kernel(s_ptr, rstd_ptr, hi_ptr, lo_ptr, D, eps, BLOCK: tl.constexpr):
+    # one (row, stream): rstd = rsqrt(mean(x^2) + eps), x * rstd split into half hi + lo
+    row = tl.program_id(0)
+    d = tl.arange(0, BLOCK)
+    m = d < D
+    x = tl.load(s_ptr + row * D + d, mask = m, other = 0.0)
+    rs = 1.0 / tl.sqrt(tl.sum(x * x, axis = 0) / D + eps)
+    tl.store(rstd_ptr + row, rs)
+    y = x * rs
+    hi = y.to(tl.float16)
+    lo = (y - hi.to(tl.float32)).to(tl.float16)
+    tl.store(hi_ptr + row * D + d, hi, mask = m)
+    tl.store(lo_ptr + row * D + d, lo, mask = m)
+
+
+def _gr_norm_split(s3, eps):
+    R, H, Dh = s3.shape
+    rstd = torch.empty((R, H), dtype = torch.float, device = s3.device)
+    hi = torch.empty((R, H * Dh), dtype = torch.half, device = s3.device)
+    lo = torch.empty_like(hi)
+    _gr_norm_split_kernel[(R * H,)](s3, rstd, hi, lo, Dh, eps, BLOCK = triton.next_power_of_2(Dh))
+    return rstd, hi, lo
+
+
+def _mm_hilo(hi, lo, w_t):
+    y = torch.mm(hi, w_t, out_dtype = torch.float32)
+    return torch.addmm(y, lo, w_t, out_dtype = torch.float32, out = y)
+
+
+def _mm_split(x, w_t):
+    """x (R, K) fp32 @ w_t (K, N) half -> (R, N) fp32 at ~fp32 accuracy: x = hi + lo in half,
+    two fp16 tensor-core GEMMs accumulating into one fp32 output."""
+    hi = x.half()
+    lo = torch.sub(x, hi, out = torch.empty_like(x)).half()
+    y = torch.mm(hi, w_t, out_dtype = torch.float32)
+    return torch.addmm(y, lo, w_t, out_dtype = torch.float32, out = y)
+
+
+def _gr_folded_epilogue(g, s3, rstd, w_h, out, H, Dh):
+    R = s3.shape[0]
+    BLOCK = 512
+    _gr_folded_epilogue_kernel[(R, triton.cdiv(Dh, BLOCK))](g, s3, rstd, w_h, out, Dh, H = H, BLOCK = BLOCK)
+
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
 # the embedding into the streams, each sublayer site mixes them through a HyperConnection
@@ -352,9 +416,10 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
-        if self.tiled and not keep_source_weights:
+        if not keep_source_weights:
             # Every inference consumer now reads the int8 tables (tiled path) or the folded and
-            # repacked copies (fused decode path): release the fp16 sources
+            # repacked copies (fused decode path, and the cuBLAS path when not tiled): release
+            # the fp16 sources
             self.proj_h = self.down_h = self.inject_h = self.up_h = None
 
     @override
@@ -450,8 +515,7 @@ class GatedResidual(Module):
                 ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
                 ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
             )
-        else:
-            self._require_source_weights("the cuBLAS path")
+        elif self.proj_h is not None:
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
@@ -464,6 +528,26 @@ class GatedResidual(Module):
             g = torch.matmul(t, self.up_h.t())                             # (R, H * Dh)
             mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
                      * normed.float().view(R, H, Dh)).mean(dim = -2).half()
+        else:
+            # cuBLAS path on the fused decode tables (sources released, no int8 tables): fn_h
+            # has the norm weight folded in, so it projects the unweighted norm, and upx_h is
+            # unpacked from its (H, D/4, rank, 4) layout per call (transient, rank * H * D)
+            post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                if self.use_combine else None
+            # fp32-equivalent products over the fp16 tables (exact copies of the checkpoint
+            # weights, unlike the 14-bit int8 tables): activations are split x = hi + lo in half
+            # (~22 bits together) and both halves go through one fp16 tensor-core GEMM with fp32
+            # accumulation and output. The norm weight is folded into fn_h, so the GEMM takes the
+            # unweighted norm; the epilogue recomputes the normed stack in fp32 from s3
+            rstd, nn_hi, nn_lo = _gr_norm_split(s3, self.rms_eps)          # (R, H), 2 x (R, H * D)
+            dm = _mm_hilo(nn_hi, nn_lo, self.fn_h.t())                     # (R, rank [+ H]) fp32
+            t = F.silu(dm[:, : self.rank] / H)
+            if self.use_combine:
+                post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :] / H))
+            up = self.upx_h.permute(0, 1, 3, 2).reshape(H * Dh, self.rank)
+            g = _mm_split(t, up.t())                                       # (R, H * Dh) fp32
+            mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+            _gr_folded_epilogue(g, s3, rstd, self.w_h, mixed, H, Dh)
         return post, mixed
 
     def mix(self, streams: torch.Tensor, params: dict):
