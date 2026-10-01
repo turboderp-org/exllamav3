@@ -38,6 +38,7 @@ __device__ inline ValIdx block_reduce_argmax(ValIdx v)
         v = shared[lane_id];
         v = warp_reduce_argmax(v);
     }
+    __syncthreads();
     return v;
 }
 
@@ -79,6 +80,7 @@ __device__ inline half block_reduce_max_h(half v, int num_threads)
         v = lane_id < max_warp_id ? shared[lane_id] : NEG_INF_F16;
         v = warp_reduce_max_h(v);
     }
+    __syncthreads();
     return v;
 }
 
@@ -136,6 +138,7 @@ __device__ inline float block_reduce_sum_f(float v, int num_threads)
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
     }
+    __syncthreads();
     return v;
 }
 
