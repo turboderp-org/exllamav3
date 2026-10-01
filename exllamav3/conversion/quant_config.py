@@ -8,8 +8,8 @@ def update_config(
     """
     Make necessary updates to config.json
     """
-    if "tied_word_embeddings" in config_dict:
-        config_dict["tied_word_embeddings"] = True
+    if "tie_word_embeddings" in config_dict:
+        config_dict["tie_word_embeddings"] = True
 
 
 def create_quantization_config_json(
