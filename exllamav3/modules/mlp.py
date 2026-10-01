@@ -777,8 +777,9 @@ class GatedMLP(Module):
 
         # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
+        # (not with interm_div: the graph has no hook for the pre-activation rescale)
         self.bc = None
-        if self.num_slices == 1 and self.downs[0].inner.bc is not None:
+        if self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (
