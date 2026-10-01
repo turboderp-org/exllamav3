@@ -1345,7 +1345,9 @@ class GatedDeltaNet(Module):
             if num_k_heads else None
         k_split = (True, (global_num_k_heads + first) * k_head_dim, (global_num_k_heads + last) * k_head_dim) \
             if num_k_heads else None
-        v_split = (True, (global_num_k_heads * 2 + first * G) * v_head_dim, (global_num_k_heads * 2 + last * G) * v_head_dim) \
+        # V rows follow the q and k rows, which are k_head_dim wide
+        v_base = global_num_k_heads * 2 * k_head_dim
+        v_split = (True, v_base + first * G * v_head_dim, v_base + last * G * v_head_dim) \
             if num_k_heads else None
         z_split = (True, first * v_head_dim * G, last * v_head_dim * G) \
             if num_k_heads else None
