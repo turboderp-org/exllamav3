@@ -738,15 +738,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def load_routing(self, **kwargs):
 
+        per_expert_scale = self.per_expert_scale
         if self.interm_div != 1.0 and self.router_type == "std":
             # std routing has no scaling factor; fold the interm_div compensation into the
             # per-expert scale, which routing_std applies after top-k normalization. Both the
-            # GPU and CPU-offload load paths come through here, and unload clears the tensor
-            if self.per_expert_scale is None:
-                self.per_expert_scale = torch.full(
+            # GPU and CPU-offload load paths come through here. The folded scale only goes to the
+            # routing config: self.per_expert_scale stays the checkpoint tensor, which is what
+            # get_tensors and the TP export hand on
+            if per_expert_scale is None:
+                per_expert_scale = torch.full(
                     (self.num_experts,), self.interm_div, dtype = torch.bfloat16, device = self.device)
             else:
-                self.per_expert_scale = (self.per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
+                per_expert_scale = (per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
@@ -768,7 +771,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
-            per_expert_scale = self.per_expert_scale,
+            per_expert_scale = per_expert_scale,
         )
 
 
@@ -1307,7 +1310,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 interm_a_ = interm_a[:count]
 
                             yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
-                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
+                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state_)
                             current_state = out_state_
                     else:
 
