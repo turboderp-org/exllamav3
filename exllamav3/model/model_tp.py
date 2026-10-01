@@ -541,7 +541,7 @@ class Model_TPMixin:
                 progress.update(idx + 1)
 
             # Append final gather layer
-            if last_module.caps["logits_output"]:
+            if last_module.caps.get("logits_output"):
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
 
             # Final callback, 100% loaded
