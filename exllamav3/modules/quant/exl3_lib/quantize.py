@@ -593,7 +593,7 @@ def ldlq(
 
         buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
         assert buf_size_k % 16 == 0
-        assert size_n % buf_size_k == 0
+        assert size_k % buf_size_k == 0
 
         p_row = 0
 
