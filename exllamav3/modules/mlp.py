@@ -398,7 +398,7 @@ class MLP(Module):
             self.bc is not None and bsz == 1 and q_len == 1 and
             x.dtype == torch.float16 and x.is_contiguous()
         ):
-            d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+            d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], d)
