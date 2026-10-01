@@ -476,7 +476,7 @@ def main(args):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1

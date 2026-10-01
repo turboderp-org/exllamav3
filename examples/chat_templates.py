@@ -18,6 +18,8 @@ class PromptFormat:
     def harmony_tags(self):
         # None: Streamer_harmony keeps its GPT-OSS default tags
         return None
+    def inject_thinktag(self):
+        return True
 
 
 class PromptFormat_raw(PromptFormat):
@@ -114,6 +116,50 @@ class PromptFormat_chatml(PromptFormat):
 
     def thinktag(self):
         return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
+class PromptFormat_mimo(PromptFormat):
+    description = "MiMo (ChatML variant)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # MiMo quirk: no newline after <|im_end|>
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>"
+            context += f"<|im_start|>assistant\n"
+            if a is None and not think:
+                # Closed think tags to disable thinking
+                context += "<think></think>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        # Also no newline after <think>
+        return "<think>", "</think>"
+
+    def inject_thinktag(self):
+        # Model decides in reasoning mode
+        return False
 
     def stop_conditions(self, tokenizer):
         return [
@@ -1203,4 +1249,5 @@ prompt_formats = {
     "ds4": PromptFormat_ds4,
     "spark": PromptFormat_spark,
     "muse": PromptFormat_muse,
+    "mimo": PromptFormat_mimo,
 }
