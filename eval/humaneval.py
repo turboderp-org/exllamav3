@@ -45,7 +45,7 @@ prompt_formats = {
     ),
     "gemma": (
         "<bos><start_of_turn>user\n"
-        "Complete the following Python function:\n\n{{problem}}<|eot_id|>"
+        "Complete the following Python function:\n\n{{problem}}<end_of_turn>"
         "<start_of_turn>model\n"
         "```python\n{{problem}}",
         "    "
