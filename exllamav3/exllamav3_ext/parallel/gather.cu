@@ -285,21 +285,25 @@ void pg_gather_small_kernel
             int src_device = __ffs(pending) - 1;
             int src_rank = __popc(device_mask & ((1 << src_device) - 1));
             int src_ldim = all_offsets[src_device + 1] - all_offsets[src_device];
-            if (src_ldim == 0)
-                continue;
 
+            // The output rank is the only reader of the produced flags, so it also clears them,
+            // empty ranks included (they publish too). A producer is held in the barrier below
+            // until this rank has cleared its flag and released, so the clear can neither wipe
+            // the producer's next publish nor be outrun by this rank's next gather
             if (t == 0)
             {
                 uint32_t sleep = SYNC_MIN_SLEEP;
                 uint64_t deadline = sync_deadline();
-                while (ldg_acquire_sys_u32(ctx->gather_stage_produced + src_rank) < 1)
+                while (!*abort_flag && ldg_acquire_sys_u32(ctx->gather_stage_produced + src_rank) < 1)
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "gather_small");
-                    if (*abort_flag) break;
                 }
+                stg_release_sys_u32(ctx->gather_stage_produced + src_rank, 0);
             }
+            if (src_ldim == 0)
+                continue;
             __syncthreads();
             if (*abort_flag)
                 break;
@@ -318,12 +322,6 @@ void pg_gather_small_kernel
     }
 
     pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
-
-    if (t == 0)
-    {
-        ctx->gather_stage_produced[this_rank] = 0;
-        __threadfence_system();
-    }
 }
 
 
