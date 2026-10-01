@@ -142,8 +142,11 @@ class SS_Sample_mn(SS_Sample):
     """
     def run(self, state: SamplingState):
         match state.state:
-            case SS.PROBS_N_S | SS.PROBS_N:
+            case SS.PROBS_N:
                 state.sample = torch.multinomial(state.probs, num_samples = 1)
+            case SS.PROBS_N_S:
+                temp = torch.multinomial(state.probs, num_samples = 1)
+                state.sample = state.indices.gather(-1, temp)
             case _:
                 raise ValueError("Sampling logic error")
         state.state = SS.DONE
