@@ -230,6 +230,36 @@ class Attention(Module):
         self.key_sinks = key_sinks
         self.sinks = None
 
+        # Runtime and TP bookkeeping; set before the zero-head early return below (forward(), unload()
+        # and the TP import glue touch these on ranks that hold none of this layer's heads)
+        self.cache_layers = []
+        self.tp_cache_lookup = {}
+        self.multi_kv = None
+        self.multi_qg = None
+        self.tp_reduce = False
+        self.dispatch_cache = {}
+        self.bc_attn = {}
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+
+        self.has_split_cache = False
+
+        # TP-aware span_heads norm support
+        self.tp_span_heads_norm = False
+        self.q_global_dim = 0
+        self.k_global_dim = 0
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
+
         if self.num_kv_heads == 0:
             return
 
@@ -386,34 +416,6 @@ class Attention(Module):
         self.caps.update({
             "kv_cache": True
         })
-
-        self.cache_layers = []
-        self.tp_cache_lookup = {}
-        self.multi_kv = None
-        self.multi_qg = None
-        self.tp_reduce = False
-        self.dispatch_cache = {}
-        self.bc_attn = {}
-
-        self.q_norm_tensor = None
-        self.k_norm_tensor = None
-
-        self.has_split_cache = False
-
-        # TP-aware span_heads norm support
-        self.tp_span_heads_norm = False
-        self.q_global_dim = 0
-        self.k_global_dim = 0
-
-        self.prealloc_qgh_1 = None
-        self.prealloc_qg_1 = None
-        self.prealloc_kvh_1 = None
-        self.prealloc_kv_1 = None
-        self.multi_qkv = None
-        self.prealloc_qkvh_1 = None
-        self.prealloc_qkv_out_1 = None
-        self.prealloc_qkv_cptrs_1 = None
-        self.prealloc_qkv_carrier = None
 
 
     @override
