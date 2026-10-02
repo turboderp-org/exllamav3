@@ -1511,6 +1511,16 @@ class Job:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
 
+                # A full prompt page that prefill (re)built rather than reusing by hash (the page MTP leaves
+                # out of the cached prefix so one real token runs) was allocated under a random hash; give
+                # it its content hash now, or every page completed after it chains off the random one and
+                # no later checkpoint is findable by a requeued job
+                for local_idx in range(p0, p2):
+                    page = seq.allocated_pages[local_idx]
+                    if page.kv_position == PAGE_SIZE and local_idx < len(seq.page_hashes) \
+                            and page.phash != seq.page_hashes[local_idx]:
+                        self.hash_completed_page(seq, local_idx)
+
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
