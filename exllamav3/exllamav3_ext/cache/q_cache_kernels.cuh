@@ -304,14 +304,19 @@ void quant_cache_paged_kernel
     const int blocks_per_seq,
     const int groups_per_token,
     const float compand_a,
-    const int in_contiguous   // k_in/v_in indexed (batch, append_pos) instead of paged positions
+    const int in_contiguous,  // k_in/v_in indexed (batch, append_pos) instead of paged positions
+    const int num_cache_pages
 )
 {
     __shared__ uint32_t sh_pack[MAX_WARPS][32];
     int batch_idx = blockIdx.z;
     int token_idx = blockIdx.y + cache_seqlens[batch_idx];
+    if (token_idx < 0) return;
     int page_idx = token_idx / CQ_PAGE_SIZE;
-    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+    if (page_idx >= blocks_per_seq) return;   // torn cache_seqlens would index past the table
+    int mapped_page = block_table[blocks_per_seq * batch_idx + page_idx];
+    if (mapped_page < 0 || mapped_page >= num_cache_pages) return;  // torn table entry -> wild write
+    int token_pos = mapped_page * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
     int in_pos = in_contiguous ? (batch_idx * gridDim.y + blockIdx.y) : token_pos;
 
     int warp = threadIdx.x >> 5;
@@ -359,7 +364,8 @@ void dequant_cache_paged_kernel
     const float compand_a,
     const int compact_out,          // write pages densely at (batch * pages_per_seq + page)
                                     // instead of the source physical index (window scratch)
-    const int bonus_len             // rows past cache_seqlens to include (pre-appended chunk)
+    const int bonus_len,            // rows past cache_seqlens to include (pre-appended chunk)
+    const int num_cache_pages
 )
 {
     int batch_idx = blockIdx.y;
@@ -385,7 +391,9 @@ void dequant_cache_paged_kernel
         int g0 = (chunk_id - token_idx * chunks_per_token) * 4;
         int active = min(4, groups_per_token - g0);
         int page_idx = token_idx / CQ_PAGE_SIZE;
+        if (page_idx < 0 || page_idx >= pages_per_seq) break;   // torn seqlen -> OOB table read
         int mapped_page = b_block_table[page_idx];
+        if (mapped_page < 0 || mapped_page >= num_cache_pages) continue;  // torn table -> wild access
         int token_pos = mapped_page * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
         int base = token_pos * groups_per_token + g0;
         int out_pos = compact_out ? (batch_idx * pages_per_seq + page_idx) * CQ_PAGE_SIZE

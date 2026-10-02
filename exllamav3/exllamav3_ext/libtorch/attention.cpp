@@ -585,6 +585,7 @@ void BC_Attention::run_gr
             (void*) block_table.data_ptr(),
             (void*) cache_seqlens.data_ptr(),
             (void*) (intptr_t) (int) block_table.size(1),
+            (void*) (intptr_t) (int) cache_k.size(0),
         };
         s.k_update->launch(s.upd_grid.x, s.upd_grid.y, s.upd_grid.z, args, stream);
         if (graph)
@@ -782,6 +783,7 @@ void BC_Attention::run_gr
             (void*) (intptr_t) (int) block_table.size(1),
             (void*) (intptr_t) num_splits,
             (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
+            (void*) (intptr_t) (int) cache_k.size(0),
         };
         // Launched at the split cap so the captured grid never changes; splits at or above the
         // live count exit without storing

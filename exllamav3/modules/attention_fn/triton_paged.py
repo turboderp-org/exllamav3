@@ -23,6 +23,7 @@ def _paged_kv_update_kernel(
     block_table,
     cache_seqlens,
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index guard
     kv_append_len,       # runtime: append length varies per prefill chunk (bc_attn still bakes
                          # it as a constexpr through its explicit ASTSource signature)
     n_kv_heads: tl.constexpr,
@@ -39,12 +40,15 @@ def _paged_kv_update_kernel(
     logical_t = tl.load(cache_seqlens + batch) + t
     page = logical_t // page_size
     page_off = logical_t - page * page_size
-    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    # A torn seqlen/table entry must not turn into an out-of-pool write.
+    in_table = (page >= 0) & (page < num_pages_per_seq)
+    phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_table, other = 0)
+    ok = in_table & (phys >= 0) & (phys < num_cache_pages)
 
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     src = (((batch * kv_append_len + t) * n_kv_heads + pid_h) * head_dim + offs_d)
     dst = (((phys * page_size + page_off) * n_kv_heads + pid_h) * head_dim + offs_d)
-    mask = offs_d < head_dim
+    mask = (offs_d < head_dim) & ok
     tl.store(k_cache + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
     tl.store(v_cache + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
 
@@ -63,6 +67,7 @@ def _paged_attn_splitdv_kernel(
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
@@ -95,6 +100,7 @@ def _paged_attn_splitdv_kernel(
     q_tile = tl.load(q_ptrs, mask=offs_m[:, None] < q_len, other=0.0)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
     q_abs = total_k_len - q_len + offs_m
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
@@ -110,6 +116,7 @@ def _paged_attn_splitdv_kernel(
             mask=offs_n < total_k_len,
             other=0,
         )
+        phys = tl.minimum(tl.maximum(phys, 0), num_cache_pages - 1)
 
         k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
         k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
@@ -171,6 +178,7 @@ def _paged_attn_longq_grouped_kernel(
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
@@ -213,6 +221,7 @@ def _paged_attn_longq_grouped_kernel(
     q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None], other=0.0)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
     q_abs = total_k_len - q_len + row_q
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
@@ -228,6 +237,7 @@ def _paged_attn_longq_grouped_kernel(
             mask=offs_n < total_k_len,
             other=0,
         )
+        phys = tl.minimum(tl.maximum(phys, 0), num_cache_pages - 1)
 
         k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
         k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
@@ -425,6 +435,7 @@ def paged_attn_triton(
                 block_table,
                 cache_seqlens,
                 num_pages_per_seq,
+                k_cache.shape[0],
                 kv_append_len,
                 n_kv_heads,
                 page_size,
@@ -448,7 +459,7 @@ def paged_attn_triton(
             kv_append_len,
             n_q_heads,
             n_kv_heads,
-            num_pages_per_seq,
+            num_pages_per_seq, k_cache.shape[0],
             page_size,
             head_dim,
             float(softmax_scale),
@@ -573,6 +584,7 @@ def paged_attn_triton_longq(
                 block_table,
                 cache_seqlens,
                 num_pages_per_seq,
+                k_cache.shape[0],
                 kv_append_len,
                 n_kv_heads,
                 page_size,
@@ -596,7 +608,7 @@ def paged_attn_triton_longq(
             kv_append_len,
             n_q_heads,
             n_kv_heads,
-            num_pages_per_seq,
+            num_pages_per_seq, k_cache.shape[0],
             page_size,
             head_dim,
             float(softmax_scale),
@@ -866,6 +878,7 @@ def _paged_attn_decode_split_kernel(
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits,          # runtime: the grid may be launched wider (graph path); extra splits idle
     sinks,               # last runtime arg: the BC launch appends it after the patched ints
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
@@ -913,6 +926,8 @@ def _paged_attn_decode_split_kernel(
         q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    # A torn seqlen would run reads past the block table; clamp to the table span
+    total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
     q_abs = total_k_len - q_len + row_q
 
     if WINDOW_LEFT >= 0:
@@ -942,6 +957,8 @@ def _paged_attn_decode_split_kernel(
             mask=offs_n < n_end,
             other=0,
         )
+        # Torn table entries become wild reads; pin them to the pool
+        phys = tl.minimum(tl.maximum(phys, 0), num_cache_pages - 1)
 
         if QCK > 0:
             tok_rows = phys * page_size + page_off
@@ -1232,7 +1249,7 @@ def paged_attn_triton_decode(
         args = (
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, splits, sinks,
+            split_len, num_pages_per_seq, splits, sinks, k_cache.shape[0],
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
@@ -1253,7 +1270,7 @@ def paged_attn_triton_decode(
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
                 k, v, k_cache, v_cache, block_table, cache_seqlens,
-                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
+                num_pages_per_seq, k_cache.shape[0], kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
                 num_warps=2, num_stages=3,
             )
 
@@ -1326,6 +1343,7 @@ def _paged_attn_prefill_inner(
     MASKED: tl.constexpr,
     SRC_NEW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
 ):
     """One pass over kv tiles [n_start, n_end). With MASKED = False the tiles are known to be
     fully inside the causal/window region for every row and all bounds/mask logic is skipped.
@@ -1344,6 +1362,9 @@ def _paged_attn_prefill_inner(
             phys = tl.load(block_table_b + page, mask = offs_n < n_end, other = 0)
         else:
             phys = tl.load(block_table_b + page)
+        # Torn table entries become wild reads; pin them to the pool (SRC_NEW skips the table)
+        if not SRC_NEW:
+            phys = tl.minimum(tl.maximum(phys, 0), num_cache_pages - 1)
 
         if SRC_NEW:
             k_ptrs = k_cache + ((offs_n[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
@@ -1465,6 +1486,7 @@ def _paged_attn_prefill_kernel(
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,      # power of two >= head_dim: tile width, zero-padded columns
@@ -1509,6 +1531,7 @@ def _paged_attn_prefill_kernel(
         q_tile = _rot_h32(q_tile, h32, BLOCK_M, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
     q_abs = total_k_len - q_len + offs_m
     qk_scale_log2e = scale * 1.4426950408889634
 
@@ -1558,13 +1581,13 @@ def _paged_attn_prefill_kernel(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, num_cache_pages,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, True, BLOCK_N,
+            True, True, BLOCK_N, num_cache_pages,
         )
     elif NEW_KV == 2:
         # Cache known empty: same structure as the cache path, reading the contiguous source
@@ -1574,20 +1597,20 @@ def _paged_attn_prefill_kernel(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                False, True, BLOCK_N,
+                False, True, BLOCK_N, num_cache_pages,
             )
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                True, True, BLOCK_N,
+                True, True, BLOCK_N, num_cache_pages,
             )
         else:
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                True, True, BLOCK_N,
+                True, True, BLOCK_N, num_cache_pages,
             )
     elif CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
         n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
@@ -1595,20 +1618,20 @@ def _paged_attn_prefill_kernel(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            False, False, BLOCK_N,
+            False, False, BLOCK_N, num_cache_pages,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, num_cache_pages,
         )
     else:
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, num_cache_pages,
         )
 
     if IS_SPLIT:
@@ -1972,7 +1995,7 @@ def paged_attn_triton_prefill(
             k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
             splits, splits > 1, new_kv_mode, qck, qcv,
             q_len, kv_append_len, n_q_heads, n_kv_heads,
-            num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
+            num_pages_per_seq, k_cache.shape[0], page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right),
             window_left >= 0, window_right >= 0, float(softcap or 0.0),
             has_sinks, wide_index, block_m, block_n,
@@ -1993,7 +2016,7 @@ def paged_attn_triton_prefill(
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
                 k, v, k_cache, v_cache, block_table, cache_seqlens,
-                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
+                num_pages_per_seq, k_cache.shape[0], kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
                 num_warps=2, num_stages=3,
             )
 

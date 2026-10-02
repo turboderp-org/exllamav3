@@ -18,12 +18,20 @@ __device__ __forceinline__ uint64_t paged_cache_offset
     int64_t kv_head,
     int64_t n_kv_heads,
     int64_t dim,
-    int d
+    int d,
+    int64_t num_pages_per_seq,
+    int64_t num_cache_pages
 )
 {
+    if (logical_pos < 0) logical_pos = 0;
     const int64_t logical_page   = logical_pos / PAGE_SIZE;
     const int64_t offset_in_page = logical_pos % PAGE_SIZE;
-    const int32_t physical_page  = block_row[logical_page];
+    // Clamp a torn index instead of faulting on a wild address; a bad logical_page reads the
+    // last table slot and a bad physical page reads the last cache page.
+    const int64_t lp = logical_page < 0 ? 0 : (logical_page >= num_pages_per_seq ? num_pages_per_seq - 1 : logical_page);
+    int32_t physical_page = block_row[lp];
+    if (physical_page < 0) physical_page = 0;
+    else if (physical_page >= num_cache_pages) physical_page = (int32_t)(num_cache_pages - 1);
 
     return
         ((((uint64_t)physical_page * (uint64_t)PAGE_SIZE +
@@ -43,7 +51,8 @@ __global__ void kv_cache_update_kernel_paged
     int64_t bsz,
     int64_t kv_append_len,
     int64_t n_kv_heads,
-    int64_t num_pages_per_seq
+    int64_t num_pages_per_seq,
+    int64_t num_cache_pages
 )
 {
     constexpr int THREADS = D / 2;
@@ -59,14 +68,18 @@ __global__ void kv_cache_update_kernel_paged
     const int64_t kv_pos = bt_idx % kv_append_len;
 
     const int64_t logical_pos = (int64_t)cache_seqlens[batch] + kv_pos;
+    if (logical_pos < 0 || logical_pos / PAGE_SIZE >= num_pages_per_seq) return;  // torn seqlen -> OOB table read
     const int32_t* block_row  = block_table + batch * num_pages_per_seq;
 
     const uint64_t src_off =
         ((((uint64_t)batch * (uint64_t)kv_append_len + (uint64_t)kv_pos) * (uint64_t)n_kv_heads +
           (uint64_t)kv_head) * (uint64_t)D) + (uint64_t)d0;
 
+    const int64_t logical_page = logical_pos / PAGE_SIZE;
+    const int32_t phys = block_row[logical_page];
+    if (phys < 0 || phys >= num_cache_pages) return;              // torn table entry -> wild write
     const uint64_t dst_off =
-        paged_cache_offset(block_row, logical_pos, kv_head, n_kv_heads, D, d0);
+        paged_cache_offset(block_row, logical_pos, kv_head, n_kv_heads, D, d0, num_pages_per_seq, num_cache_pages);
 
     *((half2*)(k_cache + dst_off)) = *((const half2*)(k + src_off));
     *((half2*)(v_cache + dst_off)) = *((const half2*)(v + src_off));
@@ -90,6 +103,7 @@ __global__ void attn_chunked_paged_kernel_512x256
     int64_t n_chunks,
     int64_t kv_chunk_size,
     int64_t num_pages_per_seq,
+    int64_t num_cache_pages,
     bool causal,
     float scale
 )
@@ -152,7 +166,7 @@ __global__ void attn_chunked_paged_kernel_512x256
         if (kv_pos > causal_limit) break;
 
         const uint64_t k_off =
-            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, d0);
+            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, d0, num_pages_per_seq, num_cache_pages);
         const half2 k_reg = *((half2*)(k_cache + k_off));
         const float2 kf   = __half22float2(k_reg);
 
@@ -191,7 +205,7 @@ __global__ void attn_chunked_paged_kernel_512x256
         __syncthreads();
 
         const uint64_t v_off =
-            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, d0);
+            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, d0, num_pages_per_seq, num_cache_pages);
         const half2 v_reg = *((half2*)(v_cache + v_off));
         const float2 vf   = __half22float2(v_reg);
 
@@ -468,6 +482,7 @@ __global__ void attn_chunked_paged_kernel
     int64_t n_chunks,
     int64_t kv_chunk_size,
     int64_t num_pages_per_seq,
+    int64_t num_cache_pages,
     bool causal,
     float scale
 )
@@ -521,7 +536,7 @@ __global__ void attn_chunked_paged_kernel
         if (kv_pos > causal_limit) break;
 
         const uint64_t k_off =
-            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, tid);
+            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, tid, num_pages_per_seq, num_cache_pages);
         kv_smem[tid] = k_cache[k_off];
         __syncthreads();
 
@@ -560,7 +575,7 @@ __global__ void attn_chunked_paged_kernel
         __syncthreads();
 
         const uint64_t v_off =
-            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, tid);
+            paged_cache_offset(block_row, kv_pos, kv_head, n_kv_heads, D, tid, num_pages_per_seq, num_cache_pages);
         kv_smem[tid] = v_cache[v_off];
         __syncthreads();
 
@@ -909,12 +924,12 @@ void bighead_attn_paged
 
     #define PAGED_UPDATE_ARGS \
         k_ptr, v_ptr, k_cache_ptr, v_cache_ptr, block_ptr, seqlens_ptr, \
-        bsz, kv_append_len, n_kv_heads, num_pages_per_seq
+        bsz, kv_append_len, n_kv_heads, num_pages_per_seq, num_cache_pages
 
     #define PAGED_ARGS1 \
         q_ptr, k_cache_ptr, v_cache_ptr, block_ptr, seqlens_ptr, ws_ptr, \
         bsz, q_len, kv_append_len, n_q_heads, n_kv_heads, n_chunks, \
-        (int64_t)kv_chunk_size, num_pages_per_seq, causal, scale
+        (int64_t)kv_chunk_size, num_pages_per_seq, num_cache_pages, causal, scale
 
     #define ARGS2 \
         ws_ptr, o_ptr, bsz, q_len, n_q_heads, n_chunks

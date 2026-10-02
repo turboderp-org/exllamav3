@@ -312,6 +312,7 @@ class BCAttn:
             "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
+            "num_cache_pages": "i32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
@@ -347,6 +348,7 @@ class BCAttn:
             sig_u = {
                 "k": "*fp16", "v": "*fp16", "k_cache": "*fp16", "v_cache": "*fp16",
                 "block_table": "*i32", "cache_seqlens": "*i32", "num_pages_per_seq": "i32",
+                "num_cache_pages": "i32",
             } | {n: "constexpr" for n in (
                 "kv_append_len", "n_kv_heads", "page_size", "head_dim", "BLOCK_D")}
             consts_u = dict(

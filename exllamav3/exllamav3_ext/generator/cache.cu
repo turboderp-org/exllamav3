@@ -107,7 +107,8 @@ __global__ void dspark_write_rows_kernel
     const int* __restrict__ seqlens,     // (bsz,)
     const int s,
     const int w,
-    const int npr
+    const int npr,
+    const int num_pages
 )
 {
     int b = blockIdx.y;
@@ -116,7 +117,9 @@ __global__ void dspark_write_rows_kernel
     int r = (int) (i / w);
     int c = (int) (i % w);
     int pos = seqlens[b] + r;
+    if (pos < 0 || pos / kPageSize >= npr) return;     // torn seqlen -> OOB table read
     int page = block_table[b * npr + pos / kPageSize];
+    if (page < 0 || page >= num_pages) return;         // torn table entry -> wild write
     kv[((int64_t) page * kPageSize + pos % kPageSize) * w + c] =
         rows[((int64_t) b * s + r) * w + c];
 }
@@ -145,7 +148,7 @@ void dspark_write_rows
         (half*) kv.data_ptr(),
         (const int*) block_table.data_ptr(),
         (const int*) cache_seqlens.data_ptr(),
-        s, w, (int) block_table.size(1)
+        s, w, (int) block_table.size(1), (int) kv.size(0)
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -163,7 +166,8 @@ __global__ void paged_kv_update_vec8_kernel
     int H,
     int D,
     int max_blocks_per_seq,
-    int64_t total_vecs
+    int64_t total_vecs,
+    int64_t num_blocks
 )
 {
     const int64_t vecs_per_row = (int64_t) D >> 3;  // 8 halfs = 16 bytes = uint4
@@ -181,9 +185,12 @@ __global__ void paged_kv_update_vec8_kernel
         const int64_t b = tmp1 / S;
 
         const int64_t logical_pos = int64_t(cache_seqlens[b]) + s;
+        if (logical_pos < 0) continue;
         const int64_t logical_block = logical_pos >> 8;
         const int64_t page_offset = logical_pos & (kPageSize - 1);
+        if (logical_block >= max_blocks_per_seq) continue;    // torn seqlen -> OOB table read
         const int64_t phys_block = int64_t(block_table[b * max_blocks_per_seq + logical_block]);
+        if (phys_block < 0 || phys_block >= num_blocks) continue;  // torn table entry -> wild write
 
         const int64_t src_elem = (((b * S + s) * H + h) * D) + (vec_id << 3);
         const int64_t dst_elem = (((phys_block * kPageSize + page_offset) * H + h) * D) + (vec_id << 3);
@@ -247,7 +254,8 @@ void paged_kv_cache_update
         (const int*) cache_seqlens.data_ptr(),
         B, S, H, D,
         max_blocks_per_seq,
-        total_vecs
+        total_vecs,
+        k_cache.size(0)
     );
     cuda_check(cudaPeekAtLastError());
 }

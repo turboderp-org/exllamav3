@@ -193,6 +193,7 @@ void quant_cache_paged_gr
 
     int bsz = block_table.size(0);
     int blocks_per_seq = block_table.size(1);
+    int num_cache_pages = k_out.size(0);
 
     dim3 blocks(tb_per_token, seq_len, bsz);
     dim3 threads(32 * tb_usage);
@@ -223,7 +224,8 @@ void quant_cache_paged_gr
         &blocks_per_seq,
         &groups_per_token,
         &compand_a,
-        &in_cont
+        &in_cont,
+        &num_cache_pages
     };
     cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
 
@@ -341,7 +343,8 @@ void dequant_cache_paged
         sliding_window,
         compand_a,
         0,
-        0
+        0,
+        (int) k_in.size(0)
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -429,7 +432,8 @@ void dequant_cache_paged_window
         -1,
         compand_a,
         1,
-        bonus_len
+        bonus_len,
+        (int) k_in.size(0)
     );
     cuda_check(cudaPeekAtLastError());
 }
