@@ -27,11 +27,16 @@ __device__ __forceinline__ uint64_t paged_cache_offset
     const int64_t logical_page   = logical_pos / PAGE_SIZE;
     const int64_t offset_in_page = logical_pos % PAGE_SIZE;
     // Clamp a torn index instead of faulting on a wild address; a bad logical_page reads the
-    // last table slot and a bad physical page reads the last cache page.
-    const int64_t lp = logical_page < 0 ? 0 : (logical_page >= num_pages_per_seq ? num_pages_per_seq - 1 : logical_page);
+    // last table slot and a bad physical page reads the last cache page. Both clamps floor at
+    // zero: a zero width/pool would otherwise turn the clamp itself into the OOB access it
+    // guards against (lp = -1 / page = -1).
+    const int64_t lp = logical_page >= num_pages_per_seq
+        ? (num_pages_per_seq > 0 ? num_pages_per_seq - 1 : 0)
+        : (logical_page < 0 ? 0 : logical_page);
     int32_t physical_page = block_row[lp];
     if (physical_page < 0) physical_page = 0;
-    else if (physical_page >= num_cache_pages) physical_page = (int32_t)(num_cache_pages - 1);
+    else if (physical_page >= num_cache_pages)
+        physical_page = (int32_t)(num_cache_pages > 0 ? num_cache_pages - 1 : 0);
 
     return
         ((((uint64_t)physical_page * (uint64_t)PAGE_SIZE +

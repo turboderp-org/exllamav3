@@ -7,6 +7,7 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+from ..util.tensor import wait_pinned_uploads
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
@@ -980,6 +981,10 @@ class Generator:
         # since the kernels bound their reads by the cache lengths
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        # Reused pinned staging: the previous iteration's async uploads must have executed
+        # before this rewrite, or the queued copies tear (no-op once the sampler's
+        # synchronize has drained the stream)
+        wait_pinned_uploads()
         block_index = self._staging("block_index", batch_size, max_pages_batch)
         block_index.zero_()
         cache_seqlens = self._staging("cache_seqlens", batch_size)

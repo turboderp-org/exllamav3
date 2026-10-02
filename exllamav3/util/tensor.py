@@ -158,11 +158,40 @@ def get_for_device(
         # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
         # that consume it, so the host never stalls. Callers that reuse pinned staging buffers
         # must not refill them until a sync point (the generator syncs every iteration when
-        # collecting sampled tokens)
+        # collecting sampled tokens) -- enforced mechanically by wait_pinned_uploads() at the
+        # refill sites, since the copy reads the pinned bytes at execution time and a rewrite
+        # while it is still queued tears the upload (verified on ROCm gfx1100: the device
+        # receives the new bytes)
         nb = v.device.type == "cpu" and v.is_pinned()
         dv = to_device(v, device, non_blocking = nb)
+        if nb:
+            with torch.cuda.device(dv.device):
+                ev = torch.cuda.Event()
+                ev.record()
+                _last_pinned_upload_events[dv.device.index] = ev
     cache[cache_key] = (v, dv)
     return dv
+
+
+_last_pinned_upload_events: dict = {}
+
+
+def wait_pinned_uploads(device_index: int | None = None):
+    """Block the host until every async pinned H2D issued so far has executed.
+
+    Waits the most recent event recorded per device: stream order makes it cover
+    all earlier pinned uploads on that stream. Call before rewriting a pinned
+    staging buffer in place (generator batch staging). With device_index None,
+    waits all devices (TP / unknown target). A no-op once the stream has drained
+    -- the decode loop's sampler sync means the event is already complete there.
+    """
+    if device_index is None:
+        for ev in _last_pinned_upload_events.values():
+            ev.synchronize()
+    else:
+        ev = _last_pinned_upload_events.get(device_index)
+        if ev is not None:
+            ev.synchronize()
 
 
 buffered_aranges = {}
