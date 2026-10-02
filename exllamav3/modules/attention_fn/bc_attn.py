@@ -611,6 +611,12 @@ class BCAttn:
             except BCKernelTooLarge:
                 return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
+        # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
+        # loads); the block table is the only one bound per call rather than a whole static, and
+        # the generator uploads it fresh each step. A caller passing a row slice of a device
+        # table could break the assumption silently, so fail here instead
+        assert block_table.data_ptr() % 16 == 0, \
+            "BC_Attention: block_table must be 16-byte aligned (pass a whole tensor, not a sliced view)"
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
                     position_ids, inv_freq, regime, t_total)
