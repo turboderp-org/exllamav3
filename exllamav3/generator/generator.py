@@ -3,7 +3,7 @@ import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
-from ..cache.recurrent import RecurrentCache
+from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -588,6 +588,11 @@ class Generator:
         """
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
+            # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
+            # is actually returned (the next stash reallocates once)
+            host_pool.release()
+            if self.model.loaded_tp:
+                self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device

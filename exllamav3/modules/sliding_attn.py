@@ -18,6 +18,7 @@ from ..cache.recurrent import (
 )
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..cache.recurrent import host_copy
 import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
@@ -225,8 +226,8 @@ class SWALayerState:
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         return (
-            self.k_state[slot, a:b].cpu(),
-            self.v_state[slot, a:b].cpu()
+            host_copy(self.k_state[slot, a:b]),
+            host_copy(self.v_state[slot, a:b])
         )
 
 

@@ -12,6 +12,7 @@ from ..cache.recurrent import (
     mp_cache_recurrent_unstash,
     mp_cache_recurrent_clear,
     new_checkpoint_handle,
+    host_copy,
 )
 
 
@@ -185,7 +186,7 @@ class ShortConvLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return self.conv_state[slot, :, :cdim].cpu()
+        return host_copy(self.conv_state[slot, :, :cdim])
 
 
     def unstash(self, slot, stashed, position: int = 0):

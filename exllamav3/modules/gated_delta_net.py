@@ -36,6 +36,7 @@ from ..cache.recurrent import (
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+from ..cache.recurrent import host_copy
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
@@ -298,8 +299,8 @@ class GDNLayerState:
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
         return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
+            host_copy(self.recurrent_state[slot, :1]),
+            host_copy(self.conv_state[slot, :, :cdim])
         )
 
 

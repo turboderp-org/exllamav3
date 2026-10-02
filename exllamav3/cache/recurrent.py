@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from ..constants import PAGE_SIZE
+import torch
 from ..util.memory import malloc_trim
 
 # Checkpoint stashes are MB-scale host allocations with LRU (i.e. interleaved) lifetimes —
@@ -9,6 +10,64 @@ from ..util.memory import malloc_trim
 # in the child processes)
 _TRIM_THRESHOLD = 256 * 1024**2
 _freed_bytes = 0
+
+
+class HostPool:
+    """
+    Reusable host buffers for recurrent checkpoints. A checkpoint is a few dozen multi-MiB tensors with
+    lifetimes interleaved with everything else the process allocates; allocating them fresh per stash
+    and freeing them on eviction is exactly the pattern that strands memory in glibc's arenas (the
+    dynamic mmap threshold moves them into the heap after the first free, and what malloc_trim can
+    then hand back depends on the allocator and the platform). Buffers are handed out by exact shape
+    and dtype, returned on eviction, and never freed, so the pool's footprint is bounded by the peak
+    checkpoint occupancy and the allocator sees no churn at all.
+    """
+
+    def __init__(self):
+        self.free = {}
+        self.allocated = 0
+        self.reused = 0
+
+    def take(self, shape, dtype):
+        key = (tuple(shape), dtype)
+        lst = self.free.get(key)
+        if lst:
+            self.reused += 1
+            return lst.pop()
+        self.allocated += 1
+        return torch.empty(shape, dtype = dtype)
+
+    def give(self, obj):
+        """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type == "cpu":
+                self.free.setdefault((tuple(obj.shape), obj.dtype), []).append(obj)
+        elif isinstance(obj, (list, tuple)):
+            for o in obj:
+                self.give(o)
+        elif isinstance(obj, dict):
+            for k, o in obj.items():
+                if k not in ("position", "checkpoint_size", "tp_handle"):
+                    self.give(o)
+
+    def release(self):
+        """Drop the idle buffers (idle-transition housekeeping: the ones pruning stranded checkpoints
+        just returned would otherwise hold their RAM for the whole idle period)"""
+        self.free.clear()
+
+
+host_pool = HostPool()
+
+
+def mp_host_pool_release(local_context: dict):
+    host_pool.release()
+
+
+def host_copy(src: torch.Tensor) -> torch.Tensor:
+    """Copy a device tensor (any strides) into a pooled host buffer; the stash-side replacement for .cpu()"""
+    dst = host_pool.take(src.shape, src.dtype)
+    dst.copy_(src)
+    return dst
 
 def note_freed(nbytes: int):
     global _freed_bytes
@@ -56,8 +115,9 @@ class RecurrentCache(OrderedDict):
         if key in self:
             self.move_to_end(key)
         else:
-            stashed_state = state.stash()
-            state_size = stashed_state["checkpoint_size"]
+            # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
+            # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
+            state_size = state.checkpoint_size
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
                 pt = self.pagetable
@@ -83,11 +143,12 @@ class RecurrentCache(OrderedDict):
                             self.metrics["stash_evictions_live_kv"] += 1
 
                 self.metrics["stash_evictions"] += 1
+                host_pool.give(popped)
                 note_freed(popped["checkpoint_size"])
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
-            self[key] = stashed_state
+            self[key] = state.stash()
             self.update_total_size()
 
 
@@ -104,6 +165,7 @@ class RecurrentCache(OrderedDict):
         for k in stranded:
             popped = self.pop(k)
             self.metrics["stash_pruned"] += 1
+            host_pool.give(popped)
             note_freed(popped["checkpoint_size"])
             if self.model.loaded_tp:
                 self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
@@ -175,4 +237,5 @@ def _stashed_bytes(obj) -> int:
 def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):
     recurrent_cache = local_context["recurrent_cache"]
     stashed = recurrent_cache.pop(cp_handle)
+    host_pool.give(stashed)
     note_freed(_stashed_bytes(stashed))
