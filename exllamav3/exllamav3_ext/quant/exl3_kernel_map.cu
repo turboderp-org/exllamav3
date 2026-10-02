@@ -79,6 +79,7 @@ int exl3_gemm_num_kernel_shapes()
     return EXL3_GEMM_NUM_SHAPES;
 }
 
+int exl3_gemm_tilesize_m[] = {EXL3_GEMM_TILESIZE_M};
 int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
@@ -98,9 +99,12 @@ int exl3_gemm_shape_smem(int shape_idx, int K, bool half_k)
 
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K, bool half_k)
 {
+    int tilesize_m = exl3_gemm_tilesize_m[shape_idx];
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
     if (size_k % tilesize_k || size_n % tilesize_n) return false;
+    // A wider row tile only pays once it replaces at least two 16-row passes
+    if (tilesize_m > 16 && size_m <= tilesize_m / 2) return false;
 
     // Device-dependent: callers with tensors on a non-current device must set a device guard
     // first (every in-tree caller runs under OptionalCUDAGuard). Only matters on a mixed-arch

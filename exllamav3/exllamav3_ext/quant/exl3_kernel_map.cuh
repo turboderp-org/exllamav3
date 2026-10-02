@@ -63,12 +63,18 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
 #define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
 #define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
+// Multi-row tiles: all rows of a tile share each decoded B fragment, where the 16-row shapes
+// read and decode the whole weight matrix again for every 16 rows
+#define EXL3_GEMM_SHAPE_5     32,     32,    128,     3,     3
+#define EXL3_GEMM_SHAPE_6     48,     32,    128,     3,     3
+#define EXL3_GEMM_SHAPE_7     64,     32,    128,     3,     3
 
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
-#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 48, 64
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 32, 32
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 128, 128
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 512, 512
 
-#define EXL3_GEMM_NUM_SHAPES 4
+#define EXL3_GEMM_NUM_SHAPES 7
 
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
@@ -76,7 +82,10 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_6>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_7>
 
 // Half-integer bitrates (bits + 0.5), mul1 codebook, single GEMM only (no mgemm bundles yet)
 #define EXL3_GEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
@@ -84,14 +93,20 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
     exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_5>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_6>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_7>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
     nullptr, \
     exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
     exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
     exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_5>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_6>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_7>
 
 #define EXL3_KERNEL_INSTANCES_H(K) \
     fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_h##K[] = { EXL3_GEMM_KERNEL_INSTANCES_H(K, true) }; \
@@ -110,7 +125,10 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_6>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_7>
 
 #define EXL3_GEMM_BASE_THREADS 256
 
@@ -160,6 +178,9 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
         case 2: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_2, bits, half_k, shmem_out_had);
         case 3: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_3, bits, half_k, shmem_out_had);
         case 4: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_4, bits, half_k, shmem_out_had);
+        case 5: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_5, bits, half_k, shmem_out_had);
+        case 6: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_6, bits, half_k, shmem_out_had);
+        case 7: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_7, bits, half_k, shmem_out_had);
         default: return 0;
     }
 }
