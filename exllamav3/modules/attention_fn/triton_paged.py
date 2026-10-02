@@ -1531,7 +1531,10 @@ def _paged_attn_prefill_kernel(
         q_tile = _rot_h32(q_tile, h32, BLOCK_M, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
-    total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
+    # A torn seqlen would run reads past the block table; clamp to the table span. Skip in
+    # NEW_KV = 2 (cacheless): the synthesized 1-page table is a dummy, not a bound
+    if NEW_KV != 2:
+        total_k_len = tl.minimum(tl.maximum(total_k_len, 0), num_pages_per_seq * page_size)
     q_abs = total_k_len - q_len + offs_m
     qk_scale_log2e = scale * 1.4426950408889634
 
