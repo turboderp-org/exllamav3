@@ -96,6 +96,11 @@ class MoeCpuTuning:
         # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
         # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
+        # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
+        # into loader tensors and then copied into the arena, so this bounds the transient host
+        # memory on top of the arena to a slice of a layer instead of the whole layer (~1.2 GiB
+        # per layer on a 512-expert model). 0 loads the whole layer in one pass
+        self.load_batch_experts = int(os.environ.get("EXL3_MOE_CPU_LOAD_BATCH", 32))
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
@@ -326,6 +331,7 @@ class _HugeArena:
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
     WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
+    CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
     def __init__(self, shared = False, huge = "", conn = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
@@ -338,6 +344,13 @@ class _HugeArena:
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        # A private anonymous chunk (Linux, not shared) only takes RAM for the pages rehome()
+        # writes, and the last chunk of a load is usually mostly unused, so the host-memory
+        # guard runs on bytes written (in CHECK_STEP slices) rather than on whole chunks.
+        # Shared, hugetlb and Windows chunks are committed up front and keep the per-chunk check
+        self.lazy = not shared and os.name != "nt"
+        self.written = 0
+        self.checked = 0
         self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
         # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
         # attempt: the size the last chunk was served at, or below the smallest size that failed
@@ -346,8 +359,9 @@ class _HugeArena:
     def _new_chunk(self, min_bytes):
         import mmap, os
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
-        check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
-                                f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
+        if not self.lazy:
+            check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
+                                    f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
         if self.shared and os.name == "nt":
             # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
             # trips on the layer tensors' exports at worker exit). It charges commit and gets
@@ -497,6 +511,12 @@ class _HugeArena:
             return tensor
         nbytes = tensor.numel() * tensor.element_size()
         aligned = (nbytes + 63) & ~63
+        if self.lazy:
+            if self.written + aligned > self.checked:
+                step = max(aligned, self.CHECK_STEP)
+                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                self.checked = self.written + step
+            self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
             self._new_chunk(aligned)
         off = self.cur_off
@@ -600,14 +620,23 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             msg = conn.recv()
             if msg[0] == "layer":
                 spec = msg[1]
-                stc.begin_deferred_load()
-                g = fetch(spec["gate_keys"])
-                u = fetch(spec["up_keys"])
-                d = fetch(spec["down_keys"])
-                stc.end_deferred_load()
-                # Copy into the hugepage-backed arena now that the deferred reads have actually
-                # populated these tensors
-                g, u, d, blocks = rehome_experts(g, u, d)
+                num_experts = len(spec["up_keys"])
+                batch = TUNING.load_batch_experts or num_experts
+                g, u, d, blocks = [], [], [], []
+                for e0 in range(0, num_experts, batch):
+                    sl = slice(e0, e0 + batch)
+                    stc.begin_deferred_load()
+                    bg = fetch(spec["gate_keys"][sl])
+                    bu = fetch(spec["up_keys"][sl])
+                    bd = fetch(spec["down_keys"][sl])
+                    stc.end_deferred_load()
+                    # Copy into the hugepage-backed arena now that the deferred reads have
+                    # actually populated these tensors; the loader tensors die with this batch
+                    bg, bu, bd, bb = rehome_experts(bg, bu, bd)
+                    g += bg
+                    u += bu
+                    d += bd
+                    blocks += bb
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
