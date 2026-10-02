@@ -117,7 +117,7 @@ def test_qc_hdpad(hd, bits, q_len, past):
     import triton
     with torch.cuda.device(q.device):
         _paged_kv_update_kernel[(B * q_len, kvh, 1)](
-            k, v, kc, vc, bt, sl, bt.shape[1], q_len, kvh, PAGE_SIZE, hd, triton.next_power_of_2(hd),
+            k, v, kc, vc, bt, sl, bt.shape[1], kc.shape[0], q_len, kvh, PAGE_SIZE, hd, triton.next_power_of_2(hd),
             num_warps = 2, num_stages = 3)
     qk, sk, kdeq = _quant_cache(kc, bits); qv, sv, vdeq = _quant_cache(vc, bits)
     fn = paged_attn_triton_decode if q_len <= 16 else paged_attn_triton_prefill

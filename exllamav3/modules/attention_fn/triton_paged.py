@@ -877,8 +877,8 @@ def _paged_attn_decode_split_kernel(
     split_len,           # runtime: derived from the block-table bound, changes as it grows
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits,          # runtime: the grid may be launched wider (graph path); extra splits idle
-    sinks,               # last runtime arg: the BC launch appends it after the patched ints
-    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp
+    sinks,               # BC launch appends it after the patched ints
+    num_cache_pages,     # runtime: cache pool size; bounds the torn-index clamp (last runtime arg)
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
