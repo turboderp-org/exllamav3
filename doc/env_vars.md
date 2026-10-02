@@ -537,11 +537,12 @@ when it is created, or the load fails naming the chunk.
 
 Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
 held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
-psutil where that is unavailable) must cover the allocation plus this reserve, or the load
-fails with a message naming the allocation. Linux has no allocation-time failure for anonymous
-or shmem memory: an oversized arena only fails once the machine has swapped itself into a
-minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
-all. `0` disables the check.
+psutil where that is unavailable, or the available physical RAM from `GlobalMemoryStatusEx` on
+Windows without psutil) must cover the allocation plus this reserve, or the load fails with a
+message naming the allocation. Linux has no allocation-time failure for anonymous or shmem
+memory: an oversized arena only fails once the machine has swapped itself into a minutes-long
+stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at all.
+`0` disables the check.
 
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
