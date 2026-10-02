@@ -545,7 +545,19 @@ Windows without psutil) must cover the allocation plus this reserve, or the load
 message naming the allocation. Linux has no allocation-time failure for anonymous or shmem
 memory: an oversized arena only fails once the machine has swapped itself into a minutes-long
 stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at all.
-`0` disables the check.
+`0` disables the check. Plain (unpinned) arena chunks on Linux are private anonymous mappings
+that only take RAM for the pages actually written, so for those the guard runs on the bytes
+written, in 256 MiB steps, rather than on each whole 1 GiB chunk: a model whose experts fit no
+longer fails on its last, mostly empty chunk. Pinned (shared memfd, hugetlb) and Windows chunks
+are committed up front and keep the per-chunk check.
+
+### `EXL3_MOE_CPU_LOAD_BATCH` (default: `32`)
+
+Experts the CPU MoE worker reads per deferred-load pass while loading a layer. Each pass goes
+through loader tensors that are then copied into the arena, so this bounds the transient host
+memory on top of the arena to a slice of a layer instead of a whole layer (which is over a GiB
+on 512-expert models). The arena layout and contents do not depend on it. `0` reads the whole
+layer in one pass.
 
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
