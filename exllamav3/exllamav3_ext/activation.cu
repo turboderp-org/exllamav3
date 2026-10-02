@@ -19,6 +19,28 @@
 
 #include "activation_kernels.cuh"
 
+// The act_mul kernels treat x, y and z as flat buffers of x.numel() elements, processed in aligned
+// pairs (half2/float2) with no tail. Refuse anything else on the host, before this op launches anything or
+// records graph params
+
+static void act_mul_check
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    const at::Tensor& z
+)
+{
+    TORCH_CHECK_NUMEL(y, x);
+    TORCH_CHECK_NUMEL(z, x);
+    TORCH_CHECK(x.numel() > 0, "x must not be empty");
+    TORCH_CHECK(x.numel() % 2 == 0, "x.numel() must be even");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && z.is_contiguous(), "x, y and z must be contiguous");
+    TORCH_CHECK(((uintptr_t) x.data_ptr()) % (2 * x.element_size()) == 0 &&
+                ((uintptr_t) y.data_ptr()) % (2 * y.element_size()) == 0 &&
+                ((uintptr_t) z.data_ptr()) % (2 * z.element_size()) == 0, "x, y and z must be aligned to element pairs");
+    TORCH_CHECK(x.is_cuda() && y.device() == x.device() && z.device() == x.device(), "x, y and z must be on the same CUDA device");
+}
+
 // silu(x) * y -> z, in-place if z == x or z == y
 
 void silu_mul_gr
@@ -30,6 +52,8 @@ void silu_mul_gr
     Graph* graph
 )
 {
+    act_mul_check(x, y, z);
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
@@ -109,6 +133,8 @@ void silu_oai_mul_gr
     Graph* graph
 )
 {
+    act_mul_check(x, y, z);
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
@@ -187,6 +213,8 @@ void gelu_mul_gr
     Graph* graph
 )
 {
+    act_mul_check(x, y, z);
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
@@ -265,6 +293,8 @@ void relu2_mul_gr
     Graph* graph
 )
 {
+    act_mul_check(x, y, z);
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
@@ -344,6 +374,8 @@ void relu_mul_gr
     Graph* graph
 )
 {
+    act_mul_check(x, y, z);
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
