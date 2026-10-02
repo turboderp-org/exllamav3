@@ -252,7 +252,7 @@ class PromptFormat_glm(PromptFormat):
         context += f"<|system|>{system_prompt}"
         for (u, a) in messages:
             context += f"<|user|>\n{u}"
-            context += f"<|assistant|>"
+            context += f"<|assistant|>\n"
             if a is not None: context += f"{a}"
         return context
 
