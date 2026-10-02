@@ -10,6 +10,7 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "turing/fa75.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -195,6 +196,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

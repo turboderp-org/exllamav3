@@ -1,5 +1,6 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
+from ...util.turing import turing_flag
 import torch.nn.functional as F
 
 
@@ -49,17 +50,19 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
 
 
 def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
+    # Turing takes this path for every prefill chunk (see attn_dispatch), not only for head_dim >= 512
+    turing_prefill = args.q_len > 8 and turing_flag("SDPA_PREFILL", args.q.device) != 0
     if (
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.dim < 512 or
+        (args.dim < 512 and not turing_prefill) or
         args.softcap != 0.0 or
         args.sinks is not None or
         args.is_swa()
     ):
         return None
 
-    if args.dim > 256:
+    if args.dim > 256 and not turing_prefill:
         _warn_sdpa_fallback()
 
     if not args.non_causal_spans:
@@ -95,7 +98,9 @@ def _torch_bighead_fallback(
     _, seqlen_new, nheads_k, _ = k.shape
     block_size = k_cache.shape[1]
 
-    _warn_sdpa_fallback()
+    turing = turing_flag("SDPA_PREFILL", q.device) != 0
+    if not turing:
+        _warn_sdpa_fallback()
     outputs = []
     for b in range(batch):
         seq_len = cache_seqlens[b].item()
@@ -104,46 +109,36 @@ def _torch_bighead_fallback(
         # Gather this sequence's blocks into a contiguous page-aligned buffer
         num_blocks_needed = (total_len + block_size - 1) // block_size
         phys_blocks = block_table[b, :num_blocks_needed]
-        k_buf = k_cache[phys_blocks].reshape(-1, nheads_k, headdim)
-        v_buf = v_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+        p0 = int(phys_blocks[0])
+        if turing and bool((phys_blocks == torch.arange(p0, p0 + num_blocks_needed, device = phys_blocks.device)).all()):
+            # Pages are physically consecutive (always the case for the compact prefill window): view the
+            # cache instead of gathering a copy, which saves ~0.8 GB at 190K context. New K/V land in
+            # place, which is what the write-back below does anyway
+            k_buf = k_cache[p0:p0 + num_blocks_needed].view(-1, nheads_k, headdim)
+            v_buf = v_cache[p0:p0 + num_blocks_needed].view(-1, nheads_k, headdim)
+        else:
+            k_buf = k_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+            v_buf = v_cache[phys_blocks].reshape(-1, nheads_k, headdim)
 
         # In-place copy new tokens into the buffer
         k_buf[seq_len:total_len] = k[b]
         v_buf[seq_len:total_len] = v[b]
 
-        # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
-        k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
-        v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
-
-        # Process q in chunks
-        chunk_outputs = []
-        for chunk_start in range(0, seqlen_q, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, seqlen_q)
-            q_chunk = q[b, chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
-            q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
-            chunk_len = chunk_end - chunk_start
-
-            if causal:
-                # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
-                # So it only needs kv up to that position (inclusive)
-                kv_end = total_len - seqlen_q + chunk_end
-                k_sdpa = k_sdpa_full[:, :, :kv_end]
-                v_sdpa = v_sdpa_full[:, :, :kv_end]
-                attn_mask = _causal_lower_right(chunk_len, kv_end)
-            else:
-                k_sdpa = k_sdpa_full[:, :, :total_len]
-                v_sdpa = v_sdpa_full[:, :, :total_len]
-                attn_mask = None
-
-            o = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask = attn_mask,
-                scale = softmax_scale,
-                enable_gqa = True,
-            )
-            chunk_outputs.append(o.squeeze(0).transpose(0, 1))
-
-        outputs.append(torch.cat(chunk_outputs, dim = 0))
+        if (
+            turing and headdim == 256 and q.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+            not softcap and window_size in (None, -1, (-1, -1)) and total_len >= seqlen_q and
+            turing_flag("FA75", q.device)
+        ):
+            # Turing: one fa75 call covers every q chunk and the whole GQA group (~2.3-3x the cutlass kernel)
+            from ...ext import exllamav3_ext as ext
+            o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q.dtype, device = q.device)
+            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+            ext.fa75_fwd(q[b], k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
+            outputs.append(o_b)
+        else:
+            outputs.append(_sdpa_chunks(
+                q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing
+            ))
 
         # Write back only the new tokens to the paged cache
         first_block = seq_len // block_size
@@ -167,3 +162,55 @@ def _torch_bighead_fallback(
             v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
 
     return torch.stack(outputs)
+
+
+def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing):
+    """Chunked SDPA over one sequence's gathered cache (bottom-right causal per q chunk)"""
+    # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
+    k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
+    v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
+
+    # Process q in chunks
+    chunk_outputs = []
+    for chunk_start in range(0, seqlen_q, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seqlen_q)
+        q_chunk = q_b[chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
+        q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
+        chunk_len = chunk_end - chunk_start
+
+        if causal:
+            # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
+            # So it only needs kv up to that position (inclusive)
+            kv_end = total_len - seqlen_q + chunk_end
+            k_sdpa = k_sdpa_full[:, :, :kv_end]
+            v_sdpa = v_sdpa_full[:, :, :kv_end]
+            attn_mask = _causal_lower_right(chunk_len, kv_end)
+        else:
+            k_sdpa = k_sdpa_full[:, :, :total_len]
+            v_sdpa = v_sdpa_full[:, :, :total_len]
+            attn_mask = None
+
+        if turing and nheads != nheads_k:
+            # The memory-efficient (cutlass) SDPA kernel rejects enable_gqa and falls back to the math
+            # kernel, ~5x slower on Turing. Run each KV group with expand() views instead: same kernel,
+            # no copies, bit-identical to the repeat_interleave reference
+            grp = nheads // nheads_k
+            o = torch.empty_like(q_sdpa)
+            for g in range(nheads_k):
+                o[:, g * grp:(g + 1) * grp] = F.scaled_dot_product_attention(
+                    q_sdpa[:, g * grp:(g + 1) * grp],
+                    k_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
+                    v_sdpa[:, g:g + 1].expand(-1, grp, -1, -1),
+                    attn_mask = attn_mask,
+                    scale = softmax_scale,
+                )
+        else:
+            o = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask = attn_mask,
+                scale = softmax_scale,
+                enable_gqa = True,
+            )
+        chunk_outputs.append(o.squeeze(0).transpose(0, 1))
+
+    return torch.cat(chunk_outputs, dim = 0)
