@@ -216,8 +216,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         of the graph-captured decode paths. Runs a short schedule of real forward passes through the loaded
         model (layer-split or tensor-parallel alike):
 
-          - single rows at 1, 2, 4, 8 and 16 tokens: the GEMM autotuner keys on the row count only up to the
-            16-row bucket, so these five passes cover every tuned shape of every quantized projection
+          - single rows at 1, 2, 4, 8, 16, 32, 48 and 64 tokens: the GEMM autotuner keys on the row count only up
+            to the 64-row bucket, so these passes cover every tuned shape of every quantized projection
           - one full chunk (prefill kernels, MoE prefill paths)
           - a batched family (max_batch_size rows): a short prefill, a one-token decode step and a multi-token
             step with recurrent history (draft/MTP verification shapes), then the same at batch size 1
@@ -274,14 +274,14 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Steps of a family share recurrent states and advance the position; each family starts at 0
         families = []
         if cache is None:
-            for n in (1, 2, 4, 8, 16, max_chunk_size):
+            for n in (1, 2, 4, 8, 16, 32, 48, 64, max_chunk_size):
                 families.append((f"rows {n}", 1, None, [(n, False)]))
         else:
             cap = cache.max_num_tokens
             def rup(n):
                 return -(-n // PAGE_SIZE) * PAGE_SIZE
             chunk = min(max_chunk_size, cap)
-            for n in (1, 2, 4, 8, 16):
+            for n in (1, 2, 4, 8, 16, 32, 48, 64):
                 if rup(n) <= cap:
                     families.append((f"rows {n}", 1, rup(n), [(n, False)]))
             if chunk > 16:
