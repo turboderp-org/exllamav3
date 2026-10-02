@@ -274,26 +274,34 @@ GatedResidual (Qwen4Exp, the low-rank elementwise cousin of mHC) fused mix, deco
   Same two-launch, no-grid-sync, deterministic shape as hc_mix, restructured for the wide low
   rank (LR >> mHC's M = 24, so per-thread accumulator arrays don't fit):
     K1 gr_dots: one block per (fn row | sum-of-squares), computing per-STREAM partial dots
-      against the RAW streams -- by linearity the per-stream rms scale applies in K2, and the
-      norm WEIGHT is folded into the fn rows at load time.
+      against the UNNORMALIZED streams -- by linearity the per-stream rms scale applies in K2.
+      The norm weight is per (h, d), so it belongs on the stream side of the dot: the kernel
+      takes the pre-weighted stream copy that the previous site's hc_apply emitted (wstreams,
+      the per-element factor applied while those values were in registers anyway) and falls
+      back to multiplying the raw streams by w in the inner loop when no such copy exists
+      (the first site after the stream expansion, a device boundary, a PLE layer in between).
+      Either way the fn table is the plain fp16 projection, shared with the tiled prefill path.
     K2 gr_finalize: every block re-derives rmr / t redundantly from the K1 output (the mHC
       finalize pattern), then streams its chunk of mixed, evaluating the per-channel up-gate
       inline -- upT is laid out (LR, H * D) so the serial rank loop reads coalesced and stays
       L2-resident at decode R. NOT for large R (the untiled up/down reads defeat the L2);
       the python side runs a plain half-GEMM path for prefill.
 
-  apply_ is hc_apply with no comb: x[h] += post[h] * y.
+  apply_ is hc_apply with no comb: x[h] += post[h] * y, optionally also writing the next
+  site's weighted copy xw[h] = x[h] * w_next[h] for its K1.
 
 */
 
 #define GR_THREADS_A 128
 
-template <int H>
+template <int H, bool WEIGHTED>
 __global__ __launch_bounds__(GR_THREADS_A)
 void gr_dots_kernel
 (
-    const float* __restrict__ streams,   // (R, H, D)
-    const half* __restrict__ fn,         // (M, H * D) half, norm weight folded in
+    const float* __restrict__ streams,   // (R, H, D) raw (sum of squares)
+    const float* __restrict__ wstreams,  // (R, H, D) streams * w, or null (WEIGHTED = false)
+    const half* __restrict__ fn,         // (M, H * D) half projection
+    const half* __restrict__ wn,         // (H * D) half norm weight, applied here when not WEIGHTED
     float* __restrict__ dots,            // (R, M + 1, H): per-stream dots, row M = sum sq
     const int M,
     const int D
@@ -303,6 +311,7 @@ void gr_dots_kernel
     const int j = blockIdx.x;            // fn row, or M for the sum-of-squares row
     const int D4 = D / 4;
     const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+    const float4* d4 = (const float4*) ((WEIGHTED ? wstreams : streams) + (size_t) r * H * D);
 
     __shared__ float red[H][GR_THREADS_A / 32];
     const int lane = threadIdx.x % 32;
@@ -316,10 +325,21 @@ void gr_dots_kernel
         {
             // 16-byte fn loads (8 halves) against two 16-byte stream quads
             const int4* f8 = (const int4*) (fn + ((size_t) j * H + h) * D);
+            const int4* w8 = (const int4*) (wn + (size_t) h * D);
             for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
             {
-                float4 s0 = s4[(size_t) h * D4 + 2 * c];
-                float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
+                float4 s0 = d4[(size_t) h * D4 + 2 * c];
+                float4 s1 = d4[(size_t) h * D4 + 2 * c + 1];
+                if constexpr (!WEIGHTED)
+                {
+                    int4 wk = w8[c];
+                    half4 v0 = *(half4*) &wk.x;
+                    half4 v1 = *(half4*) &wk.z;
+                    s0.x = __fmul_rn(s0.x, LOW_TO_FLOAT(v0.x)); s0.y = __fmul_rn(s0.y, HIGH_TO_FLOAT(v0.x));
+                    s0.z = __fmul_rn(s0.z, LOW_TO_FLOAT(v0.y)); s0.w = __fmul_rn(s0.w, HIGH_TO_FLOAT(v0.y));
+                    s1.x = __fmul_rn(s1.x, LOW_TO_FLOAT(v1.x)); s1.y = __fmul_rn(s1.y, HIGH_TO_FLOAT(v1.x));
+                    s1.z = __fmul_rn(s1.z, LOW_TO_FLOAT(v1.y)); s1.w = __fmul_rn(s1.w, HIGH_TO_FLOAT(v1.y));
+                }
                 int4 pk = f8[c];
                 half4 w0 = *(half4*) &pk.x;
                 half4 w1 = *(half4*) &pk.z;
@@ -480,25 +500,38 @@ void gr_finalize_kernel
 #define GR_MAX_R 32
 #define GR_J 2                      // fn rows per dots block (share the stream loads)
 
-// Phase A: dots[r, j, h] = <streams[r, h, :], fn[j, h, :]> for every row r (row M: sum of squares).
-// One block per fn row j, one warp per stream h: each lane holds its 10 x 16-byte chunks of the
-// fn row in registers (issued together: the whole 20 KB row is in flight per block), then runs
-// the rows in groups of GR_RB against the L2-resident streams. The table is read once per site
-// regardless of R.
-template <int H, int NCH>
+// Phase A: dots[r, j, h] = <wstreams[r, h, :], fn[j, h, :]> for every row r (row M: sum of
+// squares of the raw streams). One block per fn row j, one warp per stream h: each lane holds
+// its 10 x 16-byte chunks of the fn row in registers (issued together: the whole 20 KB row is in
+// flight per block), then runs the rows in groups of GR_RB against the L2-resident streams. The
+// table is read once per site regardless of R. Without a weighted copy (WEIGHTED = false) the
+// lane also holds its chunks of w and scales the raw stream values before the FMAs.
+template <int H, int NCH, bool WEIGHTED>
 __device__ __forceinline__ void gr_dots_block
 (
-    const float* __restrict__ streams, const half* __restrict__ fn, float* __restrict__ dots,
-    const int M, const int D, const int R, const int block
+    const float* __restrict__ streams, const float* __restrict__ wstreams, const half* __restrict__ fn,
+    const half* __restrict__ wn, float* __restrict__ dots, const int M, const int D, const int R, const int block
 )
 {
     const int j0 = block * GR_J;
     const int h = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int D8 = D / 8;                // chunks per stream row
+    const float* dsrc = WEIGHTED ? wstreams : streams;
     if (j0 < M)
     {
         int4 f[GR_J][NCH];
+        int4 wc[WEIGHTED ? 1 : NCH];
+        if constexpr (!WEIGHTED)
+        {
+            const int4* w8 = (const int4*) (wn + (size_t) h * D);
+            #pragma unroll
+            for (int k = 0; k < NCH; ++k)
+            {
+                const int c = lane + k * 32;
+                wc[k] = (c < D8) ? w8[c] : make_int4(0, 0, 0, 0);
+            }
+        }
         #pragma unroll
         for (int jj = 0; jj < GR_J; ++jj)
         {
@@ -526,8 +559,15 @@ __device__ __forceinline__ void gr_dots_block
                 for (int q = 0; q < GR_RB; ++q)
                 {
                     const int r = r0 + q;
-                    const float4* s4 = (const float4*) (streams + ((size_t) min(r, R - 1) * H + h) * D + (ok ? c : 0) * 8);
+                    const float4* s4 = (const float4*) (dsrc + ((size_t) min(r, R - 1) * H + h) * D + (ok ? c : 0) * 8);
                     float4 s0 = s4[0], s1 = s4[1];
+                    if constexpr (!WEIGHTED)
+                    {
+                        const half2* v2 = (const half2*) &wc[k];
+                        float2 v0 = __half22float2(v2[0]), v1 = __half22float2(v2[1]), v2_ = __half22float2(v2[2]), v3 = __half22float2(v2[3]);
+                        s0.x = __fmul_rn(s0.x, v0.x); s0.y = __fmul_rn(s0.y, v0.y); s0.z = __fmul_rn(s0.z, v1.x); s0.w = __fmul_rn(s0.w, v1.y);
+                        s1.x = __fmul_rn(s1.x, v2_.x); s1.y = __fmul_rn(s1.y, v2_.y); s1.z = __fmul_rn(s1.z, v3.x); s1.w = __fmul_rn(s1.w, v3.y);
+                    }
                     #pragma unroll
                     for (int jj = 0; jj < GR_J; ++jj)
                     {
@@ -701,11 +741,12 @@ __device__ __forceinline__ void gr_finalize_block
 }
 
 
-template <int H, int NCH>
+template <int H, int NCH, bool WEIGHTED>
 __global__ __launch_bounds__(GR_THREADS_A2)
-void gr_dots_kernel2(const float* __restrict__ streams, const half* __restrict__ fn, float* __restrict__ dots, const int M, const int D, const int R)
+void gr_dots_kernel2(const float* __restrict__ streams, const float* __restrict__ wstreams, const half* __restrict__ fn, const half* __restrict__ wn,
+                     float* __restrict__ dots, const int M, const int D, const int R)
 {
-    gr_dots_block<H, NCH>(streams, fn, dots, M, D, R, blockIdx.x);
+    gr_dots_block<H, NCH, WEIGHTED>(streams, wstreams, fn, wn, dots, M, D, R, blockIdx.x);
 }
 template <int H, bool HALF_OUT, int NIT>
 __global__ __launch_bounds__(GR_THREADS_C)
@@ -718,9 +759,11 @@ void gr_finalize_kernel2(const float* __restrict__ streams, const float* __restr
 // Residual update for one sublayer site: x[h, d] <- post[h] * y[d] + sum_h' comb[h', h] *
 // x[h', d]. Without comb (GatedResidual): x[h, d] <- post[h] * y[d] + x[h, d]. Pure per-column
 // mix of the H stream rows, so it runs in place: each thread loads all H values of its columns
-// into registers before writing any back.
+// into registers before writing any back. With xw (GatedResidual decode): also writes the next
+// site's weighted stream copy xw[h, d] = x[h, d] * wn[h, d] for its gr_dots, while the values
+// are in registers.
 
-template <int H, typename Y_T, bool HAS_COMB>
+template <int H, typename Y_T, bool HAS_COMB, bool XW>
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_apply_kernel
 (
@@ -728,6 +771,8 @@ void hc_apply_kernel
     const Y_T* __restrict__ y,           // (R, D) float or half
     const float* __restrict__ post,      // (R, H)
     const float* __restrict__ comb,      // (R, H, H), or null
+    const half* __restrict__ wn,         // (H, D) next site's norm weight, or null
+    float* __restrict__ xw,              // (R, H, D) weighted copy out, or null
     const int D,
     const int chunk_cols                 // multiple of 4
 )
@@ -752,6 +797,7 @@ void hc_apply_kernel
     }
 
     float4* x4 = (float4*) (x + (size_t) r * H * D);
+    float4* xw4 = XW ? (float4*) (xw + (size_t) r * H * D) : nullptr;
     for (int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS)
     {
         float4 xv[H];
@@ -798,6 +844,13 @@ void hc_apply_kernel
                 o.w += xv[h].w;
             }
             x4[(size_t) h * D4 + c] = o;
+            if constexpr (XW)
+            {
+                const half2* w2 = (const half2*) (wn + (size_t) h * D + c * 4);
+                float2 w01 = __half22float2(w2[0]), w23 = __half22float2(w2[1]);
+                xw4[(size_t) h * D4 + c] = make_float4(__fmul_rn(o.x, w01.x), __fmul_rn(o.y, w01.y),
+                                                       __fmul_rn(o.z, w23.x), __fmul_rn(o.w, w23.y));
+            }
         }
     }
 }
@@ -964,7 +1017,9 @@ void hc_apply
     at::Tensor x,                        // (R, H, D) float, updated IN PLACE
     const at::Tensor& y,                 // (R, D) float or half
     const at::Tensor& post,              // (R, H) float
-    const c10::optional<at::Tensor>& comb   // (R, H, H) float, or none (x[h] += post[h] * y)
+    const c10::optional<at::Tensor>& comb,  // (R, H, H) float, or none (x[h] += post[h] * y)
+    const c10::optional<at::Tensor>& wn,    // (H * D) half: next site's norm weight, with xw
+    c10::optional<at::Tensor> xw         // (R, H, D) float out: updated x * wn, or none
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -987,6 +1042,18 @@ void hc_apply
         TORCH_CHECK(comb.value().is_contiguous() && comb.value().size(0) == R, "hc_apply: comb shape");
         comb_p = (const float*) comb.value().data_ptr();
     }
+    const half* wn_p = nullptr;
+    float* xw_p = nullptr;
+    if (xw)
+    {
+        TORCH_CHECK(wn, "hc_apply: xw needs wn");
+        TORCH_CHECK_DTYPE(wn.value(), kHalf);
+        TORCH_CHECK_DTYPE(xw.value(), kFloat);
+        TORCH_CHECK(wn.value().is_contiguous() && wn.value().numel() == H * D, "hc_apply: wn shape");
+        TORCH_CHECK(xw.value().is_contiguous() && xw.value().sizes() == x.sizes(), "hc_apply: xw shape");
+        wn_p = (const half*) wn.value().data_ptr();
+        xw_p = (float*) xw.value().data_ptr();
+    }
 
     int chunks_c = std::min(32, std::max(1, 256 / R));
     int chunk_cols = ((D / chunks_c + 4 * NUM_THREADS - 1)
@@ -996,17 +1063,15 @@ void hc_apply
     dim3 grid(n_chunks, R);
     #define ARGS(Y_T) \
         (float*) x.data_ptr(), (const Y_T*) y.data_ptr(), \
-        (const float*) post.data_ptr(), comb_p, D, chunk_cols
-    if (y.dtype() == at::kHalf)
-    {
-        if (comb_p) hc_apply_kernel<4, half, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(half));
-        else        hc_apply_kernel<4, half, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(half));
-    }
-    else
-    {
-        if (comb_p) hc_apply_kernel<4, float, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(float));
-        else        hc_apply_kernel<4, float, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(float));
-    }
+        (const float*) post.data_ptr(), comb_p, wn_p, xw_p, D, chunk_cols
+    #define LAUNCH(Y_T) \
+        if (comb_p)      hc_apply_kernel<4, Y_T, true, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
+        else if (xw_p)   hc_apply_kernel<4, Y_T, false, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
+        else             hc_apply_kernel<4, Y_T, false, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T));
+    TORCH_CHECK(!(comb_p && xw_p), "hc_apply: xw is for the comb-less (GatedResidual) form");
+    if (y.dtype() == at::kHalf) { LAUNCH(half) }
+    else                        { LAUNCH(float) }
+    #undef LAUNCH
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
 }
@@ -1014,7 +1079,8 @@ void hc_apply
 void gr_mix
 (
     const at::Tensor& streams,           // (R, H, D) float
-    const at::Tensor& fn,                // (M, H * D) half: cat(down, inject) * w
+    const c10::optional<at::Tensor>& wstreams,   // (R, H, D) float: streams * w (from hc_apply), or none
+    const at::Tensor& fn,                // (M, H * D) half: cat(down, inject)
     const at::Tensor& upt,               // (H, D / 4, LR, 4) half: up repacked lane-contiguous
     const at::Tensor& w,                 // (H * D) half norm weight (incl +1)
     double rms_eps,
@@ -1045,6 +1111,14 @@ void gr_mix
     TORCH_CHECK(M == LR + (post ? H : 0), "gr_mix: fn rows must be LR (+ H with post)");
     TORCH_CHECK(fn.size(1) == H * D && w.numel() == H * D, "gr_mix: dims");
     TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix: dots shape");
+    const float* ws_p = nullptr;
+    if (wstreams)
+    {
+        TORCH_CHECK_DTYPE(wstreams.value(), kFloat);
+        TORCH_CHECK(wstreams.value().is_contiguous() && wstreams.value().sizes() == streams.sizes(), "gr_mix: wstreams shape");
+        ws_p = (const float*) wstreams.value().data_ptr();
+    }
+    const half* w_p = (const half*) w.data_ptr();
 
     const int nch = D / 256, nit = (LR + 63) / 64;
     const bool fast = R <= GR_MAX_R && D % 256 == 0 && (nch == 10 || nch == 16 || nch == 20) && (nit == 5 || nit == 8 || nit == 16) && LR % 2 == 0;
@@ -1052,12 +1126,20 @@ void gr_mix
     {
         const float* s_p = (const float*) streams.data_ptr(); const half* fn_p = (const half*) fn.data_ptr(); float* dots_p = (float*) dots.data_ptr();
         const int grid_a2 = (M + GR_J - 1) / GR_J + 1;
-        switch (nch)
+        #define DOTS2(NCH, WTD) gr_dots_kernel2<4, NCH, WTD><<<grid_a2, GR_THREADS_A2, 0, stream>>>(s_p, ws_p, fn_p, w_p, dots_p, M, D, R)
+        if (ws_p) switch (nch)
         {
-            case 10: gr_dots_kernel2<4, 10><<<grid_a2, GR_THREADS_A2, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
-            case 16: gr_dots_kernel2<4, 16><<<grid_a2, GR_THREADS_A2, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
-            case 20: gr_dots_kernel2<4, 20><<<grid_a2, GR_THREADS_A2, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
+            case 10: DOTS2(10, true); break;
+            case 16: DOTS2(16, true); break;
+            case 20: DOTS2(20, true); break;
         }
+        else switch (nch)
+        {
+            case 10: DOTS2(10, false); break;
+            case 16: DOTS2(16, false); break;
+            case 20: DOTS2(20, false); break;
+        }
+        #undef DOTS2
         cuda_check(cudaPeekAtLastError());
         const int grid_c2 = D / 4 / (GR_THREADS_C / 32);
         const int smem2 = (R * LR + R * 4) * sizeof(float);
@@ -1078,11 +1160,10 @@ void gr_mix
     }
 
     dim3 grid_a(M + 1, R);
-    gr_dots_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
-    (
-        (const float*) streams.data_ptr(), (const half*) fn.data_ptr(),
-        (float*) dots.data_ptr(), M, D
-    );
+    #define DOTS_ARGS (const float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), w_p, (float*) dots.data_ptr(), M, D
+    if (ws_p) gr_dots_kernel<4, true><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS);
+    else      gr_dots_kernel<4, false><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS);
+    #undef DOTS_ARGS
     cuda_check(cudaPeekAtLastError());
 
     // Phase C is warp-per-column-quad: chunk at warp granularity (4 * NUM_THREADS / 32

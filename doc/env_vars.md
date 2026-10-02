@@ -69,7 +69,10 @@ tensor-parallel ranks compute identical streams (a prerequisite for replicating 
 MoE routing across ranks instead of broadcasting them). Precision matches the fp16 path and it is
 faster than the cuBLAS path it replaces. Set to `0` to fall back to the cuBLAS GEMM path
 (device-dependent kernel choice, not rank-consistent). Decode-sized mixes use the fused `gr_mix`
-kernel either way. The same int8 scheme covers the MoE router projection for batched rows
+kernel either way. Both kernels read the one resident fp16 table set; the tiled path derives its
+int8 operands from it per call (a deterministic per-row split, so the same bytes every call),
+and the decode kernel takes the norm weight on the stream side, written by the preceding site's
+residual update. The same int8 scheme covers the MoE router projection for batched rows
 (`routing_gemm.cu`), which has no switch.
 
 ### `EXL3_BC_GDN` (default: `1`)

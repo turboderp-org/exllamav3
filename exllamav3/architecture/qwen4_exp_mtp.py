@@ -109,6 +109,7 @@ class Qwen4ExpMTPModel(Model):
             ),
         )
         self.modules.append(self.stack_out)
+        GatedResidual.link_sites(self.modules)
 
         self.caps.update({
             "supports_tp": False,
