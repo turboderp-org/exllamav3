@@ -1,279 +1,358 @@
+"""
+Load EXL3-quantized checkpoints into Transformers models.
+
+The quantizer registers itself with Transformers' own `register_quantization_config` / `register_quantizer`
+(the `quant_method: "exl3"` entry the converter writes into config.json selects it), replaces every
+`nn.Linear` that has EXL3 tensors in the checkpoint with `Exl3HfLinear`, and lets the regular weight loader
+fill that module's buffers. The forward pass runs ExLlamaV3's kernels; the backward pass is the matmul
+against the dequantized weight, so gradients flow to the input (the quantized weights themselves are frozen).
+
+Limits: every quantized tensor must correspond to one `nn.Linear` in the Transformers model, so models whose
+HF implementation fuses projections that the converter splits (fused qkv / gate_up, stacked MoE experts,
+sliced wide MLPs) are not loadable this way.
+
+Requires transformers >= 5.
+"""
 import os
-from dataclasses import dataclass
-from typing import Optional, List
+import re
+from typing import Optional
 
 import torch
 import torch.nn
-from transformers.quantizers.auto import HfQuantizer
-from transformers.quantizers.base import QuantizationConfigMixin
+
+from transformers.quantizers.base import HfQuantizer
 from transformers.quantizers.auto import AUTO_QUANTIZER_MAPPING, AUTO_QUANTIZATION_CONFIG_MAPPING
-from transformers.utils.quantization_config import QuantizationMethod
+from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from exllamav3.loader import SafetensorsCollection
 from exllamav3.modules.quant.exl3 import LinearEXL3
 
+QUANT_METHOD = "exl3"
+
+
+class Exl3LinearFunction(torch.autograd.Function):
+    """
+    y = x W + b through the EXL3 kernels; d/dx through the dequantized W. No gradient for the weights
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, module: "Exl3HfLinear"):
+        ctx.module = module
+        return module.inner.forward(x.contiguous(), {})
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        w = ctx.module.dequantized_weight()
+        grad_x = grad_out.contiguous().to(w.dtype) @ w.T
+        return grad_x, None
+
+
 class Exl3HfLinear(torch.nn.Module):
     """
-    Basic nn.Module wrapping an EXL3 linear layer.
+    nn.Module standing in for an nn.Linear, holding the EXL3 tensors as buffers the weight loader fills
     """
 
     def __init__(self, in_features: int, out_features: int, exl3_tensors: dict):
         """
-        :param in_features:
-            Number of input features
-
-        :param out_features:
-            Number of output features
-
         :param exl3_tensors:
-            Defines tensors to expect for the layer, as loaded from the model safetensors file. Example set:
-            {
-                # 1024x4096 layer in 16x16 tiles, 3 bits per weight = 48 uint16s per tile
-                "model.layers.0.attn.v_proj.trellis": {
-                    "shape": [256, 64, 48],
-                    "torch_dtype": torch.int16
-                }
-                # 4096 input channels
-                "model.layers.0.attn.q_proj.suh": {
-                    "shape": [4096],
-                    "torch_dtype": torch.float16
-                }
-                # 1024 output channels
-                "model.layers.0.attn.q_proj.svh": {
-                    "shape": [1024],
-                    "torch_dtype": torch.float16
-                }
-                # 1024 channel bias (optional)
-                "model.layers.0.attn.q_proj.bias": {
-                    "shape": [1024],
-                    "torch_dtype": torch.float16
-                }
-            }
-
-            "su" and "sv" keys are packed signs bits supported for legacy reasons. They are expanded to "suh" and "svh"
-            float16 tensors at load time, and models quantized since ~v0.0.2 will contain only "suh" and "svh" tensors
-            with baked-in input/output channel scales.
+            The module's tensors as listed by SafetensorsCollection.list_tensors: {key: {"shape", "torch_dtype"}}
+            for "trellis", "suh", "svh", the optional "bias", the codebook markers "mcg" / "mul1", and the legacy
+            packed-sign "su" / "sv"
         """
         super().__init__()
-
         self.in_features = in_features
         self.out_features = out_features
 
-        # Find prefix, only needed to extract the right keys from the exl3_tensors dict
-        subkeys = list(exl3_tensors.keys())
-        l = subkeys[0].rfind(".")
-        self.key = subkeys[0][:l]
-        assert all(key[:l] == self.key for key in subkeys), "All tensors must belong to the same module"
+        keys = list(exl3_tensors.keys())
+        l = keys[0].rfind(".")
+        self.key = keys[0][:l]
+        assert all(k[:l] == self.key for k in keys), "All tensors must belong to the same module"
 
-        # Metadata for each sub-tensor
-        m_trellis = exl3_tensors.get(f"{self.key}.trellis")
-        m_suh = exl3_tensors.get(f"{self.key}.suh")
-        m_svh = exl3_tensors.get(f"{self.key}.svh")
-        m_su = exl3_tensors.get(f"{self.key}.su")  # Legacy models
-        m_sv = exl3_tensors.get(f"{self.key}.sv")  # Legacy models
-        m_bias = exl3_tensors.get(f"{self.key}.bias")
+        self.optional = []
+        for name in ("trellis", "suh", "svh", "su", "sv", "bias", "mcg", "mul1"):
+            meta = exl3_tensors.get(f"{self.key}.{name}")
+            if meta is None:
+                setattr(self, name, None)
+                continue
+            self.register_buffer(name, torch.empty(meta["shape"], dtype = meta["torch_dtype"], device = "meta"))
+        assert self.trellis is not None, f"{self.key}: no trellis tensor"
 
-        # Create empty meta tensors accordingly
-        t_trellis = torch.empty(m_trellis["shape"], dtype = m_trellis["torch_dtype"], device = "meta")
-        t_suh = torch.empty(m_suh["shape"], dtype = m_suh["torch_dtype"], device = "meta") if m_suh else None
-        t_svh = torch.empty(m_svh["shape"], dtype = m_svh["torch_dtype"], device = "meta") if m_svh else None
-        t_su = torch.empty(m_su["shape"], dtype = m_su["torch_dtype"], device = "meta") if m_su else None
-        t_sv = torch.empty(m_sv["shape"], dtype = m_sv["torch_dtype"], device = "meta") if m_sv else None
-        t_bias = torch.empty(m_bias["shape"], dtype = m_bias["torch_dtype"], device = "meta") if m_bias else None
-
-        # Create buffers to load into
-        self.register_buffer("trellis", t_trellis)
-        if m_suh: self.register_buffer("suh", t_suh)
-        else: self.suh = None
-        if m_svh: self.register_buffer("svh", t_svh)
-        else: self.svh = None
-        if m_su: self.register_buffer("su", t_su)
-        else: self.su = None
-        if m_sv: self.register_buffer("sv", t_sv)
-        else: self.sv = None
-        if m_bias: self.register_buffer("bias", t_bias)
-        else: self.bias = None
-
-        # Inner LinearEXL3 module initialized after loading
-        self.inner = None
-
-        # Some implementations in transformers (Cohere2 at least) seem to reference .weight.dtype directly, so create
-        # a dummy tensor keep them happy
+        # Some model implementations read .weight.dtype / .weight.device; a stand-in keeps them happy
         self.weight = torch.zeros((1,), dtype = torch.float16, device = "meta")
+
+        self.inner = None
+        self.cache_dequantized = False
+        self._dequantized = None
 
 
     def finalize(self):
         """
-        Call once parameters are loaded.
+        Call once the buffers are loaded
         """
-
-        # Some models seem to want to cast these to other types. Make sure they're float16 by the time the module
-        # is fully loaded
-        if self.suh is not None:
-            self.suh = self.suh.half()
-        if self.svh is not None:
-            self.svh = self.svh.half()
-        if self.bias is not None:
-            self.bias = self.bias.half()
+        for name in ("suh", "svh", "bias"):
+            t = getattr(self, name)
+            if t is not None and t.dtype != torch.half:
+                setattr(self, name, t.half())
+        self.weight = torch.zeros((1,), dtype = torch.float16, device = self.trellis.device)
 
         self.inner = LinearEXL3(
             config = None,
             in_features = self.in_features,
             out_features = self.out_features,
-            trellis = self.trellis,
-            suh = self.suh,
-            svh = self.svh,
+            scale = None,
             su = self.su,
             sv = self.sv,
+            suh = self.suh,
+            svh = self.svh,
+            trellis = self.trellis,
+            mcg = self.mcg,
+            mul1 = self.mul1,
             bias = self.bias,
             out_dtype = torch.float16,
-            transformers_fix = True
+            transformers_fix = True,
+            key = self.key,
         )
 
 
+    def dequantized_weight(self) -> torch.Tensor:
+        """
+        W as (in_features, out_features) fp16, reconstructed from the trellis. Reconstructed on every call
+        unless `cache_dequantized` is set, which keeps a full fp16 copy per layer
+        """
+        if self._dequantized is not None:
+            return self._dequantized
+        w = self.inner.get_weight_tensor()
+        if self.cache_dequantized:
+            self._dequantized = w
+        return w
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass works in float16 only, but some models (e.g. Gemma) require BF16 or FP32 precision, so allow
-        # for that by temporarily downcasting just for individual linear layers
+        # The kernels take fp16; models that run in bf16 or fp32 get the cast around each layer
         dtype = x.dtype
-        return self.inner.forward(x.half(), {}).to(dtype)
+        y = Exl3LinearFunction.apply(x.half(), self)
+        return y.to(dtype)
+
+
+# Per-expert projection names the converter leaves in the checkpoint, (gate, up, down)
+EXPERT_PROJ_NAMES = (("gate_proj", "up_proj", "down_proj"), ("w1", "w3", "w2"))
+
+
+class Exl3HfExperts(torch.nn.Module):
+    """
+    Stands in for a Transformers v5 experts container (3D gate_up_proj / down_proj parameters and the
+    forward(hidden_states, top_k_index, top_k_weights) interface) with one EXL3 linear per expert and
+    projection, registered under the checkpoint's own names (experts.{e}.gate_proj etc.) so the weight
+    loader fills them directly. The forward is the eager per-expert loop
+    """
+
+    def __init__(self, experts: torch.nn.Module, key: str, exl3_tensors: dict, names: tuple):
+        super().__init__()
+        self.num_experts = experts.num_experts
+        self.act_fn = experts.act_fn
+        self.key = key
+        self.names = names
+        H, I = experts.hidden_dim, experts.intermediate_dim
+        for e in range(self.num_experts):
+            m = torch.nn.Module()
+            for name, (k, n) in zip(names, ((H, I), (H, I), (I, H))):
+                prefix = f"{key}.{e}.{name}"
+                group = {t: meta for t, meta in exl3_tensors.items() if t.startswith(prefix + ".")}
+                if not group:
+                    raise ValueError(f"{prefix}: expert projection missing from the checkpoint")
+                m.add_module(name, Exl3HfLinear(k, n, group))
+            self.add_module(str(e), m)
+        self.linears = [getattr(getattr(self, str(e)), name) for e in range(self.num_experts) for name in names]
+
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        gate_name, up_name, down_name = self.names
+        final = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            mask = torch.nn.functional.one_hot(top_k_index, num_classes = self.num_experts).permute(2, 1, 0)
+            hit = torch.greater(mask.sum(dim = (-1, -2)), 0).nonzero()
+        for e in hit:
+            e = int(e[0])
+            expert = getattr(self, str(e))
+            top_k_pos, token_idx = torch.where(mask[e])
+            x = hidden_states[token_idx]
+            h = self.act_fn(getattr(expert, gate_name)(x)) * getattr(expert, up_name)(x)
+            y = getattr(expert, down_name)(h) * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, y.to(final.dtype))
+        return final
+
+
+class Exl3Config(QuantizationConfigMixin):
+    """
+    The converter's config.json entry: {"quant_method": "exl3", "version": ..., "bits": ...}. Everything but
+    quant_method is informational
+    """
+
+    def __init__(self, version: str | None = None, bits: float | None = None, **kwargs):
+        self.quant_method = QUANT_METHOD
+        self.version = version
+        self.bits = bits
+        self.extra = kwargs
+
+
+    def to_dict(self):
+        return {"quant_method": self.quant_method, "version": self.version, "bits": self.bits, **self.extra}
 
 
 class Exl3HfQuantizer(HfQuantizer):
 
     requires_calibration = False
-    required_packages = "exllamav3>=0.0.5"
+    required_packages = ["exllamav3"]
     requires_parameters_quantization = False
 
     def __init__(self, quantization_config: QuantizationConfigMixin, **kwargs):
         super().__init__(quantization_config, **kwargs)
-        self.quantization_config = quantization_config
         self.postprocess_modules = []
 
 
     def validate_environment(self, *args, **kwargs):
         if not torch.cuda.is_available():
-            raise RuntimeError("GPU is required to run EXL3 model.")
+            raise RuntimeError("EXL3 models need a CUDA device")
 
 
-    def update_torch_dtype(self, torch_dtype: "torch.dtype") -> "torch.dtype":
-        # Change the default datatype only
-        if torch_dtype is None:
-            torch_dtype = torch.float16
-        return torch_dtype
+    def update_dtype(self, dtype):
+        return dtype if dtype is not None else torch.float16
+
+    # (pre-5.0 name)
+    def update_torch_dtype(self, torch_dtype):
+        return self.update_dtype(torch_dtype)
 
 
-    def get_modules_to_replace(self, model):
+    @staticmethod
+    def _checkpoint_dir(model, checkpoint_files):
+        if checkpoint_files:
+            return os.path.dirname(os.path.abspath(checkpoint_files[0]))
+        path = getattr(model, "name_or_path", None)
+        if path and os.path.isdir(path):
+            return path
+        raise ValueError("Could not locate the EXL3 checkpoint files")
 
-        # Ideally we would start from whatever directory is used by `_get_resolved_checkpoint_files`, to allow
-        # instantiating model from a name on the Hub. For now, assume `model.name_or_path` is a path.
-        # TODO: Figure this out
-        path = model.name_or_path
-        if not os.path.isdir(path):
-            raise ValueError("EXL3 model must be initialized from local directory")
 
-        # Use ExLlamaV3's own utility functions for indexing safetensors files. We only need this to determine which
-        # tensor keys to mark as EXL3 tensors using the logic below. Models quantized since v0.0.2 also include a
-        # `quantization_config.json` file that could be used instead (essentially just a compilation of the headers
-        # from each individual .safetensors file in a mode.)
-        stc = SafetensorsCollection(path)
+    @staticmethod
+    def _key_renames(model):
+        """
+        Checkpoint key -> model key, as the weight loader will rename them: the plain renaming entries of the
+        model's conversion mapping (legacy prefixes such as Gemma3's language_model.model -> model.language_model).
+        Structural conversions (merged expert lists etc.) are not representable here, and those models are out
+        of scope anyway
+        """
+        try:
+            from transformers.conversion_mapping import get_model_conversion_mapping, WeightRenaming
+            transforms = [t for t in get_model_conversion_mapping(model) if type(t) is WeightRenaming]
+        except Exception:
+            return lambda key: key
 
-        # Find modules to replace and create placeholders for them
-        modules_to_replace = {}
-        for name, module in tuple(model.named_modules()):
-            if isinstance(module, torch.nn.Linear):
+        def rename(key):
+            for t in transforms:
+                scope = getattr(t, "scope_prefix", None)
+                if scope and not key.startswith(scope + "."):
+                    continue
+                for src, tgt in zip(t.source_patterns, t.target_patterns):
+                    new = re.sub(src, tgt, key, count = 1)
+                    if new != key:
+                        key = new
+                        break
+            return key
+        return rename
 
-                # Kludge for models like Gemma3 where named_modules() don't match stored tensor keys.
-                # TODO: Figure out the right way to handle this
-                m_name = name
-                if name.startswith("model.language_model."):
-                    name = "language_model.model." + name[21:]
 
-                if stc.has_tensor_group(name, [["sv", "svh"], ["su", "suh"], "trellis"]):
-                    modules_to_replace[m_name] = Exl3HfLinear(
-                        module.in_features,
-                        module.out_features,
-                        stc.list_tensors(name)
-                    )
+    def get_modules_to_replace(self, model, checkpoint_dir):
+        stc = SafetensorsCollection(checkpoint_dir)
+        rename = self._key_renames(model)
+        linears = {name: m for name, m in model.named_modules() if isinstance(m, torch.nn.Linear)}
 
-        # SafetensorsCollection may allocate managed resources. This ensures everything is freed
+        all_modules = dict(model.named_modules())
+
+        # Every module prefix with a trellis tensor in the checkpoint, mapped into the model's namespace.
+        # Per-expert projections belong to an experts container (3D parameters in Transformers v5),
+        # replaced as a whole
+        modules = {}
+        experts = {}
+        skipped = []
+        expert_re = re.compile(r"^(.*)\.(\d+)\.(" + "|".join(n for names in EXPERT_PROJ_NAMES for n in names) + r")$")
+        for key in stc.tensor_file_map:
+            if not key.endswith(".trellis"):
+                continue
+            ck = key[:-len(".trellis")]
+            name = rename(ck)
+            module = linears.get(name)
+            if module is not None:
+                modules[name] = Exl3HfLinear(module.in_features, module.out_features, stc.list_tensors(ck))
+                continue
+            m = expert_re.match(ck)
+            container = all_modules.get(rename(m.group(1))) if m else None
+            if container is not None and hasattr(container, "num_experts") and hasattr(container, "act_fn"):
+                experts.setdefault((rename(m.group(1)), m.group(1)), set()).add(m.group(3))
+                continue
+            skipped.append(ck)
+        for (name, ck), found in experts.items():
+            names = next((n for n in EXPERT_PROJ_NAMES if set(n) <= found), None)
+            if names is None:
+                raise ValueError(f"{ck}: expert projections {sorted(found)} are not a (gate, up, down) set")
+            modules[name] = Exl3HfExperts(all_modules[name], ck, stc.list_tensors(ck), names)
         stc.close()
+        if skipped:
+            raise ValueError(
+                f"{len(skipped)} EXL3 tensors have no nn.Linear in the Transformers model (first: {skipped[0]}). "
+                f"Projections the converter splits or re-arranges relative to the HF implementation can't be loaded this way")
+        return modules
 
-        return modules_to_replace
 
-
-    def replace_modules(self, module, path, modules_to_replace: dict):
-
-        # Identify nodes by path
-        children_to_replace = {}
-        for name, child in module.named_children():
-            key = f"{path}.{name}" if path else name
-            if new_module := modules_to_replace.get(key):
-                children_to_replace[name] = new_module
-            else:
-                self.replace_modules(child, key, modules_to_replace)
-
-        # Replace after to avoid modifying any collections while iterating over them
-        for name, new in children_to_replace.items():
-            setattr(module, name, new)
+    def _process_model_before_weight_loading(self, model, checkpoint_files = None, **kwargs):
+        modules = self.get_modules_to_replace(model, self._checkpoint_dir(model, checkpoint_files))
+        for name, new in modules.items():
+            parent_name, _, child = name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child, new)
             self.postprocess_modules.append(new)
 
-
-    def _process_model_before_weight_loading(
-        self,
-        model,
-        keep_in_fp32_modules: Optional[List[str]] = None,
-        **kwargs,
-    ):
-        # Get list of modules to replace and create their replacements (with meta tensors)
-        modules_to_replace = self.get_modules_to_replace(model)
-
-        # Recursively walk through model and insert new modules where needed
-        self.replace_modules(model, None, modules_to_replace)
-
-        # For models with tied embeddings, ExLlamaV3 always separates into an unquantized embedding layer (to be kept
-        # in system RAM) and a quantized output layer that resides in VRAM. Make sure the HF config reflects this
-        # TODO: Figure out if Transformers allows for keeping the embedding layer in system RAM
-        config = kwargs.get("config")
-        if config:
-            config.tie_word_embeddings = False
+        # A quantized output layer can't share the embedding's weight: drop the tie and the tied-key
+        # bookkeeping post_init already derived from the config
+        tied = getattr(model, "all_tied_weights_keys", None) or {}
+        replaced = set(modules)
+        def owner(param_name):
+            return param_name.rpartition(".")[0]
+        stale = [k for k, v in tied.items() if owner(k) in replaced or owner(v) in replaced]
+        if stale:
+            for k in stale:
+                tied.pop(k, None)
+            for cfg in (model.config, model.config.get_text_config()):
+                if getattr(cfg, "tie_word_embeddings", False):
+                    cfg.tie_word_embeddings = False
 
 
     def _process_model_after_weight_loading(self, model, **kwargs):
-
-        # Finalize modules after loading
         for module in self.postprocess_modules:
-            module.finalize()
-
-        # Don't hold on to any references
+            for lin in (module.linears if isinstance(module, Exl3HfExperts) else [module]):
+                lin.finalize()
         self.postprocess_modules = []
-
         return model
 
 
     @property
-    def is_trainable(self, model = None):
-        return False
+    def is_trainable(self):
+        # Gradients flow through the layers (see Exl3LinearFunction); the quantized weights are frozen
+        return True
 
     def is_serializable(self, safe_serialization = None):
         return False
 
 
-@dataclass
-class Exl3Config(QuantizationConfigMixin):
-    def __init__(
-        self,
-        **kwargs,
-    ):
-        # Unsure if this value is used anywhere?
-        self.quant_method = QuantizationMethod.EXL3
+def register():
+    """
+    Register the EXL3 quantizer with Transformers. Idempotent
+    """
+    from transformers.quantizers import register_quantization_config, register_quantizer
+    if QUANT_METHOD not in AUTO_QUANTIZATION_CONFIG_MAPPING:
+        register_quantization_config(QUANT_METHOD)(Exl3Config)
+    if QUANT_METHOD not in AUTO_QUANTIZER_MAPPING:
+        register_quantizer(QUANT_METHOD)(Exl3HfQuantizer)
 
 
-def patch_transformers():
-
-    # Inject EXL3 quantizer and config classes
-    AUTO_QUANTIZER_MAPPING["exl3"] = Exl3HfQuantizer
-    AUTO_QUANTIZATION_CONFIG_MAPPING["exl3"] = Exl3Config
-
-    # Can't actually mutate this Enum, but code seems to work regardless
-    # TODO: Something else
-    QuantizationMethod.EXL3 = "exl3"
+# (earlier name)
+patch_transformers = register
