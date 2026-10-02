@@ -1249,8 +1249,11 @@ class Generator:
                             # Advance filters
                             for f in job.filters:
                                 if not f.is_active: continue
+                                # Both lists take one entry per active filter (prepare_logit_mask indexes them
+                                # in step)
                                 if f.use_background_worker():
                                     job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                                    job.logit_masks.append(None)
                                 else:
                                     job.logit_masks.append(f.get_next_logit_mask())
                                     job.filter_futures.append(None)

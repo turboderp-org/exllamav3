@@ -510,13 +510,13 @@ void exl3_moe_gather
                 slot_base.is_contiguous() && slot_kind.is_contiguous() && weight_sorted.is_contiguous(),
                 "exl3_moe_gather: index tensors must be contiguous");
     int tokens = output_state.size(0);
+    if (!tokens) return;
     int hidden_dim = output_state.size(1);
     int num_assign = flat_expert.size(0);
     TORCH_CHECK(num_assign % tokens == 0, "exl3_moe_gather: assignments / tokens");
     int topk = num_assign / tokens;
     int num_experts = slot_kind.size(0);
     TORCH_CHECK(slot_base.size(0) >= num_experts && expert_start.size(0) >= num_experts, "exl3_moe_gather: table sizes");
-    if (!tokens) return;
     TORCH_CHECK(topk <= MOE_GATHER_MAX_TOPK, "exl3_moe_gather: top-k too large");
     int threads = MAX(MIN(hidden_dim, 1024), 32);
     exl3_moe_gather_kernel<<<tokens, threads, 0, stream>>>

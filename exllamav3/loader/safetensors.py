@@ -569,7 +569,7 @@ class SafetensorsCollection:
         optional: bool = True
     ) -> dict | None:
         filename = self.tensor_file_map.get(key)
-        if optional and key is None:
+        if optional and filename is None:
             return None
         header = self.file_headers[filename]
         h = header[key]

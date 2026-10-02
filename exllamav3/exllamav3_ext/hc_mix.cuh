@@ -40,12 +40,15 @@ void hc_apply
     at::Tensor x,
     const at::Tensor& y,
     const at::Tensor& post,
-    const c10::optional<at::Tensor>& comb
+    const c10::optional<at::Tensor>& comb,
+    const c10::optional<at::Tensor>& wn,
+    c10::optional<at::Tensor> xw
 );
 
 void gr_mix
 (
     const at::Tensor& streams,
+    const c10::optional<at::Tensor>& wstreams,
     const at::Tensor& fn,
     const at::Tensor& upt,
     const at::Tensor& w,

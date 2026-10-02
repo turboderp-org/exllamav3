@@ -87,7 +87,13 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self.generator.enqueue(job.job)
+        try:
+            self.generator.enqueue(job.job)
+        except Exception:
+            # A rejected job (e.g. too long for the cache) must not stay tracked: it would never produce a
+            # result, and a non-empty job map keeps the iteration loop spinning instead of idling
+            del self.jobs[job.job]
+            raise
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.

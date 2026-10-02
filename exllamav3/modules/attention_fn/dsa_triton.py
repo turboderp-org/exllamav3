@@ -854,10 +854,16 @@ def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c
     G = D_c // 32
     npw = -(-pool_len // page_size)
     pages = block_table[0, :npw].long()
-    pc = pool_c.reshape(-1, page_size, G * bits)[pages]
+    pool_pages = pool_c.reshape(-1, page_size, G * bits)
+    pc = pool_pages[pages]
     ps = pool_s.reshape(-1, page_size, G)[pages]
     n_rows = npw * page_size
-    rows_alloc = max(page_size, 1 << (n_rows - 1).bit_length())      # pow2: few distinct sizes
+    # pow2: few distinct sizes, but never past the pool itself: the rounding alone would
+    # double a 2049-page window to 4096 pages. MLAttention.autosplit_extra_measure stages a
+    # window spanning the pool (pools within the staging limit), so its reserve follows the
+    # same cap
+    pool_rows = pool_pages.shape[0] * page_size
+    rows_alloc = min(max(page_size, 1 << (n_rows - 1).bit_length()), max(n_rows, pool_rows))
     out = torch.empty((rows_alloc, D_c), dtype = torch.half, device = pool_c.device)
     ext.dequant_cache_cont(pc.view(-1, G * bits), ps.view(-1, G), out[:n_rows], 0.0)
     pr = pool_r.reshape(-1, page_size, D_r)[pages].contiguous() if D_r > 0 else pool_r

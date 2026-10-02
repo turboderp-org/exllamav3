@@ -168,6 +168,9 @@ def mp_model_append(local_context: dict, exported: dict):
 
     module = cls.tp_import(local_context, exported, plan[device])
     modules.append(module)
+    # Gated-residual sites hand a weighted stream copy to their successor; rewire on each append
+    from ..modules.hyperconnections import GatedResidual
+    GatedResidual.link_sites(modules)
     kv_modules += module.all_cache_modules()
     recurrent_modules += module.all_recurrent_modules()
     if module.caps.get("logits_output"):

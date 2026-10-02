@@ -593,7 +593,15 @@ def host_memory_available() -> int | None:
         import psutil
         return int(psutil.virtual_memory().available)
     except Exception:
-        return None
+        pass
+    # Windows without psutil: the available physical RAM psutil itself reports there
+    import os
+    if os.name == "nt":
+        try:
+            return int(windows_memory_status()[0])
+        except Exception:
+            pass
+    return None
 
 
 def check_host_memory(nbytes: int, what: str):

@@ -110,21 +110,30 @@ void rope_kernel
     // Loop over heads
     // Heads are distributed over gridDim.z as well as blockDim.y: at decode (seq 1, bsz 1)
     // the per-token grid is otherwise a single block walking every head serially between
-    // block-wide barriers
-    for (int head_idx = blockIdx.z * blockDim.y + threadIdx.y;
-         head_idx < num_heads_q + num_heads_k;
-         head_idx += gridDim.z * blockDim.y)
+    // block-wide barriers.
+    // The head count is rarely a multiple of blockDim.y, so the last round leaves some thread
+    // rows without a head. The loop runs the same number of rounds for the whole block (row 0's
+    // count) and those rows idle through the round's barriers, so every barrier is reached by
+    // every thread
+    const int num_heads = num_heads_q + num_heads_k;
+    const int head_base = blockIdx.z * blockDim.y;
+    const int head_step = gridDim.z * blockDim.y;
+    const int head_rounds = head_base < num_heads ? (num_heads - head_base + head_step - 1) / head_step : 0;
+    for (int round = 0; round < head_rounds; ++round)
     {
-        const half* g_head_in_ptr;
-        half* g_head_out_ptr;
-        const void* norm_weight;
+        const int head_idx = head_base + round * head_step + threadIdx.y;
+        const bool active = head_idx < num_heads;
+
+        const half* g_head_in_ptr = nullptr;
+        half* g_head_out_ptr = nullptr;
+        const void* norm_weight = nullptr;
         if (head_idx < num_heads_q)
         {
             g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
             g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
             norm_weight = q_norm;
         }
-        else if (head_idx < num_heads_q + num_heads_k)
+        else if (active)
         {
             g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
             g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
@@ -135,15 +144,18 @@ void rope_kernel
         half* sh_head = norm_head + t_head * head_dim_pad;
         auto load_head = [&] ()
         {
-            if (t < head_dim / 2)
-                ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
-            else
-                ((half2*) sh_head)[t] = {};
+            if (active)
+            {
+                if (t < head_dim / 2)
+                    ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
+                else
+                    ((half2*) sh_head)[t] = {};
+            }
             __syncthreads();
         };
         auto store_head = [&] ()
         {
-            if (t < head_dim / 2)
+            if (active && t < head_dim / 2)
                 ((half2*) g_head_out_ptr)[t] = ((half2*) sh_head)[t];
             __syncthreads();
         };
@@ -154,7 +166,7 @@ void rope_kernel
             for (int rdim = 0; rdim < rotate_dims; ++rdim)
             {
                 int offset = rotate_offset + partial_head_dim * rdim;
-                if (t < partial_head_dim / 2)
+                if (active && t < partial_head_dim / 2)
                 {
                     float sin = sin_cache[rdim];
                     float cos = cos_cache[rdim];
@@ -192,17 +204,28 @@ void rope_kernel
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
 
-            // Sum of squares
-            half2 v = *tptr;
-            float v1 = __low2float(v);
-            float v2 = __high2float(v);
-            float sum = v1 * v1 + v2 * v2;
-            sum = warp_reduce_sum_f(sum);
-            if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
+            // Sum of squares. A thread row is a whole number of warps, so the warp reduction
+            // never mixes active and idle lanes
+            half2 v = {};
+            float v1 = 0.0f;
+            float v2 = 0.0f;
+            float sum = 0.0f;
+            if (active)
+            {
+                v = *tptr;
+                v1 = __low2float(v);
+                v2 = __high2float(v);
+                sum = v1 * v1 + v2 * v2;
+                sum = warp_reduce_sum_f(sum);
+                if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
+            }
             __syncthreads();
 
-            sum = sums[warps * t_head];
-            for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+            if (active)
+            {
+                sum = sums[warps * t_head];
+                for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+            }
 
             // Normalize and downcast
             float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
@@ -211,7 +234,7 @@ void rope_kernel
 
             // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
             // hold padding and must not read the weight
-            if (t * 2 < head_dim)
+            if (active && t * 2 < head_dim)
             {
                 if constexpr (norm_bf16)
                 {
@@ -241,7 +264,7 @@ void rope_kernel
         // concurrently and the lambda syncs), so k heads scale by 1.0
         auto apply_l4_scaling = [&] (float scaling)
         {
-            if (t < head_dim / 2)
+            if (active && t < head_dim / 2)
             {
                 half2* tptr = ((half2*) sh_head) + t;
                 half2 v = *tptr;

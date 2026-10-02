@@ -6,6 +6,7 @@ from ..model.model import Model
 from ..util.rope import RopeStyle, RopeSettings
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, SlidingAttention, SWAState, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class Spark2_5Config(Config):
     arch_string = "Spark2_5ForCausalLM"
@@ -228,6 +229,8 @@ class Spark2_5Model(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if not self.swa_full:
+            prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

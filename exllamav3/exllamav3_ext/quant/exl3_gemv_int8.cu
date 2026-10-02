@@ -26,6 +26,7 @@ static int exl3_gemv_int8_mode()
     if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
     const char* e = getenv("EXL3_INT8_GEMV");
     _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+    _exl3_gemv_int8_mode_chk = true;
     return _exl3_gemv_int8_mode;
 }
 

@@ -164,7 +164,7 @@ class Cache:
         self.recurrent_state_cls = model.recurrent_state_cls
 
         rl = self.model.get_recurrent_layers()
-        self.num_layers = len(rl)
+        self.num_recurrent_layers = len(rl)
         self.recurrent_layers = {}
         for layer in rl:
             for instance in self.model.get_layer_instances(layer.layer_idx):
