@@ -3,6 +3,7 @@
 #include <c10/util/Exception.h>
 #include <cstdio>
 #include "cuda_drv.h"
+#include "util.cuh"
 
 TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, int _shared_bytes) :
     name(std::move(_name)),
@@ -18,7 +19,23 @@ TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, i
     cuda_check_drv(drv.module_load_data(&mod, data.data()));
     cuda_check_drv(drv.module_get_function(&fn, mod, name.c_str()));
     if (shared_bytes > 48 * 1024)
+    {
+#if defined(USE_ROCM)
+        cuda_check_drv(drv.func_set_attribute(fn, hipFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+#else
         cuda_check_drv(drv.func_set_attribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes));
+#endif
+    }
+
+#if defined(USE_ROCM)
+    // Triton's num_warps counts hardware warps; the launch block size is
+    // num_warps * warpSize (32 on RDNA, 64 on CDNA).
+    int dev;
+    cudaGetDevice(&dev);
+    cuda_check(cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, dev));
+#else
+    warp_size = 32;
+#endif
 }
 
 TritonKernel::~TritonKernel()
@@ -39,7 +56,7 @@ void TritonKernel::launch(int gx, int gy, int gz, std::vector<void*>& args, cuda
         CudaDrv::instance().launch_kernel(
             fn,
             gx, gy, gz,
-            32 * num_warps, 1, 1,
+            warp_size * num_warps, 1, 1,
             shared_bytes,
             stream,
             arg_ptrs.data(),

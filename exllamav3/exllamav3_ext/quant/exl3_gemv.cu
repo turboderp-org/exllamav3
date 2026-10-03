@@ -62,7 +62,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     // Per-bits envelopes: 2 bpw is decode-bound and won at every measured shape on both archs;
     // 3 bpw wins everywhere on Ada but only in the narrow envelope on Ampere
     if (K == 2) return size_n <= 8192 ? 0 : 1;
-    if (K == 3 && cc == CC_ADA) return size_n <= 8192 ? 0 : 1;
+    if (K == 3 && (cc == CC_ADA || cc == CC_RDNA3)) return size_n <= 8192 ? 0 : 1;
     if (size_n / 32 <= narrow_coresident) return 0;
     if (size_k <= 2048 && size_n <= 8192) return 0;
     if (K == 3) return -1;
@@ -138,6 +138,12 @@ bool exl3_gemv_try_launch
         if (it != cache.end()) return it->second;
         int blocks_per_sm;
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+#if defined(USE_ROCM)
+        // hipOccupancyMaxActiveBlocksPerMultiprocessor overestimates co-residency on RDNA:
+        // kernels reporting N blocks/SM can deadlock grid.sync() when all N are scheduled
+        // (observed on gfx1100: reported 3, real limit 2). Launch one fewer per SM.
+        if (blocks_per_sm > 1) blocks_per_sm -= 1;
+#endif
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };

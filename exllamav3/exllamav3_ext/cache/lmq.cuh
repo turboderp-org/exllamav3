@@ -3,7 +3,7 @@
 
 // Portable clamp: works on both CUDA and CPU
 #ifndef LM_CLAMP_IDX
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIPCC__)
 #define LM_CLAMP_IDX(idx, lo, hi) max((lo), min((hi), (idx)))
 #else
 static inline int lm_clamp_(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }

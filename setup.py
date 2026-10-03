@@ -25,11 +25,13 @@ _spec = importlib.util.spec_from_file_location(
 cuda_flags = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cuda_flags)
 
+is_hip = bool(torch and torch_version.hip)
+
 extra_cflags = []
 extra_cuda_cflags = cuda_flags.cuda_cflags(
     cuda_home = cpp_extension.CUDA_HOME,
     debug = ext_debug,
-    hip = bool(torch_version.hip),
+    hip = is_hip,
 ) if precompile and torch else []
 
 if windows:
@@ -50,16 +52,18 @@ else:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
         extra_cuda_cflags += []
 
-if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
+if not is_hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
     extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
-
-if torch and torch_version.hip:
-    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
 }
+if is_hip:
+    extra_compile_args["hipcc"] = extra_cuda_cflags
+    extra_compile_args["hip"] = extra_cuda_cflags
+if verbose:
+    print("EXL3 flags:", "hip" if is_hip else "cuda", extra_cuda_cflags)
 
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
@@ -68,23 +72,37 @@ sources = [
     for root, _, files in os.walk(sources_dir)
     for file in files
     if file.endswith(('.c', '.cpp', '.cu'))
+    # Skip hipify outputs: they are regenerated in-place by torch's BuildExtension
+    # on every ROCm rebuild, and compiling them alongside their non-hipified
+    # counterparts produces duplicate-symbol link errors.
+    and '_hip.' not in file and not file.startswith('hip_')
+    # CUDA-only sources that do not hipify (inline PTX asm, ldmatrix, cuda::atomic):
+    # excluded from HIP builds; their bindings are #ifndef USE_ROCM.
+    and not (is_hip and file in (
+        'dflash2.cu',
+        'hc_mix_tiled.cu',
+        'routing_gemm.cu',
+    ))
 ]
 
-setup_kwargs = (
-    {
+setup_kwargs = {}
+if precompile and cpp_extension is not None:
+    setup_kwargs = {
         "ext_modules": [
             cpp_extension.CUDAExtension(
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
-                libraries=["cublas"] if windows else [],
+                include_dirs=[sources_dir],
+                libraries=(
+                    ["hipblas"] if is_hip else
+                    ["cublas"] if windows else
+                    []
+                ),
             )
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},
     }
-    if precompile and torch
-    else {}
-)
 
 setup(
     verbose=verbose,

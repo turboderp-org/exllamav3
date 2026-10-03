@@ -37,6 +37,11 @@ namespace exl3_gemv_ns {
 // extra rounding at the k=8 boundary. See the longer note in ptx.cuh.
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
 {
+#if defined(USE_ROCM)
+    FragA a;
+    a[0] = a01[0]; a[1] = a01[1]; a[2] = a23[0]; a[3] = a23[1];
+    ptx_mma_m16n8k16(a, b, c);
+#else
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
@@ -67,6 +72,8 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
         :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
            "r"(bb[0]), "r"(bb[1])
     );
+#endif
+}
 #endif
 }
 
@@ -393,8 +400,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
+#if defined(USE_ROCM)
+                FragA a;
+                a[0] = a01[0]; a[1] = a01[1]; a[2] = a23[0]; a[3] = a23[1];
+                ptx_mma_m16n16k16(a, f0, f1, ch[t][0], ch[t][1]);
+#else
                 exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+#endif
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)

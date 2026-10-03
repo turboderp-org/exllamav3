@@ -1,20 +1,23 @@
 #pragma once
+#include "hip_compat.cuh"
+
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#else
 #include <cuda/atomic>
 #include "arch.cuh"
+#endif
 
-// Tensor core fragments
+// Tensor core fragments (Vec<> is defined in hip_compat.cuh)
 
-template <typename T, int n>
-struct Vec
-{
-    T elems[n];
-    __device__ T& operator[](int i) { return elems[i]; }
-};
-
+#if !defined(USE_ROCM)
 using FragA = Vec<half2, 4>;
 using FragB = Vec<half2, 2>;
 using FragC = Vec<float, 4>;
 using FragC_h = Vec<half2, 2>;
+#endif
+#if !defined(USE_ROCM)
 
 // m8n8k4 tensor core matmul (emulated on Ampere and later), don't use
 //
@@ -45,6 +48,8 @@ __device__ inline void ptx_mma_m8n8k4
     );
 }
 
+#endif  // !USE_ROCM
+
 // m16n8k16 tensor core matmul
 //
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
@@ -69,6 +74,9 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
+#if defined(USE_ROCM)
+    mma_m16n8k16_f32_emu(frag_a, frag_b, frag_c);
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -106,7 +114,8 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
-#endif
+#endif  // EXL3_SM75
+#endif  // USE_ROCM
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -117,6 +126,9 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
+#if defined(USE_ROCM)
+    mma_m16n8k16_f16_emu(frag_a, frag_b, frag_c);
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -154,11 +166,41 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "r"(d[0]), "r"(d[1])
     );
-#endif
+#endif  // EXL3_SM75
+#endif  // USE_ROCM
+}
+
+// Paired 16x16 MMA: combines two adjacent 16x8 tiles into one call.
+
+// FP16 @ FP16 + FP32 -> FP32 (paired)
+__device__ inline void ptx_mma_m16n16k16
+(
+    const FragA& frag_a,
+    const FragB& frag_b0,
+    const FragB& frag_b1,
+    FragC& frag_c0,
+    FragC& frag_c1
+)
+{
+    ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
+    ptx_mma_m16n8k16(frag_a, frag_b1, frag_c1);
+}
+
+// FP16 @ FP16 + FP16 -> FP16 (paired)
+__device__ inline void ptx_mma_m16n16k16
+(
+    const FragA& frag_a,
+    const FragB& frag_b0,
+    const FragB& frag_b1,
+    FragC_h& frag_c0,
+    FragC_h& frag_c1
+)
+{
+    ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
+    ptx_mma_m16n8k16(frag_a, frag_b1, frag_c1);
 }
 
 // Global barrier
-
 __device__ inline void barrier_acquire
 (
     int* lock,
@@ -167,12 +209,21 @@ __device__ inline void barrier_acquire
 {
     if (threadIdx.x == 0)
     {
+#if defined(USE_ROCM)
+        int state = -1;
+        do
+        {
+            state = ldg_acquire_gpu_i32(lock);
+        }
+        while (state != stage);
+#else
         volatile int state = -1;
         do
         {
             asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
         }
         while (state != stage);
+#endif
     }
     __syncthreads();
 }
@@ -189,13 +240,27 @@ __device__ inline void barrier_release
     {
         if (reset)
         {
+#if defined(USE_ROCM)
+            __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+#else
+            asm volatile ("fence.acq_rel.gpu;\n");
             *lock = 0;
+#endif
             return;
         }
+#if defined(USE_ROCM)
+        // Release-ordered atomic ensures all prior writes (output data) are
+        // visible before the lock value advances. Replaces the old __threadfence()
+        // + relaxed-add pair, which could reorder the store after the atomic.
+        __atomic_fetch_add(lock, val, __ATOMIC_RELEASE);
+#else
         asm volatile ("fence.acq_rel.gpu;\n");
         asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
+#endif
     }
 }
+
+#if !defined(USE_ROCM)
 
 // Load global to shared memory, predicated. Seems to produce incorrect code when compiling for Blackwell, but
 // `if (...) cp_async(...)` compiles to a predicated instruction anyway
@@ -364,7 +429,8 @@ __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
     uint64_t v;
-    asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    asm volatile("ld.global.acquire.sys.u64 %0, [%1];"
+                 : "=l"(v) : "l"(p) : "memory");
     return v;
 }
 
@@ -402,6 +468,20 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
 #define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
 #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
 
+#else  // USE_ROCM
+
+__device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
+{
+    return x * y;
+}
+
+__device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
+{
+    return __umulhi(x, y);
+}
+
+#endif  // !USE_ROCM
+
 // Inter-block barrier
 
 __device__ inline void group_barrier
@@ -415,6 +495,23 @@ __device__ inline void group_barrier
 
     if (threadIdx.x == 0)
     {
+#if defined(USE_ROCM)
+        int* counter_p = &barrier_counters_sense[group_id * 2];
+        int* sense_p = &barrier_counters_sense[group_id * 2 + 1];
+
+        int old_sense = __hip_atomic_load(sense_p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        int old = __hip_atomic_fetch_add(counter_p, 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+
+        if (old == group_size - 1)
+        {
+            __hip_atomic_store(counter_p, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(sense_p, 1 - old_sense, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        else
+        {
+            while (__hip_atomic_load(sense_p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == old_sense) __nanosleep(32);
+        }
+#else
         cuda::atomic_ref<int, cuda::thread_scope_device> counter(barrier_counters_sense[group_id * 2]);
         cuda::atomic_ref<int, cuda::thread_scope_device> sense(barrier_counters_sense[group_id * 2 + 1]);
 
@@ -430,6 +527,7 @@ __device__ inline void group_barrier
         {
             while (sense.load(cuda::memory_order_acquire) == old_sense) __nanosleep(32);
         }
+#endif
     }
 
     __syncthreads();

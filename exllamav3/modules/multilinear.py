@@ -120,7 +120,16 @@ class SlicedMultiLinear:
             o = outputs[t]
             assert o.is_contiguous() and o.shape[-1] == self.linears[t].out_features
             ptrs.append(o.data_ptr() + n0 * o.element_size())
-        return torch.tensor(ptrs, dtype = torch.long, device = self.device)
+        n = len(ptrs)
+        # Graph-capture safe path: stage through a persistent pinned buffer so
+        # the H2D upload records as a memcpy node. Reused across calls; a
+        # captured graph replays the copy with whatever the caller just wrote.
+        buf = self.__dict__.get("_c_ptrs_pin")
+        if buf is None or buf.numel() < n:
+            buf = torch.empty((max(n, 32),), dtype = torch.long, pin_memory = True)
+            self.__dict__["_c_ptrs_pin"] = buf
+        buf[:n].copy_(torch.tensor(ptrs, dtype = torch.long))
+        return buf[:n].to(self.device, non_blocking = True)
 
     def q_cb(self):
         return self.mcg, self.mul1

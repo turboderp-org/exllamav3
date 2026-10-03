@@ -49,6 +49,9 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
     EXLLAMA_EXT_COMPRESS=require fails the build when the compiler lacks the option, so that a
     release build cannot fall back to uncompressed images unnoticed.
     """
+    if hip:
+        return hip_cflags(debug)
+
     flags = []
     if debug or os.environ.get("EXLLAMA_EXT_LINEINFO"):
         flags += ["-lineinfo"]
@@ -67,4 +70,26 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
                 f"EXLLAMA_EXT_COMPRESS=require, but nvcc ({' '.join(nvcc) if nvcc else 'not found'}) does not support "
                 f"--compress-mode (CUDA 12.8 or later is needed)"
             )
+    return flags
+
+
+def hip_cflags(debug: bool = False) -> list[str]:
+    """
+    Flags for the extension's HIP translation units (compiled by hipcc).
+
+    hipcc is clang-based; the nvcc-only flags used for CUDA (-Xcudafe, --use_fast_math,
+    -lineinfo, --compress-mode) are not accepted. -ffast-math is the closest equivalent of
+    --use_fast_math. gfx10/gfx11 targets execute in wave32 by default, matching the 32-lane
+    warp assumptions throughout the kernels.
+
+    EXL3_CUMODE=1 builds with -mcumode: on gfx11 the default WGP mode pairs two CUs per
+    workgroup scheduler; CU mode schedules each 256-thread GEMV block on one CU, doubling
+    the number of independent workgroup slots (48 WGPs -> 96 CUs). Measured +7.6% decode
+    on gfx1100. HIPCC_FLAGS is appended as well because some build paths (e.g. torch's
+    hipified ninja rules) consume it rather than the extension's flag list.
+    """
+    flags = ["-O3", "-ffast-math", "-DHIPBLAS_USE_HIP_HALF"]
+    if os.environ.get("EXL3_CUMODE") == "1":
+        flags += ["-mcumode", "-DEXL3_CUMODE"]
+        os.environ["HIPCC_FLAGS"] = (os.environ.get("HIPCC_FLAGS", "") + " -mcumode").strip()
     return flags

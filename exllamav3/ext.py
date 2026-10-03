@@ -89,10 +89,11 @@ else:
     # compiler flags
 
     extra_cflags = []
+    is_hip = torch.version.hip is not None
     extra_cuda_cflags = cuda_cflags(
         cuda_home = torch.utils.cpp_extension.CUDA_HOME,
         debug = ext_debug,
-        hip = bool(torch.version.hip),
+        hip = is_hip,
     )
 
     if windows:
@@ -114,7 +115,7 @@ else:
             extra_cuda_cflags += []
 
     # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe
-    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    if not windows and not is_hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
     elif windows and os.environ.get("CUDAHOSTCXX"):
         print(
@@ -123,20 +124,20 @@ else:
             file = sys.stderr
         )
 
-    if torch.version.hip:
-        extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
-
     if verbose:
-        extra_cuda_cflags += ["--ptxas-options=-v"]
+        extra_cuda_cflags += ["-v" if is_hip else "--ptxas-options=-v"]
 
     # linker flags
 
     extra_ldflags = []
 
     if windows:
-        extra_ldflags += ["cublas.lib"]
+        extra_ldflags += ["hipblas.lib" if is_hip else "cublas.lib"]
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
+    elif is_hip:
+        # The extension calls hipBLAS directly (hgemm.cu, graph.cu); link it explicitly
+        extra_ldflags += ["-lhipblas"]
 
     # sources
 
@@ -147,16 +148,34 @@ else:
         for root, _, files in os.walk(sources_dir)
         for file in files
         if file.endswith(('.c', '.cpp', '.cu'))
+        # Skip hipify outputs left over from a previous build: torch's hipify marks
+        # them already-translated (hipified_path = None), which crashes the ninja
+        # writer, and they must not be compiled as sources anyway.
+        and '_hip.' not in file and not file.startswith('hip_')
     ]
 
-    # Load extension
+    extra_include_paths = [sources_dir]
+    if is_hip:
+        # The pip ROCm SDK ships runtime headers only; torch's c10 headers pull in
+        # thrust/complex.h, which lives in a full ROCm install. Add it when present.
+        for rocm_root in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("ROCM_HOME"),
+            "/opt/rocm",
+        ):
+            if not rocm_root:
+                continue
+            inc = os.path.join(rocm_root, "include")
+            if os.path.exists(os.path.join(inc, "thrust", "complex.h")):
+                extra_include_paths.append(inc)
+                break
 
     maybe_set_arch_list_env()
     try:
         exllamav3_ext = load(
             name = extension_name,
             sources = sources,
-            extra_include_paths = [sources_dir],
+            extra_include_paths = extra_include_paths,
             verbose = verbose,
             extra_ldflags = extra_ldflags,
             extra_cuda_cflags = extra_cuda_cflags,
@@ -170,5 +189,11 @@ else:
             raise RuntimeError(
                 f"No CUDA device is visible to determine the architectures to build {extension_name} for. "
                 "Set TORCH_CUDA_ARCH_LIST to the target architectures, e.g. TORCH_CUDA_ARCH_LIST=\"8.6;8.9+PTX\""
+            ) from e
+        if torch.version.hip and os.environ.get("PYTORCH_ROCM_ARCH", "") == "" and \
+                not torch.cuda.device_count():
+            raise RuntimeError(
+                f"No ROCm device is visible to determine the architectures to build {extension_name} for. "
+                "Set PYTORCH_ROCM_ARCH to the target, e.g. PYTORCH_ROCM_ARCH=\"gfx1100\""
             ) from e
         raise

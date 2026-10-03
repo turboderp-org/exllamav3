@@ -1,7 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+
+pytestmark = pytest.mark.skipif(
+    bool(torch.version.hip),
+    reason = "dflash2 kernels are CUDA-only (not in HIP builds)",
+)
 from exllamav3.ext import exllamav3_ext as ext
 
 from exllamav3.architecture.architectures import ARCHITECTURES

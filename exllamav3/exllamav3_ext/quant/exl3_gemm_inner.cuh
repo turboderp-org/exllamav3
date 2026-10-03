@@ -226,11 +226,11 @@ void exl3_gemm_kernel_inner
     // TILEBLOCKS_M == 1 (dense / decode): A fragments double-buffered across the fragment stages,
     // as before. TILEBLOCKS_M > 1 (fused MoE prefill tiles): one A fragment per 16-row block,
     // single-buffered, so the row fragments fit alongside the prefetched B fragments
-    register FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
-    register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+    FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
+    FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
+    FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+        FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()
@@ -309,6 +309,35 @@ void exl3_gemm_kernel_inner
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
+        // Zero out A fragment elements for rows >= size_m. On ROCm, the MMA emulation uses
+        // __shfl_sync to gather across all 32 lanes, so uninitialized rows (>= size_m) in shared
+        // memory can contain NaN bit patterns that propagate to valid output rows via the shuffle.
+        // On NVIDIA the hardware MMA reads each lane's fragment independently, so this cannot occur.
+        #if defined(USE_ROCM)
+        {
+            int g = lane_id / 4;
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            {
+                int row_lo = m * 16 + g;
+                int row_hi = row_lo + 8;
+                int idx = (TILEBLOCKS_M == 1) ? buf : m;
+                if (row_lo >= size_m)
+                {
+                    half2 z = __float2half2_rn(0.0f);
+                    frag_a[idx][0] = z; frag_a[idx][1] = z;
+                    frag_a[idx][2] = z; frag_a[idx][3] = z;
+                }
+                else if (row_hi >= size_m)
+                {
+                    half2 z = __float2half2_rn(0.0f);
+                    frag_a[idx][1] = z;
+                    frag_a[idx][3] = z;
+                }
+            }
+        }
+        #endif
+
 
         // B fragments
         #pragma unroll

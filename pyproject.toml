@@ -69,6 +69,9 @@ cu130 = [
 cu132 = [
     "torch>=2.6.0",
 ]
+rocm = [
+    "torch>=2.6.0",
+]
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -98,6 +101,7 @@ conflicts = [
         { extra = "cu129" },
         { extra = "cu130" },
         { extra = "cu132" },
+        { extra = "rocm" },
     ],
 ]
 
@@ -109,6 +113,7 @@ torch = [
     { index = "pytorch-cu129", extra = "cu129" },
     { index = "pytorch-cu130", extra = "cu130" },
     { index = "pytorch-cu132", extra = "cu132" },
+    { index = "pytorch-rocm", extra = "rocm" },
 ]
 
 
@@ -140,4 +145,9 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.14"
 explicit = true

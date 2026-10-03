@@ -86,9 +86,15 @@ void Graph::capture_end()
             else
             {
                 (void) cudaGetLastError();
+#if defined(USE_ROCM)
+                // HIP has no separate driver-API graph node query; a failure here means the
+                // node cannot be introspected at all.
+                TORCH_CHECK(false, "hipGraphKernelNodeGetParams failed on a kernel node");
+#else
                 cuda_check_drv(CudaDrv::instance().graph_kernel_node_get_params((CUgraphNode) nodes[n], &node_params_drv[n]));
                 node_is_driver[n] = 1;
                 node_func = (void*) node_params_drv[n].func;
+#endif
             }
 
             for(; c < graph_sites.size(); c++)
@@ -173,6 +179,9 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;
+#if defined(USE_ROCM)
+        cuda_check(cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]));
+#else
         if (node_is_driver[n])
         {
             CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
@@ -180,6 +189,7 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         }
         else
             cuda_check(cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]));
+#endif
         node_needs_update[n] = false;
     }
 

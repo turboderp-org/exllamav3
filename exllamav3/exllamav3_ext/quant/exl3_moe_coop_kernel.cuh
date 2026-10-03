@@ -491,8 +491,9 @@ __device__ __forceinline__ void gemv_tile
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                FragA a;
+                a[0] = a01[0]; a[1] = a01[1]; a[2] = a23[0]; a[3] = a23[1];
+                ptx_mma_m16n16k16(a, f0, f1, ch[t][0], ch[t][1]);
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)

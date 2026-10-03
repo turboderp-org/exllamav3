@@ -1,4 +1,5 @@
 #pragma once
+#include "hip_compat.cuh"
 
 struct ValIdx
 {

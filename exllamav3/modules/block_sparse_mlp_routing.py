@@ -79,7 +79,9 @@ def _gate_t(cfg):
     (weights may be deferred when the RoutingCFG is constructed)."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and cfg.gate_tensor_t.dtype == torch.half and not torch.version.hip:
+        # det_quant_weight/routing_gemm_det are CUDA-only; the int8 gate is never
+        # prepared on ROCm so routing_std falls through to the GEMV/cuBLAS paths.
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)

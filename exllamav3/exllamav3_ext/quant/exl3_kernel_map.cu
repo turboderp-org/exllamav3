@@ -42,6 +42,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
             if (mod_256) return 3;
             return 2;
 
+        case CC_RDNA3:  // gfx1100 series: same shape ladder as Ada
         case CC_ADA:
             if (mod_256 && K <= 3)
             {

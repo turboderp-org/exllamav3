@@ -7,6 +7,32 @@ import torch
 
 def maybe_set_arch_list_env():
 
+    if torch.version.hip:
+        # The kernels assume 32-lane warps throughout (warp masks, ballot widths, MMA
+        # fragment layouts). RDNA parts run wave32; CDNA runs wave64 and is not
+        # supported. Check every visible device at import so unsupported hardware
+        # fails before any kernel launch, not just the quant paths that query DevCtx.
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            if props.warp_size != 32:
+                raise RuntimeError(
+                    f"exllamav3: ROCm device {props.name} has warp size "
+                    f"{props.warp_size}; only wave32 (RDNA) targets are supported"
+                )
+        # ROCm: cpp_extension reads PYTORCH_ROCM_ARCH (not TORCH_CUDA_ARCH_LIST) and
+        # expects gfx names (e.g. gfx1100). get_device_capability returns (major, minor)
+        # which does not map to a gfx name, so use the device gcnArchName directly.
+        if os.environ.get('PYTORCH_ROCM_ARCH', None):
+            return
+        arch_list = []
+        for i in range(torch.cuda.device_count()):
+            arch = torch.cuda.get_device_properties(i).gcnArchName.split(':')[0]
+            if arch not in arch_list:
+                arch_list.append(arch)
+        if arch_list:
+            os.environ["PYTORCH_ROCM_ARCH"] = ";".join(sorted(arch_list))
+        return
+
     if os.environ.get('TORCH_CUDA_ARCH_LIST', None):
         return
 

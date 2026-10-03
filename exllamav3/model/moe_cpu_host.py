@@ -1068,9 +1068,10 @@ class MoeCpuHost:
 
         def wd():
             while True:
-                if not self.started or self.proc is None:
+                proc = self.proc   # snapshot: shutdown() can null it between checks
+                if not self.started or proc is None:
                     return
-                if not self.proc.is_alive():
+                if not proc.is_alive():
                     try:
                         u32 = self._flags_u32
                         seq, wseq = self.seq + 1, self.wseq + 1
@@ -1175,7 +1176,13 @@ class MoeCpuHost:
         """
         rows = y.shape[0]
         spec = self.specs[layer_idx]
-        if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
+        # selected_experts contiguity belongs in this guard too: it is .view(-1)'d
+        # below AFTER the job descriptor is published, and a view() on a
+        # non-contiguous tensor raises there, stranding the published-but-never-
+        # issued job and desyncing the ring (every later submit would "ring stall")
+        if (rows > self.cap_rows
+                or not (y.is_contiguous() and routing_weights.is_contiguous()
+                        and selected_experts.is_contiguous())):
             return None
         h_ = y.shape[1]
         hi = spec["hi"]
@@ -1934,3 +1941,16 @@ class MoeCpuHost:
             self.shm = None
         self.started = False
         self.by_key = {}
+        # Sequence counters must return to their construction values: the host
+        # instance is cached and REUSED for a reload of the same config
+        # (block_sparse_mlp_cpu.hosts), and the new child starts with a fresh,
+        # zeroed SharedMemory. A stale slot_last_seq/wslot_prev_seq against
+        # flags that restarted at 0 makes the first submit enqueue a GEQ flag
+        # wait that can never be satisfied (the memop wait has no timeout) and
+        # permanently wedges the stream.
+        self.seq = 0
+        self.next_slot = 0
+        self.slot_last_seq = [0] * MOE_MAX_SLOTS
+        self.wseq = 0
+        self.next_wslot = 0
+        self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS

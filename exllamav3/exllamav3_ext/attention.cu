@@ -497,7 +497,7 @@ __global__ void attn_chunked_paged_kernel
     half*  kv_smem     = (half*) smem_raw;
     float* reduce_smem = (float*) (kv_smem + D);
 
-    register half q_reg[G];
+    half q_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -507,7 +507,7 @@ __global__ void attn_chunked_paged_kernel
         q_reg[g] = q[q_off];
     }
 
-    register float m_reg[G], l_reg[G], o_reg[G];
+    float m_reg[G], l_reg[G], o_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -642,7 +642,7 @@ __global__ void attn_chunked_kernel
     // reduce_smem has WARPS*G_MAX entries:
     //   reduce_smem[g*WARPS + w] is warp w's partial for head g.
 
-    register half q_reg[G];
+    half q_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -652,7 +652,7 @@ __global__ void attn_chunked_kernel
         q_reg[g] = q[q_off];
     }
 
-    register float m_reg[G], l_reg[G], o_reg[G];
+    float m_reg[G], l_reg[G], o_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -905,7 +905,7 @@ void bighead_attn_paged
     dim3 grid1((uint32_t)(bsz * q_len), (uint32_t)n_kv_heads, (uint32_t)n_chunks);
     dim3 grid2((uint32_t)(bsz * q_len), (uint32_t)n_q_heads);
 
-    const float scale = sm_scale == 0.0f ? rsqrtf((float) dim) : sm_scale;
+    const float scale = sm_scale == 0.0f ? 1.0f / sqrtf((float) dim) : sm_scale;
 
     #define PAGED_UPDATE_ARGS \
         k_ptr, v_ptr, k_cache_ptr, v_cache_ptr, block_ptr, seqlens_ptr, \
@@ -1050,7 +1050,7 @@ void bighead_attn
     dim3 grid1_512((uint32_t)(bsz * q_len), (uint32_t)n_kv_heads, (uint32_t)n_chunks);
     dim3 grid2_512((uint32_t)(bsz * q_len), (uint32_t)n_q_heads);
 
-    const float scale = sm_scale == 0.0f ? rsqrtf((float) dim) : sm_scale;
+    const float scale = sm_scale == 0.0f ? 1.0f / sqrtf((float) dim) : sm_scale;
 
     #define ARGS1 \
         q_ptr, k_ptr, v_ptr, ws_ptr, \

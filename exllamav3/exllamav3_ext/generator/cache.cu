@@ -88,11 +88,12 @@ void cache_rotate
     const int32_t* o = (const int32_t*) order.data_ptr();
     uint8_t* t = (uint8_t*) temp.data_ptr();
     uintptr_t align = (uintptr_t) c | (uintptr_t) t | page_size;
-    if      (align % 16 == 0) cache_rotate_kernel<uint4>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
-    else if (align %  8 == 0) cache_rotate_kernel<uint2>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
-    else if (align %  4 == 0) cache_rotate_kernel<uint32_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
-    else if (align %  2 == 0) cache_rotate_kernel<uint16_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
-    else                      cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    // Braced: torch's hipify misparses `else <kernel><<<...` as a kernel name on ROCm.
+    if      (align % 16 == 0) { cache_rotate_kernel<uint4>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
+    else if (align %  8 == 0) { cache_rotate_kernel<uint2>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
+    else if (align %  4 == 0) { cache_rotate_kernel<uint32_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
+    else if (align %  2 == 0) { cache_rotate_kernel<uint16_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
+    else                      { cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
     cuda_check(cudaPeekAtLastError());
 }
 

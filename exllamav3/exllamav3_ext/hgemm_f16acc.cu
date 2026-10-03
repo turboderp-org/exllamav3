@@ -50,6 +50,11 @@ template <int TILE_N, bool TUNED> struct Config
     static constexpr size_t SMEM_BYTES = (size_t) STAGES * (A_STAGE + B_STAGE) * sizeof(half);
 };
 
+#if !defined(USE_ROCM)
+// The fp16-accumulator MMA path exists for GeForce parts where mma.sync.f32 runs at half
+// rate. AMD has no such rate split, so the kernel is not ported; hgemm_f16acc_try returns
+// false under USE_ROCM and hgemm_f16acc falls back to hipBLAS.
+
 __device__ __forceinline__ void add_half_pair(float& a, float& b, uint32_t h)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
@@ -370,8 +375,8 @@ static std::mutex g_mutex;
 
 static float probe_ms(bool f16, int blocks, int iters, float* sink, cudaStream_t stream)
 {
-    auto run = [&]() { if (f16) rate_kernel<true><<<blocks, 256, 0, stream>>>(iters, sink);
-                       else rate_kernel<false><<<blocks, 256, 0, stream>>>(iters, sink); };
+    auto run = [&]() { if (f16) { rate_kernel<true><<<blocks, 256, 0, stream>>>(iters, sink); }
+                       else       { rate_kernel<false><<<blocks, 256, 0, stream>>>(iters, sink); } };
     run();
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
@@ -426,37 +431,6 @@ bool enabled(int device)
     return on == 1;
 }
 
-// Hard shape coverage of the kernel (independent of the device decision).
-static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
-{
-    if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
-    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
-    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
-    if (a.dim() != b.dim() || a.dim() != c.dim() || (a.dim() != 2 && a.dim() != 3)) return false;
-    int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
-    if (b.size(-2) != K || c.size(-2) != M || c.size(-1) != N) return false;
-    if (K < 1 || N < 1 || M < 1 || K % BK != 0 || N % BN != 0) return false;
-    if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
-        K > std::numeric_limits<int>::max()) return false;
-    // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
-    if ((M + BM - 1) / BM > 65535) return false;
-    if (a.stride(-1) != 1 || b.stride(-1) != 1 || c.stride(-1) != 1) return false;
-    if (a.stride(-2) != K || b.stride(-2) != N) return false;
-    if (c.stride(-2) < N || c.stride(-2) > std::numeric_limits<int>::max() ||
-        c.stride(-2) % 2 != 0) return false;
-    const uintptr_t output_alignment = c.dtype() == at::kFloat ? 8 : 4;
-    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) b.data_ptr() & 15) ||
-        ((uintptr_t) c.data_ptr() & (output_alignment - 1))) return false;
-    if (a.dim() == 3)
-    {
-        if (a.size(0) < 1 || a.size(0) > 65535 || a.size(0) != b.size(0) || a.size(0) != c.size(0)) return false;
-        // Inputs may broadcast across batches; each batch must still start at a copy-aligned address.
-        if (a.stride(0) % 8 || b.stride(0) % 8 || c.stride(0) % 2) return false;
-        if (a.size(0) > 1 && c.stride(0) < (M - 1) * c.stride(-2) + N) return false;
-    }
-    return at::cuda::getDeviceProperties(a.device().index())->major >= 8;
-}
-
 static bool tuned_device(int device)
 {
     // The layout/shape sweep was measured on GeForce Blackwell. Other Ampere+ parts retain
@@ -504,7 +478,7 @@ static void launch_config(const at::Tensor& a, const at::Tensor& b, const at::Te
     TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "hgemm_f16acc: device index");
     std::call_once(attr_set[device], [&]()
     {
-        cuda_check(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) CF::SMEM_BYTES));
+        cuda_check(cudaFuncSetAttribute((const void*) kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) CF::SMEM_BYTES));
     });
     bool batched = a.dim() == 3;
     int batch = batched ? a.size(0) : 1;
@@ -529,11 +503,48 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
     else launch_config<OUT_F32, 128, true>(a, b, c, stream);
 }
 
+#endif // !USE_ROCM
+
+// Hard shape coverage of the kernel (independent of the device decision).
+static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+{
+    if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
+    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (a.dim() != b.dim() || a.dim() != c.dim() || (a.dim() != 2 && a.dim() != 3)) return false;
+    int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
+    if (b.size(-2) != K || c.size(-2) != M || c.size(-1) != N) return false;
+    if (K < 1 || N < 1 || M < 1 || K % BK != 0 || N % BN != 0) return false;
+    if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
+        K > std::numeric_limits<int>::max()) return false;
+    // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
+    if ((M + BM - 1) / BM > 65535) return false;
+    if (a.stride(-1) != 1 || b.stride(-1) != 1 || c.stride(-1) != 1) return false;
+    if (a.stride(-2) != K || b.stride(-2) != N) return false;
+    if (c.stride(-2) < N || c.stride(-2) > std::numeric_limits<int>::max() ||
+        c.stride(-2) % 2 != 0) return false;
+    const uintptr_t output_alignment = c.dtype() == at::kFloat ? 8 : 4;
+    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) b.data_ptr() & 15) ||
+        ((uintptr_t) c.data_ptr() & (output_alignment - 1))) return false;
+    if (a.dim() == 3)
+    {
+        if (a.size(0) < 1 || a.size(0) > 65535 || a.size(0) != b.size(0) || a.size(0) != c.size(0)) return false;
+        // Inputs may broadcast across batches; each batch must still start at a copy-aligned address.
+        if (a.stride(0) % 8 || b.stride(0) % 8 || c.stride(0) % 2) return false;
+        if (a.size(0) > 1 && c.stride(0) < (M - 1) * c.stride(-2) + N) return false;
+    }
+    return at::cuda::getDeviceProperties(a.device().index())->major >= 8;
+}
+
+
 } // namespace f16acc
 
 // Try the fp16-accumulator kernel; false = caller should use cuBLAS
 bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 {
+#if defined(USE_ROCM)
+    return false;
+#else
     if (!f16acc::covered(a, b, c) || !f16acc::worthwhile(a, b)) return false;
     if (!f16acc::enabled(a.device().index())) return false;
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
@@ -541,22 +552,40 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
     if (c.dtype() == at::kFloat) f16acc::launch<true>(a, b, c, stream);
     else f16acc::launch<false>(a, b, c, stream);
     return true;
+#endif
 }
 
 // Force the kernel (tests / benchmarks): errors if the shape is not covered
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
 {
+#if defined(USE_ROCM)
+    // No fp16-accumulator MMA path on AMD; run the hipBLAS GEMM so callers still get a
+    // correct result. hgemm is 2D-only, so loop over the batch dim for 3D inputs.
+    TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: unsupported device, shape, strides or alignment (K % 64, N % 128; 16-byte input and vector-aligned output)");
+    if (a.dim() == 3)
+    {
+        for (int64_t i = 0; i < a.size(0); ++i)
+            hgemm(a[i], b[i], c[i]);
+        return;
+    }
+    hgemm(a, b, c);
+#else
     TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: unsupported device, shape, strides or alignment (Ampere+, K % 64, N % 128; 16-byte input and vector-aligned output)");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     if (c.dtype() == at::kFloat) f16acc::launch<true>(a, b, c, stream);
     else f16acc::launch<false>(a, b, c, stream);
+#endif
 }
 
 // 1 = fp16-accumulate kernel active on this device, 0 = cuBLAS (probe result or env override)
 int hgemm_f16acc_status(int device)
 {
+#if defined(USE_ROCM)
+    return 0;
+#else
     return f16acc::enabled(device) ? 1 : 0;
+#endif
 }
 
 // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
