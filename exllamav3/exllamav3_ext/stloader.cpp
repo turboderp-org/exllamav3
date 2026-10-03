@@ -628,6 +628,70 @@ void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
     TORCH_CHECK(!error.is_failed(), error.msg);
 }
 
+// Batch front end: the caller describes a whole deferred pass as one int64 tensor, one row per
+// tensor (layout in stloader.h), instead of one Python-constructed TensorLoadJob per chunk. Rows
+// are taken in order (the caller sorts them by file and offset so adjacent reads coalesce), split
+// into jobs of at most max_chunk_size bytes, and handed to the CPU and CUDA engines, host
+// destinations first.
+void stloader_deferred_batch
+(
+    std::vector<std::vector<uintptr_t>> const& file_handles,
+    at::Tensor const& loads,
+    size_t max_chunk_size
+)
+{
+    TORCH_CHECK(loads.device().is_cpu() && loads.scalar_type() == at::kLong && loads.dim() == 2 &&
+                loads.size(1) == STLOADER_NUM_COLS && loads.is_contiguous(),
+                "stloader: loads must be a contiguous int64 CPU tensor of shape (n, ", (int) STLOADER_NUM_COLS, ")");
+    TORCH_CHECK(max_chunk_size > 0, "stloader: max_chunk_size must be positive");
+
+    const int64_t num_rows = loads.size(0);
+    const int64_t* row = loads.data_ptr<int64_t>();
+    std::vector<TensorLoadJob> cpu_jobs;
+    std::vector<TensorLoadJob> cuda_jobs;
+
+    for (int64_t i = 0; i < num_rows; ++i, row += STLOADER_NUM_COLS)
+    {
+        const int64_t file_idx = row[STLOADER_COL_FILE];
+        TORCH_CHECK(file_idx >= 0 && file_idx < (int64_t) file_handles.size(),
+                    "stloader: load ", i, " has file index ", file_idx, " out of range");
+        TORCH_CHECK(row[STLOADER_COL_OFFSET] >= 0 && row[STLOADER_COL_SIZE] >= 0 && row[STLOADER_COL_DEST_SIZE] >= 0,
+                    "stloader: load ", i, " has a negative offset or size");
+
+        size_t file_offset = (size_t) row[STLOADER_COL_OFFSET];
+        size_t bytesize = (size_t) row[STLOADER_COL_SIZE];
+        uintptr_t dest = (uintptr_t) row[STLOADER_COL_DEST];
+        size_t dest_size = (size_t) row[STLOADER_COL_DEST_SIZE];
+        const int64_t flags = row[STLOADER_COL_FLAGS];
+        const bool bf16 = flags & STLOADER_FLAG_BF16_TO_FP16;
+        const bool fp32 = flags & STLOADER_FLAG_FP32_TO_FP16;
+        const bool cuda = flags & STLOADER_FLAG_CUDA;
+        const int device = (int) row[STLOADER_COL_DEVICE];
+        if (!bytesize) continue;
+
+        // Checked per load here too (validate_jobs checks per job) so the error names the load
+        TORCH_CHECK(bytesize <= dest_size, "stloader: load ", i, " of ", bytesize,
+                    " bytes into a destination of ", dest_size, " bytes");
+
+        std::vector<TensorLoadJob>& jobs = cuda ? cuda_jobs : cpu_jobs;
+        const std::vector<uintptr_t>& handles = file_handles[file_idx];
+        while (bytesize > max_chunk_size)
+        {
+            jobs.push_back({handles, file_offset, max_chunk_size, dest, dest_size, bf16, fp32, cuda, device});
+            file_offset += max_chunk_size;
+            dest += max_chunk_size;
+            dest_size -= max_chunk_size;
+            bytesize -= max_chunk_size;
+        }
+        jobs.push_back({handles, file_offset, bytesize, dest, dest_size, bf16, fp32, cuda, device});
+    }
+
+    if (!cpu_jobs.empty())
+        stloader_deferred_cpu(cpu_jobs);
+    if (!cuda_jobs.empty())
+        stloader_deferred_cuda(cuda_jobs, max_chunk_size);
+}
+
 // TODO: GPUDirect option
 void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_chunk_size)
 {

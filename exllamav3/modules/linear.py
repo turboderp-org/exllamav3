@@ -7,6 +7,7 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
@@ -431,8 +432,8 @@ class Linear(Module):
         sv = opt(".sv", self.device, no_defer = True)
         svh = opt(".svh", self.device)
         trellis = stc.get_tensor(key + ".trellis", self.device)
-        mcg = opt(".mcg", "cpu")
-        mul1 = opt(".mul1", "cpu")
+        mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
+        mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
         bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
