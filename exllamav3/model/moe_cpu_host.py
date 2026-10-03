@@ -877,7 +877,7 @@ class MoeCpuHost:
                   flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None):
+                       proj_dims = None, aux = None, interm_fp32 = False):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -898,6 +898,7 @@ class MoeCpuHost:
             hi = hi, ho = ho, topk = topk,
             num_experts = len(up_keys),
             proj_dims = proj_dims,
+            interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
         )
         if proj_dims is not None:
             # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
@@ -1413,14 +1414,17 @@ class MoeCpuHost:
         self.sstate[key] = st
         return st
 
-    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch):
-        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias)"""
+    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
+        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). out_dtype
+        follows the resident experts (fp32 for the down projection, the model's interm_dtype
+        for gate/up): on models with massive activations the output-side Hadamard concentrates
+        a 128-block past the fp16 range, and an in-place fp16 transform overflows to inf"""
         k, n, K = dims
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh, None, 1.0)
         w = w_scratch[:k * n].view(k, n)
         ext.reconstruct(w, trellis_view, K, False, True)
-        y = torch.empty((x.shape[0], n), dtype = torch.half, device = x.device)
+        y = torch.empty((x.shape[0], n), dtype = out_dtype, device = x.device)
         ext.hgemm(xh, w, y)
         ext.had_r_128(y, y, None, svh, 1.0)
         if bias is not None:
@@ -1814,21 +1818,25 @@ class MoeCpuHost:
                     numel = (k // 16) * (n // 16) * int(16 * K)
                     return vslot[boff + off_b // 2 : boff + off_b // 2 + numel] \
                         .view(k // 16, n // 16, int(16 * K))
+                # Same output dtypes as the resident experts: the intermediate as the model's
+                # interm_dtype, the down projection fp32 (the activation casts to half for the
+                # down GEMM either way)
+                idt = torch.float if spec.get("interm_fp32") else torch.half
                 if gated:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
-                                         st["w_scratch"])
+                                         st["w_scratch"], out_dtype = idt)
                 uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
-                                     st["w_scratch"])
+                                     st["w_scratch"], out_dtype = idt)
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
                 dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
-                                     st["w_scratch"])
-                out.index_add_(0, idx, dy[:, :h].float() * we)
+                                     st["w_scratch"], out_dtype = torch.float)
+                out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
         # Collect the CPU tail (by now usually complete) and merge
