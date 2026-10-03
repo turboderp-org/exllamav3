@@ -41,6 +41,7 @@ import triton
 import triton.language as tl
 
 from .triton_paged import _rot_h32, _qc_load_v, _get_h32
+from .smem import pick_config, shared_bytes, halving_ladder
 
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
@@ -1030,15 +1031,18 @@ def dsa_attn(
 
     if n_splits > 1:
         block_h = min(block_h, 16)   # more head-blocks: the split path wants parallelism
+        # Head tile and kv tile, then pipeline depth, against the device's shared memory
+        # (smem.py); the workspace below follows the picked head tile
+        hb_ladder = [(bh, bn, ns) for ns in (2, 1) for bh in halving_ladder(block_h, 8) for bn in halving_ladder(block_n)]
         # Flash-decoding split: the monolithic kernel at R = 1 is 2 blocks walking the key
         # tiles serially (pure latency); the split phase spreads the keys over
         # R * h_blocks * n_splits programs and the combine folds sinks/derot/store
-        hb = triton.cdiv(H, block_h)
         D_out = D_c if out_latent else D
-        ws_ml = g_tensor_cache.get(q.device, (R * hb * n_splits * block_h * 2,),
-                                   torch.float, "dsa_ws_ml")
-        ws_acc = g_tensor_cache.get(q.device, (R * hb * n_splits * block_h * D_out,),
-                                    torch.float, "dsa_ws_acc")
+        def workspace(bh):
+            hb = triton.cdiv(H, bh)
+            ws_ml = g_tensor_cache.get(q.device, (R * hb * n_splits * bh * 2,), torch.float, "dsa_ws_ml")
+            ws_acc = g_tensor_cache.get(q.device, (R * hb * n_splits * bh * D_out,), torch.float, "dsa_ws_acc")
+            return hb, ws_ml, ws_acc
         if multirow is not None:
             mr = multirow
             a_klen, a_pool = mr["k_len"], mr["pool_len"]
@@ -1049,21 +1053,35 @@ def dsa_attn(
             a_klen, a_pool, a_qpos, a_floor, a_beg = k_len, pool_len, q_pos0, win_floor, ring_beg
             # ring_stride carries R for the head-major q_lat load in split-q mode
             a_slots, a_rstride, a_seq = 0, (R if q_split else 0), 1
-        with torch.cuda.device(q.device):
-            _dsa_attn_split_kernel[(R * hb, n_splits)](
+        def s_args(ws_ml, ws_acc):
+            return (
                 q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
                 block_table, indices, ws_ml, ws_acc,
                 a_klen, win_len, a_pool, npr, a_qpos, a_floor, a_beg,
                 a_slots, a_rstride, pool_s, h32_t,
+            )
+        def s_consts(bh, bn):
+            return dict(
                 H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
                 D_r = D_r, K_pad = K_pad, compress_rate = compress_rate, scale = scale,
                 HAS_WINDOW = has_window, DENSE_POOL = dense_pool,
-                BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
+                BLOCK_H = bh, BLOCK_N = bn, BLOCK_W = 16,
                 SEQ = a_seq, MULTIROW = multirow is not None,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
                 QC = qc_bits,
-                num_warps = num_warps, num_stages = 2,
+            )
+        with torch.cuda.device(q.device):
+            pick_key = (H, D_c, D_r, K_pad, has_window, dense_pool, a_seq, multirow is not None,
+                        dbg, bool(q_split), bool(out_latent), qc_bits, num_warps, hb_ladder[0])
+            def probe(cfg):
+                bh, bn, ns = cfg
+                _, ws_ml, ws_acc = workspace(bh)
+                return shared_bytes(_dsa_attn_split_kernel, s_args(ws_ml, ws_acc), **s_consts(bh, bn), num_warps = num_warps, num_stages = ns)
+            block_h, block_n, s_stages = pick_config(q.device, "dsa_attn_split", pick_key, hb_ladder, probe)
+            hb, ws_ml, ws_acc = workspace(block_h)
+            _dsa_attn_split_kernel[(R * hb, n_splits)](
+                *s_args(ws_ml, ws_acc), **s_consts(block_h, block_n), num_warps = num_warps, num_stages = s_stages,
             )
             _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
@@ -1078,12 +1096,14 @@ def dsa_attn(
             )
         return out
 
-    grid = (R * triton.cdiv(H, block_h),)
-    with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
-        _dsa_attn_kernel[grid](
-            q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
-            block_table, indices, sinks_t, derot_t, out,
-            k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg, pool_s, h32_t,
+    m_args = (
+        q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
+        block_table, indices, sinks_t, derot_t, out,
+        k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg, pool_s, h32_t,
+    )
+    def m_consts(cfg):
+        bh, bn, _ = cfg
+        return dict(
             H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
             D_r = D_r, K_pad = K_pad, compress_rate = compress_rate,
             scale = scale,
@@ -1092,13 +1112,30 @@ def dsa_attn(
             DENSE_POOL = dense_pool,
             DEROTATE = derotate,
             HPG = hpg,
-            BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
+            BLOCK_H = bh, BLOCK_N = bn, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             NC_BLOCK = 1 if nc_block else 0,
             NC_CHUNK = 1 if nc_chunk else 0, NC_HIST = nc_hist,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
-            num_warps = num_warps, num_stages = num_stages,
+        )
+    # Head tile, then kv tile, then pipeline depth (smem.py); the stock config leads
+    ladder = [(block_h, block_n, num_stages)]
+    for ns in range(num_stages, 0, -1):
+        for bh in halving_ladder(block_h, 8):
+            for bn in halving_ladder(block_n):
+                if (bh, bn, ns) not in ladder:
+                    ladder.append((bh, bn, ns))
+    with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
+        pick_key = (H, D_c, D_r, K_pad, has_window, has_sinks, dense_pool, derotate, hpg, dbg,
+                    bool(nc_block), bool(nc_chunk), nc_hist, bool(q_split), bool(out_latent), qc_bits,
+                    num_warps, ladder[0])
+        block_h, block_n, num_stages = pick_config(
+            q.device, "dsa_attn", pick_key, ladder,
+            lambda cfg: shared_bytes(_dsa_attn_kernel, m_args, **m_consts(cfg), num_warps = num_warps, num_stages = cfg[2]))
+        grid = (R * triton.cdiv(H, block_h),)
+        _dsa_attn_kernel[grid](
+            *m_args, **m_consts((block_h, block_n, num_stages)), num_warps = num_warps, num_stages = num_stages,
         )
     return out
 
@@ -1154,24 +1191,37 @@ def dsa_indexer_scores(
         if R <= 4:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
             # the query-tiled kernel degenerates to a serial head loop over padding here
+            f_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)
+            def f_consts(bn):
+                return dict(
+                    H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
+                    S_stride = S_stride, compress_rate = compress_rate,
+                    scale = scale,
+                    BLOCK_N = bn, EPP = epp,
+                    DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                )
+            # kv tile ladder (smem.py); the score stride stays the caller's, tiles only shrink
+            block_n = pick_config(
+                q_idx.device, "dsa_indexer_fewq", (H_i, D_i, S_stride, compress_rate, epp, dbg, num_warps, num_stages, block_n),
+                halving_ladder(block_n),
+                lambda bn: shared_bytes(_dsa_indexer_fewq_kernel, f_args, **f_consts(bn), num_warps = num_warps, num_stages = num_stages))
             grid = (R, triton.cdiv(max(T, 1), block_n))
-            _dsa_indexer_fewq_kernel[grid](
-                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0,
-                H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
-                S_stride = S_stride, compress_rate = compress_rate,
-                scale = scale,
-                BLOCK_N = block_n, EPP = epp,
-                DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
-                num_warps = num_warps, num_stages = num_stages,
-            )
+            _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
         else:
+            t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt)
+            def t_consts(cfg):
+                bm, bn = cfg
+                return dict(
+                    H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate,
+                    scale = scale,
+                    BLOCK_M = bm, BLOCK_N = bn, EPP = epp,
+                    DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                )
+            ladder = [(block_m, block_n)] + [(bm, bn) for bn in halving_ladder(block_n) for bm in halving_ladder(block_m) if (bm, bn) != (block_m, block_n)]
+            block_m, block_n = pick_config(
+                q_idx.device, "dsa_indexer", (H_i, D_i, S_stride, compress_rate, epp, dbg, num_warps, num_stages, ladder[0]),
+                ladder,
+                lambda cfg: shared_bytes(_dsa_indexer_kernel, t_args, **t_consts(cfg), num_warps = num_warps, num_stages = num_stages))
             grid = (triton.cdiv(R, block_m), triton.cdiv(max(T, 1), block_n))
-            _dsa_indexer_kernel[grid](
-                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt,
-                H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate,
-                scale = scale,
-                BLOCK_M = block_m, BLOCK_N = block_n, EPP = epp,
-                DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
-                num_warps = num_warps, num_stages = num_stages,
-            )
+            _dsa_indexer_kernel[grid](*t_args, **t_consts((block_m, block_n)), num_warps = num_warps, num_stages = num_stages)
     return scores[:, :T]

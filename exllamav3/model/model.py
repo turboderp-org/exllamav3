@@ -324,6 +324,12 @@ class Model(Model_TPMixin, Model_LSMixin):
                             params["recurrent_states"] = states
                         if history:
                             params["recurrent_history"] = True
+                    # Chunk-class steps stop the head at the last row, like prefill does (the
+                    # generator never takes logits for a whole chunk): full-chunk logits are the
+                    # single largest transient of the whole load (1.9 GiB fp16 at 4096 rows on a
+                    # 248k vocab) and would set the process's reserved high-water mark for nothing
+                    if q > 16:
+                        params["last_tokens_only"] = 1
                     step_label = f"{label}, {q} token(s) at {pos}" if cache is not None else label
                     try:
                         self.forward(ids(bsz, q), params)
@@ -368,6 +374,33 @@ class Model(Model_TPMixin, Model_LSMixin):
             y = self.prefill_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
+
+
+    @torch.inference_mode
+    def lm_head_argmax(self, state: torch.Tensor, params: dict) -> torch.Tensor:
+        """
+        Greedy token per position from a hidden state through this model's LM head, for drafters
+        that borrow the target's head (MTP, DFlash). Works in both layer-split and tensor-parallel
+        mode. With params["export_draft_conf"], also exports the winning logit per position as
+        params["draft_conf"], which the generator's confidence-calibrated draft sizing consumes.
+        The vocabulary is cropped to the unpadded size in both modes, so a zero-initialized
+        padding column can never win.
+        """
+        export = bool(params.get("export_draft_conf"))
+        if self.loaded_tp:
+            state = self.tp_producer.send(state)
+            ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
+            if export:
+                params["draft_conf"] = conf
+            return ids
+        lm = self.modules[self.logit_layer_idx]
+        logits = lm.forward(lm.prepare_for_device(state, params), params)
+        logits = logits[..., :self.config.vocab_size]
+        if export:
+            conf, ids = torch.max(logits, dim = -1)
+            params["draft_conf"] = conf
+            return ids
+        return torch.argmax(logits, dim = -1)
 
 
     @torch.inference_mode
@@ -603,6 +636,22 @@ class Model(Model_TPMixin, Model_LSMixin):
                     raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
                 if self.config.layer_map:
                     raise NotImplementedError(f"Tensor-parallel is not currently implemented for relayered models.")
+                # CPU expert offload hooks into a module's load onto a CUDA device. The TP loader
+                # stages modules on the CPU and the workers rebuild them from the export, so a
+                # requested offload would be dropped without notice and every expert would land
+                # in VRAM
+                ip = self.config.infer_params
+                cpu_modes = [name for name, value in (
+                    ("moe_cpu_split", getattr(ip, "moe_cpu_split", 0)),
+                    ("moe_cpu_offload", getattr(ip, "moe_cpu_offload", 0)
+                        if getattr(self, "component", "text") == "text"
+                        else getattr(ip, "draft_moe_cpu_offload", 0)),
+                ) if value]
+                if cpu_modes:
+                    raise NotImplementedError(
+                        f"CPU expert offload ({', '.join(cpu_modes)}) is not currently implemented for "
+                        f"tensor-parallel loads; use layer-split mode or disable the offload."
+                    )
 
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]

@@ -88,9 +88,9 @@ class HyperConnection(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):
@@ -237,8 +237,10 @@ class GatedResidual(Module):
     dots on the raw streams + a finalize that derives the low-rank gate inline); large R
     (prefill) runs the tiled ext.gr_mix_tiled kernels (hc_mix_tiled.cu: int8 tensor-core
     tiles over the row stack with exact integer accumulation and a fixed fp32 combination, so
-    replicated TP ranks of ANY architecture produce identical streams and any replicated
-    decision downstream agrees),
+    replicated TP ranks of any sm_80+ architecture produce identical streams and any
+    replicated decision downstream agrees — the tiled int8 kernels need cp.async and
+    mma.m16n8k32 s8, both sm_80+, so pre-Ampere devices take the cuBLAS path below
+    (device-dependent, but uniform within a single-arch fleet),
     or, where the shape does not fit that kernel or EXL3_GR_MIX_TILED=0, half cuBLAS GEMMs +
     a few elementwise ops. apply_() is ext.hc_apply without a comb (x[h] += post[h] * y),
     shared with mHC. _mix_ref() keeps the fp32 torch reference the parity tests compare
@@ -292,10 +294,12 @@ class GatedResidual(Module):
         super().load(device, **kwargs)
         stc = self.config.stc
         self.norm_w_raw = stc.get_tensor(f"{self.key}.hc_norm.weight", device, no_defer = True)
-        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True)
-        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True)
+        # Sources only: _prepare copies them into the kernel layouts, so keep them out of the
+        # loader's slab blocks or the dead copies stay resident
+        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True, arena = False)
+        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True, arena = False)
         inject = stc.get_tensor(f"{self.key}.block_inject_weight.weight", device,
-                                no_defer = True) if self.use_combine else None
+                                no_defer = True, arena = False) if self.use_combine else None
         self._prepare(down, up, inject, keep_source_weights)
 
     def _prepare(self, down, up, inject, keep_source_weights: bool = False):
@@ -326,8 +330,12 @@ class GatedResidual(Module):
         # pre-quantized per row (14-bit fixed point split into two int8 slices, det_quant_weight)
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
+        # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
+        # instructions — so the path is Ampere+ only; below that the cuBLAS
+        # fallback serves the projection.
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda"
+            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda" \
+            and torch.cuda.get_device_capability(dev)[0] >= 8
         tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
             .view(M, H * Dh)
         tmp.copy_(self.proj_h[: M])
@@ -569,9 +577,9 @@ class HyperHead(Module):
         if self.mean:
             return
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):
@@ -643,10 +651,14 @@ class HyperHead(Module):
         if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
-            partials = g_tensor_cache.get_bucketed(
-                x.device, R * chunks * (H + 1), torch.float, "hc_head_partials").view(R, chunks, H + 1)
-            collapsed = g_tensor_cache.get_bucketed(
-                x.device, R * D, torch.float, "hc_head_coll").view(R, D)
+            # Decode-class row counts take the static workspaces (same rule as _mix); prefill
+            # chunks allocate per call, or the collapsed rows alone would pin 64 MiB per device
+            def ws(numel, tag):
+                if R <= 32:
+                    return g_tensor_cache.get_bucketed(x.device, numel, torch.float, tag)
+                return torch.empty((numel,), dtype = torch.float, device = x.device)
+            partials = ws(R * chunks * (H + 1), "hc_head_partials").view(R, chunks, H + 1)
+            collapsed = ws(R * D, "hc_head_coll").view(R, D)
             if R <= 32:
                 if self.fn_h is None:
                     self.fn_h = self.fn.half()

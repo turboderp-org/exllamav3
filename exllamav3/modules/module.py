@@ -203,8 +203,19 @@ class Module(ABC):
     def get_compile_tensors(self, stc):
         return stc.get_tensors(self.key, allow_bf16 = True)
 
+    def autosplit_prepare(self, params):
+        """
+        Autosplit loader hook, called after load and before the measuring forward: allocate
+        state that stays resident for the life of the module (host-side offload buffers, tier
+        tables, graph slot statics) so the measuring window only sees recurring transients.
+        Anything left resident inside the window would be budgeted twice, as resident memory
+        and as headroom.
+        """
+        pass
+
     def autosplit_extra_measure(self, params):
         """
-        Extra measuring forwards for the autosplit loader.
+        Extra measuring forwards for the autosplit loader: allocate (and drop) worst-case
+        transients the (1, chunk)-at-context-0 forward does not reach.
         """
         pass

@@ -102,7 +102,7 @@ class ModelParker:
         # memory (zero-copy device aliases); module.load() puts them back in
         # VRAM, so re-pin after every restore or the tower silently regrows.
         pin = (
-            getattr(config.infer_params, "vision_pinned", False) and
+            getattr(getattr(config, "infer_params", None), "vision_pinned", False) and
             getattr(self.model, "component", "text") == "vision"
         )
         for module, device in homes:

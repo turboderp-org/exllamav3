@@ -23,13 +23,29 @@ def touch_device_measure_vram(local_context: dict):
     return torch.cuda.mem_get_info(device)
 
 
+def is_integrated_device(device) -> bool:
+    """True for GPUs that share system memory with the host (e.g. GB10, Jetson)"""
+    return bool(torch.cuda.get_device_properties(device).is_integrated)
+
+
+def device_mem_info(device) -> tuple[int, int]:
+    """(free, total) bytes for device. On an integrated GPU, CUDA's free figure is the host's
+    MemFree, which leaves out reclaimable page cache, so use MemAvailable instead"""
+    free, total = torch.cuda.mem_get_info(device)
+    if is_integrated_device(device):
+        available = host_memory_available()
+        if available is not None:
+            free = min(max(free, available), total)
+    return free, total
+
+
 # Reserve byte amount on device
 def set_memory_fraction_reserve(
     reserve: int,
     device: int
 ):
     touch_device(device)
-    free, total = torch.cuda.mem_get_info(device)
+    free, total = device_mem_info(device)
     # mem_get_info reports memory free *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
     # current reservation back, or memory held by an earlier load in the same process (a draft
@@ -58,7 +74,7 @@ def set_memory_fraction_use(
     # card's size would otherwise plan against memory the CUDA context and other processes
     # already hold, and the loader's headroom check would pass loads that fail at the first
     # real forward
-    free, _ = torch.cuda.mem_get_info(device)
+    free, _ = device_mem_info(device)
     fraction = min((current + min(use, free)) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
     return int(fraction * total)

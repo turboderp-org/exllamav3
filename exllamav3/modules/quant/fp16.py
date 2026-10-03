@@ -257,4 +257,4 @@ class LinearFP16_torch:
         return self.nn_linear.bias.data if self.nn_linear.bias is not None else None
 
     def set_weight(self, w):
-        self.nn_linear.weight = nn.Parameter(w.T.half())
+        self.nn_linear.weight = nn.Parameter(w.T.half(), requires_grad = False)

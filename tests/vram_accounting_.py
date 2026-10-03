@@ -33,6 +33,7 @@ def report(tag, model, cache, gen):
     print(format_vram_report(reps, color = not args.no_color))
     return reps
 
+torch.cuda.init()  # the allocator's stats exist only after init (imports no longer touch CUDA)
 for i in range(torch.cuda.device_count()):
     torch.cuda.reset_peak_memory_stats(i)
 model, config, cache, tokenizer, *_ = model_init.init(args)

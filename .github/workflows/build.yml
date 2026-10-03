@@ -52,7 +52,7 @@ jobs:
           # built against CUDA 13.2 below
           torches = ["2.8.0", "2.9.0", "2.10.0", "2.11.0"]
           torches_cu13 = ["2.12.0", "2.13.0"]
-          cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+          cudaarch = "7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
 
           combos = []
 
@@ -396,8 +396,40 @@ jobs:
           $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_BUILD }}-torch${{ matrix.torch }}"
           $env:BUILD_TARGET = "cuda"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+          # Kernel images must be stored compressed: with every architecture in the list the
+          # uncompressed extension grows past what the Windows loader accepts (issue #413)
+          $env:EXLLAMA_EXT_COMPRESS = "require"
 
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
+      - name: Verify extension size
+        if: matrix.cuda != ''
+        run: |
+          $verifyScript = @'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          # Well below the point where Windows refuses to load the module, and far above what a
+          # compressed build comes to, so this only trips when something is wrong with the build
+          limit = 1024 ** 3
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as zf:
+              exts = [
+                  i for i in zf.infolist()
+                  if Path(i.filename).name.startswith("exllamav3_ext") and i.filename.endswith((".pyd", ".so"))
+              ]
+          if len(exts) != 1:
+              raise SystemExit(f"Expected one compiled extension in {wheel.name}, found {len(exts)}")
+
+          size = exts[0].file_size
+          print(f"{exts[0].filename}: {size / 1024 ** 2:.1f} MiB (limit {limit / 1024 ** 2:.0f} MiB)")
+          if size > limit:
+              raise SystemExit("Compiled extension is too large; were the kernel images compressed?")
+          '@
+
+          Set-Content -Path verify_ext_size.py -Value $verifyScript -Encoding UTF8
+          python verify_ext_size.py
 
       - name: Verify wheel dependency metadata
         run: |

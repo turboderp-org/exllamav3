@@ -19,10 +19,24 @@ Chat normally at the prompt. Commands:
     /learn <text>      Replace the assistant's LAST reply with <text> and
                        train on the corrected conversation (the whole point:
                        correct the model and watch the correction stick).
+    /prefer <text>     DPO: train on one preference pair -- <text> is the
+                       CHOSEN reply, the assistant's last reply the REJECTED
+                       one, the conversation before it the prompt. The
+                       history then continues with <text>.
+    /good, /bad        KTO: label the assistant's last reply desirable /
+                       undesirable and train on that single unpaired row
+                       (a /bad reply stays in the history; /learn or /prefer
+                       to replace it).
     /again             Re-ask the last user message (compare before/after).
     /ingest <file>     Train through a JSONL file of samples; each line is a
                        dict in any ingest form: {"messages": [...]},
-                       {"prompt", "response"}, {"text"}, or pre-tokenized.
+                       {"prompt", "response"}, {"text"}, pre-tokenized, or
+                       the TRL explicit-prompt preference forms
+                       {"prompt", "chosen", "rejected"} (DPO) and
+                       {"prompt", "completion", "label"} (KTO) -- prompt as
+                       a message list (rendered through the chat template)
+                       or a rendered string, completions as strings or
+                       assistant message lists.
     /lr <value>        Set the (constant) learning rate, e.g. /lr 5e-5.
     /checkpoint        Write a timestamped adapter checkpoint now.
     /unload            Remove the adapter from generation (compare to base).
@@ -35,7 +49,15 @@ Prompts are rendered through the model directory's own Jinja chat template
 (the same one inference servers use), and `/learn` / `/ingest` messages
 samples train with exact per-turn loss masks via the same template
 (training/chat_jinja.py) -- assistant turns supervised, everything else
-masked. This script is also the reference wiring for hooking RealtimeQLoRA
+masked. Preference samples (`/prefer`, `/good`, `/bad`, the DPO/KTO ingest
+forms) render their prompt through the same template with the generation
+prompt appended and score only the completion (+ the template's own
+turn-close), the frozen base serving as the DPO/KTO reference model (adapters
+disabled, no second copy). Preference LRs typically run 10-100x below SFT
+(--lr 5e-6 .. 5e-5), and KTO's KL reference point needs --batch >= 2 (only
+reachable through /ingest files; the single-row /good and /bad train with
+KL = 0, i.e. the apo_zero_unpaired loss). This script is also the reference
+wiring for hooking RealtimeQLoRA
 into a server backend (e.g. tabbyAPI's backends/exllamav3/model.py): the
 pieces marked [integration] below are exactly what a backend needs to add.
 """
@@ -72,8 +94,12 @@ def parse_args():
     p.add_argument("--targets", nargs="*", default=None,
                    help="LoRA target modules (default: all attn+mlp proj; "
                         "exclude k_proj/v_proj for an adapter-free KV cache)")
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4,
+                   help="constant learning rate (SFT default 1e-4; preference "
+                        "training usually wants 5e-6 .. 5e-5)")
+    p.add_argument("--batch", type=int, default=1,
+                   help="samples per micro-batch (a DPO pair is 2 sequences; "
+                        "KTO's KL estimate needs >= 2)")
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--head-vocab-chunk", type=int, default=None,
@@ -81,6 +107,23 @@ def parse_args():
                         "(default: the coordinator's 32768; 0 = reconstruct "
                         "the whole head at once, which spikes ~12 GB on a "
                         "248k-vocab 27B and OOMs a serving card)")
+    # preference (DPO / KTO) knobs -- same semantics as qlora_train_pref.py
+    p.add_argument("--beta", type=float, default=0.1,
+                   help="DPO/KTO inverse temperature (default 0.1)")
+    p.add_argument("--dpo-loss", default="sigmoid",
+                   choices=["sigmoid", "hinge", "ipo"],
+                   help="DPO loss variant (sigmoid = standard/cDPO, hinge = "
+                        "SLiC, ipo)")
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="cDPO label-flip probability (sigmoid loss)")
+    p.add_argument("--kto-loss", default="kto",
+                   choices=["kto", "apo_zero_unpaired"],
+                   help="KTO loss variant (kto = batch-KL reference point, "
+                        "needs --batch >= 2; apo_zero_unpaired = no KL term)")
+    p.add_argument("--desirable-weight", type=float, default=1.0,
+                   help="KTO loss weight on desirable (/good) rows")
+    p.add_argument("--undesirable-weight", type=float, default=1.0,
+                   help="KTO loss weight on undesirable (/bad) rows")
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--checkpoint-every", type=int, default=0,
                    help="checkpoint every N optimizer steps (0 = manual only)")
@@ -132,6 +175,14 @@ def main():
         turns = extract_rich_turns(sample["messages"])
         return seg_build(turns, **row_template_extras(sample))
 
+    def render_prompt(sample):
+        # A preference sample's conversational prompt: the history rendered
+        # WITH the generation prompt, so the separately encoded completion
+        # follows the assistant-turn opener exactly as it does at inference.
+        turns = extract_rich_turns(sample["prompt"])
+        return seg_build(turns, add_generation_prompt=True,
+                         **row_template_extras(sample))
+
     # -- [integration] the realtime coordinator ------------------------------
     rt = RealtimeQLoRA(
         model, tokenizer,
@@ -144,9 +195,17 @@ def main():
             checkpoint_every=args.checkpoint_every,
             keep_checkpoints=args.keep_checkpoints,
             offload_when_idle=not args.no_idle_offload,
-            offload_aux_when_training=not args.no_aux_offload),
+            offload_aux_when_training=not args.no_aux_offload,
+            # the template's own turn-close string closes every prompt/
+            # response reply and every preference completion
+            eot_text=eot or "",
+            beta=args.beta, dpo_loss=args.dpo_loss,
+            label_smoothing=args.label_smoothing, kto_loss=args.kto_loss,
+            desirable_weight=args.desirable_weight,
+            undesirable_weight=args.undesirable_weight),
         adapter_dir=args.adapter,
         render_segments=render_segments,
+        render_prompt=render_prompt,
         base_model_name_or_path=args.model)
     rt.attach_generator(generator)   # page table reset on every adapter update
     # [integration] serving-only components (a vision tower would go here too)
@@ -176,20 +235,48 @@ def main():
                 stop_conditions=stop, completion_only=True, add_bos=False)
 
     def report(stats):
+        if stats.get("skipped"):
+            print(f" !! skipped {stats['skipped']} sample(s) whose prompt "
+                  f"alone fills --seq-len {args.seq_len}")
         if stats["steps"] == 0:
             print(" -- nothing to train on")
             return
+        parts = []
+        if stats["mean_loss"] is not None:
+            parts.append(f"sft {stats['sft_samples']} sample(s) "
+                         f"loss {stats['mean_loss']:.4f}")
+        if stats["dpo"]:
+            d = stats["dpo"]
+            parts.append(f"dpo {d['pairs']} pair(s) loss {d['loss']:.4f} "
+                         f"reward acc {d['acc']:.2f} margin {d['margin']:+.3f}")
+        if stats["kto"]:
+            k = stats["kto"]
+            rewards = ", ".join(
+                f"{name} {val:+.3f}" for name, val in
+                (("reward_d", k["reward_d"]), ("reward_u", k["reward_u"]))
+                if val is not None)
+            parts.append(f"kto {k['samples']} row(s) loss {k['loss']:.4f} "
+                         f"kl {k['kl']:.3f} {rewards}")
         print(f" -- trained: {stats['steps']} step(s), "
               f"{stats['samples']} sample(s), "
-              f"{stats['supervised_tokens']} supervised tokens, "
-              f"loss {stats['mean_loss']:.4f}, "
+              f"{stats['supervised_tokens']} supervised tokens; "
+              f"{'; '.join(parts)}; "
               f"{stats['duration_s']:.1f}s (lr {stats['lr']:g}); "
               f"adapter live, cache flushed")
         for c in stats["checkpoints"]:
             print(f" -- checkpoint: {c}")
 
-    print("Chat away. /learn <corrected reply> trains on a correction; "
-          "/quit exits; see --help for all commands.")
+    def last_exchange():
+        """(prompt messages, last assistant reply) for the preference
+        commands, or None when there is no reply to judge yet."""
+        if not messages or messages[-1]["role"] != "assistant":
+            return None
+        return list(messages[:-1]), messages[-1]["content"]
+
+    print("Chat away. /learn <corrected reply> trains on a correction (SFT), "
+          "/prefer <better reply> on a preference pair (DPO), /good and /bad "
+          "label the last reply (KTO); /quit exits; see --help for all "
+          "commands.")
     while True:
         try:
             line = input("\n> ").strip()
@@ -244,6 +331,28 @@ def main():
                     continue
                 messages[-1] = {"role": "assistant", "content": rest}
                 report(rt.ingest([{"messages": list(messages)}]))
+            elif cmd == "/prefer":
+                if not rest:
+                    print(" !! usage: /prefer <better assistant reply>")
+                    continue
+                ex = last_exchange()
+                if ex is None:
+                    print(" !! no assistant reply to prefer against yet")
+                    continue
+                prompt, rejected = ex
+                # TRL explicit-prompt pair: the history is the prompt, the
+                # model's own reply is rejected, the user's text is chosen.
+                report(rt.ingest([{"prompt": prompt, "chosen": rest,
+                                   "rejected": rejected}]))
+                messages[-1] = {"role": "assistant", "content": rest}
+            elif cmd in ("/good", "/bad"):
+                ex = last_exchange()
+                if ex is None:
+                    print(" !! no assistant reply to label yet")
+                    continue
+                prompt, completion = ex
+                report(rt.ingest([{"prompt": prompt, "completion": completion,
+                                   "label": cmd == "/good"}]))
             elif cmd == "/ingest":
                 if not os.path.exists(rest):
                     print(f" !! no such file: {rest}")

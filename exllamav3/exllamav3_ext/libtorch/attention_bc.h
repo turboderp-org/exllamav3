@@ -11,7 +11,7 @@ py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel")
 py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
 (
     py::init<
-        int,
+        int, int,
         int,
         int,
         int,
@@ -72,6 +72,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("num_q_heads"),
     py::arg("num_kv_heads"),
     py::arg("head_dim"),
+    py::arg("v_head_dim"),
     py::arg("hidden_size"),
     py::arg("hidden_size_padded"),
     py::arg("page_size"),

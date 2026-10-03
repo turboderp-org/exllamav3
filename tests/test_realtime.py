@@ -12,6 +12,13 @@ CPU tests for exllamav3/training/realtime.py -- the real-time
   * the ingest loop: in-order consumption, batch/grad-accum windowing, step
     counting across ingests, token-weighted mean loss, adapter sync + update
     callbacks (cache invalidation) firing once per ingest, generator drain;
+  * preference samples: TRL explicit-prompt DPO pairs and KTO rows (string
+    and conversational prompts via render_prompt, pre-tokenized forms, label
+    coercion, completion-tail fit / prompt-overflow skip), the DPO batch
+    layout (chosen block then rejected block, policy + adapters-disabled
+    reference forward), the ln-2 step-0 anchor and reward direction, KTO's
+    mismatched-pair KL rows (batch >= 2 only) and row weights, and mixed
+    ingests where a kind change closes the accumulation window;
   * checkpoint policy: timestamped names, cadence, pruning to
     keep_checkpoints, optimizer-state save/resume via load();
   * the externally settable constant lr;
@@ -28,8 +35,10 @@ coordinator uses. No GPU / compiled extension / real model needed. Run:
 """
 
 from __future__ import annotations
+import contextlib
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -60,6 +69,7 @@ def _load(name: str):
 
 
 _load("fused_ce")
+_load("preference")
 aux_mod = _load("aux_offload")
 rt_mod = _load("realtime")
 
@@ -101,6 +111,8 @@ class StubNet(nn.Module):
         self.p = nn.Parameter(torch.zeros(1))
         self.losses = list(losses or [])
         self.seen = []            # (input_ids, labels, attn) tensors per call
+        self.logps_calls = []     # (input_ids, labels, attn, adapters_off)
+        self.adapters_off = False
         self.applied = 0
         self.removed = 0
         self.saved = []           # directories save_adapter wrote to
@@ -121,6 +133,29 @@ class StubNet(nn.Module):
         self.seen.append((input_ids, labels, attention_mask))
         c = self.losses.pop(0) if self.losses else 1.0
         return self.p.sum() * 0.0 + c
+
+    # -- preference surface (DPO / KTO) --
+    # The "model" scores every completion token at logp -1 as the frozen
+    # base, and at -1 + p as the adapted policy: reference == policy at p = 0
+    # (DPO's ln-2 anchor holds exactly), and a longer chosen completion makes
+    # the DPO gradient push p UP.
+    def compute_logps(self, input_ids, labels, attention_mask=None, chunk=0):
+        self.logps_calls.append((input_ids, labels, attention_mask,
+                                 self.adapters_off))
+        counts = (labels[:, 1:] != -100).sum(dim=-1)
+        base = -counts.float()
+        if self.adapters_off:
+            return base, counts
+        return base + self.p * counts.float(), counts
+
+    @contextlib.contextmanager
+    def adapters_disabled(self):
+        prev = self.adapters_off
+        self.adapters_off = True
+        try:
+            yield self
+        finally:
+            self.adapters_off = prev
 
     def apply_to_native(self, scaling=1.0):
         self.applied += 1
@@ -719,6 +754,246 @@ def test_unload_reload():
     print("unload/reload: OK")
 
 
+# ---------------------------------------------------------------------------
+# Preference samples (DPO / KTO)
+# ---------------------------------------------------------------------------
+
+def _render_prompt(sample):
+    # a fake template: every prompt message as a segment, then the
+    # assistant-turn opener (the generation prompt)
+    return [(m["content"], False) for m in sample["prompt"]] + [("<a>", False)]
+
+
+def test_encode_preference():
+    rt = make_rt(RealtimeConfig(eot_text="!"), render_prompt=_render_prompt)
+
+    # DPO, rendered-string prompt: prompt keeps one BOS (auto-prepended,
+    # deduped), completions lose theirs and gain the eot; nothing is
+    # supervised in the prompt (the kind tag is the only extra key)
+    ex = rt._encode({"prompt": "ab", "chosen": "c", "rejected": "de"})
+    assert ex["kind"] == "dpo"
+    assert ex["prompt_ids"] == [1, ord("a"), ord("b")]
+    assert ex["chosen_ids"] == [ord("c"), ord("!")]
+    assert ex["rejected_ids"] == [ord("d"), ord("e"), ord("!")]
+
+    # conversational prompt through render_prompt (+ generation prompt);
+    # completions as assistant message lists
+    ex = rt._encode({"prompt": [{"role": "user", "content": "a"}],
+                     "chosen": [{"role": "assistant", "content": "c"}],
+                     "rejected": [{"role": "assistant", "content": "d"}]})
+    assert ex["prompt_ids"] == [1, ord("a")] + [ord(ch) for ch in "<a>"]
+    assert ex["chosen_ids"] == [ord("c"), ord("!")]
+
+    # KTO: label coercion (bool / int / string spellings), kind tag
+    ex = rt._encode({"prompt": "ab", "completion": "c", "label": "false"})
+    assert ex["kind"] == "kto" and ex["label"] is False
+    assert ex["completion_ids"] == [ord("c"), ord("!")]
+    assert rt._encode({"prompt": "a", "completion": "c", "label": 1})["label"] is True
+    assert rt._encode({"prompt": "a", "completion": "c", "label": True})["label"] is True
+
+    # pre-tokenized forms pass through untouched (no BOS / eot handling)
+    ex = rt._encode({"prompt_ids": [5, 6], "chosen_ids": [7],
+                     "rejected_ids": [8, 9]})
+    assert ex == {"kind": "dpo", "prompt_ids": [5, 6], "chosen_ids": [7],
+                  "rejected_ids": [8, 9]}
+    ex = rt._encode({"prompt_ids": [5], "completion_ids": [7, 7], "label": 0})
+    assert ex == {"kind": "kto", "prompt_ids": [5], "completion_ids": [7, 7],
+                  "label": False}
+
+    # malformed rows raise (never silently mistrain)
+    for bad in ({"prompt": "a", "completion": "c", "label": "maybe"},
+                {"prompt": "a", "chosen": "", "rejected": "d"},
+                {"prompt": "a", "completion": "  ", "label": True},
+                {"prompt": 7, "chosen": "c", "rejected": "d"}):
+        try:
+            rt._encode(bad)
+            assert False, f"expected ValueError for {bad}"
+        except ValueError:
+            pass
+    try:
+        make_rt()._encode({"prompt": [{"role": "user", "content": "a"}],
+                           "chosen": "c", "rejected": "d"})
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "render_prompt" in str(e)
+
+    # seq_len: completion tail truncated first; prompt-only overflow -> None
+    rt = make_rt(RealtimeConfig(seq_len=4, eot_text="!"))
+    ex = rt._encode({"prompt": "ab", "chosen": "cd", "rejected": "e"})
+    assert ex["chosen_ids"] == [ord("c")] and ex["rejected_ids"] == [ord("e")]
+    assert rt._encode({"prompt": "abc", "chosen": "d", "rejected": "e"}) is None
+    assert rt._encode({"prompt": "abc", "completion": "d", "label": True}) is None
+
+    # config validation of the loss variants
+    for kw in ({"dpo_loss": "bogus"}, {"kto_loss": "bogus"}):
+        try:
+            RealtimeConfig(**kw)
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+    print("encode preference: OK")
+
+
+def _pair(prompt, chosen_len, rejected_len):
+    return {"prompt_ids": prompt, "chosen_ids": [7] * chosen_len,
+            "rejected_ids": [8] * rejected_len}
+
+
+def test_ingest_dpo():
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=2, grad_accum=1, lr=1e-2,
+                                weight_decay=0.0, beta=0.1), net=net)
+    fired = []
+    rt.add_update_callback(lambda: fired.append(1))
+    # 3 pairs @ batch 2 -> micro-batches of 2 and 1 -> 2 steps. Chosen
+    # completions are longer (3 tokens vs 1), so the policy's p lifts the
+    # chosen logratio more than the rejected one: the gradient pushes p up.
+    pairs = [_pair([1, 2], 3, 1), _pair([1, 3], 3, 1), _pair([1, 4], 3, 1)]
+    stats = rt.ingest(pairs)
+
+    assert stats["steps"] == 2 and rt.step == 2
+    assert stats["samples"] == 3 and rt.samples_seen == 3
+    assert stats["skipped"] == 0
+    assert stats["sft_samples"] == 0 and stats["mean_loss"] is None
+    assert stats["kto"] is None
+    assert not net.seen                        # no SFT forward at all
+    # first micro-batch: one policy + one reference (adapters off) forward
+    # over 2*b rows, chosen block first
+    ids0, labels0, attn0, off0 = net.logps_calls[0]
+    _, _, _, off1 = net.logps_calls[1]
+    assert (off0, off1) == (False, True)
+    assert ids0.shape[0] == 4
+    assert ids0[0].tolist()[:2] == [1, 2] and ids0[2].tolist()[:2] == [1, 2]
+    counts = (labels0[:, 1:] != -100).sum(dim=-1).tolist()
+    assert counts == [3, 3, 1, 1]              # chosen ×2, then rejected ×2
+    assert labels0[0].tolist()[:2] == [-100, -100]   # prompt masked
+    assert len(net.logps_calls) == 4           # 2 micro-batches × (pol, ref)
+    assert net.adapters_off is False           # context restored
+    # step-0 anchor: policy == reference -> loss ln 2, zero rewards; the
+    # second micro-batch ran after one step, so the pair-weighted mean sits
+    # at or below ln 2 and p moved up
+    d = stats["dpo"]
+    assert d["pairs"] == 3
+    assert d["loss"] <= math.log(2) + 1e-6
+    assert net.p.item() > 0
+    assert stats["supervised_tokens"] == 3 * (3 + 1)
+    assert stats["total_tokens"] == sum(int(a.sum()) for _, _, a, off
+                                        in net.logps_calls if not off)
+    assert net.applied == 1 and len(fired) == 1
+
+    # with p > 0 the chosen reward now exceeds the rejected one on every pair
+    stats = rt.ingest(pairs)
+    d = stats["dpo"]
+    assert d["acc"] == 1.0 and d["margin"] > 0
+    assert d["loss"] < math.log(2)
+    assert rt.step == 4 and net.applied == 2
+
+    # the hinge / ipo variants run through the same path. hinge: relu(1 -
+    # beta*delta) still pushes p up; ipo length-normalizes, and the stub's
+    # per-token logratio is p on both sides, so its loss is the constant
+    # (0 - 1/(2 beta))^2 = 25 at beta 0.1 with a zero gradient.
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=1, grad_accum=3, lr=1e-2,
+                                dpo_loss="hinge"), net=net)
+    stats = rt.ingest(pairs)
+    assert stats["steps"] == 1 and stats["dpo"]["pairs"] == 3
+    assert net.p.item() > 0
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=1, grad_accum=3, lr=1e-2,
+                                dpo_loss="ipo"), net=net)
+    stats = rt.ingest(pairs)
+    assert stats["steps"] == 1 and abs(stats["dpo"]["loss"] - 25.0) < 1e-4
+    assert net.p.item() == 0.0
+    print("ingest dpo: OK")
+
+
+def _row(prompt, comp_len, label):
+    return {"prompt_ids": prompt, "completion_ids": [7] * comp_len,
+            "label": label}
+
+
+def test_ingest_kto():
+    # batch 2: KL rows from mismatched pairs (prompt i + completion i-1) ->
+    # 4 forwards per micro-batch: policy, reference, KL policy, KL reference
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=2, grad_accum=1, lr=1e-2,
+                                weight_decay=0.0), net=net)
+    rows = [_row([1, 2], 3, True), _row([1, 3], 1, False)]
+    stats = rt.ingest(rows)
+    assert stats["steps"] == 1 and stats["samples"] == 2
+    assert stats["dpo"] is None and stats["mean_loss"] is None
+    assert len(net.logps_calls) == 4
+    offs = [c[3] for c in net.logps_calls]
+    assert offs == [False, True, False, True]
+    kl_ids, kl_labels, _, _ = net.logps_calls[2]
+    assert kl_ids[0].tolist()[:2] == [1, 2] and kl_ids[1].tolist()[:2] == [1, 3]
+    kl_counts = (kl_labels[:, 1:] != -100).sum(dim=-1).tolist()
+    assert kl_counts == [1, 3]                 # completions swapped
+    # step 0: policy == reference -> KL 0, every row at 1 - sigmoid(0) = 0.5
+    k = stats["kto"]
+    assert k["samples"] == 2
+    assert abs(k["loss"] - 0.5) < 1e-6 and abs(k["kl"]) < 1e-6
+    assert abs(k["reward_d"]) < 1e-6 and abs(k["reward_u"]) < 1e-6
+    assert stats["supervised_tokens"] == 4
+    # the desirable row is longer, so lifting p raises its reward more than
+    # the undesirable row's: p moves up
+    assert net.p.item() > 0
+
+    # singleton micro-batches: no KL rows (2 forwards each), loss reduces to
+    # apo_zero_unpaired; row weights scale the per-row losses
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=1, grad_accum=2, lr=1e-2,
+                                desirable_weight=2.0, undesirable_weight=1.0),
+                 net=net)
+    stats = rt.ingest(rows)
+    assert stats["steps"] == 1
+    assert len(net.logps_calls) == 4 and [c[3] for c in net.logps_calls] == \
+        [False, True, False, True]
+    assert all(c[0].shape[0] == 1 for c in net.logps_calls)
+    assert abs(stats["kto"]["loss"] - (2.0 * 0.5 + 1.0 * 0.5) / 2) < 1e-6
+    assert stats["kto"]["reward_u"] is not None
+
+    # all-desirable batch: reward_u is None, not NaN
+    net = StubNet()
+    rt = make_rt(RealtimeConfig(batch_size=2, kto_loss="apo_zero_unpaired"),
+                 net=net)
+    stats = rt.ingest([_row([1, 2], 2, True), _row([1, 3], 2, True)])
+    assert stats["kto"]["reward_u"] is None and stats["kto"]["reward_d"] == 0.0
+    assert len(net.logps_calls) == 2           # apo_zero: no KL forwards
+    print("ingest kto: OK")
+
+
+def test_ingest_mixed_kinds():
+    # A kind change closes the accumulation window: [sft, sft, dpo, sft] at
+    # grad_accum 4 is three runs -> three steps, in order, and the SFT
+    # mean loss only counts the SFT rows.
+    net = StubNet(losses=[2.0, 2.0, 6.0])
+    rt = make_rt(RealtimeConfig(batch_size=1, grad_accum=4), net=net)
+    stats = rt.ingest([
+        {"input_ids": [5, 6], "labels": [5, 6]},
+        {"input_ids": [5, 6], "labels": [5, 6]},
+        _pair([1, 2], 2, 1),
+        {"input_ids": [5, 6], "labels": [5, 6]},
+    ])
+    assert stats["steps"] == 3 and rt.step == 3
+    assert stats["samples"] == 4 and rt.samples_seen == 4
+    assert stats["sft_samples"] == 3 and stats["dpo"]["pairs"] == 1
+    assert abs(stats["mean_loss"] - (2.0 + 2.0 + 6.0) / 3) < 1e-6
+    assert len(net.seen) == 3 and len(net.logps_calls) == 2
+    assert stats["supervised_tokens"] == 3 * 1 + (2 + 1)
+    assert net.applied == 1
+
+    # skipped rows (prompt fills seq_len) are counted, the rest still train;
+    # an ingest of only skipped rows is a no-op that reports the count
+    rt = make_rt(RealtimeConfig(seq_len=3), net=StubNet())
+    stats = rt.ingest([_pair([1, 2, 3], 1, 1), {"text": "ab"}])
+    assert stats["skipped"] == 1 and stats["steps"] == 1
+    stats = rt.ingest([_pair([1, 2, 3], 1, 1)])
+    assert stats["skipped"] == 1 and stats["steps"] == 0
+    assert stats["dpo"] is None and stats["kto"] is None
+    print("ingest mixed kinds: OK")
+
+
 if __name__ == "__main__":
     test_rwlock()
     test_encode_prompt_response()
@@ -727,6 +1002,10 @@ if __name__ == "__main__":
     test_encode_messages()
     test_ingest_batching_and_callbacks()
     test_ingest_token_weighted_loss()
+    test_encode_preference()
+    test_ingest_dpo()
+    test_ingest_kto()
+    test_ingest_mixed_kinds()
     test_lr_control()
     test_ingest_blocks_inference()
     test_checkpoint_naming_and_listing()

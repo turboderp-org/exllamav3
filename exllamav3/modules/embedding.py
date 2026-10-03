@@ -52,7 +52,7 @@ class Embedding(Module):
             self.hidden_size,
             device = "meta"
         )
-        self.embedding.weight = nn.Parameter(weight)
+        self.embedding.weight = nn.Parameter(weight, requires_grad = False)
 
     @override
     def unload(self):
@@ -200,5 +200,5 @@ class Embedding(Module):
             device = "meta"
         )
         emb = consumer.recv(exported["embedding.weight"], cuda = False)
-        module.embedding.weight = nn.Parameter(emb)
+        module.embedding.weight = nn.Parameter(emb, requires_grad = False)
         return module

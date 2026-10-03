@@ -5,7 +5,7 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import _compile_kernel
+from .bc_attn import _compile_kernel, BCKernelTooLarge
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
@@ -236,8 +236,10 @@ class BCDsa:
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
-        ws_ml = st((seq * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")
-        ws_acc = st((seq * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")
+        # Split-decode partials: one backing per device sized for the largest slot, viewed to
+        # this slot's rows.
+        ws_ml = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")[:seq * hb * N_SPLITS * BLOCK_H * 2]
+        ws_acc = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")[:seq * hb * N_SPLITS * BLOCK_H * D]
         attn_out = st((G, seq, hpg * hd), torch.half, "bcd_aout")
         woa_c = st((G, seq, self.o_lora), torch.half, "bcd_woac")
         woa_t = st((seq, G * self.o_lora), torch.half, "bcd_woat")
@@ -318,7 +320,10 @@ class BCDsa:
             return None
 
         if self.bc.needs_configure(seq, regime):
-            self._configure(seq, regime)
+            try:
+                self._configure(seq, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
 
         # Refresh the block-table static once per job step (any compressor layer may be the
         # one to do it; sliding layers never touch it, so this is tracked separately from
@@ -616,7 +621,10 @@ class BCDsaBatch:
         """x (B, S, hidden) fp16 contiguous, bt (rows, npr) i32 device batch block table.
         Returns y (B, S, hidden) fp32 (a static: consume before the next BC call)."""
         if self.bc.needs_configure(B, S):
-            self._configure(B, S)
+            try:
+                self._configure(B, S)
+            except BCKernelTooLarge:
+                return None
 
         pin = self.pins[self.pin_i]
         self.pin_i = (self.pin_i + 1) % len(self.pins)

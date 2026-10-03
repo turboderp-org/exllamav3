@@ -78,6 +78,43 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
 the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
 force the torch path, for A/B testing.
 
+### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
+
+Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
+of this many tokens, carrying the fp32 recurrent state between them. The projections and the
+convolution still run at the full chunk size; only the scan's temporaries (about 112 KB per
+token at 48 value heads of 128) shrink from the chunk to the sub-range, e.g. 1.5 GB to 0.7 GB
+per layer at a 16k chunk. The result is bit-identical to a single pass, and 2048 is also the
+fastest setting measured (1024 costs about 40% more on the scan). Set to `0` to run the whole
+chunk in one pass.
+
+### `EXL3_GDN_PROJ_FP32` (default: `0`)
+
+Prefill of a gated-delta-net / KDA layer takes its q/k/v projection out of the GEMM in fp16
+instead of fp32; the values are converted to bf16 for the recurrence either way, and the
+projections stay below |100| on natural text. Set to `1` for the fp32 projection (about
+0.5-2.5e-3 relative difference in the layer's output, 1.5 GB less transient per 16k rows on
+GLM-5.3).
+
+### `EXL3_GDN_GATE_FP32` (default: `1`)
+
+KDA's forget-gate and beta projections (the inputs to the per-channel decay) stay fp32. Set to
+`0` for fp16: 256 MiB less per 16k rows on GLM-5.3, about 1e-3 relative difference in the
+layer's output.
+
+### `EXL3_GDN_CONV_TOKEN_MAJOR` (default: `1`)
+
+The prefill short convolution reads the projection output in place (token-major, any float
+dtype) instead of a transposed bf16 copy of it. Same kernel arithmetic; a bf16 projection is
+bit-identical to the copy, an fp16 one skips its bf16 rounding. Set to `0` for the copy.
+
+### `EXL3_PLE_SUB_CHUNK` (default: `1024`)
+
+Prefill of the PLE (n-gram) layer runs its fused stream pass in row slabs of this many tokens,
+carrying the short-conv state between slabs and adding each slab's result into the stream in
+place. The pass holds several full-width fp32 working tensors of the stream stack so the slab 
+bounds that. 1024 is the fastest slab measured. Set to `0` to run the chunk whole.
+
 ### `EXL3_BC_DSA_DEBUG` (default: `0`)
 
 Raise errors encountered while building the graphed DSA path instead of silently declining to
@@ -127,6 +164,20 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 {1, 2} is measured once per (shape family, device) at first use; a nonzero value pins it,
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
+
+### `EXL3_TRITON_SMEM_LIMIT` (default: unset)
+
+Caps the dynamic shared memory per block that the Triton attention kernels believe the device
+grants. The kernels' tile configs are sized for Ampere-class budgets; each launch site lists a
+ladder of smaller configs and takes the first whose compiled footprint fits the device (Turing:
+64 KB). Setting a limit below the real one walks the ladders on any GPU, which is how the
+stepped-down configs are exercised without the smaller hardware. Note the picks then reflect
+this device's footprints, which differ from the target architecture's. Debugging only.
+
+### `EXL3_TRITON_SMEM_DEBUG` (default: `0`)
+
+Prints every ladder probe (kernel, config, measured footprint, fits or over) and every graph
+kernel that declines to the eager path for lack of shared memory.
 
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
@@ -379,6 +430,26 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
+On Windows there is no post-hoc promotion, so the same flag instead makes each arena chunk
+attempt a `MEM_LARGE_PAGES` `VirtualAlloc` at creation (requires `SeLockMemoryPrivilege` on the
+account, enabled on the worker's token at runtime) and falls back to a plain mapping per chunk
+when large pages cannot be supplied. A failed request is retried at half the size down to
+64 MiB before giving up: Windows large pages need physically contiguous 2 MiB regions, which
+a long-running system can often still supply in smaller runs even when a full 1 GiB chunk
+does not fit -- a fresh boot typically can serve the full size. Later chunks start at the
+size the previous one was served at, and no further attempts are made once the smallest size
+has failed, so a fragmented system does not pay for the search on every chunk.
+
+The privilege is the "Lock pages in memory" user right (Local Security Policy > Local Policies
+> User Rights Assignment, or the same entry in Group Policy). It is not granted to any account
+by default, and a newly granted right only takes effect after signing out and back in.
+Without it nothing changes: the arena uses regular pages and prints nothing.
+
+With it, the arena is committed up front and locked in RAM: large pages are never paged out,
+so that memory is unavailable to everything else for as long as the model is loaded. The
+worker prints one line after loading that states how much of the arena is on large pages, or
+that none could be allocated. Set the flag to `0` to keep the arena on regular pages.
+
 ### `EXL3_HGEMM_F16ACC` (default: auto)
 
 GeForce parts run the fp32-accumulator tensor-core MMA at half the rate of the fp16-accumulator
@@ -609,6 +680,16 @@ these modules allocate and drop an upper bound of those transients inside the me
 (`autosplit_extra_measure`), so the split leaves room for them. `0` restores the plain
 measured forward.
 
+### `EXL3_AUTOSPLIT_PREPARE` (default: `1`)
+
+Before measuring a module's transient memory, the autosplit loader lets the module allocate
+the state it would otherwise create lazily inside the measuring forward and keep for good
+(CPU-offload host buffers, batched-reconstruct tables, decode graph slot statics). Measured
+inside the window, that state would be budgeted twice: as resident memory and again as
+transient headroom. Set to `0` to skip the preparation step, for comparison. With verbose
+loading, the loader prints a notice for any module that still leaves more than a small amount
+resident during its measuring forward.
+
 ### `EXL3_AUTOSPLIT_MARGIN_MB` (default: `256`)
 
 The layer-split loader closes a device when its remaining headroom no longer covers the largest
@@ -741,7 +822,22 @@ present in the environment. Categories are defined at the call sites (see
 ## Build (JIT extension)
 
 These only matter when the C++/CUDA extension is compiled at import time rather than installed
-prebuilt.
+prebuilt. `EXLLAMA_EXT_LINEINFO` and `EXLLAMA_EXT_COMPRESS` apply to wheel builds as well.
+
+### `EXLLAMA_EXT_LINEINFO` (default: unset)
+
+Compiles the CUDA kernels with source line tables (`-lineinfo`), for profilers and debuggers that
+attribute samples or faults to source lines. Off by default because the tables make up most of
+the size of the embedded kernel images and have no effect on the generated code.
+
+### `EXLLAMA_EXT_COMPRESS` (default: auto)
+
+The embedded kernel images are stored compressed (`--compress-mode=size`) when the installed nvcc
+supports it (CUDA 12.8 and later). Compression is applied to the finished images, so the kernels
+themselves are identical either way. `0` disables it, which may be needed to run a locally built
+extension on a driver that predates compressed images. `require` makes the build fail when nvcc
+does not offer the option instead of silently building uncompressed; the release wheels are built
+this way. Not used for ROCm builds.
 
 ### `CUDAHOSTCXX` (default: unset)
 

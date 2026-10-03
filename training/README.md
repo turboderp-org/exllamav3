@@ -116,9 +116,22 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 - `realtime_chat.py` — interactive demo of REAL-TIME (inference-time)
   training: one loaded model chats through the normal generator AND trains
   its LoRA adapter in place (`exllamav3.training.RealtimeQLoRA`). `/learn
-  <corrected reply>` retrains the last exchange, `/ingest file.jsonl` feeds a
-  batch of samples, `/lr` sets the constant learning rate live, `/unload`
-  compares against the base model. The coordinator alternates serving and
+  <corrected reply>` retrains the last exchange (SFT), `/prefer <better
+  reply>` trains one DPO pair (the model's own reply rejected, yours chosen,
+  the history as the prompt), `/good` / `/bad` label the last reply for KTO,
+  `/ingest file.jsonl` feeds a batch of samples, `/lr` sets the constant
+  learning rate live, `/unload` compares against the base model. Ingest
+  accepts SFT rows and TRL explicit-prompt preference rows in one call —
+  `{"prompt", "chosen", "rejected"}` (DPO) and `{"prompt", "completion",
+  "label"}` (KTO), prompt as a message list rendered through the chat
+  template or a rendered string — with the same losses and knobs as
+  `qlora_train_pref.py` (`beta`, `dpo_loss` sigmoid/hinge/ipo,
+  `label_smoothing`, `kto_loss` kto/apo_zero_unpaired, desirable/undesirable
+  weights; the frozen base is the reference model via the adapters-disabled
+  forward, no second copy). Consecutive same-kind samples form the
+  micro-batches and a kind change closes the accumulation window; KTO's KL
+  reference point needs `batch_size >= 2`, a singleton row trains with KL =
+  0 (the `apo_zero_unpaired` loss). The coordinator alternates serving and
   training under a readers/writer lock, pushes updated adapter weights into
   the runtime LoRA slots in memory after every ingest (no save/load
   round-trip), nukes the generator's page table on each update (cached KV is

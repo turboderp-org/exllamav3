@@ -878,16 +878,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
         return fixed, max(per_expert, batched)
 
+    def autosplit_prepare(self, params):
+        """Autosplit loader hook, before the measuring window: the worst-case computation below
+        creates the CPU-offload host's per-device stream state and this layer's tier tables as
+        a side effect, so running it here makes them resident memory rather than transient"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        rows = (params.get("batch_shape") or (1, 0))[1]
+        if rows and self.device is not None and self.device.type == "cuda":
+            self._autosplit_worst_case(rows)
+
     def autosplit_extra_measure(self, params):
         """Autosplit loader hook: allocate (and drop) the worst-case prefill transient so the
-        device keeps headroom for it. The CPU-offload host's per-device stream state and this
-        layer's tier statics are allocated for real here: the measuring forward skips the CPU
-        path, and they would otherwise appear unaccounted on the first real prefill"""
+        device keeps headroom for it (the measuring forward skips the CPU path)"""
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
             return
         rows = getattr(self, "_measure_rows", 0)
         if not rows or self.device is None or self.device.type != "cuda":
             return
+        total = self._autosplit_worst_case(rows)
+        if total > 0:
+            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
+            del t
+
+    def _autosplit_worst_case(self, rows: int) -> int:
+        """Upper bound on this layer's prefill transient for a `rows`-token chunk, in bytes"""
         A = rows * self.num_experts_per_tok
         host = getattr(self, "cpu_host", None)
         if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
@@ -901,9 +916,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 total = max(total, gf + cf + max(gv, cv))
         else:
             total = sum(self.prefill_worst_case_parts(rows, A))
-        if total > 0:
-            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
-            del t
+        return total
 
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                          scratch = None, tables = None):
@@ -955,6 +968,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.e_score_bias_vl = None
         self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
@@ -1074,7 +1088,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     f"{self.key}: runtime LoRA on routed expert projections is not supported "
                     f"with CPU expert offload (expert weights are not resident on GPU)"
                 )
-            final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)
+            final_hidden_states, cpu_pending = self.cpu_offload_issue(
+                eshape, y, selected_experts, routing_weights, params)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
@@ -1362,6 +1377,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
+        # Independent shared-expert work can cover the CPU job (split tail or whole layer)
+        # before collect enqueues its stream wait. Fused shared experts have already run
+        # inside the routed path. Keep prefill scheduling and the order of post norms / TP
+        # collectives unchanged.
+        shared_hidden_states = None
+        if cpu_pending is not None and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
+            shared_hidden_states = self.shared_experts.forward(x, params)
+
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
@@ -1392,7 +1415,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, params)
+            y = shared_hidden_states
+            if y is None:
+                y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
                 self.tp_collect(params["backend"], y, True)
             if self.shared_experts_post_norm:
@@ -1523,8 +1548,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "num_experts": self.num_experts,
                 "num_experts_per_tok": self.num_experts_per_tok,
                 "interm_dtype": self.interm_dtype,
+                "interm_div": self.interm_div,
                 "router_type": self.router_type,
-                "routed_scaling_factor": self.routed_scaling_factor,
+                # The constructor folds interm_div into the routing scale again on import, so
+                # send the pre-fold value (the expert tensors arrive already rescaled)
+                "routed_scaling_factor": self.routed_scaling_factor / self.interm_div
+                    if (self.interm_div != 1.0 and self.router_type != "std") else self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,

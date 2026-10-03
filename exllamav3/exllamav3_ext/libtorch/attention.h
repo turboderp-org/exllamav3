@@ -43,6 +43,7 @@ struct BC_Attention
     int num_q_heads;
     int num_kv_heads;
     int head_dim;
+    int v_head_dim;         // output lanes per head; == head_dim unless V is zero-padded in the cache
     int hidden_size;
     int hidden_size_padded;
     int page_size;
@@ -196,6 +197,7 @@ struct BC_Attention
         int num_q_heads,
         int num_kv_heads,
         int head_dim,
+        int v_head_dim,
         int hidden_size,
         int hidden_size_padded,
         int page_size,

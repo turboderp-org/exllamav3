@@ -265,6 +265,7 @@ class DeepseekV4MTPModel(Model):
 
 
     @override
+    @torch.inference_mode
     def forward(self, input_ids: torch.Tensor, params: dict, **kwargs) -> torch.Tensor:
         """Draft-block forward: seed token per row -> [seed, noise x (block-1)] -> input
         layer (embed + stream expand) -> blocks -> hc_head collapse -> norm. Returns the

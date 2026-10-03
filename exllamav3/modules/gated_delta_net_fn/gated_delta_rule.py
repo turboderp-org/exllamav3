@@ -1,3 +1,4 @@
+import os
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
@@ -85,6 +86,38 @@ def torch_recurrent_kda(q, k, v, g, beta, state):
     return out.to(torch.bfloat16)
 
 
+# Prefill sub-range for the fla chunk kernels. The chunked scan is run over consecutive
+# sub-ranges of the sequence with the fp32 state carried between them, which is bit-identical
+# to one pass over the whole range: the kernels' T-shaped temporaries (w, u, A, the per-64-token
+# chunk states h, v_new, o: ~112 KB/token at 48 v-heads x 128) then scale with the sub-range
+# instead of the chunk. 2048 is also the fastest point (-18% vs one 16k pass, -12% vs one 8k
+# pass on a 5090: better program counts than a long pass, and 1024 already costs +38%)
+_scan_sub_range = int(os.environ.get("EXL3_GDN_SUB_CHUNK", "2048"))
+
+
+def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
+    """
+    fn (chunk_gated_delta_rule / chunk_kda) over one batch row in sub-ranges of the sequence.
+    q, k: (1, T, H, K); v: (1, T, HV, V); state: (1, HV, K, V) fp32 or None. Returns the
+    concatenated output (1, T, HV, V) in fn's output dtype and the final state (None unless
+    save_state)
+    """
+    T = q.shape[1]
+    sub = _scan_sub_range if _scan_sub_range > 0 else T
+    if T <= sub:
+        return fn(q, k, v, g = g, beta = beta, initial_state = state, output_final_state = save_state,
+                  use_qk_l2norm_in_kernel = True)
+    out = None
+    for t0 in range(0, T, sub):
+        t1 = min(t0 + sub, T)
+        o, state = fn(q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g = g[:, t0:t1], beta = beta[:, t0:t1],
+                      initial_state = state, output_final_state = True, use_qk_l2norm_in_kernel = True)
+        if out is None:
+            out = torch.empty((1, T) + o.shape[2:], dtype = o.dtype, device = o.device)
+        out[:, t0:t1] = o
+    return out, state if save_state else None
+
+
 def gated_delta_rule_fn(
     mixed_qkv: torch.Tensor,
     beta: torch.Tensor,
@@ -123,13 +156,9 @@ def gated_delta_rule_fn(
             core_attn_out = []
             for i, s in enumerate(recurrent_slots_cpu.tolist()):
                 state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
-                core_attn, new_state = chunk_kda(
-                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
-                    g = g[i:i + 1],
-                    beta = beta[i:i + 1],
-                    initial_state = state,
-                    output_final_state = save_state,
-                    use_qk_l2norm_in_kernel = True,
+                core_attn, new_state = _chunked_scan(
+                    chunk_kda, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
+                    state, save_state,
                 )
                 if save_state and state is not None:
                     state.copy_(new_state)
@@ -178,13 +207,9 @@ def gated_delta_rule_fn(
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
-            core_attn, new_state = chunk_gated_delta_rule(
-                q[i:i + 1], k[i:i + 1], v[i:i + 1],
-                g = g[i:i + 1],
-                beta = beta[i:i + 1],
-                initial_state = state,
-                output_final_state = save_state,
-                use_qk_l2norm_in_kernel = True,
+            core_attn, new_state = _chunked_scan(
+                chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
+                state, save_state,
             )
             if save_state and state is not None:
                 state.copy_(new_state)

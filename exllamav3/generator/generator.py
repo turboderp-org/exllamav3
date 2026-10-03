@@ -46,6 +46,7 @@ class Generator:
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
+        ngram_corpus: str | None = None,
         **kwargs
     ):
         """
@@ -86,6 +87,9 @@ class Generator:
 
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
+
+        :param ngram_corpus:
+            Optional frozen SAM file shared by n-gram jobs; requires ngram_match_min > 0.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -165,11 +169,22 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            depths = draft_model.caps.get("mtp_depths")
+            if depths is not None and self.num_draft_tokens > depths:
+                print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
+                      f"{depths} reuse the last one, with decreasing acceptance (num_draft_tokens = "
+                      f"{self.num_draft_tokens})")
         elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
 
+        self.ngram_corpus = None
+        if ngram_corpus is not None:
+            if ngram_match_min <= 0:
+                raise ValueError("ngram_corpus requires ngram_match_min > 0")
+            from .ngram import NgramCorpus
+            self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
@@ -238,7 +253,7 @@ class Generator:
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
         def ceil_span(a, b):
             return (a + b - 1) // b * b
@@ -765,6 +780,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "draft_step": idx,   # heads specialized per depth pick their head from this
             }
             if cal is not None:
                 params["export_draft_conf"] = True

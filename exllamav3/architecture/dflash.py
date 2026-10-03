@@ -57,6 +57,9 @@ class DFlashConfig(Config):
         # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
         self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
         self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
+        # Block attention direction, as the reference draft reads it: "is_causal" in the checkpoint
+        # config overrides the default of causal on sliding-window layers, bidirectional elsewhere
+        self.is_causal = self.read_cfg(bool, ["is_causal", "dflash_config->is_causal"], None)
 
         # DFlash. Config keys live under dflash_config-> in the original release, at the top
         # level in later ones (MuseGlimmerAssistant)
@@ -72,11 +75,44 @@ class DFlashConfig(Config):
             "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
+        # Variant switches for drafters other than the original z-lab ones (e.g. MiMo-V2.6's).
+        # Each defaults to the previous behaviour.
+
+        # Learned per-head attention sinks
+        self.attention_sink_bias = self.read_cfg(
+            bool,
+            ["dflash_config->attention_sink_bias", "attention_sink_bias", "add_swa_attention_sink_bias"],
+            None,
+        )
+        if self.attention_sink_bias is None:
+            self.attention_sink_bias = self.stc.has_tensor("layers.0.self_attn.attention_sink_bias")
+
+        # Scale on V, folded into o_proj
+        self.attention_value_scale = self.read_cfg(
+            float, ["dflash_config->attention_value_scale", "attention_value_scale"], None
+        ) or 1.0
+
+        # Learned mask embedding shipped with the drafter, used instead of the target's
+        # embedding row for mask_token_id
+        self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
+
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
         # Vision placeholders
         self.vision = None
+
+
+    def block_window(self, idx: int) -> tuple[int, int]:
+        """
+        (sliding_window, window_right) for draft layer idx. The reference masks q - k < sw,
+        i.e. self plus sw - 1 past keys; a layer that is not causal within the draft block sees
+        the same span ahead of the query
+        """
+        if self.layer_types[idx] != "sliding_attention":
+            return -1, 0
+        causal = True if self.is_causal is None else self.is_causal
+        return self.sliding_window - 1, 0 if causal else self.sliding_window - 1
 
 
 def dflash_update_kv_from_target(
@@ -176,6 +212,7 @@ class DFlashModel(Model):
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
+            key_mask_embedding = config.key_mask_embedding,
             qmap = "target_hidden",
         )
         self.modules += [self.input_layer]
@@ -184,7 +221,7 @@ class DFlashModel(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
-            is_swa = config.layer_types[idx] == "sliding_attention"
+            window_left, window_right = config.block_window(idx)
 
             attn = Attention(
                 config = config,
@@ -200,7 +237,9 @@ class DFlashModel(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = config.sliding_window if is_swa else -1,
+                sliding_window = window_left,
+                window_right = window_right,
+                key_sinks = "attention_sink_bias" if config.attention_sink_bias else None,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -213,6 +252,7 @@ class DFlashModel(Model):
                 ),
                 out_dtype = torch.float,
             )
+            attn.o_proj.weight_scale = config.attention_value_scale
             self.attn_modules.append(attn)
 
             self.modules += [
@@ -294,24 +334,8 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
-            ll = self.attached_model().logit_layer_idx
-            lm = self.attached_model().modules[ll]
-            logits = lm.prepare_for_device(state, params)
-            logits = lm.forward(logits, params)
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            if params.get("export_draft_conf"):
-                # Per-position confidence for the generator's draft truncation: the argmax logit
-                # value separates converged from degenerate block positions far better than any
-                # distribution-shape statistic (the softcapped head is near-flat either way)
-                conf, ids = torch.max(logits, dim = -1)
-                params["draft_conf"] = conf
-                return ids
-            return torch.argmax(logits, dim = -1)
-        else:
-            state = self.attached_model().tp_producer.send(state)
-            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
-            return argmax
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -324,9 +348,9 @@ class DFlashModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        # The draft block attends to itself bidirectionally; causality on the sliding-window
-        # layers is expressed through their window (left sw, right 0) instead
-        params["causal"] = False
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
@@ -340,5 +364,7 @@ class DFlashModel(Model):
     @override
     def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
         # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
-        norm_weight = config.stc.list_tensors(prefix = cls.key_fc_norm)
-        return norm_weight
+        tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
+        if config.key_mask_embedding:
+            tensors.update(config.stc.list_tensors(prefix = config.key_mask_embedding))
+        return tensors

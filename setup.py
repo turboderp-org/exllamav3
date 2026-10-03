@@ -18,12 +18,19 @@ if precompile and not torch:
 
 windows = os.name == "nt"
 
+# Shared with the JIT build; loaded by path because the package is not importable yet
+_spec = importlib.util.spec_from_file_location(
+    "cuda_flags", os.path.join(os.path.dirname(os.path.abspath(__file__)), "exllamav3", "util", "cuda_flags.py")
+)
+cuda_flags = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cuda_flags)
+
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+extra_cuda_cflags = cuda_flags.cuda_cflags(
+    cuda_home = cpp_extension.CUDA_HOME,
+    debug = ext_debug,
+    hip = bool(torch_version.hip),
+) if precompile and torch else []
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
