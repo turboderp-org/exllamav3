@@ -1,0 +1,62 @@
+# ROCm 10 build/bench image for exllamav3 on RDNA3 (gfx1100 / RX 7900 XTX).
+#
+# Base: rocm-dev:10.0.0 ships a native ROCm 10.0 SDK under /opt/rocm (hipcc,
+# hipBLAS) and a venv at /opt/rocm-venv. Torch is the rocm7.14 wheel installed
+# --no-deps so it cannot pull the (header-less) wheel SDK over the image's
+# native install.
+#
+# Build:  docker build -f Dockerfile.rocm -t exl3-rocm:gfx1100 .
+#         (--build-arg PYTORCH_ROCM_ARCH=gfx1101 for gfx1101 parts;
+#          --build-arg EXL3_CUMODE=0 to disable CU-mode scheduling)
+# Run:    docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+#           -v /path/to/model:/models/qwen38-27b:ro exl3-rocm:gfx1100
+
+FROM rocm-dev:10.0.0
+ARG PYTORCH_ROCM_ARCH=gfx1100
+ARG EXL3_CUMODE=1
+SHELL ["/bin/bash", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm
+ENV PATH=/opt/rocm-venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    python3-dev g++ && rm -rf /var/lib/apt/lists/*
+
+# Torch ROCm wheel + runtime deps. --no-deps mirrors the known-good recipe;
+# triton-rocm (not triton) is required for the triton attention path on ROCm.
+RUN pip install --no-cache-dir --no-deps \
+    --index-url https://download.pytorch.org/whl/rocm7.14 torch==2.14.0+rocm7.14 && \
+    pip install --no-cache-dir -q \
+    filelock typing-extensions sympy networkx jinja2 fsspec setuptools ninja \
+    fastapi uvicorn tokenizers numpy rich safetensors pillow pyyaml marisa_trie \
+    pydantic llguidance && \
+    pip install --no-cache-dir -q \
+    --index-url https://download.pytorch.org/whl/rocm7.14 "triton-rocm~=3.8.0"
+
+WORKDIR /opt/exllamav3
+COPY . /opt/exllamav3
+
+# Non-editable install compiles the C++/HIP extension at build time.
+# EXL3_CUMODE=1 builds with -mcumode (each workgroup pinned to one CU instead of
+# a WGP pair): measured +7.6% decode on gfx1100. The ELF gate verifies the flag
+# actually reached the code objects (.workgroup_processor_mode), which a pip-log
+# grep cannot prove.
+RUN set -o pipefail && \
+    EXL3_CUMODE=${EXL3_CUMODE} EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    MAX_JOBS=16 pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -80
+RUN python3 -c "import torch, exllamav3_ext" && echo INSTALL_VERIFIED && \
+    if [ "${EXL3_CUMODE}" = "1" ]; then \
+      python3 /opt/exllamav3/util/check_so_wgp_mode.py \
+        /opt/rocm-venv/lib/python3.12/site-packages/exllamav3_ext.cpython-312-x86_64-linux-gnu.so \
+        --require cu; \
+    fi
+
+# RDNA3 GEMV/reconstruct crossover is ~16 rows (GEMV ~56 tok/s, reconstruct ~700
+# for chat-size prefills); 144 is the NVIDIA-tuned default and would put
+# 17..144-row prefills on the decode path (+0.5-1.5 s TTFT). Override to restore
+# the upstream default.
+ENV EXL3_RECONSTRUCT_THRESHOLD=16
+# Serving: run TabbyAPI (the official exllamav3 backend) inside this image or a
+# venv built from it; there is no bundled server entrypoint.
+CMD ["bash"]

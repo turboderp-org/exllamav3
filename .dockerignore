@@ -1,0 +1,24 @@
+# Keep the image build context slim and the extension build honest: a stale
+# build/ tree in the context made setuptools skip the recompile.
+build/
+dist/
+*.egg-info
+*.egg-info/
+.git
+.pytest_cache
+__pycache__/
+**/__pycache__/
+docs/
+science/
+eval/
+uv.lock
+
+# torch hipify outputs are regenerated in-tree during the ROCm extension build;
+# shipping stale copies produces duplicate-symbol links and silent stale-binary
+# images.
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.cuh
+exllamav3/exllamav3_ext/**/*_hip.cpp
+exllamav3/exllamav3_ext/**/*_hip.h
+exllamav3/exllamav3_ext/**/hip_*.cpp
+exllamav3/exllamav3_ext/**/hip_*.h
