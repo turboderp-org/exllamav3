@@ -451,6 +451,7 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            interm_fp32 = self.interm_dtype == torch.float,
         )
         self.cpu_offload = True
         print(f" -- CPU-offloaded experts (worker): {self.key}")
@@ -579,6 +580,7 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            interm_fp32 = self.interm_dtype == torch.float,
         )
 
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never

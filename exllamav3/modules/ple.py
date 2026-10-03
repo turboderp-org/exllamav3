@@ -13,6 +13,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.config import Config
 from ..util.tensor import get_for_device
+from ..cache.recurrent import host_copy
 
 """
 PLE (per-layer embedding) injection layer (Qwen3.8-Flash-Next): feeds hashed n-gram features into
@@ -103,7 +104,7 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        return (host_copy(self.conv_state[slot, :, :self.win]), host_copy(self.id_state[slot, :self.ctx]))
 
     def unstash(self, slot, stashed, position: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])
