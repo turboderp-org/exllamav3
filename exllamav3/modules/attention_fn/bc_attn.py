@@ -40,7 +40,11 @@ fall back to the dispatch path by design (build_bc_attn returns None); unexpecte
 while building the path raise.
 """
 
-bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
+# ROCm/gfx1100 (2026-09-18, Qwen3.8-27B-3.5bpw, 4096/256 TG): the captured BC block replays
+# 3.5% SLOWER than the eager dispatch path (34.14 vs 32.98 tok/s median, token parity green,
+# reproduced). The eager triton decode attention wins on RDNA3 - default the path off there.
+_bc_attn_default = "0" if torch.version.hip else "1"
+bc_attn_enable = os.environ.get("EXL3_BC_ATTN", _bc_attn_default) != "0"
 
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
@@ -97,7 +101,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # CUDA emits a cubin; the ROCm backend emits an hsaco
+            image = ck.asm["hsaco" if torch.version.hip else "cubin"]
+            k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -305,14 +311,11 @@ class BCAttn:
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
-        # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the
-        # generator's block table), so the 16-byte divisibility the JIT would infer holds
-        cache_t += ":16"
         sig = {
-            "q": "*fp16:16", "k_cache": cache_t, "v_cache": cache_t,
-            "block_table": "*i32:16", "cache_seqlens": "*i32", "out": "*fp16:16",
-            "partial_o": "*fp32:16", "partial_ml": "*fp32:16",
-            "k_scales": "*fp16:16", "v_scales": "*fp16:16", "h32": "*fp16:16",
+            "q": "*fp16", "k_cache": cache_t, "v_cache": cache_t,
+            "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
+            "partial_o": "*fp32", "partial_ml": "*fp32",
+            "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
@@ -330,7 +333,7 @@ class BCAttn:
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
         sig_c = {
-            "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
+            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
@@ -611,12 +614,6 @@ class BCAttn:
             except BCKernelTooLarge:
                 return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
-        # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
-        # loads); the block table is the only one bound per call rather than a whole static, and
-        # the generator uploads it fresh each step. A caller passing a row slice of a device
-        # table could break the assumption silently, so fail here instead
-        assert block_table.data_ptr() % 16 == 0, \
-            "BC_Attention: block_table must be 16-byte aligned (pass a whole tensor, not a sliced view)"
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
                     position_ids, inv_freq, regime, t_total)

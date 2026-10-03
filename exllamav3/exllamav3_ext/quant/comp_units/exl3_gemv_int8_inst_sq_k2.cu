@@ -12,6 +12,7 @@ void* exl3_gemv_int8_sq_sel_k2(int M, bool c_fp32, bool residual)
     {
         case 1: { SELM_(1) }
         case 2: { SELM_(2) }
+        case 4: { SELM_(4) }
     }
     #undef SELM_
     return nullptr;

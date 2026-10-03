@@ -532,7 +532,6 @@ class Job:
 
         # Accept any text held back by a partial banned-string match. Matching is suspended while
         # forced tokens remain, so the checkpoint could never be rewound to anyway
-        self.hash_deferred_pages()
         self.checkpoint = None
 
         if self.forced_ids is not None:
@@ -540,67 +539,6 @@ class Job:
         self.forced_ids = ids
         self.forced_index = 0
         self.forced_ids_device = None
-
-
-    def hash_completed_page(self, seq: Sequence, page_idx: int):
-        """
-        Give a page its content hash once all of its tokens are final, and link the following page to it.
-        """
-        page = seq.allocated_pages[page_idx]
-        old_hash = page.phash
-
-        if page_idx > 0:
-            last_page = seq.allocated_pages[page_idx - 1]
-            last_hash = last_page.phash
-        else:
-            last_hash = None
-
-        page_ids = seq.sequence_ids.torch_slice(page_idx * PAGE_SIZE, (page_idx + 1) * PAGE_SIZE)
-        new_hash = tensor_hash_checksum(page_ids, last_hash)
-
-        # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
-        # the position crossed the boundary. Move it along so it stays findable under the final hash
-        rc = self.generator.recurrent_cache
-        if rc is not None and old_hash in rc and new_hash not in rc:
-            rc[new_hash] = rc.pop(old_hash)
-
-        # If another referenced page has the same hash, switch to referencing that instead
-        if new_hash in self.pagetable.referenced_pages:
-            new_serial = page.access_serial
-            page.sub_ref()
-            page = self.pagetable.referenced_pages[new_hash]
-            assert page.kv_position == PAGE_SIZE
-            seq.allocated_pages[page_idx] = page
-            seq.build_block_index_tensor()
-            page.add_ref(new_serial)
-
-        else:
-            # If an unreferenced page has the same hash, clear that page
-            if new_hash in self.pagetable.unreferenced_pages:
-                up = self.pagetable.unreferenced_pages[new_hash]
-                up.clear()
-
-            # Update the hash
-            page.update_hash(new_hash)
-
-        # Allow completing the final page without starting a new one (for requeue)
-        if page_idx + 1 < len(seq.allocated_pages):
-            page = seq.allocated_pages[page_idx + 1]
-            page.prev_hash = new_hash
-            page.can_revert = False
-
-
-    def hash_deferred_pages(self):
-        """
-        Hash the pages that completed while a banned-string checkpoint was holding tokens. Called when the
-        held tokens become final: the hold is released, or the job ends or requeues with the checkpoint in
-        place. A rewind discards the deferred pages instead, since it truncates them.
-        """
-        if self.checkpoint is None:
-            return
-        for seq, page_idx in self.checkpoint["deferred_pages"]:
-            self.hash_completed_page(seq, page_idx)
-        self.checkpoint["deferred_pages"].clear()
 
 
     def _pop_forced_token(self, device) -> torch.Tensor:
@@ -692,7 +630,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.rq_margin
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
 
         for seq in self.sequences:
 
@@ -700,21 +638,50 @@ class Job:
             seq.sequence_ids.append(next_token)
             page_before = seq.kv_position // PAGE_SIZE
             seq.kv_position += 1
-            page_after = seq.kv_position // PAGE_SIZE
+            pos = seq.kv_position
+            if self.checkpoint:
+                pos -= self.checkpoint["offset"]
+            page_after = pos // PAGE_SIZE
 
             # Hash completed page
             if page_after > page_before:
+                assert page_after == page_before + 1
 
-                # A page that completes while a banned-string checkpoint holds tokens contains tokens that
-                # may still be rewound, so it can't be published under its content hash yet. Defer it until
-                # the hold resolves. The next page starts filling right away: link it to the completed
-                # page's current (unique) hash in the meantime, so it never reads as the root of a sequence
-                if self.checkpoint and self.checkpoint["offset"] > 0:
-                    self.checkpoint["deferred_pages"].append((seq, page_before))
-                    if page_after < len(seq.allocated_pages):
-                        seq.allocated_pages[page_after].prev_hash = seq.allocated_pages[page_before].phash
+                page = seq.allocated_pages[page_before]
+
+                if page_before > 0:
+                    last_page = seq.allocated_pages[page_before - 1]
+                    last_hash = last_page.phash
                 else:
-                    self.hash_completed_page(seq, page_before)
+                    last_hash = None
+
+                page_ids = seq.sequence_ids.torch_slice(page_before * PAGE_SIZE, page_after * PAGE_SIZE)
+                new_hash = tensor_hash_checksum(page_ids, last_hash)
+
+                # If another referenced page has the same hash, switch to referencing that instead
+                if new_hash in self.pagetable.referenced_pages:
+                    new_serial = page.access_serial
+                    page.sub_ref()
+                    page = self.pagetable.referenced_pages[new_hash]
+                    assert page.kv_position == PAGE_SIZE
+                    seq.allocated_pages[page_before] = page
+                    seq.build_block_index_tensor()
+                    page.add_ref(new_serial)
+
+                else:
+                    # If an unreferenced page has the same hash, clear that page
+                    if new_hash in self.pagetable.unreferenced_pages:
+                        up = self.pagetable.unreferenced_pages[new_hash]
+                        up.clear()
+
+                    # Update the hash
+                    page.update_hash(new_hash)
+
+                # Allow completing the final page without starting a new one (for requeue)
+                if page_after < len(seq.allocated_pages):
+                    page = seq.allocated_pages[page_after]
+                    page.prev_hash = new_hash
+                    page.can_revert = False
 
         # Stream output
 
@@ -788,8 +755,6 @@ class Job:
                 r.update({ "suppressed_tokens": suppressed_tokens.torch() })
 
             if emit_eos or requeue_now:
-                # Nothing can be rewound past this point, so pages deferred by a held checkpoint are final
-                self.hash_deferred_pages()
                 self.time_last_token = time.time()
                 self.time_enqueued += self.time_first_prefill - self.time_enqueue
                 self.time_prefill += self.time_first_token - self.time_first_prefill
@@ -889,7 +854,6 @@ class Job:
 
         # Hold text as long as it contains part of a banned string
         def unset_checkpoint():
-            self.hash_deferred_pages()
             self.checkpoint = None
 
         def set_checkpoint():
@@ -903,7 +867,6 @@ class Job:
                     "held_k_probs": self.held_k_probs.clone(1),
                     "held_logits": self.held_logits.clone(1),
                     "explored_tokens": [next_token.item()],
-                    "deferred_pages": [],
                 }
                 # Keep the nearest recurrent stash warm in the LRU cache in case this hold ends in a rewind
                 if self.recurrent_state is not None:
@@ -978,23 +941,15 @@ class Job:
             # draft verification window must be abandoned.
             self.mtp_last_hidden = None
             self.checkpoint_rewound = True
-            # Every deferred page held rewound tokens and was truncated above
-            self.checkpoint["deferred_pages"].clear()
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
-            self.held_tokens = self.checkpoint["held_tokens"].clone()
-            self.held_probs = self.checkpoint["held_probs"].clone()
-            self.held_k_tokens = self.checkpoint["held_k_tokens"].clone()
-            self.held_k_probs = self.checkpoint["held_k_probs"].clone()
-            self.held_logits = self.checkpoint["held_logits"].clone()
-            # The checkpoint stays in place (offset 0, explored tokens) in case the resampled token is
-            # rejected too. The caller emits the restored buffers right away, so what a second rewind
-            # must restore is the empty state after that emit, not the pre-match contents again
+            self.held_tokens = self.checkpoint["held_tokens"]
+            self.held_probs = self.checkpoint["held_probs"]
+            self.held_k_tokens = self.checkpoint["held_k_tokens"]
+            self.held_k_probs = self.checkpoint["held_k_probs"]
+            self.held_logits = self.checkpoint["held_logits"]
             self.checkpoint["offset"] = 0
-            self.checkpoint["held_text"] = ""
-            for k in ("held_tokens", "held_probs", "held_k_tokens", "held_k_probs", "held_logits"):
-                self.checkpoint[k].clear()
             return off_tokens, off_text
 
         if requeue_now:
@@ -1161,18 +1116,9 @@ class Job:
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
-            # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
-            # resumes the next segment with nothing to replay. A speculative window writes K/V past that
-            # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
-            # (early by the window misses the boundary and replays up to a checkpoint interval; early by
-            # a page shortens every segment by a page and requeues up to twice as often)
-            self.rq_margin = 0
-            self.rq_headroom = self.generator.num_draft_tokens
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
-            self.rq_margin = self.generator.num_draft_tokens
-            self.rq_headroom = 0
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
@@ -1193,7 +1139,7 @@ class Job:
         all_unique_hashes = set()
         all_unique_pages = 0
         for seq in self.sequences:
-            unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom)
+            unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens)
             if self.generator.mtp_draft:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
@@ -1434,15 +1380,25 @@ class Job:
                         ids, self.embeddings, ids.shape[-1]
                     )
 
+                # Fresh pinned tensor per chunk: the upload is enqueued behind this
+                # chunk's compute, so a reused buffer would be overwritten by the
+                # host before its H2D lands. The caching host allocator records a
+                # stream event on free and won't hand the block out again until
+                # the copy completes.
+                cache_seqlens = torch.empty((1,), dtype = torch.int32, pin_memory = True)
+                cache_seqlens[0] = prefill_start
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
-                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "cache_seqlens": cache_seqlens,
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
+                    # Same staging contract as iterate_gen: CPU embedding output is
+                    # copied into a reused pinned buffer, then uploaded async.
+                    "pinned_staging": True,
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
@@ -1512,16 +1468,6 @@ class Job:
                     if pfp_b > pfp_a:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
-
-                # A full prompt page that prefill (re)built rather than reusing by hash (the page MTP leaves
-                # out of the cached prefix so one real token runs) was allocated under a random hash; give
-                # it its content hash now, or every page completed after it chains off the random one and
-                # no later checkpoint is findable by a requeued job
-                for local_idx in range(p0, p2):
-                    page = seq.allocated_pages[local_idx]
-                    if page.kv_position == PAGE_SIZE and local_idx < len(seq.page_hashes) \
-                            and page.phash != seq.page_hashes[local_idx]:
-                        self.hash_completed_page(seq, local_idx)
 
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:

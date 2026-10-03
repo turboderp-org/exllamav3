@@ -1,5 +1,6 @@
 #pragma once
 #include "../compat.cuh"
+#include "../hip_compat.cuh"
 
 #define ACT_SILU 0
 #define ACT_GELU 1
@@ -7,7 +8,34 @@
 // gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
 #define ACT_RELU2_NOGATE 2
 
-// Hadamard transform 128-element vector across one warp, with optional pre and post scales
+// Hadamard transform 128-element vector across one warp, with optional pre and post scales.
+// ROCm xor-butterfly: DPP ROW_XMASK for 1/2/4/8, DS_SWIZZLE SWAPX16 for 16. Same mapping as
+// gemv_int8 exl3_row_xmask. e2e keep: 41.30 vs 40.79 on CU+MULT=2+rows40
+// (occupancy maxb 3→4). shfl_xor lowers to ds_bpermute and fights LDS.
+
+__device__ __forceinline__ uint32_t had_xmask(uint32_t v, int mask)
+{
+#if defined(USE_ROCM)
+    switch (mask)
+    {
+        case 1:  return __builtin_amdgcn_update_dpp(v, v, 0x161, 0xf, 0xf, false);
+        case 2:  return __builtin_amdgcn_update_dpp(v, v, 0x162, 0xf, 0xf, false);
+        case 4:  return __builtin_amdgcn_update_dpp(v, v, 0x164, 0xf, 0xf, false);
+        case 8:  return __builtin_amdgcn_update_dpp(v, v, 0x168, 0xf, 0xf, false);
+        case 16: return __builtin_amdgcn_ds_swizzle(v, 0x401f);
+        default: return __shfl_xor_sync(0xffffffff, v, mask);
+    }
+#else
+    return __shfl_xor_sync(0xffffffff, v, mask);
+#endif
+}
+
+__device__ __forceinline__ uint64_t had_xmask64(uint64_t v, int mask)
+{
+    uint32_t lo = had_xmask((uint32_t) v, mask);
+    uint32_t hi = had_xmask((uint32_t) (v >> 32), mask);
+    return (uint64_t) lo | ((uint64_t) hi << 32);
+}
 
 __device__ inline half hreduce(half2 x)
 {
@@ -25,8 +53,8 @@ __device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float&
         uint32_t i3 = __float_as_uint(h3);
         uint64_t h01 =  (uint64_t) i0 | (((uint64_t) i1) << 32);
         uint64_t h23 =  (uint64_t) i2 | (((uint64_t) i3) << 32);
-        uint64_t ph01 = __shfl_xor_sync(0xffffffff, h01, i);
-        uint64_t ph23 = __shfl_xor_sync(0xffffffff, h23, i);
+        uint64_t ph01 = had_xmask64(h01, i);
+        uint64_t ph23 = had_xmask64(h23, i);
         float ph0 = __uint_as_float((uint32_t) (ph01 & 0xffffffff));
         float ph1 = __uint_as_float((uint32_t) (ph01 >> 32));
         float ph2 = __uint_as_float((uint32_t) (ph23 & 0xffffffff));
@@ -49,7 +77,7 @@ __device__ inline void shuffle_had_f2x32(float& v, float& w, const int lane_id)
     for (int i = 1; i < 32; i <<= 1)
     {
         uint64_t vw = ((uint64_t) __float_as_uint(v)) | (((uint64_t) __float_as_uint(w)) << 32);
-        uint64_t pvw = __shfl_xor_sync(0xffffffff, vw, i);
+        uint64_t pvw = had_xmask64(vw, i);
         float pv = __uint_as_float((uint32_t) (pvw & 0xffffffff));
         float pw = __uint_as_float((uint32_t) (pvw >> 32));
         uint32_t vi = __float_as_uint(v);
@@ -64,9 +92,10 @@ __device__ inline void shuffle_had_f2x32(float& v, float& w, const int lane_id)
 
 __device__ inline float shuffle_had_fx32(float v, const int lane_id)
 {
+    #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
     {
-        float pv = __shfl_xor_sync(0xffffffff, v, i);
+        float pv = __uint_as_float(had_xmask(__float_as_uint(v), i));
         uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
         int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
         *vi ^= (sfm & 0x80000000);
@@ -77,9 +106,11 @@ __device__ inline float shuffle_had_fx32(float v, const int lane_id)
 
 __device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
 {
+    #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
     {
-        half2 pv = __shfl_xor_sync(0xffffffff, v, i);
+        half2 pv;
+        *reinterpret_cast<uint32_t*>(&pv) = had_xmask(*reinterpret_cast<uint32_t*>(&v), i);
         uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
         int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
         *vi ^= (sfm & 0x80008000);

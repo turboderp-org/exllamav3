@@ -83,7 +83,16 @@ def to_device(t: torch.Tensor, device: torch.device | str | int, non_blocking: b
             stats["bounced"] += 1
             return t.cpu().to(device)
         stats["direct"] += 1
+    if _h2d_trace and t.device.type == "cpu" and device.type == "cuda" and not t.is_pinned():
+        import traceback as _tb
+        print(f"[H2D pageable] shape={tuple(t.shape)} dtype={t.dtype} nbytes={t.nbytes}")
+        _tb.print_stack(limit=8)
     return t.to(device, non_blocking = non_blocking)
+
+# EXL3_H2D_TRACE=1: log every pageable (non-pinned) host->device copy. Pageable
+# copies synchronize the stream (torch falls back to a blocking staging copy),
+# which shows up as hipMemcpyWithStream host self-time in profiles.
+_h2d_trace = os.environ.get("EXL3_H2D_TRACE", "0") == "1"
 
 
 def reset_verdicts():

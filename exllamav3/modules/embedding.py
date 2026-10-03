@@ -252,7 +252,17 @@ class Embedding(Module):
         # No indexed embeddings, or none in current batch
         else:
             if isinstance(self.embedding, TableEmbedding):
-                x = self.embedding.forward(x, bool(params.get("pinned_staging")))
+                # pinned_staging is a buffer-reuse request, NOT a sync guarantee
+                # (on master it only selects the pinned staging buffer; the port's
+                # prefill sets it precisely because chunks run back-to-back with
+                # no sync - see the resident-path comment below). RowTable.synced
+                # asserts the opposite ("caller guarantees a sync point before the
+                # next lookup"), and feeding pinned_staging into it disabled the
+                # pin-set event guard during prefill: with the uploads async, a
+                # reused staging set could be rewritten on the host before its
+                # H2D landed (torn table gather). lookup() must always record the
+                # event; the synchronize on reuse is free when a sync did happen.
+                x = self.embedding.forward(x, False)
             else:
                 x = self.embedding.forward(x)
             if self.multiplier != 1.0:
@@ -261,17 +271,32 @@ class Embedding(Module):
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
             # When the embedding resides on the CPU, its output is uploaded to the first
-            # device layer; staging it through a reused pinned buffer makes that upload
-            # asynchronous. Only callers that guarantee a sync point between forward passes
-            # (the generator's decode loop) may set the pinned_staging flag.
+            # device layer; staging it through a pinned buffer makes that upload
+            # asynchronous. Prefill callers may enqueue back-to-back chunks without a
+            # sync, so each buffer pair alternates and the writer waits on the event
+            # recorded after its previous upload was submitted.
             if params.get("pinned_staging") and x.device.type == "cpu":
                 key = (x.shape, x.dtype)
-                buf = self._pinned_staging.get(key)
-                if buf is None:
+                entry = self._pinned_staging.get(key)
+                if entry is None:
                     if len(self._pinned_staging) > 8:
                         self._pinned_staging.clear()
-                    buf = torch.empty_like(x, pin_memory = True)
-                    self._pinned_staging[key] = buf
+                    # (two pinned buffers, two events, index of the last-used
+                    # buffer, whether that use still needs its event recorded)
+                    entry = [torch.empty_like(x, pin_memory = True),
+                             torch.empty_like(x, pin_memory = True),
+                             torch.cuda.Event(), torch.cuda.Event(), 0, False]
+                    self._pinned_staging[key] = entry
+                # Record the event for the buffer used on the previous call: its
+                # H2D upload was enqueued on this stream since then, so this
+                # event completes only after that copy has been read out.
+                if entry[5]:
+                    entry[2 + entry[4]].record(torch.cuda.current_stream())
+                i = entry[4] ^ 1
+                entry[4] = i
+                entry[5] = True
+                buf, ev = entry[i], entry[2 + i]
+                ev.synchronize()
                 buf.copy_(x)
                 x = buf
             return x

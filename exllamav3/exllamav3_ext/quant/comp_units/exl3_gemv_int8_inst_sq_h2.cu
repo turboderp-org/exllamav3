@@ -1,7 +1,7 @@
 #include "exl3_gemv_int8_instances.cuh"
 #include "../exl3_gemv_int8_kernel.cuh"
 
-// 2.5 bpw
+// 2.5 bpw (half-integer rate K + 0.5, mul1 codebook): 16 * K + 8 uint16 per 256-weight tile
 void* exl3_gemv_int8_sq_sel_h2(int M, bool c_fp32, bool residual)
 {
     #define SELM_(M_) \
@@ -13,6 +13,7 @@ void* exl3_gemv_int8_sq_sel_h2(int M, bool c_fp32, bool residual)
     {
         case 1: { SELM_(1) }
         case 2: { SELM_(2) }
+        case 4: { SELM_(4) }
     }
     #undef SELM_
     return nullptr;

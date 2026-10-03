@@ -17,7 +17,8 @@ class SeqTensor:
         dtype: torch.dtype,
         seq_dim: int,
         device: torch.device = "cpu",
-        init_cap: int = -1
+        init_cap: int = -1,
+        pin: bool = False,
     ):
         if seq_dim < 0: seq_dim = len(shape) + seq_dim
         self.seq_dim = seq_dim
@@ -35,6 +36,7 @@ class SeqTensor:
         self.init_shape = shape
         self.dtype = dtype
         self.device = device
+        self.pin = pin
         self.tensor = None
 
     def __len__(self):
@@ -43,13 +45,19 @@ class SeqTensor:
     def __bool__(self):
         return self.seq_len > 0
 
+    def _alloc(self, shape):
+        if self.pin and torch.device(self.device).type == "cpu":
+            return torch.empty(shape, dtype = self.dtype, device = self.device, pin_memory = True)
+        return torch.empty(shape, dtype = self.dtype, device = self.device)
+
     def _ensure_init(self):
         if self.tensor is None:
-            self.tensor = torch.empty(self.init_shape, dtype = self.dtype, device = self.device)
+            self.tensor = self._alloc(self.init_shape)
 
     @staticmethod
-    def from_tensor(tensor: torch.Tensor, seq_dim: int):
-        s = SeqTensor(tensor.shape, tensor.dtype, seq_dim, tensor.device, init_cap = tensor.shape[seq_dim])
+    def from_tensor(tensor: torch.Tensor, seq_dim: int, pin: bool = False):
+        s = SeqTensor(tensor.shape, tensor.dtype, seq_dim, tensor.device,
+                      init_cap = tensor.shape[seq_dim], pin = pin)
         s.append(tensor)
         return s
 
@@ -75,11 +83,21 @@ class SeqTensor:
         end_pos = self.seq_len + new_len
         if end_pos >= self.seq_cap:
             new_cap = (end_pos // self.PAGE_SIZE + 1) * self.PAGE_SIZE
-            grow_shape = list(new_data.shape)
-            grow_shape[self.seq_dim] = new_cap - self.seq_cap
-            grow_shape = tuple(grow_shape)
-            grow_tensor = torch.empty(grow_shape, dtype = self.tensor.dtype, device = self.tensor.device)
-            self.tensor = torch.cat((self.tensor, grow_tensor), dim = self.seq_dim)
+            if self.pin and self.tensor.is_pinned():
+                # cat() would produce a pageable tensor; grow into a fresh
+                # pinned buffer so H2D slices stay async-eligible
+                new_shape = list(self.tensor.shape)
+                new_shape[self.seq_dim] = new_cap
+                nt = self._alloc(tuple(new_shape))
+                nt.narrow(self.seq_dim, 0, self.seq_len).copy_(
+                    self.tensor.narrow(self.seq_dim, 0, self.seq_len))
+                self.tensor = nt
+            else:
+                grow_shape = list(new_data.shape)
+                grow_shape[self.seq_dim] = new_cap - self.seq_cap
+                grow_shape = tuple(grow_shape)
+                grow_tensor = torch.empty(grow_shape, dtype = self.tensor.dtype, device = self.tensor.device)
+                self.tensor = torch.cat((self.tensor, grow_tensor), dim = self.seq_dim)
             self.seq_cap = new_cap
         s = self.tensor.narrow(self.seq_dim, self.seq_len, end_pos - self.seq_len)
         s.copy_(new_data)

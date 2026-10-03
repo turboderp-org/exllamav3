@@ -210,7 +210,9 @@ class Sequence:
 
     def __init__(self, ids: torch.Tensor, seq_ids: torch.Tensor):
         self.input_ids = SeqTensor.from_tensor(ids, seq_dim = -1)
-        self.sequence_ids = SeqTensor.from_tensor(seq_ids, seq_dim = -1)
+        # Pinned so prefill chunk slices upload via async H2D (pageable copies
+        # drain the stream and stall the host ~10 ms per chunk boundary).
+        self.sequence_ids = SeqTensor.from_tensor(seq_ids, seq_dim = -1, pin = True)
         self.kv_position = 0
         self.page_hashes = None
         self.max_cached_pages = None
@@ -250,10 +252,38 @@ class Sequence:
         return unique_hashes, self.new_unique_pages
 
     def build_block_index_tensor(self):
-        self.block_index_tensor = torch.tensor(
-            [[page.page_index for page in self.allocated_pages]],
-            dtype = torch.int32,
-        )
+        # Pinned so get_for_device uploads it with a non-blocking copy; a
+        # pageable tensor would serialize the stream at chunk boundaries.
+        #
+        # SINGLE buffer, deliberately. Two invariants make in-place updates safe:
+        # 1. Captured graphs replay the H2D memcpy from this fixed address (same
+        #    contract as multilinear's _c_ptrs_pin) - double-buffering breaks
+        #    replay (measured: batch gate batch_c diverged 98/144 tokens with
+        #    alternating buffers). 2. In-place rewrites between async uploads rely
+        #    on page indices being append-stable: existing pages keep their
+        #    indices when pages are appended (the common rebuild); a mid-list
+        #    page SWITCH (job.py's shared-reference dedup) rewrites a slot, which
+        #    is only safe because page hashing synchronizes with the GPU between
+        #    generator steps. If a rebuild ever rewrites slots without such a
+        #    sync, this needs event-guarding WITHOUT changing the address.
+        #
+        # 2026-10-03 review correction: (1) described the whole-step CUDA graph
+        # experiments, since removed (EXL3_STEP_GRAPH was measured and rejected;
+        # BC-attention capture is default-off on ROCm) - no graph in the current
+        # tree replays this memcpy; the historical divergence measurement was
+        # taken under those experiments. And the growth branch below DOES
+        # reallocate a new address (only the initial 64-page buffer is stable);
+        # what actually protects reuse today is the per-generator-step sync plus
+        # the caching allocator's stream-event recording on free. Pre-size this
+        # buffer to the sequence's page budget before ever relying on the fixed
+        # address again.
+        n = len(self.allocated_pages)
+        buf = self.__dict__.get("_block_index_pin")
+        if buf is None or buf.shape[-1] < n:
+            buf = torch.empty((1, max(n, 64)), dtype = torch.int32, pin_memory = True)
+            self.__dict__["_block_index_pin"] = buf
+        buf[0, :n] = torch.tensor([p.page_index for p in self.allocated_pages], dtype = torch.int32)
+        self.block_index_tensor = buf[:, :n]
 
     def allocate_pages(
         self,

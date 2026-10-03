@@ -1,7 +1,7 @@
 #include "exl3_gemv_int8_instances.cuh"
 #include "../exl3_gemv_int8_kernel.cuh"
 
-// 1.5 bpw
+// 1.5 bpw (half-integer rate K + 0.5, mul1 codebook)
 void* exl3_gemv_int8_coop_sel_h1(bool c_fp32, bool residual)
 {
     if (c_fp32)  return residual ? (void*) exl3_gemv_int8_coop_kernel<1, true, true, true>

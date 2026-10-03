@@ -72,8 +72,7 @@ uint64_t gemm_autotune_hash
         h *= 1099511628211ull;
     };
     mix((uint64_t) (half_k ? 1 : 0));
-    // Past 16 rows, buckets follow the multi-row tile heights so each is tuned separately
-    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
+    mix((uint64_t) MIN(roundup_pow2(size_m), 16));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);
@@ -160,6 +159,12 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
+    // tg-1a was attempted here (double the coop grid to cover all 96 CUs on RDNA3):
+    // the kernel cannot co-reside 96 blocks of 512 threads at 184+ VGPRs — launch
+    // asserts with "too many blocks in cooperative launch" (hardware co-residency
+    // limit, not a reporting bug). Fixing batch decode requires the regular-launch
+    // msq path instead (tg-1b); do not extend the coop grid without shrinking the
+    // block footprint first.
     int* locks = DevCtx::instance().get_locks(device);
     // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
     // request would fail the launch there. Ask for what this device actually permits.
@@ -188,11 +193,11 @@ int exl3_gemm_gr
 
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
-    // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
-    // to the regular kernel.
+    // threshold keeps m <= 144 in practice). The sq/coop int8 kernels carry the half-integer rates
+    // (16 * K + 8 uint16 per tile) for K = 1.5 / 2.5 / 3.5 too, so no rate gate is needed here.
     if (mul1 && exl3_gemv_int8_enabled())
     {
-        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
+        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, force_num_sms, stream, graph))
             return 0;
     }
 
@@ -246,6 +251,9 @@ int exl3_gemm_gr
         }
     }
 
+    // On ROCm the autotuner itself clamps concurrency to 1 (see tune() in
+    // coop_autotune.cu): RDNA over-reports cooperative co-residency and
+    // concurrency > 1 deadlocks grid.sync(). (shape, num_sms) tuning still applies.
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
@@ -300,9 +308,11 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
-        kernel_attr_set[device].insert((void*) kernel);
+        #if !defined(USE_ROCM)
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         cuda_check(cudaPeekAtLastError());
+        #endif
+        kernel_attr_set[device].insert((void*) kernel);
     }
     cudaLaunchCooperativeKernel
     (
@@ -545,6 +555,24 @@ int exl3_mgemm_gr
     const bool half_k = bk.half;
     TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
 
+    // Multi-matrix/sliced fast path: one regular launch covers the whole call (sliced
+    // SlicedMultiLinear bundles and plain multi-matrix projections), any m - rows are flattened
+    // into the unit index. No filtering/reduction; MoE-style per-matrix inputs (bszm_in > 1)
+    // stay on the coop kernel. Half-integer rates are excluded here (the sliced kernel has no half
+    // instances) and take the sq/coop int8 path instead.
+    if (mul1 && !half_k && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() && bszm_in == 1 &&
+        min_index < 0 && !indices && !weights && num_tokens == 1 &&
+        force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        if (exl3_gemv_int8_msq(
+            A_ptr, B_ptr_ptr, C_ptr, size_m, size_k, size_n,
+            suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr, bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr, n_stride_list_ptr, had_src_list_ptr, num_had_src,
+            K, c_fp32, device, num_sms, stream, graph))
+            return 0;
+    }
+
     int shape_idx;
     int block_dim;
     fp_exl3_mgemm_kernel kernel;
@@ -588,6 +616,7 @@ int exl3_mgemm_gr
         }
     };
 
+    // See exl3_gemm_gr: on ROCm the autotuner clamps concurrency to 1 internally.
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
@@ -663,7 +692,9 @@ int exl3_mgemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+        #if !defined(USE_ROCM)
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        #endif
         kernel_attr_set[device].insert((void*) kernel);
     }
 
