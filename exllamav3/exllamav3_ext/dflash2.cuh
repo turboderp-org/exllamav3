@@ -24,6 +24,20 @@ void dflash2_selector_walk
     const c10::optional<at::Tensor>& conf
 );
 
+void dflash2_selector_walk_sample
+(
+    const at::Tensor& unary,
+    const at::Tensor& cands,
+    const at::Tensor& gate,
+    const at::Tensor& pred_cb,
+    const at::Tensor& succ_cb,
+    const at::Tensor& anchor,
+    at::Tensor& out,
+    const at::Tensor& gumbel,
+    at::Tensor& q,
+    double temperature
+);
+
 void dflash2_topk
 (
     const at::Tensor& logits,

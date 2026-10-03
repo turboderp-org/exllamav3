@@ -376,6 +376,60 @@ class DFlash2Selector(Module):
         return self._walk_torch(unary.float(), cands.long(), gate.float(), anchor_ids, return_confidence)
 
 
+    def walk_sample(
+        self,
+        hidden: torch.Tensor,
+        logits: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        temperature: float,
+        vocab_size: int | None = None,
+        scale: float = 1.0,
+        softcap: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sampled selector walk for speculative sampling (dflash reference CandidateSelector.select at
+        temperature > 0): at each row the next token is drawn from q = softmax(scores / T) over the row's top-k
+        candidates, scores conditioned on the previously drawn token. Returns ids [b, rows + 1] = [anchor, path...],
+        q [b, rows, k] and the candidates [b, rows, k], so the verifier can accept with min(1, p / q)."""
+        vocab_size = vocab_size or logits.shape[-1]
+        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        bsz, rows = logits.shape[:2]
+        if hidden.is_cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
+            unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
+            ext.dflash2_topk(logits, vocab_size, scale, softcap, unary, cands)
+        else:
+            lg = logits[..., :vocab_size].float() * scale
+            if softcap > 0.0:
+                lg = torch.tanh(lg / softcap) * softcap
+            unary, cands = torch.topk(lg, self.top_k, dim = -1, sorted = False)
+        u = torch.rand((bsz, rows, self.top_k), device = hidden.device, generator = generator)
+        gumbel = -torch.log(-torch.log(u.clamp_min(1e-20)))
+        if hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16):
+            out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
+            q = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            ext.dflash2_selector_walk_sample(
+                unary.float().contiguous(), cands.long().contiguous(), gate.contiguous(),
+                self.pred_codebook, self.succ_codebook, anchor_ids.long().to(hidden.device, non_blocking = anchor_ids.is_pinned()).contiguous(),
+                out, gumbel.contiguous(), q, float(temperature),
+            )
+            return out, q, cands
+        gate = gate.float()
+        pred = anchor_ids.long().to(hidden.device)
+        path = [pred]
+        qs = []
+        for i in range(rows):
+            a_emb = F.embedding(pred, self.pred_codebook).float()
+            b_emb = F.embedding(cands[:, i], self.succ_codebook).float()
+            scores = unary[:, i].float() + torch.einsum("br,bkr->bk", a_emb * gate[:, i], b_emb)
+            logq = torch.log_softmax(scores / temperature, dim = -1)
+            idx = torch.argmax(logq + gumbel[:, i], dim = -1)
+            pred = cands[:, i].gather(-1, idx[:, None])[:, 0]
+            path.append(pred)
+            qs.append(logq.exp())
+        return torch.stack(path, dim = 1), torch.stack(qs, dim = 1), cands
+
+
     def _walk_torch(self, unary, cands, gate, anchor_ids, return_confidence):
         pred = anchor_ids
         path = [pred]
