@@ -34,6 +34,13 @@ int DevCtx::get_cc(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!cc[device])
     {
+#if defined(USE_ROCM)
+        // HIP reports the gfx generation as the major version (gfx11 -> 11), which the NVIDIA thresholds
+        // below would read as Blackwell. Until RDNA devices get classes of their own, they take the
+        // conservative host-side choices of the oldest class (the device code is unaffected: the
+        // EXL3_SM75 gate in arch.cuh is compile-time and off for HIP)
+        cc[device] = CC_OLD;
+#else
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
@@ -41,6 +48,7 @@ int DevCtx::get_cc(int device)
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
         else if (prop.major >= 8) cc[device] = CC_AMPERE;
         else cc[device] = CC_OLD;
+#endif
     }
     return cc[device];
 }

@@ -137,7 +137,7 @@ def test_grouped_dynamic_convolve_torch_matches_reference():
 
 
 def test_grouped_dynamic_convolve_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(1)
@@ -155,7 +155,7 @@ def test_grouped_dynamic_convolve_cuda_matches_torch():
 
 
 def test_grouped_dynamic_convolve_cuda_handles_odd_geometry():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(2)
@@ -171,7 +171,7 @@ def test_grouped_dynamic_convolve_cuda_handles_odd_geometry():
 
 
 def test_grouped_dynamic_convolve_cuda_preserves_fp32_finish():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     hidden = torch.full((1, 8, 96), 1.5e5, dtype = torch.float32, device = "cuda")
@@ -188,7 +188,7 @@ def test_grouped_dynamic_convolve_cuda_preserves_fp32_finish():
 
 
 def test_grouped_dynamic_convolve_cuda_fused_residual():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(3)
@@ -207,7 +207,7 @@ def test_grouped_dynamic_convolve_cuda_fused_residual():
 
 
 def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     import pytest
     hidden = torch.randn(1, 4, 96, dtype = torch.float16, device = "cuda")
@@ -223,7 +223,7 @@ def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
 
 
 def test_selector_walk_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     from exllamav3.modules.arch_specific.dflash2 import DFlash2Selector
     torch.manual_seed(5)
@@ -257,7 +257,7 @@ def test_selector_walk_cuda_matches_torch():
 
 
 def test_topk_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     torch.manual_seed(6)
     for k in (8, 16, 32):
@@ -421,7 +421,7 @@ def test_sample_exports_selector_confidence_for_dynamic_drafting():
 def test_walk_block_takes_the_generators_strided_state():
     """Batched drafting hands walk_block state[:, 1:] and logits[:, 1:] of fp16 tensors: strided
     views once there is more than one row"""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     from exllamav3.modules.quant import LinearFP16
     torch.manual_seed(7)

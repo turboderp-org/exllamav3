@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda/atomic>
 #include "arch.cuh"
+#include "ptx_portable.cuh"
 
 // Tensor core fragments
 
@@ -301,6 +302,9 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 
 __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
 {
+#if defined(USE_ROCM)
+    return exl3_mul_lo_u32(x, y);
+#else
     uint32_t w;
     asm volatile
     (
@@ -309,10 +313,14 @@ __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
         :  "r"(x), "r"(y)
     );
     return w;
+#endif
 }
 
 __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
 {
+#if defined(USE_ROCM)
+    return exl3_mul_hi_u32(x, y);
+#else
     uint32_t w;
     asm volatile
     (
@@ -321,6 +329,7 @@ __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
         :  "r"(x), "r"(y)
     );
     return w;
+#endif
 }
 
 // Memory ops
@@ -392,15 +401,24 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, int length)
 {
     uint64_t value = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+#if defined(USE_ROCM)
+    return exl3_bfe_u64(value, offset, length);
+#else
     uint64_t result64;
     asm ("bfe.u64 %0, %1, %2, %3;"
          : "=l"(result64)
          : "l"(value), "r"(offset), "r"(length));
     return static_cast<uint32_t>(result64);
+#endif
 }
 
-#define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
-#define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+#if defined(USE_ROCM)
+    #define FSHF_IMM(dst, lo, hi, imm) (dst) = exl3_shf_r_wrap((lo), (hi), (imm))
+    #define BFE16_IMM(dst, src, imm) (dst) = exl3_bfe_u32_16((src), (imm))
+#else
+    #define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
+    #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+#endif
 
 // Inter-block barrier
 

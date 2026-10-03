@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
-from .util.cuda_flags import cuda_cflags
+from .util.cuda_flags import cuda_cflags, extension_sources
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -113,8 +113,9 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
-    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe
-    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe.
+    # ROCm: CUDAHOSTCXX belongs to nvcc; hipcc takes no -ccbin
+    if not windows and not torch.version.hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
     elif windows and os.environ.get("CUDAHOSTCXX"):
         print(
@@ -123,10 +124,7 @@ else:
             file = sys.stderr
         )
 
-    if torch.version.hip:
-        extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
-
-    if verbose:
+    if verbose and not torch.version.hip:
         extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
@@ -137,17 +135,15 @@ else:
         extra_ldflags += ["cublas.lib"]
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
+    elif torch.version.hip:
+        # The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu)
+        extra_ldflags += ["-lhipblas"]
 
     # sources
 
     library_dir = os.path.dirname(os.path.abspath(__file__))
     sources_dir = os.path.join(library_dir, extension_name)
-    sources = [
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith(('.c', '.cpp', '.cu'))
-    ]
+    sources = extension_sources(sources_dir, hip = bool(torch.version.hip))
 
     # Load extension
 

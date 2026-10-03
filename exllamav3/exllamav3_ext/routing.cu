@@ -261,11 +261,15 @@ void routing_gemv
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
+    // (the deterministic projection is CUDA-only: routing_gemm.cu is left out of ROCm builds)
+#if !defined(USE_ROCM)
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
-    else if (bsz1 && gate_t.has_value() && !(k & 1))
+    else
+#endif
+    if (bsz1 && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (

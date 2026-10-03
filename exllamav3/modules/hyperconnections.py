@@ -333,10 +333,10 @@ class GatedResidual(Module):
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
         # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
-        # instructions — so the path is Ampere+ only; below that the cuBLAS
-        # fallback serves the projection.
+        # instructions — so the path is Ampere+ only, and absent from ROCm builds;
+        # elsewhere the cuBLAS fallback serves the projection.
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda" \
+            and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
             and torch.cuda.get_device_capability(dev)[0] >= 8
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous

@@ -113,8 +113,11 @@ void hgemm_batched
     at::Tensor c
 )
 {
-    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS
+    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS. The ROCm build
+    // has no fp16-accumulator kernel (hgemm_f16acc.cu is CUDA-only)
+#if !defined(USE_ROCM)
     if (hgemm_f16acc_try(a, w, c)) return;
+#endif
 
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

@@ -76,10 +76,11 @@ class RoutingCFG:
 def _gate_t(cfg):
     """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
     scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
-    (weights may be deferred when the RoutingCFG is constructed)."""
+    (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
+    projection (ROCm) leave the int8 slices unset and route on the half gate."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)

@@ -8,6 +8,7 @@ import sys, os, unittest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.modules.hyperconnections import GatedResidual
+from exllamav3.ext import exllamav3_ext as ext
 
 DEVICE = torch.device("cuda:0")
 
@@ -30,7 +31,7 @@ def rel(a, b):
     return ((a.float() - b.float()).abs().max() / b.float().abs().max()).item()
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(torch.cuda.is_available() and ext.HAS_GR_MIX_TILED, "CUDA build with the tiled mix kernels required")
 class TestGrMixTiled(unittest.TestCase):
 
     CASES = [

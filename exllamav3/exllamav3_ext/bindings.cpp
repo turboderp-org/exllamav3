@@ -76,6 +76,19 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    // Optional kernel families. The ROCm build leaves out the sources written in inline PTX with no portable
+    // form yet (util/cuda_flags.py, HIP_EXCLUDED_SOURCES) together with their bindings below; Python checks
+    // these before taking a path that needs them
+#if defined(USE_ROCM)
+    const bool cuda_only = false;
+#else
+    const bool cuda_only = true;
+#endif
+    m.attr("HAS_GR_MIX_TILED") = cuda_only;     // gr_mix_tiled, gr_mix_tiled_slices
+    m.attr("HAS_DET_GEMM") = cuda_only;         // routing_gemm_det, det_quant_weight, det_math_test
+    m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
+    m.attr("HAS_DFLASH2") = cuda_only;          // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
+
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
@@ -121,12 +134,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
+#if !defined(USE_ROCM)
     m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
     m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
+#endif
     m.def("routing_std", &routing_std, "routing_std");
+#if !defined(USE_ROCM)
     m.def("routing_gemm_det", &routing_gemm_det, "routing_gemm_det");
     m.def("det_quant_weight", &det_quant_weight, "det_quant_weight");
     m.def("det_math_test", &det_math_test, "det_math_test");
+#endif
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
@@ -194,8 +211,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+#if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+#endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
@@ -249,9 +268,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
+#if !defined(USE_ROCM)
     m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
     m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
     m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
+#endif
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");

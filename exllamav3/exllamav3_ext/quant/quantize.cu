@@ -95,6 +95,10 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
 {
     if (const char* env = std::getenv("EXL3_QT_OPTIMIZED"))
         return env[0] == '1';
+#if defined(USE_ROCM)
+    // HIP's major is the gfx generation, so major == 12 would select the sm_120 specializations on RDNA4
+    return false;
+#endif
     if (major == 12) return true;
     if (major == 8 && minor == 9)
         return K == 1 || K == 2 || K == 4 || K == 5 || (K == 7 && cb == 0) || K == 8;

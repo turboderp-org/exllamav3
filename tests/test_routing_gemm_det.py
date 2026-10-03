@@ -23,7 +23,7 @@ def quant_gate(gate):
     return gate_t, g8, sb
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(torch.cuda.is_available() and ext.HAS_DET_GEMM, "CUDA build with the deterministic GEMM required")
 class TestRoutingGemmDet(unittest.TestCase):
 
     def test_matches_reference(self):

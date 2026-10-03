@@ -7,6 +7,10 @@ import torch
 
 def maybe_set_arch_list_env():
 
+    if torch.version.hip:
+        maybe_set_rocm_arch_env()
+        return
+
     if os.environ.get('TORCH_CUDA_ARCH_LIST', None):
         return
 
@@ -36,5 +40,28 @@ def maybe_set_arch_list_env():
     arch_list[-1] += '+PTX'
 
     os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(arch_list)
+
+def maybe_set_rocm_arch_env():
+    """
+    ROCm counterpart of the above: build for the visible devices' architectures unless PYTORCH_ROCM_ARCH
+    names them. gcnArchName carries target features after the name (e.g. "gfx90a:sramecc+:xnack-"), which
+    the offload-arch list does not take.
+
+    The kernels assume 32-lane warps throughout, which only RDNA parts (gfx10 and later consumer/workstation
+    GPUs) run; CDNA accelerators execute in wave64, so they are rejected here rather than failing obscurely
+    inside the kernels.
+    """
+    archs = set()
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        warp = getattr(props, "warp_size", 32)
+        if warp != 32:
+            raise RuntimeError(
+                f"Device {i} ({props.name}, {props.gcnArchName}) executes {warp}-wide wavefronts. "
+                f"exllamav3 on ROCm supports wave32 (RDNA) GPUs only."
+            )
+        archs.add(props.gcnArchName.split(":")[0])
+    if archs and not os.environ.get("PYTORCH_ROCM_ARCH"):
+        os.environ["PYTORCH_ROCM_ARCH"] = ";".join(sorted(archs))
 
 maybe_set_arch_list_env()

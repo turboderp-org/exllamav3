@@ -163,6 +163,8 @@ def arch_prior_speed(device: int) -> float:
     before any measurements exist. From measured conversion throughput: Ampere lands at about
     half of Ada, which is about 80% of Blackwell (Hopper assumed equal to Blackwell); anything
     older is pessimistically assumed half of Ampere."""
+    if torch.version.hip:
+        return 1.0                                    # no measurements (HIP's major is the gfx generation)
     major, minor = torch.cuda.get_device_capability(device)
     if major >= 9: return 5.0                        # Hopper, Blackwell
     if major == 8: return 4.0 if minor == 9 else 2.0  # Ada / Ampere

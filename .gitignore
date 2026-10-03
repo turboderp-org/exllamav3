@@ -10,3 +10,8 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# written next to the sources by torch's hipify during ROCm builds
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/hip_*
