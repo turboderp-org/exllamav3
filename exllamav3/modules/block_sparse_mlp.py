@@ -19,7 +19,7 @@ from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
-    routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
+    routing_std, routing_std_bias, routing_ds3, routing_ds3_fp32, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
@@ -184,9 +184,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         frange_dim: int = 0,
         gate_up_interleaved: bool = False,
         alt_residual_channel: bool = False,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        require_e_score_bias: bool = False,
     ):
         super().__init__(config, key, None)
+        if require_e_score_bias and not key_e_score_bias:
+            raise ValueError("require_e_score_bias requires key_e_score_bias")
+        self.require_e_score_bias = require_e_score_bias
 
         self.interm_dtype = interm_dtype
         self.interm_div = interm_div
@@ -462,6 +466,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             case "std": self.routing_fn = routing_std
             case "std_bias": self.routing_fn = routing_std_bias
             case "ds3": self.routing_fn = routing_ds3
+            case "ds3_fp32": self.routing_fn = routing_ds3_fp32
             case "dots": self.routing_fn = routing_dots
             case "sqrtsp": self.routing_fn = routing_sqrtsp
             case "sqrtsp_hash": self.routing_fn = routing_sqrtsp_hash
@@ -789,8 +794,37 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
 
 
+    def _validate_e_score_bias(self, tensor, key):
+        if not self.require_e_score_bias:
+            return
+        if tensor is None:
+            raise ValueError(f"Required expert correction tensor {key} not found")
+        if tuple(tensor.shape) != (self.num_experts,):
+            raise ValueError(f"Expert correction tensor {key} must have shape ({self.num_experts},), got {tuple(tensor.shape)}")
+        if not tensor.is_floating_point() or not torch.isfinite(tensor).all():
+            raise ValueError(f"Expert correction tensor {key} must contain finite floating-point values")
+
+    def _load_e_score_bias(self, device):
+        if self.e_score_correction_bias_key:
+            # Retain the legacy alias, but never hide a malformed primary behind
+            # a valid fallback. A missing trained tensor is not a zero tensor.
+            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
+                key = f"{self.key}.{k}"
+                esb = self.config.stc.get_tensor(
+                    key, device, optional = True, allow_bf16 = True, no_defer = True,
+                )
+                if esb is not None:
+                    self._validate_e_score_bias(esb, key)
+                    return esb if esb.dtype == torch.half else esb.float()
+        self._validate_e_score_bias(None, f"{self.key}.{self.e_score_correction_bias_key}")
+        return None
+
     @override
     def load(self, device: torch.Device, **kwargs):
+        # Required tensors fail before expert/native loading, including the
+        # whole-layer offload path which bypasses the normal loader below.
+        if self.require_e_score_bias:
+            self.e_score_correction_bias = self._load_e_score_bias(device)
         # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
         # GPU load entirely; a split registration shrinks the module to its GPU slice first
         if self.cpu_maybe_offload_load(device, **kwargs):
@@ -798,18 +832,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.cpu_maybe_split_load(device, **kwargs)
         super().load(device, **kwargs)
 
-        if self.e_score_correction_bias_key:
-            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
-                esb = self.config.stc.get_tensor(
-                    f"{self.key}.{k}",
-                    self.device,
-                    optional = True,
-                    allow_bf16 = True,
-                    no_defer = True,
-                )
-                if esb is not None:
-                    self.e_score_correction_bias = esb if esb.dtype == torch.half else esb.float()
-                    break
+        if not self.require_e_score_bias:
+            esb = self._load_e_score_bias(self.device)
+            if esb is not None:
+                self.e_score_correction_bias = esb
         if self.e_score_bias_vl_key:
             esb_vl = self.config.stc.get_tensor(
                 f"{self.key}.{self.e_score_bias_vl_key}",
@@ -1584,6 +1610,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "alt_residual_channel": self.alt_residual_channel,
                 "key_tid2eid": self.tid2eid_key,
                 "key_e_score_bias_vl": self.e_score_bias_vl_key,
+                "key_e_score_bias": self.e_score_correction_bias_key,
+                "require_e_score_bias": self.require_e_score_bias,
             },
             # Hash-MoE bootstrap layers (DeepSeek-V4): frozen token->experts table, needed
             # wherever routing runs (the output device, like the routing gate)
@@ -1701,6 +1729,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
+        module._validate_e_score_bias(
+            module.e_score_correction_bias, f"{key}.{module.e_score_correction_bias_key}",
+        )
         if exported.get("e_score_bias_vl") is not None:
             module.e_score_bias_vl = consumer.recv(exported["e_score_bias_vl"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)

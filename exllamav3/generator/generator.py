@@ -786,6 +786,7 @@ class Generator:
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
+                "output_vocab_size": self.tokenizer.actual_vocab_size,
             }
             if cal is not None:
                 params["export_draft_conf"] = True

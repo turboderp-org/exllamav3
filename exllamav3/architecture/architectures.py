@@ -1,6 +1,7 @@
 from .arcee import ArceeModel
 from .afmoe import AfmoeModel
 from .apertus import ApertusModel
+from .bailing_moe_v3 import BailingMoeV3Model
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
@@ -71,6 +72,7 @@ ARCHITECTURES = {
         ArceeModel,
         AfmoeModel,
         ApertusModel,
+        BailingMoeV3Model,
         CohereModel,
         Cohere2Model,
         DeciLMModel,
