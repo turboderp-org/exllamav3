@@ -1065,9 +1065,9 @@ void hc_apply
         (float*) x.data_ptr(), (const Y_T*) y.data_ptr(), \
         (const float*) post.data_ptr(), comb_p, wn_p, xw_p, D, chunk_cols
     #define LAUNCH(Y_T) \
-        if (comb_p)      hc_apply_kernel<4, Y_T, true, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
-        else if (xw_p)   hc_apply_kernel<4, Y_T, false, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
-        else             hc_apply_kernel<4, Y_T, false, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T));
+        if (comb_p)      { hc_apply_kernel<4, Y_T, true, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); } \
+        else if (xw_p)   { hc_apply_kernel<4, Y_T, false, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); } \
+        else             { hc_apply_kernel<4, Y_T, false, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); }
     TORCH_CHECK(!(comb_p && xw_p), "hc_apply: xw is for the comb-less (GatedResidual) form");
     if (y.dtype() == at::kHalf) { LAUNCH(half) }
     else                        { LAUNCH(float) }
@@ -1148,11 +1148,12 @@ void gr_mix
             (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), (const half*) upt.data_ptr(), (const half*) w.data_ptr(), \
             post_p, mixed.data_ptr(), D, LR, R, (float) rms_eps
         const bool hout = mixed.dtype() == at::kHalf;
+        // Braced bodies: torch's hipify misparses `else <kernel><<<...` as a kernel name on ROCm.
         switch (nit)
         {
-            case 5:  if (hout) gr_finalize_kernel2<4, true, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
-            case 8:  if (hout) gr_finalize_kernel2<4, true, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
-            case 16: if (hout) gr_finalize_kernel2<4, true, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); else gr_finalize_kernel2<4, false, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); break;
+            case 5:  if (hout) { gr_finalize_kernel2<4, true, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 5><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
+            case 8:  if (hout) { gr_finalize_kernel2<4, true, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 8><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
+            case 16: if (hout) { gr_finalize_kernel2<4, true, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } else { gr_finalize_kernel2<4, false, 16><<<grid_c2, GR_THREADS_C, smem2, stream>>>(ARGS2); } break;
         }
         #undef ARGS2
         cuda_check(cudaPeekAtLastError());
@@ -1161,8 +1162,8 @@ void gr_mix
 
     dim3 grid_a(M + 1, R);
     #define DOTS_ARGS (const float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), w_p, (float*) dots.data_ptr(), M, D
-    if (ws_p) gr_dots_kernel<4, true><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS);
-    else      gr_dots_kernel<4, false><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS);
+    if (ws_p) { gr_dots_kernel<4, true><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS); }
+    else      { gr_dots_kernel<4, false><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS); }
     #undef DOTS_ARGS
     cuda_check(cudaPeekAtLastError());
 

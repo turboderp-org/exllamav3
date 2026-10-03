@@ -19,7 +19,11 @@
 #endif
 
 #ifndef SMEM_MAX
+#if defined(USE_ROCM)
+#define SMEM_MAX (64 * 1024)  // dynamic shared memory opt-in limit on AMD parts
+#else
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
+#endif
 #endif
 
 #define EXL3_MOE_KERNEL_ARGS                    \

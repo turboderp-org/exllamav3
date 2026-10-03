@@ -1,5 +1,7 @@
 #include <cuda_fp16.h>
+#if !defined(USE_ROCM)
 #include <cuda_fp16.hpp>
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -1646,16 +1648,45 @@ void gdn_ba_gemv_kernel
     if (row >= n) return;
     int r = blockIdx.y;
 
-    const half2* x2 = (const half2*) (x + (size_t) r * k);
-    const half2* w2 = (const half2*) (w_t + (size_t) row * k);
-
     float sum = 0.0f;
-    for (int j = lane; j < k / 2; j += 32)
+    // A20: vectorize the k-loop. The half2 version issues 4 B loads with a 32-lane stride and
+    // spends its time latency-bound at ~30 GB/s effective (21.5 us per call x 48 GDN layers =
+    // 1.03 ms/token on Qwen3.8-27B); float4 halves the load count per output and keeps each
+    // warp-iteration a coalesced 512 B line. k % 8 tail (k is 5120 here) falls back to half2.
+    if ((k & 7) == 0)
     {
-        float2 xf = __half22float2(x2[j]);
-        float2 wf = __half22float2(w2[j]);
-        sum = fmaf(xf.x, wf.x, sum);
-        sum = fmaf(xf.y, wf.y, sum);
+        const float4* x4 = (const float4*) (x + (size_t) r * k);
+        const float4* w4 = (const float4*) (w_t + (size_t) row * k);
+        #pragma unroll 4
+        for (int j = lane; j < k / 8; j += 32)
+        {
+            float4 xv = x4[j];
+            float4 wv = w4[j];
+            float2 x0 = __half22float2(*(const __half2*) &xv.x);
+            float2 x1 = __half22float2(*(const __half2*) &xv.y);
+            float2 x2 = __half22float2(*(const __half2*) &xv.z);
+            float2 x3 = __half22float2(*(const __half2*) &xv.w);
+            float2 w0 = __half22float2(*(const __half2*) &wv.x);
+            float2 w1 = __half22float2(*(const __half2*) &wv.y);
+            float2 w2 = __half22float2(*(const __half2*) &wv.z);
+            float2 w3 = __half22float2(*(const __half2*) &wv.w);
+            sum = fmaf(x0.x, w0.x, sum); sum = fmaf(x0.y, w0.y, sum);
+            sum = fmaf(x1.x, w1.x, sum); sum = fmaf(x1.y, w1.y, sum);
+            sum = fmaf(x2.x, w2.x, sum); sum = fmaf(x2.y, w2.y, sum);
+            sum = fmaf(x3.x, w3.x, sum); sum = fmaf(x3.y, w3.y, sum);
+        }
+    }
+    else
+    {
+        const half2* x2 = (const half2*) (x + (size_t) r * k);
+        const half2* w2 = (const half2*) (w_t + (size_t) row * k);
+        for (int j = lane; j < k / 2; j += 32)
+        {
+            float2 xf = __half22float2(x2[j]);
+            float2 wf = __half22float2(w2[j]);
+            sum = fmaf(xf.x, wf.x, sum);
+            sum = fmaf(xf.y, wf.y, sum);
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include "hip_compat.cuh"
 
 typedef struct __align__(8) half4
 {
@@ -11,9 +12,11 @@ typedef struct __align__(8) half4
     half2 y;
     __device__ half4() = default;
     __device__ half4(half2 x_, half2 y_) : x(x_), y(y_) {}
+#if !defined(USE_ROCM) || defined(__HIPCC__)
     __device__ half4(half h0, half h1, half h2, half h3) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)) {}
+#endif
 }
 half4;
 
@@ -23,9 +26,11 @@ typedef struct __align__(8) bfloat164
     __nv_bfloat162 y;
     __device__ bfloat164() = default;
     __device__ bfloat164(__nv_bfloat162 x_, __nv_bfloat162 y_): x(x_), y(y_) {}
+#if !defined(USE_ROCM) || defined(__HIPCC__)
     __device__ bfloat164(__nv_bfloat16 b0, __nv_bfloat16 b1, __nv_bfloat16 b2, __nv_bfloat16 b3) :
         x(__halves2bfloat162(b0, b1)),
         y(__halves2bfloat162(b2, b3)) {}
+#endif
 }
 bfloat164;
 
@@ -37,11 +42,13 @@ typedef struct __align__(16) half8
     half2 w;
      __device__ half8() = default;
      __device__ half8(half2 x_, half2 y_, half2 z_, half2 w_) : x(x_), y(y_), z(z_), w(w_) {}
+#if !defined(USE_ROCM) || defined(__HIPCC__)
      __device__ half8(half h0, half h1, half h2, half h3, half h4, half h5, half h6, half h7) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)),
          z(__halves2half2(h4, h5)),
          w(__halves2half2(h6, h7)) {}
+#endif
 }
 half8;
 
@@ -110,7 +117,9 @@ inline const char* cublasGetErrorString(cublasStatus_t status) {
         case CUBLAS_STATUS_EXECUTION_FAILED:  return "CUBLAS_STATUS_EXECUTION_FAILED";
         case CUBLAS_STATUS_INTERNAL_ERROR:    return "CUBLAS_STATUS_INTERNAL_ERROR";
         case CUBLAS_STATUS_NOT_SUPPORTED:     return "CUBLAS_STATUS_NOT_SUPPORTED";
+#if !defined(USE_ROCM)
         case CUBLAS_STATUS_LICENSE_ERROR:     return "CUBLAS_STATUS_LICENSE_ERROR";
+#endif
         default:                              return "Unknown cuBLAS status";
     }
 }

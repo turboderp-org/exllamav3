@@ -314,7 +314,7 @@ void set_kernel_attr_once(void* kernel, size_t smem)
     auto key = std::make_tuple(device, kernel, smem);
     if (attr_set.find(key) != attr_set.end()) return;
 
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
     attr_set.insert(key);
 }
 
@@ -525,7 +525,13 @@ CoopAutotuneLaunch tune
         TORCH_CHECK(base.kernel, "CoopKernelAutotuner: null kernel candidate");
         TORCH_CHECK(base.block_dim > 0, "CoopKernelAutotuner: invalid block_dim");
         TORCH_CHECK(base.max_num_sms > 0, "CoopKernelAutotuner: invalid max_num_sms");
+#if defined(USE_ROCM)
+        // RDNA over-reports cooperative co-residency: concurrency > 1 deadlocks
+        // grid.sync() (observed on gfx1100). Explore (shape, num_sms) only.
+        int max_concurrency = 1;
+#else
         int max_concurrency = MAX(base.max_concurrency, 1);
+#endif
         int total_sms = base.total_sms > 0 ? base.total_sms : base.max_num_sms;
 
         if (max_concurrency > 1 || base.max_num_sms == 1)

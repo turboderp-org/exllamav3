@@ -1,4 +1,5 @@
 
+#include "../hip_compat.cuh"
 __device__ __forceinline__ void pg_barrier_inner
 (
     PGContext* __restrict__ ctx,

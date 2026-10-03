@@ -296,6 +296,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // straggler's in-flight grab could land after the reset and leak into the next launch)
     if (block_idx == 0 && threadIdx.x == 0)
     {
+#if defined(USE_ROCM)
+        int retired = __hip_atomic_fetch_add(&sched[1], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (retired == num_groups - 1)
+        {
+            __hip_atomic_store(&sched[0], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(&sched[1], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+#else
         cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);
         cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(sched[1]);
         int retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
@@ -304,5 +312,6 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             next_ticket.store(0, cuda::memory_order_relaxed);
             retired_groups.store(0, cuda::memory_order_relaxed);
         }
+#endif
     }
 }

@@ -9,6 +9,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.modules.hyperconnections import GatedResidual
 
+if torch.version.hip:
+    raise unittest.SkipTest("CUDA-only kernels (det_gemm/routing_gemm/hc_mix_tiled) are not in HIP builds")
+
 DEVICE = torch.device("cuda:0")
 
 

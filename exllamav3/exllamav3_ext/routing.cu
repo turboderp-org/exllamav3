@@ -1,6 +1,9 @@
 #include <cuda_fp16.h>
 #include "routing.cuh"
-#include "det_gemm.cuh"
+#if !defined(USE_ROCM)
+#include "det_gemm.cuh"   // inline PTX (mma.m16n8k32, cp.async, ldmatrix) - CUDA only
+#endif
+#include "det_math.cuh"   // exp_det/softplus_det; portable (FMA-only), needed on HIP too
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -261,11 +264,15 @@ void routing_gemv
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
+#if !defined(USE_ROCM)
+    // routing_gemm.cu is not part of HIP builds; gate_i8/gate_sb are never prepared on ROCm
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
-    else if (bsz1 && gate_t.has_value() && !(k & 1))
+    else
+#endif
+    if (bsz1 && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (

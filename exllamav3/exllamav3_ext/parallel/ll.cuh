@@ -1,4 +1,5 @@
 #pragma once
+#include "../hip_compat.cuh"
 
 __device__ __forceinline__ uint32_t synced_read_uint32
 (

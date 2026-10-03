@@ -24,6 +24,8 @@
 #define CC_ADA        3
 #define CC_HOPPER     4
 #define CC_BLACKWELL  5
+#define CC_RDNA3      6   // gfx1100 series (RX 7900 XTX etc.)
+#define CC_CDNA3      7   // gfx942 (MI300X) — future, requires wave32 mode + MFMA
 
 // Singleton to manage context for each device. Stores device attributes and a large-enough lock buffer per device
 class DevCtx

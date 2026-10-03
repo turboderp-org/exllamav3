@@ -93,6 +93,13 @@ static const half2* quantize_codebook(int device, int cb, const at::Tensor& inpu
 // extension through quantize_tiles_scratch, so the layouts always agree
 bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
 {
+#if defined(USE_ROCM)
+    // The optimized kernel keeps both cost arrays in shared memory unconditionally;
+    // at K = 2 that is 64 KB, which exceeds the AMD dynamic-smem limit. K = 1 and 2
+    // must take the generic kernel (global-memory costs) on ROCm even when the
+    // EXL3_QT_OPTIMIZED override is set.
+    if (K <= 2) return false;
+#endif
     if (const char* env = std::getenv("EXL3_QT_OPTIMIZED"))
         return env[0] == '1';
     if (major == 12) return true;
@@ -120,14 +127,20 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto* props = at::cuda::getDeviceProperties(device);
     const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
     const int edges = 65536 >> K;
+#if defined(USE_ROCM)
+    // AMD caps dynamic smem at 64 KB; K=2's two cost arrays alone need 64 KB, so the
+    // kernel keeps them in global memory (same path as K=1).
+    const int cost_arrays = optimized && K == 1 ? 1 : (K >= 3 ? 2 : 0);
+#else
     const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
+#endif
     const int shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, (const void*) kernel));
     int blocks_per_sm;
     cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, attr.maxThreadsPerBlock, shmem));
     return {optimized, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm};
@@ -280,7 +293,7 @@ void quantize_tiles_frac
     const int num_tiles = input_tiles.size(0);
     if (!num_tiles) return;
     const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128;
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    cuda_check(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {

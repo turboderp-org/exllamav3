@@ -7,7 +7,11 @@ from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
 
-AUTO_RECONSTRUCT_THRESHOLD = 144
+# rows <= this use int8 GEMV (decode). Above it, reconstruct + hipBLAS.
+# 144 is the NVIDIA-tuned default. On RDNA3 GEMV is ~56 tok/s, reconstruct ~700,
+# and the crossover is around 16 tokens — chat prefills (20-100) otherwise sit
+# on the decode path and cost 0.5-1.5s TTFT. Serve sets EXL3_RECONSTRUCT_THRESHOLD.
+AUTO_RECONSTRUCT_THRESHOLD = int(os.environ.get("EXL3_RECONSTRUCT_THRESHOLD", "144"))
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 

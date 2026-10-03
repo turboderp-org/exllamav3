@@ -1,4 +1,5 @@
 #pragma once
+#include "../hip_compat.cuh"
 
 // Dense specializations tuned on sm_120
 #include "quantize_tiles_kernel.cuh"

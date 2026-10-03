@@ -1882,7 +1882,7 @@ def paged_attn_triton_prefill(
     # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
     # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
-    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
+    blackwell = torch.version.hip is None and torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
         cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
     elif hd_pad <= 256:

@@ -1,3 +1,5 @@
+import torch
+
 from .arcee import ArceeModel
 from .afmoe import AfmoeModel
 from .apertus import ApertusModel
@@ -138,6 +140,22 @@ ARCHITECTURES = {
         Step3_7Model,
     ]
 }
+
+# Architectures whose kernels are CUDA-only for now (inline PTX / CUDA-driver-API
+# sources that are excluded from the HIP build). They stay registered so config
+# loading can fail with an explicit message instead of "Unknown architecture".
+ROCM_UNSUPPORTED_ARCHS = set()
+
+if torch.version.hip:
+    ROCM_UNSUPPORTED_ARCHS = {
+        m.config_class.arch_string
+        for m in (
+            DFlash2Model,
+            KimiLinearModel,
+            MiMoV2Model,
+        )
+    }
+
 
 def get_architectures():
     return ARCHITECTURES

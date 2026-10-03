@@ -8,6 +8,14 @@ namespace py = pybind11;
 #include <cuda_fp16.h>
 #include <cuda.h>
 
+#if defined(USE_ROCM)
+// hipify does not map the driver-API node param types; HIP exposes a single
+// hipKernelNodeParams for both runtime- and module-launched kernel nodes.
+using cudaKernelNodeParams = hipKernelNodeParams;
+using CUDA_KERNEL_NODE_PARAMS = hipKernelNodeParams;
+using CUgraphNode = hipGraphNode_t;
+using CUgraphExec = hipGraphExec_t;
+#endif
 using PPTR = std::tuple<int, void*>;
 
 enum GraphedParams

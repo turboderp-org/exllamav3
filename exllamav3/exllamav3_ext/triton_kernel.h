@@ -3,29 +3,40 @@
 #include <ATen/Tensor.h>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#else
 #include <cuda.h>
 #include <cuda_runtime.h>
+#endif
 #include <string>
 #include <vector>
 
-// A Triton kernel compiled ahead of time (triton.compile -> asm["cubin"]), loadable and
-// launchable from C++ through the driver API. Launch args are the kernel's non-constexpr
-// parameters in signature order; Triton appends two hidden trailing pointer params (global and
-// profile scratch), which launch() supplies as null (scratch sizes must be 0, which holds for
-// all kernels used here). Compatible with Graph::record_param: kernel nodes captured from
-// cuLaunchKernel are identified by the CUfunction handle().
+// A Triton kernel compiled ahead of time (triton.compile -> asm["cubin"] on CUDA,
+// asm["hsaco"] on ROCm), loadable and launchable from C++ through the driver API.
+// Launch args are the kernel's non-constexpr parameters in signature order; Triton
+// appends two hidden trailing pointer params (global and profile scratch), which
+// launch() supplies as null (scratch sizes must be 0, which holds for all kernels
+// used here). Compatible with Graph::record_param: kernel nodes captured from
+// cuLaunchKernel/hipModuleLaunchKernel are identified by the function handle.
 //
-// The module is loaded into the primary context of the device that is current at construction;
-// construct under the target torch device.
+// The module is loaded into the primary context of the device that is current at
+// construction; construct under the target torch device.
 
 struct TritonKernel
 {
+#if defined(USE_ROCM)
+    hipModule_t mod = nullptr;
+    hipFunction_t fn = nullptr;
+#else
     CUmodule mod = nullptr;
     CUfunction fn = nullptr;
+#endif
     std::string name;
     int num_warps;
     int shared_bytes;
     int grid_y = 1;     // second launch-grid axis chosen at compile time (sub-tiles), read by the graph launch sites
+    int warp_size;
 
     TritonKernel(py::bytes cubin, std::string name, int num_warps, int shared_bytes);
     ~TritonKernel();

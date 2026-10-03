@@ -20,7 +20,7 @@ test_keys = [
 ]
 
 devices = [
-    "cuda:2"
+    "cuda:0"
 ]
 
 batch_sizes = [1, 2, 8, 16, 17, 31, 32, 33, 256, 2048]

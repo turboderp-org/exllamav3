@@ -259,6 +259,12 @@ class Config(ABC):
         arch = archs[0]
         assert arch in architectures, f"Unknown architecture {arch} in {config_filename}"
 
+        from exllamav3.architecture.architectures import ROCM_UNSUPPORTED_ARCHS
+        assert arch not in ROCM_UNSUPPORTED_ARCHS, (
+            f"Architecture {arch} is not supported on ROCm: its kernels are "
+            f"CUDA-only for now (excluded from the HIP build)."
+        )
+
         arch_def = architectures[arch]
         config_class = arch_def["config_class"]
         # config = config_class(directory, arch_override = arch_override, **kwargs)
