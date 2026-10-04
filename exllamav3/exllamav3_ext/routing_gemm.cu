@@ -33,7 +33,13 @@ allocation on the host-bound decode path); larger calls allocate per call.
 #define RG_BM 128
 #define RG_BN 64
 #define RG_THREADS 512
-#define RG_STAGES 2
+// One stage on ROCm: its copies are synchronous (rocm/det_gemm_rocm.cuh), so a second stage would overlap
+// nothing, and two do not fit RDNA's 64 KB of LDS per workgroup
+#if defined(USE_ROCM)
+    #define RG_STAGES 1
+#else
+    #define RG_STAGES 2
+#endif
 #define RG_KCH 128
 #define RG_A_BYTES (2 * RG_BM * RG_KCH)
 #define RG_B_BYTES (2 * RG_BN * RG_KCH)
@@ -149,7 +155,7 @@ void routing_gemm_i8_kernel
     {
         det_cp_async_wait<0>();
         __syncthreads();
-        if (chunk + 1 < n_chunks) issue(chunk + 1, (chunk + 1) % RG_STAGES);
+        if (RG_STAGES > 1 && chunk + 1 < n_chunks) issue(chunk + 1, (chunk + 1) % RG_STAGES);
         det_cp_async_commit();
         const int st = chunk % RG_STAGES;
         const unsigned a_hi = det_smem_u32(st_ahi(st)), a_lo = det_smem_u32(st_alo(st));
@@ -193,6 +199,12 @@ void routing_gemm_i8_kernel
                 #pragma unroll
                 for (int q = 0; q < 4; ++q)
                     facc[i][j][q] = det_flush(acc_hh[i][j][q], acc_x[i][j][q], q >= 2 ? s1 : s0, facc[i][j][q]);
+        }
+        // Single buffer: the next chunk can only land once everyone is done with this one
+        if (RG_STAGES == 1 && chunk + 1 < n_chunks)
+        {
+            __syncthreads();
+            issue(chunk + 1, 0);
         }
     }
     det_cp_async_wait<0>();

@@ -95,6 +95,15 @@ struct BC_BlockSparseMLP
     std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
     at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
 
+#if defined(USE_ROCM)
+    // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
+    // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
+    bool rdna_moe = false;
+    at::Tensor rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh;     // (2E) gate tables then up tables
+    int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
+    bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
+#endif
+
     int max_experts_per_token;
     int max_tokens_per_expert;
     std::vector<at::Tensor> interm_g_single;

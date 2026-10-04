@@ -1,6 +1,7 @@
 from __future__ import annotations
 from abc import ABC
 import os, json
+import torch
 from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
@@ -27,7 +28,8 @@ class InferParams:
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
         # int8 gate); narrow same-input pairs stay fused, where batching is what restores
         # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
-        if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
+        # (the int8 mode is off by default on ROCm, see exl3_gemv_int8.cu)
+        if int(os.environ.get("EXL3_INT8_GEMV", 0 if torch.version.hip else 2)) > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
         self.mgemm_K_env = "EXL3_MGEMM_K_THRESHOLD" in os.environ

@@ -51,7 +51,14 @@ det_quant_weight). Workspaces are sized by the caller from gr_mix_tiled_slices()
 #define DOTS_A_BYTES (2 * DOTS_BM * DOTS_KCH)
 #define DOTS_B_BYTES (2 * DOTS_BN * DOTS_KCH)
 #define DOTS_STAGE_BYTES (DOTS_A_BYTES + DOTS_B_BYTES)
-#define DOTS_SMEM (2 * DOTS_STAGE_BYTES)
+// One stage on ROCm: its copies are synchronous (rocm/det_gemm_rocm.cuh), so a second stage would overlap
+// nothing, and two do not fit RDNA's 64 KB of LDS per workgroup
+#if defined(USE_ROCM)
+    #define DOTS_STAGES 1
+#else
+    #define DOTS_STAGES 2
+#endif
+#define DOTS_SMEM (DOTS_STAGES * DOTS_STAGE_BYTES)
 #define GATE_BM 64
 #define GATE_TD 32
 #define GATE_KCH 64
@@ -78,7 +85,7 @@ void gr_dots_i8
 )
 {
     extern __shared__ __align__(128) unsigned char dsm[];
-    __shared__ float sa_s[2][DOTS_BM];
+    __shared__ float sa_s[DOTS_STAGES][DOTS_BM];
     const int HD = HC * D;
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
     const int wm = warp / 8, wn = warp % 8;
@@ -167,9 +174,9 @@ void gr_dots_i8
         const bool more = stg + 1 < n_stages;
         det_cp_async_wait<0>();
         __syncthreads();                     // this stage complete for everyone; stage - 1 consumed
-        if (more) { issue_b(k0 + DOTS_KCH, (stg + 1) & 1); fetch_a(k0 + DOTS_KCH); }
+        if (more) { if (DOTS_STAGES > 1) issue_b(k0 + DOTS_KCH, (stg + 1) & 1); fetch_a(k0 + DOTS_KCH); }
         det_cp_async_commit();
-        const int st = stg & 1;
+        const int st = DOTS_STAGES > 1 ? stg & 1 : 0;
         const unsigned a_hi = det_smem_u32(st_ahi(st)), a_lo = det_smem_u32(st_alo(st));
         const unsigned b_hi = det_smem_u32(st_bhi(st)), b_lo = det_smem_u32(st_blo(st));
 
@@ -212,7 +219,14 @@ void gr_dots_i8
         }
         // The other buffer's A tiles were consumed in stage - 1 (everyone passed this stage's
         // barrier): quantize the prefetched next chunk into them
-        if (more) stage_a(k0 + DOTS_KCH, st ^ 1);
+        if (DOTS_STAGES == 1 && more)
+        {
+            // Single buffer: the next chunk can only land once everyone is done with this one
+            __syncthreads();
+            issue_b(k0 + DOTS_KCH, 0);
+            stage_a(k0 + DOTS_KCH, 0);
+        }
+        else if (more) stage_a(k0 + DOTS_KCH, st ^ 1);
     }
     det_cp_async_wait<0>();
     __syncthreads();

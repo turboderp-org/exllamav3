@@ -68,10 +68,17 @@ class BCKernelTooLarge(RuntimeError):
     walks a config ladder per device instead, so the builders decline and let it run."""
 
 
+# Split-decode attention launch config: AMD's backend runs these at 8 warps / 1 stage without spilling
+# to scratch, where 4 / 2 does
+_SPLIT_WARPS, _SPLIT_STAGES = (8, 1) if torch.version.hip else (4, 2)
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
-                    num_warps: int, num_stages: int):
+                    num_warps: int, num_stages: int, pointer_range_32: bool = False):
+    """pointer_range_32 (AMD backend): every pointer argument addresses an allocation under 2 GB, which lets
+    the compiler use buffer loads/stores; the caller must have checked the allocations"""
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
-           tuple(sorted(signature.items())))
+           tuple(sorted(signature.items())), pointer_range_32)
     k = _kernel_cache.get(key)
     if k is None:
         import triton
@@ -88,6 +95,8 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                 attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
             else:
                 sig[name] = ty
+            if pointer_range_32 and isinstance(sig[name], str) and sig[name].startswith("*"):
+                attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
@@ -97,7 +106,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # The compiled module: a cubin from the CUDA backend, an hsaco code object from the AMD one
+            image = ck.asm["hsaco" if torch.version.hip else "cubin"]
+            k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -275,6 +286,15 @@ class BCAttn:
             )
         self.slot_widths = {}
 
+    def _pointer_range_32(self) -> bool:
+        """Whether the split kernels may assume 32-bit buffer offsets (AMD buffer loads): every
+        allocation they address is under 2 GB. The caches are the only ones that can be larger; the
+        rest are graph statics, partials and the block table"""
+        if not torch.version.hip:
+            return False
+        caches = (self.cache_k, self.cache_v, self.k_scales, self.v_scales)
+        return all(t.untyped_storage().nbytes() < 2 ** 31 for t in caches if isinstance(t, torch.Tensor))
+
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
@@ -327,7 +347,8 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, _SPLIT_WARPS, _SPLIT_STAGES,
+                                  pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
@@ -540,7 +561,7 @@ class BCAttn:
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
-                4, 2)
+                _SPLIT_WARPS, _SPLIT_STAGES, pointer_range_32 = self._pointer_range_32())
 
             sp_rows_sub, sp_d_sub = combine_subtiles(block_h, self.head_dim)
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,

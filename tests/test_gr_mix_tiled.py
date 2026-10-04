@@ -3,6 +3,8 @@ GatedResidual prefill mix (ext.gr_mix_tiled, hc_mix_tiled.cu): the tiled determi
 must match the fp32 torch reference to half-precision tolerance on every proj padding class,
 row count and both module forms, agree with the cuBLAS GEMM path to the same tolerance, and be
 bit-reproducible run to run (the property the TP replicated-routing design relies on).
+Sites are prepared as tensor-parallel ranks (tp = True), which take the tiled kernel on every
+platform; single-device ROCm loads default to the BLAS path (hyperconnections.py).
 """
 import sys, os, unittest
 import torch
@@ -23,7 +25,7 @@ def make_site(D, rank, use_combine, seed = 0):
     down = torch.randn(rank, H * D, device = DEVICE) * (1.0 / (H * D) ** 0.5)
     up = torch.randn(H * D, rank, device = DEVICE) * (1.0 / rank ** 0.5)
     inject = torch.randn(H, H * D, device = DEVICE) * (1.0 / (H * D) ** 0.5) if use_combine else None
-    m._prepare(down, up, inject, keep_source_weights = True)
+    m._prepare(down, up, inject, keep_source_weights = True, tp = True)
     return m
 
 
@@ -124,7 +126,7 @@ class TestGrMixTiled(unittest.TestCase):
                                   rms_norm_eps = 1e-6, use_combine = True)
                 m.device = dev
                 m.norm_w_raw = norm.to(dev)
-                m._prepare(down.to(dev), up.to(dev), inject.to(dev), keep_source_weights = True)
+                m._prepare(down.to(dev), up.to(dev), inject.to(dev), keep_source_weights = True, tp = True)
                 post, mixed = m._mix(x.to(dev))
                 outs.append((post.cpu(), mixed.cpu()))
             for d in range(1, n):
@@ -140,7 +142,7 @@ class TestGrMixTiled(unittest.TestCase):
         m2 = GatedResidual(config = None, key = "site", hc_mult = 4, hidden_size = 256, rms_norm_eps = 1e-6, use_combine = True)
         m2.device = DEVICE
         m2.norm_w_raw = torch.randn(4 * 256, device = DEVICE) * 0.1
-        m2._prepare(torch.randn(64, 1024, device = DEVICE), torch.randn(1024, 64, device = DEVICE), torch.randn(4, 1024, device = DEVICE))
+        m2._prepare(torch.randn(64, 1024, device = DEVICE), torch.randn(1024, 64, device = DEVICE), torch.randn(4, 1024, device = DEVICE), tp = True)
         self.assertTrue(m2.tiled)
         # One table set serves both kernel paths: the fp16 projection stays (the decode kernel
         # reads it and the tiled path derives its int8 tables per call), the checkpoint-layout

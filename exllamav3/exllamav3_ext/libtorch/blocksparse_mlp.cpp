@@ -11,6 +11,9 @@
 #include "../quant/exl3_devctx.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
+#endif
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -82,6 +85,10 @@ void BC_BlockSparseMLP::run_bszN
 
     c10::cuda::CUDAGuard device_guard(y.device());
 
+#if defined(USE_ROCM)
+    if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights)) return;
+#endif
+
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
@@ -102,6 +109,62 @@ void BC_BlockSparseMLP::run_bszN
     }
     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
 }
+
+#if defined(USE_ROCM)
+// RDNA route of run_bszN: four launches through exl3_rocm_moe_decode into out_d2, then the shared expert (its
+// own multi-row graph, merged through the sigmoid gate when there is one, as the fused kernels do) and the copy
+// into out_bszn. Returns false, having launched nothing, when the call is outside the op's bounds
+bool BC_BlockSparseMLP::run_bszN_rdna
+(
+    const at::Tensor& y,
+    const at::Tensor& selected_experts,
+    const at::Tensor& routing_weights
+)
+{
+    const int bsz = (int) y.size(0);
+    const int top_k = (int) selected_experts.size(-1);
+    const int S = bsz * top_k;
+    const int Hi = (int) yh2.size(-1);
+    const int I = (int) interm_a2.size(-1);
+    const int Ho = (int) out_d2.size(-1);
+    if (y.size(-1) != Hi || !y.is_contiguous() || !selected_experts.is_contiguous() || !routing_weights.is_contiguous()) return false;
+    if (selected_experts.scalar_type() != at::kLong || routing_weights.scalar_type() != at::kHalf) return false;
+    if (!exl3_rocm_moe_decode_fits(S, Hi, I, Ho, rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb)) return false;
+    if (yh2.numel() < (int64_t) 2 * S * Hi || interm_gu.numel() < (int64_t) 2 * S * I
+        || interm_a2.numel() < (int64_t) S * I || out_d2.numel() < (int64_t) S * Ho) return false;
+
+    exl3_rocm_moe_decode
+    (
+        y, selected_experts, routing_weights,
+        rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
+        down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+        yh2, interm_gu, interm_a2, out_d2,
+        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit
+    );
+
+    const int H = (int) out_bszn.size(-1);
+    at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
+    at::Tensor dst = out_bszn.slice(0, 0, bsz);
+    if (shared_experts && out_d_sh)
+    {
+        at::Tensor x_dense = y.unsqueeze(0);
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
+        shared_experts->run_bszN(x_dense, out_d_sh_n);
+        at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
+        dst.copy_(routed);
+        if (shared_gate)
+        {
+            at::Tensor g = at::sigmoid(at::matmul(y.to(at::kFloat), shared_gate->weight.reshape({-1, 1}).to(at::kFloat)));
+            dst.addcmul_(g, sh);
+        }
+        else
+            dst.add_(sh);
+    }
+    else
+        dst.copy_(routed);
+    return true;
+}
+#endif
 
 BC_BlockSparseMLP::BC_BlockSparseMLP
 (
@@ -259,6 +322,38 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         coop_p.min_expert = min_expert;
         coop_p.max_expert = max_expert;
     }
+
+#if defined(USE_ROCM)
+    {
+        // Bit width code of the RDNA GEMVs: integer K, or EXL3_HALF_BITS(k) for a k + 0.5 mul1 rate; 0 = none
+        auto kcode = [&] (float K) -> int
+        {
+            const int k = (int) K;
+            if ((float) k == K) return k;
+            if (up_mul1 && K - (float) k == 0.5f && k >= 1 && k <= 3 && exl3_rocm_half_gemv_enabled())
+                return EXL3_HALF_BITS(k);
+            return 0;
+        };
+        rdna_K_gu = kcode(up_K);
+        rdna_K_d = kcode(down_K);
+        rdna_cb = up_mul1 ? 2 : up_mcg ? 1 : 0;
+        // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above
+        const char* env = std::getenv("EXL3_ROCM_MOE_DECODE");
+        rdna_moe = !(env && env[0] == '0')
+            && gated && act_silu && !act_gelu && !act_silu_oai && !act_relu2
+            && !gate_bias_ptrs && !up_bias_ptrs && !down_bias_ptrs
+            && min_expert < 0
+            && rdna_K_gu && rdna_K_d
+            && interm_gu.scalar_type() == at::kHalf && interm_a2.scalar_type() == at::kHalf
+            && out_d2.scalar_type() == at::kFloat;
+        if (rdna_moe)
+        {
+            rdna_gu_trellis = at::cat({gate_ptrs_trellis, up_ptrs_trellis}).contiguous();
+            rdna_gu_suh = at::cat({gate_ptrs_suh, up_ptrs_suh}).contiguous();
+            rdna_gu_svh = at::cat({gate_ptrs_svh, up_ptrs_svh}).contiguous();
+        }
+    }
+#endif
 
     // Shared expert fused launch. The shared BC_GatedMLP carries its gate and up either as one
     // merged pointer table (gu_ptrs_*: [gate, up], the multi-GEMM form) or as separate bound

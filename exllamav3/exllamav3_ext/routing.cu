@@ -7,6 +7,9 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#if defined(USE_ROCM)
+    #include "rocm/routing_gemv_rdna.cuh"
+#endif
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -261,14 +264,16 @@ void routing_gemv
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
-    // (the deterministic projection is CUDA-only: routing_gemm.cu is left out of ROCm builds)
-#if !defined(USE_ROCM)
+#if defined(USE_ROCM)
+    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh)
+    if (gate_t.has_value() && routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
+#endif
+
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
     else
-#endif
     if (bsz1 && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>

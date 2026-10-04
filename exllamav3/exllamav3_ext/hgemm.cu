@@ -6,6 +6,9 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
+#if defined(USE_ROCM)
+    #include "rocm/wmma_gemm.cuh"
+#endif
 
 /*
 
@@ -49,6 +52,16 @@ static void hgemm_gemmex_impl
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
+
+#if defined(USE_ROCM)
+    // RDNA: the WMMA GEMM (rocm/wmma_gemm.cu) for the shapes its per-arch table routes there, mainly fp32
+    // output, for which rocBLAS/hipBLASLt have no matrix-core kernels on these parts
+    if (wmma_gemm_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))
+    {
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+#endif
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
@@ -100,6 +113,14 @@ void hgemm
 {
     hgemm_gr(a, b, c, nullptr);
 }
+
+#if defined(USE_ROCM)
+// Reconstruct-path GEMM. On CUDA this lives in hgemm_f16acc.cu, which ROCm builds leave out: always hipBLAS
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+    hgemm(a, b, c);
+}
+#endif
 
 /*
 Strided-batched row-major matmul, a[b] @ w[b] -> c[b] for b in [0, B), fp16 inputs with fp32

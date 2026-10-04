@@ -1890,6 +1890,14 @@ def paged_attn_triton_prefill(
         cfg = (64, 32, 4, 2)
     else:
         cfg = (32, 16, 4, 2)
+    # RDNA (wave32): eight warps over a 128-row q tile, so each wave still owns whole 16-row WMMA tiles;
+    # at head_dim 256 (fp16 cache) a single stage keeps the tile inside the 64 KB LDS. Tiles from the
+    # CarouselAether ROCm fork
+    if torch.version.hip:
+        if hd_pad <= 128:
+            cfg = (128, 32, 8, 2)
+        elif hd_pad <= 256 and qc is None:
+            cfg = (128 if q.shape[1] >= 128 else 64, 32, 8, 1)
     # Pre-Ampere (Turing/Volta, 64 KB per-block smem; the C++ EXL3_SM75 gate is
     # __CUDA_ARCH__ < 800, the same class): the stock tiles overcommit the device's budget,
     # and the ladder's first fit starves the mma pipeline -- at hd_pad 256 it is

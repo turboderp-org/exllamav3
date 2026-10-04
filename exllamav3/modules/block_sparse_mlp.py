@@ -23,18 +23,22 @@ from .block_sparse_mlp_routing import (
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
+# ROCm: the RDNA fused MoE kernel (rocm/quant/exl3_moe_rdna.cu) pipelines and tiles the rows itself, so it
+# takes experts up to 512 rows, and the batched reconstruct tier and the wide row tiles below default off
+_rocm = bool(torch.version.hip)
+
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
 # rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps
-TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 128))
+TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 512 if _rocm else 128))
 TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
-BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
+BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "0" if _rocm else "1") != "0"
 # Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
 # instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
 # launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
 # launch
-MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+MTILE = os.environ.get("EXL3_MOE_MTILE", "0" if _rocm else "1") != "0"
 MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
@@ -1711,6 +1715,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             module.load_local()
         if module.routing_gate is not None:
             module.load_routing()
+            if replicate:
+                module.routing_cfg.det = True
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
             # Routed and shared experts are allocated separately; only when one rank owns both

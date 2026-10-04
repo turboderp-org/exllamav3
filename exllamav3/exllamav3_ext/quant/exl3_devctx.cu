@@ -92,7 +92,11 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         c10::cuda::CUDAGuard guard(device);
+#if defined(USE_ROCM)
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS) * sizeof(int);
+#else
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
+#endif
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);

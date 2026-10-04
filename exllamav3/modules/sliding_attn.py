@@ -23,7 +23,9 @@ from ..cache.recurrent import host_copy
 import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
 
 
 class SWAExportedState:

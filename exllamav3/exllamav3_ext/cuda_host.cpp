@@ -62,7 +62,14 @@ uintptr_t cuda_host_get_device_pointer(uintptr_t ptr)
 int cuda_device_get_attribute(int attr, int device)
 {
     int value = 0;
+#if defined(USE_ROCM)
+    // The caller passes CUDA's cudaDeviceAttr numbering (model_tp_cuda.py), which HIP's attribute enum does
+    // not share: translate the values in use rather than query whatever attribute HIP has at that number
+    TORCH_CHECK(attr == 91, "cuda_device_get_attribute: CUDA attribute ", attr, " has no HIP mapping here");
+    cudaError_t cr = cudaDeviceGetAttribute(&value, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+#else
     cudaError_t cr = cudaDeviceGetAttribute(&value, static_cast<cudaDeviceAttr>(attr), device);
+#endif
 
     TORCH_CHECK(
         cr == cudaSuccess,

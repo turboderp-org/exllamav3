@@ -15,7 +15,9 @@ import os
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.

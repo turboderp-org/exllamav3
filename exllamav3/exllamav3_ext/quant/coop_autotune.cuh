@@ -1,5 +1,15 @@
 #pragma once
 
+// Launch of the grid-synchronizing EXL3 GEMM kernels. ROCm's cooperative launch faults in the runtime when these
+// are submitted back to back, so ROCm launches them as plain kernels and the kernels synchronize through a device
+// barrier instead (EXL3_GRID_SYNC, exl3_gemm_kernel.cuh). Every candidate grid is at most one block per
+// multiprocessor, so all blocks are resident either way
+#if defined(USE_ROCM)
+    #define EXL3_COOP_LAUNCH cudaLaunchKernel
+#else
+    #define EXL3_COOP_LAUNCH cudaLaunchCooperativeKernel
+#endif
+
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <vector>

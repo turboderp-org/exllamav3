@@ -7,13 +7,23 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
-#include "exl3_gemm_kernel.cuh"
-#include "exl3_kernel_map.cuh"
+#if defined(USE_ROCM)
+    // RDNA: the WMMA GEMM kernels and their shape table (rocm/quant), same host interface
+    #include "../rocm/quant/exl3_gemm_kernel_rdna.cuh"
+    #include "../rocm/quant/exl3_kernel_map_rdna.cuh"
+#else
+    #include "exl3_gemm_kernel.cuh"
+    #include "exl3_kernel_map.cuh"
+#endif
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "coop_autotune.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_mgemv_rdna.cuh"
+    #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
+#endif
 #include <set>
 #include <vector>
 
@@ -186,6 +196,24 @@ int exl3_gemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+#if defined(USE_ROCM)
+    // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
+    // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
+    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8
+        && (!half_k || exl3_rocm_half_gemv_enabled()))
+    {
+        if (exl3_gemv_multirow_try_launch
+        (
+            A_ptr, B_ptr, C_ptr, suh_ptr, (half*) A_had_ptr, svh_ptr,
+            size_m, size_k, size_n, half_k ? EXL3_HALF_BITS(K) : K, cb, c_fp32, device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 92;
+        }
+    }
+#endif
+
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
@@ -232,24 +260,57 @@ int exl3_gemm_gr
     // recording is identical; falls through to the regular kernel when the heuristic declines
     if (force_shape_idx <= 0 && force_num_sms <= 0)
     {
-        void* gemv_kernel = nullptr;
-        if (exl3_gemv_try_launch
-        (
-            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
-            suh_ptr && A_had_ptr && svh_ptr,
-            device, stream, &gemv_kernel, false
-        ))
+#if defined(USE_ROCM)
+        // The RDNA GEMV's eager form records no graph sites; under capture its graph form hosts them
+        if (graph)
         {
-            add_graph_args(gemv_kernel);
-            cuda_check(cudaPeekAtLastError());
-            return 90;
+            if (!half_k && exl3_gemv_graph_try_launch
+            (
+                A_ptr, B_ptr, C_ptr, suh_ptr, (half*) A_had_ptr, svh_ptr,
+                size_m, size_k, size_n, K, cb, c_fp32, device, stream, graph
+            ))
+            {
+                cuda_check(cudaPeekAtLastError());
+                return 91;
+            }
+        }
+        else
+#endif
+        {
+            void* gemv_kernel = nullptr;
+            if (exl3_gemv_try_launch
+            (
+                kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+                suh_ptr && A_had_ptr && svh_ptr,
+                device, stream, &gemv_kernel, false
+            ))
+            {
+                add_graph_args(gemv_kernel);
+                cuda_check(cudaPeekAtLastError());
+                return 90;
+            }
         }
     }
+
+#if defined(USE_ROCM)
+    // RDNA: blocks request only the LDS the compatible shapes need rather than the whole workgroup allocation,
+    // so several fit per WGP (see the grid bound in the candidate loop below)
+    {
+        size_t need = 0;
+        for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
+            if (exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k))
+                need = MAX(need, exl3_gemm_smem_bytes(K, s, half_k));
+        if (need > 0 && need < (size_t) smem_max) smem_max = (int) need;
+    }
+#endif
 
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#if defined(USE_ROCM)
+        autotune_key ^= 0x52444e4157313031ull;   // RDNA grid rules (below) tune separately
+#endif
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
@@ -268,7 +329,15 @@ int exl3_gemm_gr
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
             int tilesize_n = exl3_gemm_tilesize_n_g[candidate_shape_idx];
             int max_slices = MAX(size_k / tilesize_k * size_n / tilesize_n, 1);
+#if defined(USE_ROCM)
+            // RDNA: the plain launch only needs every block resident (device barrier, exl3_gemm_kernel_rdna.cuh),
+            // so the grid may reach the occupancy limit; multiProcessorCount counts WGPs
+            int occ = 1;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, (const void*) candidate_kernel, exl3_gemm_blockdim_g[candidate_shape_idx], smem_max);
+            int max_candidate_sms = MAX(MIN(max_slices, num_sms * MAX(occ, 1)), 1);
+#else
             int max_candidate_sms = MAX(MIN(max_slices, num_sms), 1);
+#endif
 
             candidates.push_back
             ({
@@ -304,7 +373,7 @@ int exl3_gemm_gr
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
-    cudaLaunchCooperativeKernel
+    EXL3_COOP_LAUNCH
     (
         (void*) kernel,
         num_sms,
@@ -545,6 +614,45 @@ int exl3_mgemm_gr
     const bool half_k = bk.half;
     TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
 
+#if defined(USE_ROCM)
+    // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
+    // take m = 1..8 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
+    // handle, so it stays on the cooperative kernel
+    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
+        && (!half_k || exl3_rocm_half_gemv_enabled()))
+    {
+        if (exl3_mgemv_multirow_try_launch
+        (
+            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr,
+            size_m, size_k, size_n, half_k ? EXL3_HALF_BITS(K) : K, cb, c_fp32,
+            bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr,
+            device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 93;
+        }
+    }
+    if (size_m == 1 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list && !half_k)
+    {
+        if (exl3_mgemv_try_launch
+        (
+            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32,
+            bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr,
+            device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 0;
+        }
+    }
+#endif
+
     int shape_idx;
     int block_dim;
     fp_exl3_mgemm_kernel kernel;
@@ -667,7 +775,7 @@ int exl3_mgemm_gr
         kernel_attr_set[device].insert((void*) kernel);
     }
 
-    cudaLaunchCooperativeKernel
+    EXL3_COOP_LAUNCH
     (
         (void*) kernel,
         block_grid,
