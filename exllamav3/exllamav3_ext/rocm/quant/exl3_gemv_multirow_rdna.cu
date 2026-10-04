@@ -173,7 +173,9 @@ void exl3_gemv_multirow_prewarm(int device)
 // =============================================================================
 // Same B path, same per-row fdot2 chain and the same quad reduction as the
 // m == 1 core, so each row is bit-identical to it. A is the slab's rotated
-// rows, lda halves apart. out[r] is row r's column-lane value (lanes 0-15).
+// rows, lda halves apart, rows_valid of them (<= M): rows past that re-read
+// the last valid row rather than memory beyond the slab (their outputs are
+// discarded). out[r] is row r's column-lane value (lanes 0-15).
 
 template <int bits, int cb, int M>
 __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
@@ -186,11 +188,16 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
     const int lane,
     const int kb_begin,
     const int kb_end,
-    float* out
+    float* out,
+    const int rows_valid = M
 )
 {
     constexpr int tile_elements = Exl3Width<bits>::tile_u16;   // 16 * bits (integer K)
     const int r0 = (lane & 3) * 2;
+    const int row_last = rows_valid - 1;
+    int a_row[M];
+    #pragma unroll
+    for (int r = 0; r < M; ++r) a_row[r] = (r < row_last ? r : row_last) * lda;
 
     float accA[M], accB[M];
     #pragma unroll
@@ -207,7 +214,7 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
         #pragma unroll
         for (int r = 0; r < M; ++r)
         {
-            const half2* a2 = (const half2*) (A + r * lda + k_tile * 16);
+            const half2* a2 = (const half2*) (A + a_row[r] + k_tile * 16);
             half2 a01 = a2[r0 >> 1];
             half2 a89 = a2[(r0 >> 1) + 4];
             accA[r] = __builtin_amdgcn_fdot2(a01, frag0[0], accA[r], false);
@@ -544,8 +551,9 @@ __device__ __forceinline__ void exl3_gemv_mr_body
         core, tpb, A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc,
         [&](int tn, int k0, int k1, float* o)
         {
-            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o);
-        }
+            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o, rows_valid);
+        },
+        rows_valid
     );
     if (warp_id != 0) return;
     if constexpr (M == 1)

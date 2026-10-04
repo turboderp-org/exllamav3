@@ -350,7 +350,8 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_sel
 // the TILES core the tiles share A loads and one wide B read per k-tile; the
 // other cores run `old(tile_n, kb0, kb1, out_M)` per tile. sh_red holds
 // WARPS_PER_BLOCK * T * M * 16 floats. All threads enter; out[t * M + r] is
-// meaningful for warp 0, lanes 0-15, t < tpb.
+// meaningful for warp 0, lanes 0-15, t < tpb. rows_valid (<= M) is the number
+// of rows A actually holds; the cores read nothing past them.
 template <int bits, int cb, int WARPS_PER_BLOCK, int M, bool A_LDS, int T, typename OldCore>
 __device__ __forceinline__ void exl3_gemv_dot_tile_splitk_t
 (
@@ -366,7 +367,8 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_splitk_t
     const int lane,
     float* sh_red,
     float* out,
-    OldCore old
+    OldCore old,
+    const int rows_valid = M
 )
 {
     const int num_k_tiles = size_k / 16;
@@ -383,10 +385,10 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_splitk_t
         {
             if (T > 1 && tpb == T)
                 exl3_gemv_dot_tile_tiles<bits, cb, M, A_LDS, exl3_tiles_u_splitk<bits, M, T>(), T>
-                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc);
+                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc, rows_valid);
             else
                 exl3_gemv_dot_tile_tiles<bits, cb, M, A_LDS, exl3_tiles_u_splitk<bits, M, 1>(), 1>
-                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc);
+                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc, rows_valid);
         }
         else
         {

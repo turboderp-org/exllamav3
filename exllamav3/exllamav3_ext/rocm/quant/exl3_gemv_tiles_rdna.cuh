@@ -499,7 +499,7 @@ template <int bits, int cb, int M, bool A_LDS, int U, int T>
 __device__ __forceinline__ void exl3_tiles_step
 (
     const char* A_c,         // byte pointer, this k-group's first slice (uniform)
-    const int lda_b,         // row stride, bytes
+    const uint32_t* a_row,   // per-row byte offsets from A_c (M, uniform)
     exl3_g_char* b_c,        // byte pointer, this k-group's first tile (uniform)
     const uint32_t b_stride, // bytes between consecutive k-tiles of this N-tile
     uint32_t* off,           // lane plan byte offsets (R), loop-invariant
@@ -529,7 +529,7 @@ __device__ __forceinline__ void exl3_tiles_step
         #pragma unroll
         for (int r = 0; r < M; ++r)
         {
-            const char* a = A_c + r * lda_b + u * 32;
+            const char* a = A_c + a_row[r] + u * 32;
             if constexpr (A_LDS) { w01[u][r] = exl3_ld_l(a, a_off); w89[u][r] = exl3_ld_l(a + 16, a_off); }
             else                 { w01[u][r] = exl3_ld_g((exl3_g_char*) a, a_off); w89[u][r] = exl3_ld_g((exl3_g_char*) a + 16, a_off); }
         }
@@ -556,7 +556,10 @@ __device__ __forceinline__ void exl3_tiles_step
 }
 
 // T adjacent N-tiles [tile_n, tile_n + T) per wave, sharing the A loads and
-// reading T * 32 * bits contiguous bytes per k-tile. out[t * M + r].
+// reading T * 32 * bits contiguous bytes per k-tile. out[t * M + r]. A holds
+// rows_valid rows (<= M, the row tile): the rows past it re-read the last
+// valid row, so the tile never touches memory beyond A's rows_valid rows
+// (the caller discards their outputs).
 template <int bits, int cb, int M, bool A_LDS, int U = 1, int T = 1>
 __device__ __forceinline__ void exl3_gemv_dot_tile_tiles
 (
@@ -568,7 +571,8 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_tiles
     const int lane,
     const int kb_begin,
     const int kb_end,
-    float* out
+    float* out,
+    const int rows_valid = M
 )
 {
     // Every argument but lane is wave-uniform by contract; say so, so the
@@ -598,20 +602,24 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_tiles
     exl3_g_char* b_c = (exl3_g_char*) (const char*) B + ((size_t) kb_begin_u * n_tiles_u + tile_n_u) * tile_bytes;
     const char* a_c = (const char*) (A + kb_begin_u * 16);
     const int lda_b = lda_u * 2;
+    const int row_last = exl3_uni(rows_valid) - 1;
+    uint32_t a_row[M];
+    #pragma unroll
+    for (int r = 0; r < M; ++r) a_row[r] = (uint32_t) ((r < row_last ? r : row_last) * lda_b);
 
     int k = kb_begin_u;
     if constexpr (U > 1)
     {
         for (; k + U <= kb_end_u; k += U)
         {
-            exl3_tiles_step<bits, cb, M, A_LDS, U, T>(a_c, lda_b, b_c, b_stride, off, a_off, lp, accA, accB);
+            exl3_tiles_step<bits, cb, M, A_LDS, U, T>(a_c, a_row, b_c, b_stride, off, a_off, lp, accA, accB);
             b_c += (size_t) U * b_stride;
             a_c += U * 32;
         }
     }
     for (; k < kb_end_u; k++)
     {
-        exl3_tiles_step<bits, cb, M, A_LDS, 1, T>(a_c, lda_b, b_c, b_stride, off, a_off, lp, accA, accB);
+        exl3_tiles_step<bits, cb, M, A_LDS, 1, T>(a_c, a_row, b_c, b_stride, off, a_off, lp, accA, accB);
         b_c += b_stride;
         a_c += 32;
     }
