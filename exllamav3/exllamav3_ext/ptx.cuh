@@ -17,10 +17,16 @@ using FragB = Vec<half2, 2>;
 using FragC = Vec<float, 4>;
 using FragC_h = Vec<half2, 2>;
 
+#if defined(USE_ROCM)
+    // Tensor-core fragment ops and the async copies are emulated on ROCm (see the file for the layouts)
+    #include "rocm/ptx_rocm.cuh"
+#endif
+
 // m8n8k4 tensor core matmul (emulated on Ampere and later), don't use
 //
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m8n8k4-with-f16-floating-point-type
 
+#if !defined(USE_ROCM)
 __device__ inline void ptx_mma_m8n8k4
 (
     const Vec<half2, 2>& frag_a,
@@ -45,6 +51,7 @@ __device__ inline void ptx_mma_m8n8k4
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "f"(d[4]), "f"(d[5]), "f"(d[6]), "f"(d[7])
     );
 }
+#endif
 
 // m16n8k16 tensor core matmul
 //
@@ -70,6 +77,9 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
+#if defined(USE_ROCM)
+    exl3_mma_m16n8k16_f32(frag_a, frag_b, frag_c);
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -108,6 +118,7 @@ __device__ inline void ptx_mma_m16n8k16
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
 #endif
+#endif
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -118,6 +129,9 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
+#if defined(USE_ROCM)
+    exl3_mma_m16n8k16_f16(frag_a, frag_b, frag_c);
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -156,6 +170,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(d[0]), "r"(d[1])
     );
 #endif
+#endif
 }
 
 // Global barrier
@@ -166,6 +181,16 @@ __device__ inline void barrier_acquire
     int stage
 )
 {
+#if defined(USE_ROCM)
+    if (threadIdx.x == 0)
+    {
+        while (__hip_atomic_load(lock, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != stage)
+            __builtin_amdgcn_s_sleep(1);
+    }
+    __syncthreads();
+    // Every wave acquires at device scope, so none reads the other blocks' data through a stale per-CU cache
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
     if (threadIdx.x == 0)
     {
         volatile int state = -1;
@@ -176,6 +201,7 @@ __device__ inline void barrier_acquire
         while (state != stage);
     }
     __syncthreads();
+#endif
 }
 
 __device__ inline void barrier_release
@@ -185,6 +211,21 @@ __device__ inline void barrier_release
     bool reset
 )
 {
+#if defined(USE_ROCM)
+    // Every wave releases its stores at device scope before the block barrier, rather than relying on the one
+    // thread that signals to publish the whole block's writes
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        if (reset)
+        {
+            __hip_atomic_store(lock, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            return;
+        }
+        __hip_atomic_fetch_add(lock, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+#else
     __syncthreads();
     if (threadIdx.x == 0)
     {
@@ -196,6 +237,7 @@ __device__ inline void barrier_release
         asm volatile ("fence.acq_rel.gpu;\n");
         asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
     }
+#endif
 }
 
 // Load global to shared memory, predicated. Seems to produce incorrect code when compiling for Blackwell, but
@@ -203,7 +245,7 @@ __device__ inline void barrier_release
 
 __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
 {
-#if EXL3_SM75
+#if EXL3_SM75 || defined(USE_ROCM)
     if (pred)
     {
         uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
@@ -232,7 +274,7 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
 
 __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 {
-#if EXL3_SM75
+#if EXL3_SM75 || defined(USE_ROCM)
     uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
     *reinterpret_cast<uint4*>(smem_ptr) = v;
 #else
@@ -250,7 +292,7 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 
 __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 {
-#if EXL3_SM75
+#if EXL3_SM75 || defined(USE_ROCM)
     // No cp.async and no createpolicy on Turing; the L2 hint is only an optimization
     uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
     *reinterpret_cast<uint4*>(smem_ptr) = v;
@@ -272,7 +314,7 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 
 __device__ inline void cp_async_fence()
 {
-#if !EXL3_SM75
+#if !EXL3_SM75 && !defined(USE_ROCM)
     asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
@@ -282,7 +324,7 @@ __device__ inline void cp_async_fence()
 template <int n>
 __device__ inline void cp_async_wait()
 {
-#if !EXL3_SM75
+#if !EXL3_SM75 && !defined(USE_ROCM)
     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
 #endif
 }
@@ -291,6 +333,9 @@ __device__ inline void cp_async_wait()
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
+#if defined(USE_ROCM)
+    exl3_ldsm4(frag_a, smem_ptr);
+#else
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile
@@ -298,6 +343,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
+#endif
 }
 
 __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
@@ -333,6 +379,66 @@ __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
 }
 
 // Memory ops
+
+#if defined(USE_ROCM)
+
+// .wt (write-through) stores and .cv (don't-cache) loads exist so a flag or payload written here is seen by, or
+// re-read from, another device or the host. Relaxed system-scope atomics give that property on AMD. The 128-bit
+// forms are four 32-bit accesses; the PTX vector access is not single-copy atomic as a whole either.
+
+__device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
+{
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
+{
+    uint32_t* q = reinterpret_cast<uint32_t*>(p);
+    stg_wt_u32(q + 0, v.x);
+    stg_wt_u32(q + 1, v.y);
+    stg_wt_u32(q + 2, v.z);
+    stg_wt_u32(q + 3, v.w);
+}
+
+__device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
+{
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
+{
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(p);
+    return make_uint4(ldg_cv_u32(q + 0), ldg_cv_u32(q + 1), ldg_cv_u32(q + 2), ldg_cv_u32(q + 3));
+}
+
+__device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
+{
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
+{
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
+{
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
+{
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Global time in nanoseconds. wall_clock64() is the constant-rate counter (100 MHz on RDNA)
+
+__device__ __forceinline__ uint64_t globaltimer_ns()
+{
+    return wall_clock64() * 10;
+}
+
+#else
 
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
@@ -396,6 +502,8 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
     return t;
 }
 
+#endif
+
 // Bitfield stuff
 
 static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, int length)
@@ -429,6 +537,10 @@ __device__ inline void group_barrier
     int* barrier_counters_sense  // length 2*max(group_id). odd positions are flipped after sync (sense)
 )
 {
+#if defined(USE_ROCM)
+    // As in barrier_release/barrier_acquire: every wave publishes and refreshes at device scope
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#endif
     __syncthreads();
 
     if (threadIdx.x == 0)
@@ -451,4 +563,7 @@ __device__ inline void group_barrier
     }
 
     __syncthreads();
+#if defined(USE_ROCM)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 }

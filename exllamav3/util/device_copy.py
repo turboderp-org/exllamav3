@@ -86,6 +86,22 @@ def to_device(t: torch.Tensor, device: torch.device | str | int, non_blocking: b
     return t.to(device, non_blocking = non_blocking)
 
 
+def host_to_device(t: torch.Tensor, device: torch.device | str | int) -> torch.Tensor:
+    """
+    Asynchronous host-to-device copy of a tensor the caller may free or reuse as soon as this
+    returns (built from a list or a numpy array on the spot, say).
+
+    CUDA stages a non-blocking copy from pageable memory before the call returns, so the source
+    can go away immediately. HIP does not: the copy reads the host buffer when the stream reaches
+    it, by which time a temporary source may already have been freed and its memory reused. On
+    ROCm the source is first moved into pinned memory from torch's caching host allocator, which
+    holds the block until the copy has run.
+    """
+    if torch.version.hip and t.device.type == "cpu" and not t.is_pinned():
+        t = t.pin_memory()
+    return t.to(device, non_blocking = True)
+
+
 def reset_verdicts():
     """Forget probe results (tests)."""
     with _lock:

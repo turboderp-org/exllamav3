@@ -5,6 +5,8 @@ library only.
 """
 
 from __future__ import annotations
+import fnmatch
+import importlib.util
 import os
 import shlex
 import shutil
@@ -39,10 +41,13 @@ def nvcc_has_compress_mode(nvcc: list[str] | None) -> bool:
 # ldmatrix) with no portable form yet. Their bindings are compiled out as well and the extension reports
 # them missing through its HAS_* attributes (bindings.cpp), which the Python side checks before using them
 HIP_EXCLUDED_SOURCES = {
-    "dflash2.cu",           # DFlash2 drafter kernels
-    "hc_mix_tiled.cu",      # tiled int8 GatedResidual mix (gr_mix_tiled)
-    "routing_gemm.cu",      # deterministic int8 router GEMM (routing_gemm_det, det_quant_weight)
-    "hgemm_f16acc.cu",      # fp16-accumulator hgemm (hgemm_f16acc)
+    "hgemm_f16acc.cu",      # fp16-accumulator hgemm (hgemm_f16acc): GeForce tensor-core PTX; RDNA uses rocm/wmma_gemm.cu
+    # Replaced on ROCm by an implementation of the same interface under rocm/
+    "exl3_gemv.cu",         # -> rocm/quant/exl3_gemv_rdna.cu (exl3_gemv.cuh)
+    "quant/exl3_kernel_map.cu",                 # -> rocm/quant/exl3_kernel_map_rdna.cu (WMMA GEMM shapes)
+    "quant/comp_units/exl3_comp_unit_*.cu",     # -> rocm/quant/comp_units_rdna/ (WMMA GEMM instances)
+    "quant/exl3_moe.cu",                        # -> rocm/quant/exl3_moe_rdna.cu (pipelined fused MoE)
+    "quant/comp_units/exl3_moe_inst_*.cu",      # -> rocm/quant/comp_units_rdna/exl3_moe_inst_*
 }
 
 
@@ -55,16 +60,33 @@ def is_hipify_output(filename: str) -> bool:
     return "_hip." in filename or filename.endswith(".hip") or filename.startswith("hip_")
 
 
-def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
-    """Absolute paths of the extension's translation units for a CUDA or ROCm build."""
-    return sorted(
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith((".c", ".cpp", ".cu"))
-        and not is_hipify_output(file)
-        and not (hip and file in HIP_EXCLUDED_SOURCES)
+def _hip_excluded(rel_path: str) -> bool:
+    """HIP_EXCLUDED_SOURCES entries without a directory match a file name anywhere; entries with one
+    match the path relative to the sources directory (fnmatch patterns)"""
+    name = os.path.basename(rel_path)
+    return any(
+        fnmatch.fnmatch(rel_path if "/" in pattern else name, pattern)
+        for pattern in HIP_EXCLUDED_SOURCES
     )
+
+
+def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
+    """Absolute paths of the extension's translation units for a CUDA or ROCm build. Sources under
+    rocm/ (the RDNA kernels and the ROCm compat layer) belong to ROCm builds only."""
+    base = os.path.abspath(sources_dir)
+    sources = []
+    for root, _, files in os.walk(base):
+        for file in files:
+            path = os.path.join(root, file)
+            rel = os.path.relpath(path, base).replace(os.sep, "/")
+            if not file.endswith((".c", ".cpp", ".cu")) or is_hipify_output(file):
+                continue
+            if hip and _hip_excluded(rel):
+                continue
+            if not hip and rel.startswith("rocm/"):
+                continue
+            sources.append(path)
+    return sorted(sources)
 
 
 def hip_cflags(debug: bool = False) -> list[str]:
@@ -73,11 +95,44 @@ def hip_cflags(debug: bool = False) -> list[str]:
     none of nvcc's options). No fast-math: clang's -ffast-math also assumes finite values, which would let
     the compiler drop the infinity and NaN handling the sampling and masking kernels rely on. -Wno-register:
     C++17 removed the register storage class and clang rejects it by default.
+
+    -fgpu-flush-denormals-to-zero matches the fp32 flush-to-zero that --use_fast_math gives the CUDA build,
+    which the deterministic kernels need to agree with it bit for bit (det_gemm.cuh).
     """
-    flags = ["-O3", "-Wno-register", "-DHIPBLAS_USE_HIP_HALF"]
+    flags = ["-O3", "-Wno-register", "-DHIPBLAS_USE_HIP_HALF", "-fgpu-flush-denormals-to-zero"]
     if debug:
         flags += ["-g"]
     return flags
+
+
+def use_rocm_sdk_devel(cpp_extension) -> None:
+    """
+    pip-installed ROCm SDK (TheRock wheels): with ROCM_HOME/ROCM_PATH unset, torch takes _rocm_sdk_core as the
+    ROCm root, which holds the HIP runtime but not the library headers the build needs (hipBLAS, and thrust
+    through torch's own headers). The SDK's development package is a complete ROCm tree; point torch at it
+    instead. torch reads its module-level ROCM_HOME when it assembles the compile and link commands, so this
+    takes effect for any build started afterwards. An explicit ROCM_HOME/ROCM_PATH is left alone.
+    """
+    if os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH"):
+        return
+    has_libs = lambda root: os.path.exists(os.path.join(root, "include", "hipblas", "hipblas.h"))
+    if cpp_extension.ROCM_HOME and has_libs(cpp_extension.ROCM_HOME):
+        return
+    spec = importlib.util.find_spec("_rocm_sdk_devel")
+    if spec is None or spec.origin is None:
+        return
+    devel = os.path.dirname(os.path.realpath(spec.origin))
+    if has_libs(devel):
+        cpp_extension.ROCM_HOME = devel
+
+
+def hip_include_flags(sources_dir: str) -> list[str]:
+    """
+    Flags for every translation unit of a ROCm build, host C++ and HIP alike: force-include the compat
+    layer (rocm/compat.h) and put the stand-ins for CUDA-only headers (rocm/include) on the path.
+    """
+    rocm_dir = os.path.abspath(os.path.join(sources_dir, "rocm"))
+    return ["-include", os.path.join(rocm_dir, "compat.h"), "-I" + os.path.join(rocm_dir, "include")]
 
 
 def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = False) -> list[str]:

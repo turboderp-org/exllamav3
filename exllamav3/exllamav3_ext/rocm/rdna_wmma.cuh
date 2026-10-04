@@ -1,7 +1,8 @@
 #pragma once
 
 // RDNA WMMA fragment types and operations (native 16x16x16 FP16 -> FP32 on gfx11, the fp32-accumulating
-// variant on gfx12), used by the RDNA GEMM (rocm/quant/exl3_gemm_*_rdna.cuh).
+// variant on gfx12), used by the RDNA GEMM (rocm/quant/exl3_gemm_*_rdna.cuh). From the CarouselAether ROCm
+// fork; the vector types and bitfield/memory helpers it also carried come from ptx.cuh here.
 
 #include "../ptx.cuh"
 

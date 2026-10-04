@@ -43,6 +43,9 @@ if windows:
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
+elif torch and torch_version.hip:
+    # torch hands the C++ flags to hipcc as well, and -Ofast implies fast-math (see hip_cflags)
+    extra_cflags += ["-O3"]
 else:
     extra_cflags += ["-Ofast"]
     extra_cuda_cflags += []
@@ -67,6 +70,11 @@ sources = [
     os.path.relpath(path, start=os.path.dirname(os.path.abspath(__file__)))
     for path in cuda_flags.extension_sources(sources_dir, hip = hip)
 ]
+
+if hip:
+    cuda_flags.use_rocm_sdk_devel(cpp_extension)
+    extra_cflags += cuda_flags.hip_include_flags(sources_dir)
+    extra_cuda_cflags += cuda_flags.hip_include_flags(sources_dir)
 
 # The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu)
 libraries = ["cublas"] if windows else ["hipblas"] if hip else []

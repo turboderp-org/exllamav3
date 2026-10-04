@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
-from .util.cuda_flags import cuda_cflags, extension_sources
+from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -106,6 +106,9 @@ else:
         if ext_debug:
             extra_cflags += ["/Zi"]
             extra_cuda_cflags += []
+    elif torch.version.hip:
+        # torch hands the C++ flags to hipcc as well, and -Ofast implies fast-math (see hip_cflags)
+        extra_cflags += ["-O3"]
     else:
         extra_cflags += ["-Ofast"]
         extra_cuda_cflags += []
@@ -144,6 +147,18 @@ else:
     library_dir = os.path.dirname(os.path.abspath(__file__))
     sources_dir = os.path.join(library_dir, extension_name)
     sources = extension_sources(sources_dir, hip = bool(torch.version.hip))
+    if torch.version.hip:
+        # With no target list, torch builds for every architecture it supports, wave64 ones included, which
+        # the kernels cannot compile for. maybe_set_rocm_arch_env fills it in from the visible devices, so an
+        # empty list here means HIP sees none (CUDA_VISIBLE_DEVICES is honored by HIP as well)
+        if not os.environ.get("PYTORCH_ROCM_ARCH"):
+            raise RuntimeError(
+                "No ROCm device is visible to build the extension for. Check CUDA_VISIBLE_DEVICES and "
+                "HIP_VISIBLE_DEVICES (HIP honors both), or set PYTORCH_ROCM_ARCH (e.g. gfx1100) explicitly."
+            )
+        use_rocm_sdk_devel(torch.utils.cpp_extension)
+        extra_cflags += hip_include_flags(sources_dir)
+        extra_cuda_cflags += hip_include_flags(sources_dir)
 
     # Load extension
 
