@@ -253,14 +253,7 @@ class Job:
         self.stop_string_max_length = max([0] + [len(x) for x in self.stop_strings_list])
 
         # Banned strings
-        if banned_strings:
-            self.banned_strings = [s.lower() for s in banned_strings]
-            self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
-                _strings_to_utf32(tuple(self.banned_strings))
-        else:
-            self.banned_strings = []
-            self.banned_strings_utf32_buffer = None
-            self.banned_strings_utf32_offsets = None
+        self._init_banned_strings(banned_strings)
 
         self.checkpoint = None
         self.checkpoint_rewound = False
@@ -532,14 +525,119 @@ class Job:
 
         # Accept any text held back by a partial banned-string match. Matching is suspended while
         # forced tokens remain, so the checkpoint could never be rewound to anyway
-        self.hash_deferred_pages()
-        self.checkpoint = None
+        self._release_banned_hold()
 
         if self.forced_ids is not None:
             ids = torch.cat((self.forced_ids[:, self.forced_index:], ids), dim = -1)
         self.forced_ids = ids
         self.forced_index = 0
         self.forced_ids_device = None
+
+
+    def set_sampler(self, sampler: Sampler | None):
+        """
+        Replace the job's sampler mid-generation, e.g. to sample a response block differently from the
+        reasoning block before it. Takes effect from the next token the generator samples for this job.
+
+        Call between iterations: from the thread driving Generator.iterate(), or from any coroutine on the
+        event loop for an AsyncJob. Tokens sampled before the call keep their original settings, which
+        includes any already sampled but not yet seen by the caller: text held back by a stop string,
+        banned string or incomplete character, the rest of a speculative window accepted in the same
+        iteration, and (AsyncJob) results still queued for the consumer.
+
+        :param sampler:
+            New sampler, or None for the default sampler.
+        """
+        self.sampler = sampler if sampler is not None else DefaultSampler()
+
+
+    def set_filters(self, filters: list[Filter] | None):
+        """
+        Replace the job's filters mid-generation, e.g. to constrain only the response that follows a
+        free-form reasoning block. The new filters start from their initial state at the next token the
+        generator samples for this job (or wait for their trigger token from that point), and see none
+        of the output before it. Timing and caveats are as for set_sampler().
+
+        Any text currently held by a partial banned-string match is released (emitted with the next
+        output), since a later rewind could not be replayed through filters that were not there when the
+        held tokens were sampled. Banned-string matching itself continues for new text.
+
+        Filters disabled by constrain_output_now() stay disabled while injected tokens are still pending;
+        replacing them is only possible once the injection has drained.
+
+        :param filters:
+            New list of filters, or None/[] to remove all filters.
+        """
+        if self.forced_ids is not None:
+            raise ValueError("Cannot replace filters while a constrain_output_now() injection is still pending")
+        filters = list(filters) if filters else []
+        self._release_banned_hold()
+        self.filters = filters
+        self.filters_suspended = False
+        # Once the job has a generator, attach and reset here: activate() resets filters only for a job's
+        # first round, so a requeued job would otherwise keep the new filters unattached
+        if self.generator is not None:
+            for f in self.filters:
+                f.attach(self)
+                f.reset()
+                f.is_active = f.trigger_token is None
+
+
+    def set_banned_strings(self, banned_strings: list[str] | None):
+        """
+        Replace the job's banned strings mid-generation. Takes effect for text sampled after the call;
+        timing and caveats are as for set_sampler().
+
+        Text currently held back by a partial match against the old banned strings is released: it can no
+        longer be rewound, and it goes out with the next output unless something else holds it. Text held for
+        other reasons stays held: an incomplete UTF-8 character until it completes, the start of a possible
+        stop string until it resolves, and a partial match against the new banned strings that starts in the
+        released text and continues into new tokens (a full match there rewinds only the new tokens).
+
+        :param banned_strings:
+            New list of banned strings (case-insensitive), or None/[] to disable banned strings.
+        """
+        if self.generator is not None:
+            self._check_banned_strings([s.lower() for s in banned_strings or []])
+        self._release_banned_hold()
+        self._init_banned_strings(banned_strings)
+
+
+    def _init_banned_strings(self, banned_strings: list[str] | None):
+        if banned_strings:
+            self.banned_strings = [s.lower() for s in banned_strings]
+            self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
+                _strings_to_utf32(tuple(self.banned_strings))
+        else:
+            self.banned_strings = []
+            self.banned_strings_utf32_buffer = None
+            self.banned_strings_utf32_offsets = None
+
+
+    def _check_banned_strings(self, banned_strings: list[str]):
+        if banned_strings and self.generator.recurrent_cache is not None:
+            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
+            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
+            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
+            # by restoring a past checkpoint and replaying, which has no length limit.
+            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
+            if guaranteed:
+                max_ref_tokens = guaranteed - 8
+                for s in banned_strings:
+                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
+                    assert ref_tokens <= max_ref_tokens, \
+                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
+                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
+
+
+    def _release_banned_hold(self):
+        """
+        Drop the banned-string checkpoint, accepting the tokens held since it was set: they can no longer be
+        rewound, the held text goes out with the next emitted output, and pages completed during the hold
+        are hashed.
+        """
+        self.hash_deferred_pages()
+        self.checkpoint = None
 
 
     def hash_completed_page(self, seq: Sequence, page_idx: int):
@@ -1175,19 +1273,7 @@ class Job:
             self.rq_headroom = 0
 
         # Compatibility checks
-        if self.banned_strings and self.generator.recurrent_cache is not None:
-            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
-            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
-            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
-            # by restoring a past checkpoint and replaying, which has no length limit.
-            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
-            if guaranteed:
-                max_ref_tokens = guaranteed - 8
-                for s in self.banned_strings:
-                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
-                    assert ref_tokens <= max_ref_tokens, \
-                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
-                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
+        self._check_banned_strings(self.banned_strings)
 
         # Hash full pages of input IDs
         all_unique_hashes = set()

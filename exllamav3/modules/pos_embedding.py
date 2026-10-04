@@ -37,12 +37,10 @@ class PosEmbedding(Module):
         weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True)
         self.vocab_size = weight.shape[0]
         self._numel = weight.numel()
-        self.embedding = nn.Embedding(
-            self.vocab_size,
-            self.hidden_size,
-            device = "meta"
-        )
-        self.embedding.weight = nn.Parameter(weight, requires_grad = False)
+        # Built around the loaded weight: constructing on the meta device and swapping the weight in
+        # runs the default initializer there, and the first meta-device op in a process imports
+        # a large part of torch's Python decomposition machinery
+        self.embedding = nn.Embedding(*weight.shape, _weight = weight, _freeze = True)
 
     @override
     def unload(self):
