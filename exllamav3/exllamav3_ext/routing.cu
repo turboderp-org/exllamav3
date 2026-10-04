@@ -659,6 +659,10 @@ routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 */
 
+#if defined(USE_ROCM)
+    #include "rocm/routing_fused_rdna.cuh"
+#endif
+
 void routing_ds3_nogroup
 (
     const at::Tensor& hidden,
@@ -676,6 +680,12 @@ void routing_ds3_nogroup
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+#if defined(USE_ROCM)
+    // RDNA: bsz 1 router GEMV + top-k in one launch (rocm/routing_fused_rdna.cuh)
+    if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights, scaling_factor, act_fn, stream))
+        return;
+#endif
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 

@@ -6,6 +6,7 @@ from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
 from .bc_attn import _compile_kernel, BCKernelTooLarge
+from . import dsa_mqa
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
@@ -27,8 +28,22 @@ _bc_debug = os.environ.get("EXL3_BC_DSA_DEBUG", "0") != "0"
 
 MAX_QLEN = 16
 MAX_S = 16        # tokens per job per batched step; must match BC_DSV4BatchAttention::MAX_S
-N_SPLITS = 16
+# Key splits per decode row; ROCm's MQA split kernel (dsa_mqa.py) prefers fewer
+N_SPLITS = 8 if torch.version.hip else 16
 BLOCK_H = 16
+
+
+def _compile_split(dev, sig_s: dict, consts_s: dict):
+    """The decode split kernel: on ROCm the MQA kernel (dsa_mqa.py) where the shape allows it, else upstream's
+    at 8 warps, which spills far less to scratch on these parts"""
+    if torch.version.hip:
+        t = dsa_mqa.decode_eligible(consts_s)
+        if t is not None:
+            sig = dict(sig_s) | {n: "constexpr" for n in ("HP", "BD", "KC", "KSTAGES")}
+            return _compile_kernel(dev, dsa_mqa._dsa_decode_mqa_kernel, sig, dsa_mqa.decode_consts(consts_s, t),
+                                   dsa_mqa.DECODE_WARPS, 1)
+        return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 8, 2)
+    return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
 
 
 def _exl3_bc(lin):
@@ -269,7 +284,7 @@ class BCDsa:
             SEQ = 1, MULTIROW = 0, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
@@ -582,7 +597,7 @@ class BCDsaBatch:
             SEQ = S, MULTIROW = 1, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",

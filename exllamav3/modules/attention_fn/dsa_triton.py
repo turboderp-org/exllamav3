@@ -42,6 +42,7 @@ import triton.language as tl
 
 from .triton_paged import _rot_h32, _qc_load_v, _get_h32
 from .smem import pick_config, shared_bytes, halving_ladder
+from . import dsa_mqa
 
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
@@ -1084,11 +1085,21 @@ def dsa_attn(
                 bh, bn, ns = cfg
                 _, ws_ml, ws_acc = workspace(bh)
                 return shared_bytes(_dsa_attn_split_kernel, s_args(ws_ml, ws_acc), **s_consts(bh, bn), num_warps = num_warps, num_stages = ns)
-            block_h, block_n, s_stages = pick_config(q.device, "dsa_attn_split", pick_key, hb_ladder, probe)
-            hb, ws_ml, ws_acc = workspace(block_h)
-            _dsa_attn_split_kernel[(R * hb, n_splits)](
-                *s_args(ws_ml, ws_acc), **s_consts(block_h, block_n), num_warps = num_warps, num_stages = s_stages,
-            )
+            # ROCm: the MQA decode kernel (dsa_mqa.py) where the shape allows it, at its own tiling
+            mqa = dsa_mqa.decode_eligible(s_consts(dsa_mqa.DECODE_BLOCK_H, dsa_mqa.DECODE_BLOCK_N)) if torch.version.hip else None
+            if mqa is not None:
+                block_h = dsa_mqa.DECODE_BLOCK_H
+                hb, ws_ml, ws_acc = workspace(block_h)
+                dsa_mqa._dsa_decode_mqa_kernel[(R * hb, n_splits)](
+                    *s_args(ws_ml, ws_acc), **dsa_mqa.decode_consts(s_consts(block_h, dsa_mqa.DECODE_BLOCK_N), mqa),
+                    num_warps = dsa_mqa.DECODE_WARPS, num_stages = 1,
+                )
+            else:
+                block_h, block_n, s_stages = pick_config(q.device, "dsa_attn_split", pick_key, hb_ladder, probe)
+                hb, ws_ml, ws_acc = workspace(block_h)
+                _dsa_attn_split_kernel[(R * hb, n_splits)](
+                    *s_args(ws_ml, ws_acc), **s_consts(block_h, block_n), num_warps = num_warps, num_stages = s_stages,
+                )
             _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
                 a_qpos, R, n_splits, h32_t,
@@ -1125,6 +1136,18 @@ def dsa_attn(
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
         )
+    # ROCm: the MQA prefill kernel (dsa_mqa.py) where the shape allows it, at its own tiling
+    if torch.version.hip:
+        c = m_consts((block_h, block_n, num_stages))
+        mqa = dsa_mqa.prefill_eligible(c)
+        if mqa is not None:
+            with torch.cuda.device(q.device):
+                grid = (R * (H // mqa[0]) * ((D_c + D_r) // mqa[1]),)
+                dsa_mqa._dsa_prefill_mqa_kernel[grid](
+                    *m_args, **dsa_mqa.prefill_consts(c, mqa), num_warps = dsa_mqa.PREFILL_WARPS, num_stages = 1,
+                )
+            return out
+
     # Head tile, then kv tile, then pipeline depth (smem.py); the stock config leads
     ladder = [(block_h, block_n, num_stages)]
     for ns in range(num_stages, 0, -1):

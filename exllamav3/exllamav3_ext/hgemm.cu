@@ -8,6 +8,7 @@
 #include <limits>
 #if defined(USE_ROCM)
     #include "rocm/wmma_gemm.cuh"
+    #include "rocm/hgemm_narrow_rdna.cuh"
 #endif
 
 /*
@@ -54,6 +55,10 @@ static void hgemm_gemmex_impl
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
 #if defined(USE_ROCM)
+    // RDNA: narrow outputs at decode-class row counts on a split-K GEMV (rocm/hgemm_narrow_rdna.cuh)
+    if (hgemm_narrow_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))
+        return;
+
     // RDNA: the WMMA GEMM (rocm/wmma_gemm.cu) for the shapes its per-arch table routes there, mainly fp32
     // output, for which rocBLAS/hipBLASLt have no matrix-core kernels on these parts
     if (wmma_gemm_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))

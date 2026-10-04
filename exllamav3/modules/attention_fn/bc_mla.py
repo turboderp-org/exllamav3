@@ -176,6 +176,7 @@ class BCMLA:
             _mla_decode_split_kernel,
             _mla_decode_combine_kernel,
             _mla_unfold_kernel,
+            mla_unfold_block_k,
         )
 
         dev = self.device
@@ -271,7 +272,8 @@ class BCMLA:
         k_unfold = _compile_kernel(dev, _mla_unfold_kernel,
             {"o_lat": "*fp16", "w_uv_flat": "*fp16", "out": "*fp16", "R": "i32"}
             | {n: "constexpr" for n in ("n_q_heads", "D_c", "D_v", "BLOCK_M", "BLOCK_K")},
-            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm, BLOCK_K = 128),
+            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm,
+                 BLOCK_K = mla_unfold_block_k(dev, H, D_c, D_v, unfold_bm)),
             4, 2)
 
         # Static intermediates, shared between layers on the same device. Bucketed flat
@@ -478,7 +480,8 @@ class BCMLA:
                 Q_SPLIT = 1, OUT_LATENT = 1,
                 QC = self.k_bits if self.quant else 0,
             )
-            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+            # ROCm: 8 warps spill far less to scratch on these parts
+            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 8 if torch.version.hip else 4, 2)
 
             sig_c = {
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",

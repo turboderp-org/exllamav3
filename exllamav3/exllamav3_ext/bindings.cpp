@@ -131,6 +131,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
+#if defined(USE_ROCM)
+    m.def("hc_mix_fused", &hc_mix_fused, "hc_mix_fused");
+#endif
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");

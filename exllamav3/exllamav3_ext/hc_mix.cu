@@ -33,6 +33,11 @@ Two launches, no grid-wide sync, deterministic (fixed reduction order, no atomic
 #define NUM_THREADS 256
 #define NUM_THREADS_A 64
 
+#if defined(USE_ROCM)
+    #include "rocm/hc_dpp_rdna.cuh"
+    #include "rocm/hc_fuse_rdna.cuh"
+#endif
+
 __device__ __forceinline__ float sigmoidf_(float x)
 {
     return 1.0f / (1.0f + __expf(-x));
@@ -95,8 +100,12 @@ void hc_mix_partials_kernel
     for (int k = 0; k <= M; ++k)
     {
         float v = acc[k];
+#if defined(USE_ROCM)
+        v = hc_warp_sum_lane0(v);
+#else
         for (int offset = 16; offset > 0; offset >>= 1)
             v += __shfl_down_sync(0xffffffffu, v, offset);
+#endif
         if (lane == 0) red[warp][k] = v;
     }
     __syncthreads();
@@ -115,7 +124,13 @@ void hc_mix_partials_kernel
     }
 }
 
+#if defined(USE_ROCM)
+// NORM (ROCm, decode rows): one block per row covers all D columns and runs the following RMSNorm on the
+// collapsed row (rocm/hc_fuse_rdna.cuh)
+template <int H, int M_, bool HEAD, bool HALF_OUT, bool NORM = false>
+#else
 template <int H, int M_, bool HEAD, bool HALF_OUT>
+#endif
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_mix_finalize_kernel
 (
@@ -132,6 +147,9 @@ void hc_mix_finalize_kernel
     const float rms_eps,
     const float hc_eps,
     const int sinkhorn_iters
+#if defined(USE_ROCM)
+    , const HcNormArgs norm = {}
+#endif
 )
 {
     constexpr int M = M_;
@@ -191,6 +209,39 @@ void hc_mix_finalize_kernel
             const unsigned mask = (H * H == 32) ? 0xffffffffu : ((1u << (H * H)) - 1u);
             float v = fmaf(mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x]);
 
+#if defined(USE_ROCM)
+            if constexpr (H == 4)
+            {
+                // The same butterflies on DPP (rocm/hc_dpp_rdna.cuh): H * H = 16 lanes, one row
+                float m = v;
+                m = fmaxf(m, hc_xor16<1>(m));
+                m = fmaxf(m, hc_xor16<2>(m));
+                v = __expf(v - m);
+                float s = v;
+                s += hc_xor16<1>(s);
+                s += hc_xor16<2>(s);
+                v = __fdividef(v, s) + hc_eps;
+                float cs = v;
+                cs += hc_xor16<4>(cs);
+                cs += hc_xor16<8>(cs);
+                v = __fdividef(v, cs + hc_eps);
+                for (int it = 0; it < sinkhorn_iters - 1; ++it)
+                {
+                    float rs = v;
+                    rs += hc_xor16<1>(rs);
+                    rs += hc_xor16<2>(rs);
+                    v = __fdividef(v, rs + hc_eps);
+                    cs = v;
+                    cs += hc_xor16<4>(cs);
+                    cs += hc_xor16<8>(cs);
+                    v = __fdividef(v, cs + hc_eps);
+                }
+                comb[(size_t) r * H * H + threadIdx.x] = v;
+                (void) mask;
+            }
+            else
+#endif
+            {
             // softmax over rows
             float m = v;
             #pragma unroll
@@ -218,7 +269,12 @@ void hc_mix_finalize_kernel
                 v = __fdividef(v, cs + hc_eps);
             }
             comb[(size_t) r * H * H + threadIdx.x] = v;
+            }
         }
+#if defined(USE_ROCM)
+        // the folded norm needs every thread of the block for its reductions
+        if constexpr (!NORM)
+#endif
         return;
     }
 
@@ -235,6 +291,14 @@ void hc_mix_finalize_kernel
     const int c1 = min(c0 + chunk_cols_c, D);
     const float4* s4 = (const float4*) (streams + (size_t) r * row_len);
     const int D4 = D / 4;
+#if defined(USE_ROCM)
+    if constexpr (NORM)
+    {
+        static_assert(HALF_OUT && !HEAD, "hc_mix_finalize_kernel: the folded norm is for the half-output mix");
+        hc_finalize_norm_row<H>(s4, pre_r, sink_warp, tid, nth, D, (half*) collapsed + (size_t) r * D, norm, r);
+        return;
+    }
+#endif
     for (int c = c0 / 4 + tid; c < c1 / 4; c += nth)
     {
         float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -871,6 +935,10 @@ static void hc_mix_launch
     at::Tensor* comb,
     at::Tensor& collapsed,
     Graph* graph
+#if defined(USE_ROCM)
+    , const HcPendingApply* pend = nullptr     // fold a preceding hc_apply on these streams into the partials
+    , const HcNormArgs* nrm = nullptr          // fold the following RMSNorm into the finalize
+#endif
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -913,6 +981,65 @@ static void hc_mix_launch
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
         D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
+#if defined(USE_ROCM)
+    if (pend || nrm)
+    {
+        TORCH_CHECK(!head && half_out, "hc_mix: folds are for the half-output mix");
+        if (nrm) TORCH_CHECK(D / 4 <= 1024, "hc_mix: folded norm needs D <= 4096");
+        // The pending apply runs inside the partials kernel when each stream is a whole number of
+        // partials chunks (always at decode row counts); otherwise as its own launch first
+        const bool fusable = pend && (D % chunk_cols) == 0 && n_chunks_a % H == 0;
+        if (pend && !fusable)
+        {
+            int chunks_p = std::min(32, std::max(1, 256 / R));
+            int chunk_cols_p = ((D / chunks_p + 4 * NUM_THREADS - 1) / (4 * NUM_THREADS)) * (4 * NUM_THREADS);
+            dim3 grid_p((D + chunk_cols_p - 1) / chunk_cols_p, R);
+            #define ARGS_P(Y_T) \
+                (float*) streams.data_ptr(), (const Y_T*) pend->y, pend->post, pend->comb, nullptr, nullptr, D, chunk_cols_p
+            if (pend->y_half) hc_apply_kernel<4, half, true, false><<<grid_p, NUM_THREADS, 0, stream>>>(ARGS_P(half));
+            else              hc_apply_kernel<4, float, true, false><<<grid_p, NUM_THREADS, 0, stream>>>(ARGS_P(float));
+            #undef ARGS_P
+            cuda_check(cudaPeekAtLastError());
+        }
+        if (fusable)
+        {
+            dim3 grid_f(n_chunks_a / H, R);
+            #define ARGS_F(FN_T, Y_T) \
+                (float*) streams.data_ptr(), (const Y_T*) pend->y, pend->post, pend->comb, \
+                (const FN_T*) fn.data_ptr(), (float*) partials.data_ptr(), row_len, chunk_cols, n_chunks_a
+            #define LAUNCH_F(FN_T, Y_T) \
+                hc_apply_partials_kernel<4, 24, FN_T, Y_T><<<grid_f, 4 * NUM_THREADS_A, 0, stream>>>(ARGS_F(FN_T, Y_T));
+            if (fn_half) { if (pend->y_half) { LAUNCH_F(half, half) } else { LAUNCH_F(half, float) } }
+            else         { if (pend->y_half) { LAUNCH_F(float, half) } else { LAUNCH_F(float, float) } }
+            #undef LAUNCH_F
+            #undef ARGS_F
+        }
+        else
+        {
+            if (fn_half) hc_mix_partials_kernel<4, 24, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
+            else         hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
+        }
+        cuda_check(cudaPeekAtLastError());
+        float* post_p = (float*) post->data_ptr();
+        float* comb_p = (float*) comb->data_ptr();
+        if (nrm)
+        {
+            // One block per row covering all D columns
+            const int chunk_cols_c_n = ((D + 3) / 4) * 4;
+            hc_mix_finalize_kernel<4, 24, false, true, true><<<dim3(1, R), NUM_THREADS, 0, stream>>>
+            (
+                (const float*) streams.data_ptr(), (const float*) partials.data_ptr(),
+                (const float*) base.data_ptr(), (const float*) scale.data_ptr(),
+                post_p, comb_p, collapsed.data_ptr(),
+                D, n_chunks_a, chunk_cols_c_n, rms_eps, hc_eps, sinkhorn_iters, *nrm
+            );
+        }
+        else
+            hc_mix_finalize_kernel<4, 24, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+#endif
     if (!head)
     {
         if (fn_half)
@@ -982,6 +1109,77 @@ void hc_mix
         nullptr
     );
 }
+
+#if defined(USE_ROCM)
+// hc_mix with the launch-count folds (rocm/hc_fuse_rdna.cuh): y / post_a / comb_a describe a pending hc_apply
+// on these streams (all or none), run inside the partials kernel; norm_y receives the RMSNorm of the collapsed
+// output, run inside the finalize (norm_w may be none for an unweighted norm). collapsed is always written
+void hc_mix_fused
+(
+    at::Tensor x,                        // (R, 4, D) float, updated in place by the pending apply
+    const c10::optional<at::Tensor>& y,
+    const c10::optional<at::Tensor>& post_a,
+    const c10::optional<at::Tensor>& comb_a,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor collapsed,
+    const c10::optional<at::Tensor>& norm_w,
+    const c10::optional<at::Tensor>& norm_y,
+    double norm_eps,
+    double norm_bias,
+    double norm_scale
+)
+{
+    TORCH_CHECK_DTYPE(x, kFloat);
+    TORCH_CHECK(x.dim() == 3 && x.size(1) == 4 && x.is_contiguous(), "hc_mix_fused: x must be (R, 4, D) contiguous");
+    const int R = x.size(0);
+    const int D = x.size(2);
+
+    HcPendingApply pend {};
+    const HcPendingApply* pend_p = nullptr;
+    if (y.has_value())
+    {
+        TORCH_CHECK(post_a.has_value() && comb_a.has_value(), "hc_mix_fused: a pending apply needs y, post and comb");
+        TORCH_CHECK_DTYPE(post_a.value(), kFloat);
+        TORCH_CHECK_DTYPE(comb_a.value(), kFloat);
+        TORCH_CHECK(y->is_contiguous() && post_a->is_contiguous() && comb_a->is_contiguous(), "hc_mix_fused: contiguous inputs required");
+        TORCH_CHECK(y->size(0) == R && y->size(-1) == D && post_a->size(0) == R && comb_a->size(0) == R, "hc_mix_fused: shapes");
+        const bool y_half = y->dtype() == at::kHalf;
+        if (!y_half) TORCH_CHECK_DTYPE(y.value(), kFloat);
+        pend = { y->data_ptr(), y_half, (const float*) post_a->data_ptr(), (const float*) comb_a->data_ptr() };
+        pend_p = &pend;
+    }
+
+    HcNormArgs nrm {};
+    const HcNormArgs* nrm_p = nullptr;
+    if (norm_y.has_value())
+    {
+        TORCH_CHECK_DTYPE(norm_y.value(), kHalf);
+        TORCH_CHECK(norm_y->is_contiguous() && norm_y->numel() == (int64_t) R * D, "hc_mix_fused: norm_y shape");
+        bool w_bf16 = false;
+        const void* w = nullptr;
+        if (norm_w.has_value())
+        {
+            TORCH_CHECK(norm_w->numel() == D && norm_w->is_contiguous(), "hc_mix_fused: norm weight shape");
+            w_bf16 = norm_w->dtype() == at::kBFloat16;
+            if (!w_bf16) TORCH_CHECK_DTYPE(norm_w.value(), kHalf);
+            w = norm_w->data_ptr();
+        }
+        nrm = { w, w_bf16, (half*) norm_y->data_ptr(), (float) norm_eps, (float) norm_bias, (float) norm_scale };
+        nrm_p = &nrm;
+    }
+
+    hc_mix_launch(x, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
+                  partials, &post, &comb, collapsed, nullptr, pend_p, nrm_p);
+}
+#endif
 
 void hc_head
 (
@@ -1076,6 +1274,10 @@ void hc_apply
     cuda_check(cudaPeekAtLastError());
 }
 
+#if defined(USE_ROCM)
+    #include "rocm/gr_dots_rdna.cuh"
+#endif
+
 void gr_mix
 (
     const at::Tensor& streams,           // (R, H, D) float
@@ -1121,7 +1323,14 @@ void gr_mix
     const half* w_p = (const half*) w.data_ptr();
 
     const int nch = D / 256, nit = (LR + 63) / 64;
+#if defined(USE_ROCM)
+    // RDNA: rows dots (rocm/gr_dots_rdna.cuh) and the generic finalize below; the bytes-in-flight pair runs far
+    // off the bandwidth bound on these parts
+    const bool fast = false;
+    (void) nch; (void) nit;
+#else
     const bool fast = R <= GR_MAX_R && D % 256 == 0 && (nch == 10 || nch == 16 || nch == 20) && (nit == 5 || nit == 8 || nit == 16) && LR % 2 == 0;
+#endif
     if (fast)
     {
         const float* s_p = (const float*) streams.data_ptr(); const half* fn_p = (const half*) fn.data_ptr(); float* dots_p = (float*) dots.data_ptr();
@@ -1161,6 +1370,10 @@ void gr_mix
 
     dim3 grid_a(M + 1, R);
     #define DOTS_ARGS (const float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), w_p, (float*) dots.data_ptr(), M, D
+#if defined(USE_ROCM)
+    if (gr_dots_rows_try((const float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), w_p, (float*) dots.data_ptr(), M, D, R, stream)) {}
+    else
+#endif
     if (ws_p) gr_dots_kernel<4, true><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS);
     else    { gr_dots_kernel<4, false><<<grid_a, GR_THREADS_A, 0, stream>>>(DOTS_ARGS); }
     #undef DOTS_ARGS
