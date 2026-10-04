@@ -79,7 +79,7 @@ void quantize_tiles_kernel
     const float* input_tile = input_tiles_ptr + L * tile_idx;
     float* output_tile = output_tiles_ptr + L * tile_idx;
     uint16_t* output_indices = output_indices_ptr + L * tile_idx;
-    uint16_t* temp_edges = temp_edges_ptr + L * edges * tile_idx;
+    uint16_t* temp_edges = temp_edges_ptr + (size_t) L * edges * tile_idx;
 
     half* sh_input_tile = (half*) sh; sh += L * sizeof(half);
     half* sh_min = (half*) sh; sh += 32 * sizeof(half);
@@ -93,7 +93,7 @@ void quantize_tiles_kernel
 #else
     constexpr bool QT_SMEM_COSTS = K >= 2;
 #endif
-    half* temp_costs = QT_SMEM_COSTS ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+    half* temp_costs = QT_SMEM_COSTS ? sh_temp_costs : temp_costs_ptr + (size_t) 2 * edges * tile_idx;
     half* temp_costs_inc = temp_costs + edges;
 
     for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
