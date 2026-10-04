@@ -158,6 +158,10 @@ void gr_dots_i8
         }
     };
 
+#if defined(USE_ROCM)
+    DetWmmaTile<2, 1> wt;
+    wt.clear();
+#else
     float facc[2][2][4];
     #pragma unroll
     for (int i = 0; i < 2; ++i)
@@ -165,6 +169,7 @@ void gr_dots_i8
         for (int j = 0; j < 2; ++j)
             #pragma unroll
             for (int q = 0; q < 4; ++q) facc[i][j][q] = 0.0f;
+#endif
 
     issue_b(k_beg, 0); det_cp_async_commit();
     fetch_a(k_beg); stage_a(k_beg, 0);
@@ -180,6 +185,9 @@ void gr_dots_i8
         const unsigned a_hi = det_smem_u32(st_ahi(st)), a_lo = det_smem_u32(st_alo(st));
         const unsigned b_hi = det_smem_u32(st_bhi(st)), b_lo = det_smem_u32(st_blo(st));
 
+#if defined(USE_ROCM)
+        wt.chunk<128, DOTS_KCH>(a_hi, a_lo, wm * 32, b_hi, b_lo, wn * 16, sa_s[st], lane);
+#else
         int acc_hh[2][2][4], acc_x[2][2][4];
         #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -217,6 +225,7 @@ void gr_dots_i8
                 for (int q = 0; q < 4; ++q)
                     facc[i][j][q] = det_flush(acc_hh[i][j][q], acc_x[i][j][q], q >= 2 ? s1 : s0, facc[i][j][q]);
         }
+#endif
         // The other buffer's A tiles were consumed in stage - 1 (everyone passed this stage's
         // barrier): quantize the prefetched next chunk into them
         if (DOTS_STAGES == 1 && more)
@@ -232,6 +241,13 @@ void gr_dots_i8
     __syncthreads();
     // Epilogue: apply proj row scales; stage through smem (aliases the ring) to coalesce
     float (*cs_)[DOTS_BN + 4] = (float (*)[DOTS_BN + 4]) dsm;
+#if defined(USE_ROCM)
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int v = 0; v < 8; ++v)
+            cs_[wm * 32 + i * 16 + det_wmma_row(v, lane)][wn * 16 + (lane & 15)] = wt.acc[i][0][v];
+#else
     #pragma unroll
     for (int i = 0; i < 2; ++i)
         #pragma unroll
@@ -239,6 +255,7 @@ void gr_dots_i8
             #pragma unroll
             for (int q = 0; q < 4; ++q)
                 cs_[wm * 32 + i * 16 + g + (q >= 2 ? 8 : 0)][wn * 16 + j * 8 + tg * 2 + (q & 1)] = facc[i][j][q];
+#endif
     __syncthreads();
     float* out = dm_part + (size_t) slice * Rpad * Mpad;
     #pragma unroll
@@ -373,6 +390,10 @@ void gr_gate_i8
         }
     };
 
+#if defined(USE_ROCM)
+    DetWmmaTile<2, 2> wt;
+    wt.clear();
+#else
     float facc[2][4][4];
     #pragma unroll
     for (int i = 0; i < 2; ++i)
@@ -380,6 +401,7 @@ void gr_gate_i8
         for (int j = 0; j < 4; ++j)
             #pragma unroll
             for (int q = 0; q < 4; ++q) facc[i][j][q] = 0.0f;
+#endif
 
     issue(0, 0); det_cp_async_commit();
     for (int stg = 0; stg < n_stages; ++stg)
@@ -391,6 +413,9 @@ void gr_gate_i8
         const int st = stg & 1;
         const unsigned a_hi = det_smem_u32(st_ahi(st)), a_lo = det_smem_u32(st_alo(st));
         const unsigned b_hi = det_smem_u32(st_bhi(st)), b_lo = det_smem_u32(st_blo(st));
+#if defined(USE_ROCM)
+        wt.chunk<64, GATE_KCH>(a_hi, a_lo, wm * 32, b_hi, b_lo, h_w * GATE_TD, ts_s[st], lane);
+#else
         int acc_hh[2][4][4], acc_x[2][4][4];
         #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -432,12 +457,26 @@ void gr_gate_i8
                 for (int q = 0; q < 4; ++q)
                     facc[i][j][q] = det_flush(acc_hh[i][j][q], acc_x[i][j][q], q >= 2 ? s1 : s0, facc[i][j][q]);
         }
+#endif
     }
     det_cp_async_wait<0>();
     __syncthreads();
     // Gate tile (fp32, with the up row scales) to smem: Gs[h][64][36], aliases the ring
     float (*Gs)[GATE_BM][GATE_TD + 4] = (float (*)[GATE_BM][GATE_TD + 4]) dsm;
     static_assert(HC * GATE_BM * (GATE_TD + 4) * 4 <= GATE_SMEM, "gate staging must fit the ring");
+#if defined(USE_ROCM)
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int v = 0; v < 8; ++v)
+            {
+                const int row = wm * 32 + i * 16 + det_wmma_row(v, lane);
+                const int col = j * 16 + (lane & 15);              // d within the stream's 32
+                Gs[h_w][row][col] = __fmul_rn(wt.acc[i][j][v], usb[h_w * D + d0 + col]);
+            }
+#else
     #pragma unroll
     for (int i = 0; i < 2; ++i)
         #pragma unroll
@@ -449,6 +488,7 @@ void gr_gate_i8
                 const int col = j * 8 + tg * 2 + (q & 1);          // d within the stream's 32
                 Gs[h_w][row][col] = __fmul_rn(facc[i][j][q], usb[h_w * D + d0 + col]);
             }
+#endif
     __syncthreads();
     // mixed[r, d] = sum_h sigmoid(g) * normed(r, h, d) / H: 64 x 32 outputs, 8 per thread
     {

@@ -26,8 +26,9 @@ rounded __fsqrt_rn / __fdiv_rn, whose results are unique by definition.
 
 */
 
-// The PTX primitives (int8 MMA, ldmatrix, cp.async) have ROCm implementations in rocm/det_gemm_rocm.cuh with
-// the same fragment layouts; everything built on them is shared
+// The tensor-core blocks below (int8 MMA, ldmatrix, cp.async and the fragment loaders) are CUDA's; ROCm builds
+// take the int8 WMMA warp tiles and copy helpers of rocm/det_gemm_rocm.cuh (included at the end) instead. The
+// quantization, flush and transcendentals are shared
 
 #define DET_QMAX 16319.0f          // |q| <= 16319 keeps hi in [-128, 127] with the shifted split
 #define DET_I8_LDS 80
@@ -63,11 +64,7 @@ __device__ __forceinline__ void det_quant16(const float* v, float inv, int4& hi4
     lo4 = make_int4(pl[0], pl[1], pl[2], pl[3]);
 }
 
-#if defined(USE_ROCM)
-
-#include "rocm/det_gemm_rocm.cuh"
-
-#else
+#if !defined(USE_ROCM)
 
 __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
 {
@@ -81,8 +78,6 @@ __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsi
 #endif
 }
 
-#endif  // !USE_ROCM
-
 // One k32 step of the three-pass product for a 16 x 8 tile: hh += A_hi B_hi; x += A_hi B_lo + A_lo B_hi
 __device__ __forceinline__ void det_mma3(int* acc_hh, int* acc_x, const unsigned* ah, const unsigned* al, const unsigned* bh, const unsigned* bl)
 {
@@ -94,6 +89,8 @@ __device__ __forceinline__ void det_mma3(int* acc_hh, int* acc_x, const unsigned
     unsigned bx1[2] = { bl[1], bh[1] };
     det_mma_s8(acc_x, ax1, bx1);
 }
+
+#endif  // !USE_ROCM
 
 // Exact chunk sums -> fp32 with the chunk's activation scale, fixed order, no contraction
 __device__ __forceinline__ float det_flush(int hh, int x, float scale, float acc)
@@ -147,6 +144,8 @@ __device__ __forceinline__ int det_swz8(int r, int c) { return r * 128 + ((c ^ (
 __device__ __forceinline__ int det_swz4(int r, int c) { return r * 64 + ((c ^ ((r >> 1) & 3)) << 4); }
 template <int ROWB> __device__ __forceinline__ int det_swz(int r, int c) { return ROWB == 128 ? det_swz8(r, c) : det_swz4(r, c); }
 
+#if !defined(USE_ROCM)
+
 // A fragment (16 x 32 int8, one m-tile) for lane l via ldmatrix.x4: row (l & 7) + ((l >> 3) & 1) * 8, k piece (l >> 4)
 template <int ROWB = 128>
 __device__ __forceinline__ void det_load_a(unsigned* frag, unsigned tile_base, int row0, int kpiece0, int lane)
@@ -161,6 +160,8 @@ __device__ __forceinline__ void det_load_b2(unsigned* r4, unsigned tile_base, in
     const int n = n0 + (lane & 7) + ((lane >> 4) & 1) * 8;
     det_ldmatrix_x4(r4, tile_base + det_swz<ROWB>(n, kpiece0 + ((lane >> 3) & 1)));
 }
+
+#endif  // !USE_ROCM
 
 // exp with FMAs only: 2^n * p(r), x = n ln2 + r. About 2 ulp; identical on every architecture
 __device__ __forceinline__ float exp_det(float x)
@@ -219,3 +220,7 @@ __device__ __forceinline__ float softplus_det(float x)
     if (x > 20.0f) return x;
     return log1p_det(exp_det(x));
 }
+
+#if defined(USE_ROCM)
+#include "rocm/det_gemm_rocm.cuh"
+#endif

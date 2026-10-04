@@ -265,8 +265,11 @@ void routing_gemv
     bool bsz1 = hidden.numel() == k;
 
 #if defined(USE_ROCM)
-    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh)
-    if (gate_t.has_value() && routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
+    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
+    // with the deterministic projection available it only takes the smallest row counts, where it is faster;
+    // both are fixed-order and agree across devices
+    if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= 3) &&
+        routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
 #endif
 
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))

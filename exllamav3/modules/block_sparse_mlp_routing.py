@@ -13,11 +13,6 @@ from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
-# Multi-row routing takes the deterministic int8 projection (routing_gemm.cu) by default. ROCm emulates its
-# int8 MMA (rocm/det_gemm_rocm.cuh), which is slower there than the half-gate path, so on ROCm only
-# tensor-parallel ranks take it: they route for themselves and need rank-identical selections
-_det_routing_default = not torch.version.hip
-
 ROUTING_CACHE_ROWS = 128
 
 
@@ -76,17 +71,16 @@ class RoutingCFG:
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
     gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
     gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
-    det: bool = _det_routing_default        # take the deterministic projection (builds gate_i8)
 
 
 def _gate_t(cfg):
     """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
     scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
-    (weights may be deferred when the RoutingCFG is constructed). Without the deterministic projection
-    (cfg.det off, or a build without it) the int8 slices stay unset and rows route on the half gate."""
+    (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
+    projection leave the int8 slices unset and route on the half gate."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and cfg.det and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)

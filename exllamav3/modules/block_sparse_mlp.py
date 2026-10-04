@@ -1715,8 +1715,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             module.load_local()
         if module.routing_gate is not None:
             module.load_routing()
-            if replicate:
-                module.routing_cfg.det = True
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
             # Routed and shared experts are allocated separately; only when one rank owns both

@@ -142,6 +142,10 @@ void routing_gemm_i8_kernel
         }
     };
 
+#if defined(USE_ROCM)
+    DetWmmaTile<2, 1> wt;
+    wt.clear();
+#else
     float facc[2][2][4];
     #pragma unroll
     for (int i = 0; i < 2; ++i)
@@ -149,6 +153,7 @@ void routing_gemm_i8_kernel
         for (int j = 0; j < 2; ++j)
             #pragma unroll
             for (int q = 0; q < 4; ++q) facc[i][j][q] = 0.0f;
+#endif
 
     issue(0, 0); det_cp_async_commit();
     for (int chunk = 0; chunk < n_chunks; ++chunk)
@@ -162,6 +167,9 @@ void routing_gemm_i8_kernel
         const unsigned b_hi = det_smem_u32(st_bhi(st)), b_lo = det_smem_u32(st_blo(st));
         const float* sa_st = st_sa(st);
 
+#if defined(USE_ROCM)
+        wt.chunk<128, RG_KCH>(a_hi, a_lo, wm * 32, b_hi, b_lo, wn * 16, sa_st, lane);
+#else
         int acc_hh[2][2][4], acc_x[2][2][4];
         #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -200,6 +208,7 @@ void routing_gemm_i8_kernel
                 for (int q = 0; q < 4; ++q)
                     facc[i][j][q] = det_flush(acc_hh[i][j][q], acc_x[i][j][q], q >= 2 ? s1 : s0, facc[i][j][q]);
         }
+#endif
         // Single buffer: the next chunk can only land once everyone is done with this one
         if (RG_STAGES == 1 && chunk + 1 < n_chunks)
         {
@@ -210,6 +219,13 @@ void routing_gemm_i8_kernel
     det_cp_async_wait<0>();
     __syncthreads();
     float (*cs_)[RG_BN + 4] = (float (*)[RG_BN + 4]) dsm;
+#if defined(USE_ROCM)
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int v = 0; v < 8; ++v)
+            cs_[wm * 32 + i * 16 + det_wmma_row(v, lane)][wn * 16 + (lane & 15)] = wt.acc[i][0][v];
+#else
     #pragma unroll
     for (int i = 0; i < 2; ++i)
         #pragma unroll
@@ -217,6 +233,7 @@ void routing_gemm_i8_kernel
             #pragma unroll
             for (int q = 0; q < 4; ++q)
                 cs_[wm * 32 + i * 16 + g + (q >= 2 ? 8 : 0)][wn * 16 + j * 8 + tg * 2 + (q & 1)] = facc[i][j][q];
+#endif
     __syncthreads();
     if (part) part += (size_t) blockIdx.z * R * E;
     #pragma unroll

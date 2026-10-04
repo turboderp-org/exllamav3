@@ -11,12 +11,8 @@ import os
 import math
 
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
-# TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path. ROCm emulates the kernel's int8
-# MMA (rocm/det_gemm_rocm.cuh), which is slower there than the BLAS path, so unless the variable is
-# set, ROCm only takes the tiled kernel on tensor-parallel ranks, which need rank consistency
-_gr_mix_tiled_env = os.environ.get("EXL3_GR_MIX_TILED")
-_gr_mix_tiled_enable = _gr_mix_tiled_env != "0"
-_gr_mix_tiled_single = _gr_mix_tiled_enable and (_gr_mix_tiled_env is not None or not torch.version.hip)
+# TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
+_gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -311,7 +307,7 @@ class GatedResidual(Module):
                                 no_defer = True, arena = False) if self.use_combine else None
         self._prepare(down, up, inject, keep_source_weights)
 
-    def _prepare(self, down, up, inject, keep_source_weights: bool = False, tp: bool = False):
+    def _prepare(self, down, up, inject, keep_source_weights: bool = False):
         # Derived buffers are deduplicated: down/inject live as views of proj_h, up is kept in
         # its checkpoint orientation (the GEMM path transposes by view) only while the sources
         # are wanted, and the fused decode kernel reads the repacked copy
@@ -337,9 +333,9 @@ class GatedResidual(Module):
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
         # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
-        # instructions — so on CUDA the path is Ampere+ only (ROCm emulates both,
-        # rocm/det_gemm_rocm.cuh); elsewhere the cuBLAS fallback serves the projection.
-        self.tiled = (_gr_mix_tiled_single or (tp and _gr_mix_tiled_enable)) and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
+        # instructions — so on CUDA the path is Ampere+ only (ROCm runs it on RDNA's int8
+        # WMMA, rocm/det_gemm_rocm.cuh); elsewhere the cuBLAS fallback serves the projection.
+        self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
             and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
             and torch.cuda.get_device_capability(dev)[0] >= 8
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
@@ -609,7 +605,7 @@ class GatedResidual(Module):
         down = consumer.recv(exported["down"], cuda = True)
         up = consumer.recv(exported["up"], cuda = True)
         inject = consumer.recv(exported["inject"], cuda = True) if module.use_combine else None
-        module._prepare(down, up, inject, tp = True)
+        module._prepare(down, up, inject)
         module.device = local_context["device"]
         return module
 

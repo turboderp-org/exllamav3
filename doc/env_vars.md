@@ -60,7 +60,7 @@ shared experts with 128-aligned widths and no post-norm. Under tensor parallelis
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
 
-### `EXL3_GR_MIX_TILED` (default: `1`; ROCm: tensor-parallel ranks only)
+### `EXL3_GR_MIX_TILED` (default: `1`)
 
 Prefill-sized mixes of the Qwen3.8-style gated residual (`GatedResidual`, the low-rank
 hyper-connection) run a tiled CUDA kernel whose GEMMs use exact int8 tensor-core accumulation with
@@ -75,11 +75,9 @@ and the decode kernel takes the norm weight on the stream side, written by the p
 residual update. The same int8 scheme covers the MoE router projection for batched rows
 (`routing_gemm.cu`), which has no switch.
 
-On ROCm the int8 tensor-core operations are emulated (exact, so the results stay bit-identical to
-the CUDA build), which makes both kernels slower than the BLAS/half-gate paths there. Unless the
-variable is set, ROCm takes them only on tensor-parallel ranks, which need rank-identical streams
-and routing; single-device loads use the BLAS mix and half-gate routing. Set to `1` to take the
-tiled mix on every load.
+On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.cuh`). The
+per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
+agree across RDNA generations as well.
 
 ### `EXL3_BC_GDN` (default: `1`)
 
