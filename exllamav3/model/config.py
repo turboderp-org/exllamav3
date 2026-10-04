@@ -59,6 +59,10 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Hold the n-gram table in RAM (implies ngram_stream_from_disk = False) and mlock() it there, so the kernel
+        # can neither swap it out nor reclaim it (a swapped row costs a page-in inside the forward). Linux; needs
+        # RLIMIT_MEMLOCK to cover the table or CAP_IPC_LOCK. Set before loading the model
+        self.ngram_lock = os.environ.get("EXL3_NGRAM_LOCK", "0") != "0"
         # Stream the token embedding table from disk with per-forward row gathers instead of
         # holding it in system RAM. Works for quantized and unquantized tables. Set before
         # loading the model

@@ -700,6 +700,16 @@ only when the table lives on high-latency storage (e.g. HDD, where per-row seeks
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
 
+### `EXL3_NGRAM_LOCK` (default: `0`)
+
+Default for `Config.infer_params.ngram_lock`: hold the n-gram embedding table in RAM (as with
+`EXL3_NGRAM_STREAM=0`) and `mlock()` its pages in place, so they are never swapped out or
+reclaimed under memory pressure (a swapped-out row would cost a page-in inside the forward).
+Linux only. The process's `RLIMIT_MEMLOCK` must cover the table (the soft limit is raised to the
+hard limit when that suffices; `ulimit -l unlimited`, `LimitMEMLOCK=infinity` for systemd
+services) or the interpreter needs `CAP_IPC_LOCK`; this is checked before the table loads. Also
+`--ngram_lock` / `-ngl` in `model_init`-based scripts.
+
 ### `EXL3_EMBED_STREAM` (default: `0`)
 
 Default for `Config.infer_params.embed_stream_from_disk`: stream the token embedding table from
