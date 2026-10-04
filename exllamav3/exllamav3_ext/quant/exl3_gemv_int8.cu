@@ -27,6 +27,7 @@ static int exl3_gemv_int8_mode()
     if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
     const char* e = getenv("EXL3_INT8_GEMV");
     _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+    _exl3_gemv_int8_mode_chk = true;
     return _exl3_gemv_int8_mode;
 }
 
@@ -35,11 +36,21 @@ bool exl3_gemv_int8_enabled()
     return exl3_gemv_int8_mode() != 0;
 }
 
-// Kill switch for the multi-matrix/sliced path only (EXL3_INT8_MSQ=0), for A/B verification
-// against the cooperative mgemm kernel on identical inputs
+// Kill switch for the multi-matrix/sliced path (EXL3_INT8_MSQ=0), for A/B verification
+// against the cooperative mgemm kernel on identical inputs. Default on under HIP only:
+// the msq launch exists because RDNA cannot co-reside the cooperative kernel's blocks
+// safely; on CUDA the tuned coop path stays the default and msq is opt-in.
 bool exl3_gemv_int8_msq_enabled()
 {
-    static const int on = [] { const char* e = getenv("EXL3_INT8_MSQ"); return e ? atoi(e) : 1; }();
+    static const int on = []
+    {
+        const char* e = getenv("EXL3_INT8_MSQ");
+#if defined(USE_ROCM)
+        return e ? atoi(e) : 1;
+#else
+        return e ? atoi(e) : 0;
+#endif
+    }();
     return on != 0;
 }
 
@@ -80,15 +91,12 @@ typedef void (*gemv_int8_coop_fn)
 
 static void* select_gemv_int8_kernel(int K, bool half_k, bool c_fp32, bool residual)
 {
-    if (half_k)
+    if (half_k) switch (K)
     {
-        switch (K)
-        {
-            case 1: return exl3_gemv_int8_coop_sel_h1(c_fp32, residual);
-            case 2: return exl3_gemv_int8_coop_sel_h2(c_fp32, residual);
-            case 3: return exl3_gemv_int8_coop_sel_h3(c_fp32, residual);
-        }
-        return nullptr;
+        case 1: return exl3_gemv_int8_coop_sel_h1(c_fp32, residual);
+        case 2: return exl3_gemv_int8_coop_sel_h2(c_fp32, residual);
+        case 3: return exl3_gemv_int8_coop_sel_h3(c_fp32, residual);
+        default: return nullptr;
     }
     switch (K)
     {
@@ -104,19 +112,14 @@ static void* select_gemv_int8_kernel(int K, bool half_k, bool c_fp32, bool resid
     return nullptr;
 }
 
-
-
 static void* select_gemv_int8_sq_kernel(int K, bool half_k, int M, bool c_fp32, bool residual)
 {
-    if (half_k)
+    if (half_k) switch (K)
     {
-        switch (K)
-        {
-            case 1: return exl3_gemv_int8_sq_sel_h1(M, c_fp32, residual);
-            case 2: return exl3_gemv_int8_sq_sel_h2(M, c_fp32, residual);
-            case 3: return exl3_gemv_int8_sq_sel_h3(M, c_fp32, residual);
-        }
-        return nullptr;
+        case 1: return exl3_gemv_int8_sq_sel_h1(M, c_fp32, residual);
+        case 2: return exl3_gemv_int8_sq_sel_h2(M, c_fp32, residual);
+        case 3: return exl3_gemv_int8_sq_sel_h3(M, c_fp32, residual);
+        default: return nullptr;
     }
     switch (K)
     {
@@ -546,8 +549,9 @@ bool exl3_gemv_int8
     // Tile width: 16 * K uint16 per 256-weight tile, 16 * K + 8 at the half-integer rates
     // (K + 0.5, mul1 codebook only; the caller gates the codebook)
     const int tile_u16 = (int) B.size(2);
-    const int K = tile_u16 / 16;
     const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
+    if (half_k && (tile_u16 % 16 != 8 || K > 3)) return false;
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
     int size_m = A.numel() / size_k;
@@ -556,7 +560,18 @@ bool exl3_gemv_int8
 
     int device;
     cudaGetDevice(&device);
-    if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
+    // Half-integer rates take the gate of the integer rate above them
+    if (K < 1 || K + (half_k ? 1 : 0) > exl3_gemv_int8_max_k(device)) return false;
+
+    // Both int8 kernels below size their shared memory against a fixed ~80 KB budget baked into
+    // gemv_int8_sq_rows_max() and the coop path's 768-row bound, and - critically - the kernels
+    // recompute rows_per from those same constants on the device, so the host cannot simply ask
+    // for less without desyncing the two. On Turing (64 KB) the cudaFuncSetAttribute would fail
+    // and the following cuda_check would abort the process. This path is a decode-time
+    // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
+    // declining is a performance loss and nothing more.
+    if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
+
     int num_sms = num_sms_arg > 0 ? num_sms_arg : DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;

@@ -311,11 +311,14 @@ class BCAttn:
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
+        # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the
+        # generator's block table), so the 16-byte divisibility the JIT would infer holds
+        cache_t += ":16"
         sig = {
-            "q": "*fp16", "k_cache": cache_t, "v_cache": cache_t,
-            "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
-            "partial_o": "*fp32", "partial_ml": "*fp32",
-            "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
+            "q": "*fp16:16", "k_cache": cache_t, "v_cache": cache_t,
+            "block_table": "*i32:16", "cache_seqlens": "*i32", "out": "*fp16:16",
+            "partial_o": "*fp32:16", "partial_ml": "*fp32:16",
+            "k_scales": "*fp16:16", "v_scales": "*fp16:16", "h32": "*fp16:16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
@@ -333,7 +336,7 @@ class BCAttn:
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
         sig_c = {
-            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
@@ -614,6 +617,12 @@ class BCAttn:
             except BCKernelTooLarge:
                 return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
+        # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
+        # loads); the block table is the only one bound per call rather than a whole static, and
+        # the generator uploads it fresh each step. A caller passing a row slice of a device
+        # table could break the assumption silently, so fail here instead
+        assert block_table.data_ptr() % 16 == 0, \
+            "BC_Attention: block_table must be 16-byte aligned (pass a whole tensor, not a sliced view)"
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
                     position_ids, inv_freq, regime, t_total)

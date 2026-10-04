@@ -18,6 +18,7 @@ from ..cache.recurrent import (
 )
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..cache.recurrent import host_copy
 import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
@@ -224,16 +225,10 @@ class SWALayerState:
     def stash(self, slot, position):
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
-        # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
-        # stalls the host mid-prefill.
-# Contract: the returned pinned tensors are filled by an async D2H on the current
-        # stream. They are only safe for stream-ordered consumers (unstash re-uploads on
-        # the same stream); host-side readers must synchronize the stream first.
-        k = torch.empty_like(self.k_state[slot, a:b], device = "cpu", pin_memory = True)
-        v = torch.empty_like(self.v_state[slot, a:b], device = "cpu", pin_memory = True)
-        k.copy_(self.k_state[slot, a:b], non_blocking = True)
-        v.copy_(self.v_state[slot, a:b], non_blocking = True)
-        return k, v
+        return (
+            host_copy(self.k_state[slot, a:b]),
+            host_copy(self.v_state[slot, a:b])
+        )
 
 
     def unstash(self, slot, stashed, position):
@@ -263,6 +258,7 @@ class SlidingAttention(Module):
         key_q: str | None = None,
         key_k: str | None = None,
         key_v: str | None = None,
+        key_fused_qkv: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
         key_sinks: str | None = None,
@@ -281,7 +277,9 @@ class SlidingAttention(Module):
         g_proj: Linear | Module | None = None,
         full_gate: bool = False,
         gate_softplus: bool = False,
+        transpose_qkv: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits",
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
@@ -345,13 +343,21 @@ class SlidingAttention(Module):
             return
 
         # Create q, k, v projections
-        fkey, frange_q, frange_k, frange_v = None, None, None, None
+        if key_fused_qkv:
+            assert not (q_proj is not None or k_proj is not None or v_proj is not None), \
+                "SlidingAttention: fused QKV tensor is not supported with pre-made projections"
+            fkey = f"{key}.{key_fused_qkv}"
+            frange_q = (0, num_q_heads * head_dim)
+            frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
+            frange_v = (frange_k[1], frange_k[1] + num_kv_heads * head_dim)
+        else:
+            fkey, frange_q, frange_k, frange_v = None, None, None, None
 
         if key_q or frange_q:
             f = 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -359,7 +365,9 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -370,7 +378,7 @@ class SlidingAttention(Module):
         if key_k or frange_k:
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -378,11 +386,13 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -390,7 +400,9 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -662,7 +674,7 @@ class SlidingAttention(Module):
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -674,7 +686,7 @@ class SlidingAttention(Module):
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
-                params["backend"].all_reduce(x)
+                self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -1274,6 +1286,7 @@ class SlidingAttention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()
