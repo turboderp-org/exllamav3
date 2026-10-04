@@ -8,7 +8,10 @@ from ...util.tensor import get_for_device, buffered_arange
 # typical chat prompts (20-47 tokens) on the ~50 tok/s recurrent path and produced
 # 0.5-2s TTFT. chunk_size is 64; T < 64 is one partial chunk of the same recurrence.
 # Decode (seqlen 1, or <=8 with the BC GDN graph) never reaches this gate.
-_CHUNK_MIN = int(os.environ.get("EXL3_GDN_CHUNK_MIN", "8"))
+# ROCm default 8; on CUDA keep the upstream per-model gate (seqlen >= num_v_heads,
+# resolved in the functions below) unless the env is set explicitly.
+_CHUNK_MIN_ENV = os.environ.get("EXL3_GDN_CHUNK_MIN")
+_CHUNK_MIN = int(_CHUNK_MIN_ENV) if _CHUNK_MIN_ENV is not None else (8 if torch.version.hip else 0)
 
 # The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
 # they are imported on first use rather than with the library
@@ -150,7 +153,7 @@ def gated_delta_rule_fn(
     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
     # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
     if channelwise_g:
-        if seqlen >= _CHUNK_MIN and not history:
+        if seqlen >= (_CHUNK_MIN or num_v_heads) and not history:
             from ...vendor.fla import chunk_kda
             q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
             q = q.view(bsz, seqlen, -1, k_head_dim)
@@ -199,7 +202,7 @@ def gated_delta_rule_fn(
         return core_attn_out
 
     # Chunked rule
-    if seqlen >= _CHUNK_MIN and not history:
+    if seqlen >= (_CHUNK_MIN or num_v_heads) and not history:
         from ...vendor.fla import chunk_gated_delta_rule
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)

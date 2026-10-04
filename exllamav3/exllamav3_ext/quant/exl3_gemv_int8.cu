@@ -247,8 +247,13 @@ static bool exl3_gemv_int8_sq
     int device, int num_sms, cudaStream_t stream, Graph* graph
 )
 {
+#if defined(USE_ROCM)
     if (size_m > 4) return false;
     int M = size_m > 2 ? 4 : size_m;
+#else
+    if (size_m > 2) return false;
+    int M = size_m;
+#endif
     void* fn = select_gemv_int8_sq_kernel(K, half_k, M, c_fp32, residual);
     if (!fn) return false;
 
