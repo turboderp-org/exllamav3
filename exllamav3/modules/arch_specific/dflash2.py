@@ -16,9 +16,17 @@ import torch.nn.functional as F
 
 from ...model.config import Config
 from .. import Module, Linear, RMSNorm, Attention, GatedMLP
+import os
 from ...util.tensor import to2
 
 from ...ext import exllamav3_ext as ext
+
+# EXL3_DFLASH2_HOST_CB: keep the selector codebooks (raw fp16/bf16 [vocab, rank]) in pinned
+# host RAM and serve the CUDA kernels through a zero-copy device alias, exactly like
+# Linear.pin_linears: the kernels take the alias (a real CUDA tensor whose pages live in host
+# memory), so the whole bulk footprint leaves VRAM and every gather read goes over PCIe.
+# Env-gated for A/B testing.
+_dflash2_host_cb = os.environ.get("EXL3_DFLASH2_HOST_CB", "0") != "0"
 
 
 def _grouped_dynamic_convolve_torch(
@@ -265,6 +273,7 @@ class DFlash2Selector(Module):
         self.key_succ = f"{key}.successor_codebook"
         self.pred_codebook = None
         self.succ_codebook = None
+        self._pinned_store = {}
         self.caps.update({"x_cpu": True})
 
     def optimizer_targets(self):
@@ -282,34 +291,64 @@ class DFlash2Selector(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
-        # Older trainers append .weight to the bare codebook keys;
-        # try bare first, fall back to suffixed (same bytes either way).
-        self.pred_codebook = self.config.stc.get_tensor(
-            self.key_pred, self.device, optional = True, allow_bf16 = True)
-        if self.pred_codebook is None:
-            self.pred_codebook = self.config.stc.get_tensor(
-                self.key_pred + ".weight", self.device, optional = False, allow_bf16 = True)
-        self.succ_codebook = self.config.stc.get_tensor(
-            self.key_succ, self.device, optional = True, allow_bf16 = True)
-        if self.succ_codebook is None:
-            self.succ_codebook = self.config.stc.get_tensor(
-                self.key_succ + ".weight", self.device, optional = False, allow_bf16 = True)
+        # Codebooks come raw (fp16/bf16 [vocab, rank]); older trainers append .weight to the bare
+        # keys (same bytes). Host-resident mode pins the bulk tensor and aliases it zero-copy.
+        self.pred_codebook = self._load_codebook(self.key_pred)
+        self.succ_codebook = self._load_codebook(self.key_succ)
         expected_shape = (self.vocab_size, self.rank)
-        if self.pred_codebook.shape != expected_shape:
-            raise ValueError(
-                f"Expected {self.key_pred} shape {expected_shape}, "
-                f"got {tuple(self.pred_codebook.shape)}"
-            )
-        if self.succ_codebook.shape != expected_shape:
-            raise ValueError(
-                f"Expected {self.key_succ} shape {expected_shape}, "
-                f"got {tuple(self.succ_codebook.shape)}"
-            )
+        for name, cb in ((self.key_pred, self.pred_codebook), (self.key_succ, self.succ_codebook)):
+            if cb.shape != expected_shape:
+                raise ValueError(
+                    f"Expected {name} shape {expected_shape}, got {tuple(cb.shape)}"
+                )
+
+
+    def _load_codebook(self, key: str) -> torch.Tensor:
+        # Host-resident mode (EXL3_DFLASH2_HOST_CB): the bulk tensor loads into CPU memory and is
+        # page-locked + zero-copy aliased; no_defer because the pinned copy must be complete when
+        # we take it
+        host = _dflash2_host_cb and self.device.type == "cuda"
+        ld = torch.device("cpu") if host else self.device
+        q = self.config.stc.get_tensor(f"{key}.q", ld, optional = True, no_defer = host, arena = not host)
+        if q is None:
+            cb = self.config.stc.get_tensor(key, ld, optional = True, allow_bf16 = True, no_defer = host, arena = not host)
+            if cb is None:
+                cb = self.config.stc.get_tensor(key + ".weight", ld, optional = False, allow_bf16 = True, no_defer = host, arena = not host)
+            return (self._pin_alias(key, cb) if host else cb), None
+        if self.rank != 256:
+            raise ValueError(f"{key}: quantized codebooks require rank 256 (got {self.rank})")
+        q = q.contiguous()
+        if q.size(0) != self.vocab_size:
+            raise ValueError(f"Expected {key}.q shape ({self.vocab_size}, ...), got {tuple(q.shape)}")
+        scales = self.config.stc.get_tensor(f"{key}.scales", self.device, optional = False).contiguous()
+        mins = self.config.stc.get_tensor(f"{key}.mins", self.device, optional = True)
+        if mins is not None:
+            mins = mins.contiguous()
+        out = {
+            "q": self._pin_alias(f"{key}.q", q) if host else q,
+            "scales": scales,
+            "mins": mins,
+        }
+        return None, out
+
+
+    def _pin_alias(self, key: str, t: torch.Tensor) -> torch.Tensor:
+        # Page-lock a copy of the bulk tensor and hand the kernels a zero-copy CUDA alias of
+        # it (same pattern as Linear.pin_linears). The alias does not own the memory: the
+        # pinned source lives in _pinned_store for the module's lifetime and doubles as the
+        # export value in get_tensors
+        if t.device.type != "cpu":
+            raise ValueError(f"{key}: expected a CPU tensor to pin, got {t.device}")
+        pinned = t.pin_memory()
+        self._pinned_store[key] = pinned
+        return ext.pinned_cuda_view(pinned, self.device.index if self.device.index is not None else 0)
+
 
     @override
     def unload(self):
         self.pred_codebook = None
         self.succ_codebook = None
+        self._pinned_store.clear()
         super().unload()
 
     @override
@@ -318,6 +357,7 @@ class DFlash2Selector(Module):
         if self.pred_codebook is not None:
             t[self.key_pred] = self.pred_codebook.contiguous()
             t[self.key_succ] = self.succ_codebook.contiguous()
+        t.update(self._pinned_store)  # host-resident mode: export the sources, not the aliases
         return t
 
     def walk(
