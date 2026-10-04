@@ -905,7 +905,7 @@ void bighead_attn_paged
     dim3 grid1((uint32_t)(bsz * q_len), (uint32_t)n_kv_heads, (uint32_t)n_chunks);
     dim3 grid2((uint32_t)(bsz * q_len), (uint32_t)n_q_heads);
 
-    const float scale = sm_scale == 0.0f ? 1.0f / sqrtf((float) dim) : sm_scale;
+    const float scale = sm_scale == 0.0f ? rsqrtf((float) dim) : sm_scale;
 
     #define PAGED_UPDATE_ARGS \
         k_ptr, v_ptr, k_cache_ptr, v_cache_ptr, block_ptr, seqlens_ptr, \
@@ -1050,7 +1050,7 @@ void bighead_attn
     dim3 grid1_512((uint32_t)(bsz * q_len), (uint32_t)n_kv_heads, (uint32_t)n_chunks);
     dim3 grid2_512((uint32_t)(bsz * q_len), (uint32_t)n_q_heads);
 
-    const float scale = sm_scale == 0.0f ? 1.0f / sqrtf((float) dim) : sm_scale;
+    const float scale = sm_scale == 0.0f ? rsqrtf((float) dim) : sm_scale;
 
     #define ARGS1 \
         q_ptr, k_ptr, v_ptr, ws_ptr, \
