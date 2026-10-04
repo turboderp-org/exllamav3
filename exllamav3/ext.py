@@ -152,6 +152,14 @@ else:
         # them already-translated (hipified_path = None), which crashes the ninja
         # writer, and they must not be compiled as sources anyway.
         and '_hip.' not in file and not file.startswith('hip_')
+        # CUDA-only sources that do not hipify (inline PTX asm, ldmatrix,
+        # cuda::atomic): excluded from HIP builds; their bindings are
+        # #ifndef USE_ROCM. Mirrors the setup.py source filter.
+        and not (is_hip and file in (
+            'dflash2.cu',
+            'hc_mix_tiled.cu',
+            'routing_gemm.cu',
+        ))
     ]
 
     extra_include_paths = [sources_dir]

@@ -72,7 +72,8 @@ uint64_t gemm_autotune_hash
         h *= 1099511628211ull;
     };
     mix((uint64_t) (half_k ? 1 : 0));
-    mix((uint64_t) MIN(roundup_pow2(size_m), 16));
+    // Past 16 rows, buckets follow the multi-row tile heights so each is tuned separately
+    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);
@@ -309,7 +310,7 @@ int exl3_gemm_gr
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
         #if !defined(USE_ROCM)
-        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         cuda_check(cudaPeekAtLastError());
         #endif
         kernel_attr_set[device].insert((void*) kernel);
@@ -693,7 +694,7 @@ int exl3_mgemm_gr
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
         #if !defined(USE_ROCM)
-        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         #endif
         kernel_attr_set[device].insert((void*) kernel);
     }

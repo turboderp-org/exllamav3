@@ -322,19 +322,20 @@ __device__ __forceinline__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, 
 #define FSHF_IMM(dst, lo, hi, imm) dst = __funnelshift_r((lo), (hi), (imm))
 #define BFE16_IMM(dst, src, imm) dst = ((src) >> (imm)) & 0xffff
 
-// __fns: Find nth set bit in mask starting from position prev+1.
-// CUDA-only intrinsic; emulate with ctz + bit-clear loop for ROCm.
-// Returns the bit position (0-indexed) or -1 if not found.
+// __fns: Find the n-th set bit in mask, searching upward from prev INCLUSIVE
+// (PTX fns.b32: `fns.b32 d, 0xaaaaaaaa, 3, 1` returns 3). CUDA-only intrinsic;
+// emulate with ctz + bit-clear loop for ROCm. Returns the bit position
+// (0-indexed) or -1 if not found.
 
 __device__ __forceinline__ int __fns(unsigned int mask, int prev, int n)
 {
     if (prev >= 0)
     {
-        if (prev >= 31) return -1;
-        mask &= ~((1u << (prev + 1)) - 1);  // Clear bits 0..prev
+        if (prev >= 32) return -1;
+        mask &= ~((1u << prev) - 1);   // clear bits strictly below prev
     }
     for (int i = 1; i < n && mask; ++i)
-        mask &= mask - 1;  // Clear (n-1) lowest set bits
+        mask &= mask - 1;  // clear (n-1) lowest set bits
     return mask ? __builtin_ctz(mask) : -1;
 }
 
