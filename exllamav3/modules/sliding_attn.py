@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..model.config import Config
+from ..util.device_copy import host_to_device
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
@@ -869,7 +870,7 @@ class SlidingAttention(Module):
                 dtype = torch.int32, device = self.device
             )
             self.bt_cache[slots] = bt
-        cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
+        cache_seqlens = host_to_device(torch.tensor(positions_l, dtype = torch.int32), self.device)
         return bt, cache_seqlens
 
 
@@ -1052,7 +1053,7 @@ class SlidingAttention(Module):
                 [[rs.slot * pps + wposs[i] // PAGE_SIZE + j for j in range(pps)] for i, rs in enumerate(rsg)],
                 dtype = torch.int32, device = self.device
             )
-            cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
+            cache_seqlens = host_to_device(torch.tensor(hots, dtype = torch.int32), self.device)
 
             if not non_causal_spans:
                 o = paged_attn_triton_prefill(

@@ -27,6 +27,7 @@ import os
 import numpy as np
 import torch
 from ..ext import exllamav3_ext as ext
+from ..util.device_copy import host_to_device
 
 RECON_BATCH = max(1, int(os.environ.get("EXL3_MOE_RECON_BATCH", 16)))
 # Padded rows per group (B * cmax): bounds the gathered input / intermediate slabs
@@ -252,7 +253,7 @@ class BatchReconLayer:
             for i, pl in enumerate(ptrs):
                 if pl is not None:
                     meta_h[3 + i] = pl
-        meta = torch.from_numpy(meta_h).to(dev, non_blocking = True)
+        meta = host_to_device(torch.from_numpy(meta_h), dev)
         ids_d = meta[0]
         if ptrs is not None:
             ptr_g, ptr_u, ptr_d = meta[3], meta[4], meta[5]

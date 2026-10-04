@@ -4,6 +4,7 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
+from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
@@ -1212,7 +1213,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             for b, e in enumerate(grp):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
-                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                        tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
