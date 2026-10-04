@@ -1,7 +1,7 @@
 # ROCm support (RDNA3 / gfx11)
 
 ExLlamaV3 runs on AMD RDNA GPUs through PyTorch's ROCm builds. Scope is **wave32
-parts only** (RDNA, gfx10/gfx11); CDNA (wave64) devices are rejected at import.
+parts only** (RDNA, gfx10/gfx11); CDNA (wave64) devices are rejected on first device use.
 Developed and measured on gfx1100 (RX 7900 XTX).
 
 ## Building
@@ -63,14 +63,15 @@ correct (those paths trade determinism across ranks, not accuracy).
   HIP-graph captures on tiny prefills.
 
 ## Numerics
-
 Decode output is not bitwise identical across batch sizes on RDNA3, same as on
-CUDA: m <= 4 rows take the per-row-quantized int8 GEMV path (~0.8% RMS error)
-while larger batches take the fp16 reconstruct + GEMM path. A near-tie logit
-can flip one greedy token at the m=4/5 boundary. Same-m reruns are bitwise
-deterministic. `EXL3_HGEMM_F16OUT=1` additionally rounds each fp32-output
-reconstruct GEMM to fp16 once (the residual stream's own precision; measured
-worst model-level KLD 1.9e-3).
+CUDA: small batches take the per-row-quantized int8 GEMV path (m <= 4 on ROCm,
+m <= 2 upstream on CUDA; ~0.9% output RMS deviation) while larger batches take
+the fp16 reconstruct + GEMM path. A near-tie logit can flip one greedy token at
+the dispatch boundary. Same-m reruns are bitwise deterministic.
+`EXL3_HGEMM_F16OUT=1` additionally rounds each fp32-output reconstruct GEMM to
+fp16 once (the residual stream's own precision; measured worst model-level KLD
+1.9e-3).
+
 
 ## Known issues
 

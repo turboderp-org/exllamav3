@@ -19,7 +19,8 @@ def scan_bytes(data: bytes) -> Counter:
         j = data.find(key, i)
         if j < 0:
             break
-        c[data[j + len(key)]] += 1
+        v = data[j + len(key)] if j + len(key) < len(data) else -1
+        c[v] += 1
         i = j + len(key)
     return c
 
