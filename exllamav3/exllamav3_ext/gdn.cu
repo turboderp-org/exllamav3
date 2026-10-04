@@ -1649,6 +1649,7 @@ void gdn_ba_gemv_kernel
     int r = blockIdx.y;
 
     float sum = 0.0f;
+#if defined(USE_ROCM)
     // A20: vectorize the k-loop. The half2 version issues 4 B loads with a 32-lane stride and
     // spends its time latency-bound at ~30 GB/s effective (21.5 us per call x 48 GDN layers =
     // 1.03 ms/token on Qwen3.8-27B); float4 halves the load count per output and keeps each
@@ -1677,6 +1678,7 @@ void gdn_ba_gemv_kernel
         }
     }
     else
+#endif
     {
         const half2* x2 = (const half2*) (x + (size_t) r * k);
         const half2* w2 = (const half2*) (w_t + (size_t) row * k);
