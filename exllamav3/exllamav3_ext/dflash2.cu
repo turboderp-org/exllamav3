@@ -6,6 +6,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/codebook.cuh"
+#include "quant/bits_k.cuh"
 
 // DFlash2 grouped dynamic causal convolution over a draft block (dflash.model
 // _grouped_dynamic_convolve):
@@ -301,6 +303,301 @@ void dflash2_selector_walk
         );
     if (gate.dtype() == at::kHalf) { if (pred_cb.dtype() == at::kHalf) { LAUNCH(half, half) } else { LAUNCH(half, __nv_bfloat16) } }
     else                           { if (pred_cb.dtype() == at::kHalf) { LAUNCH(float, half) } else { LAUNCH(float, __nv_bfloat16) } }
+    #undef LAUNCH
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// ============================ quantized (integer) codebooks ============================
+//
+// A codebook may be stored as a per-32-block integer tensor: packed integer values
+// [vocab, qbytes] uint8 + per-block fp16 scales [vocab, rank/32] (+ per-block fp16 mins for the
+// asymmetric _1 forms). The serving gather reads one vocab row, dequantizes it to fp16
+// (qv * scale + min) and hands the raw row to the staged walk. Row-based (not tile-based), so a
+// single row is a contiguous read with no cross-row traffic:
+//
+//     Q8_0: 8-bit signed,   per-block scale          (qv in [-128,127], out = qv * d)
+//     Q4_1: 4-bit unsigned, per-block scale + min    (qv in [0,15],     out = qv * d + m)
+//     Q3_1: 3-bit unsigned, per-block scale + min    (qv in [0,7],      out = qv * d + m)
+//     Q2_1: 2-bit unsigned, per-block scale + min    (qv in [0,3],      out = qv * d + m)
+//
+// The q buffer is padded by one byte per row so the Q3 cross-byte read never runs past the row.
+
+#define CB_RANK 256           // codebook rank (WALK_THREADS wide)
+#define CB_BLOCKS (CB_RANK / 32)   // 8 per-32 blocks per row
+
+template <int FORMAT>
+__global__ __launch_bounds__(CB_RANK)
+void dflash2_cb_gather_int_kernel
+(
+    const uint8_t* __restrict__ q,        // [vocab, qbytes+1]
+    const half* __restrict__ scales,      // [vocab, CB_BLOCKS]
+    const half* __restrict__ mins,        // [vocab, CB_BLOCKS] (null for Q8_0)
+    const int64_t* __restrict__ ids,      // [n]
+    half* __restrict__ out,               // [n, CB_RANK]
+    const int qstride                     // qbytes + 1
+)
+{
+    const int row = blockIdx.x;
+    const int c = threadIdx.x;            // 0..CB_RANK-1
+    const int64_t v = ids[row];
+    const int blk = c >> 5;               // c / 32
+    const float d = __half2float(scales[v * CB_BLOCKS + blk]);
+    const float m = mins ? __half2float(mins[v * CB_BLOCKS + blk]) : 0.0f;
+    const uint8_t* qr = q + v * qstride;
+    float qv;
+    if constexpr (FORMAT == 0)            // Q8_0: 8-bit signed
+        qv = (float) (int8_t) qr[c];
+    else if constexpr (FORMAT == 1)       // Q4_1: 4-bit unsigned
+        qv = (float) ((qr[c >> 1] >> (4 * (c & 1))) & 0xF);
+    else if constexpr (FORMAT == 2)       // Q4_0: 4-bit signed
+    {
+        const int u = (qr[c >> 1] >> (4 * (c & 1))) & 0xF;
+        qv = (float) (u >= 8 ? u - 16 : u);
+    }
+    else if constexpr (FORMAT == 3)       // Q3_1: 3-bit unsigned
+    {
+        const int bit = 3 * c;
+        const uint16_t two = (uint16_t) (qr[bit >> 3] | (qr[(bit >> 3) + 1] << 8));
+        qv = (float) ((two >> (bit & 7)) & 0x7);
+    }
+    else if constexpr (FORMAT == 4)       // Q3_0: 3-bit signed
+    {
+        const int bit = 3 * c;
+        const uint16_t two = (uint16_t) (qr[bit >> 3] | (qr[(bit >> 3) + 1] << 8));
+        const int u = (two >> (bit & 7)) & 0x7;
+        qv = (float) (u >= 4 ? u - 8 : u);
+    }
+    else if constexpr (FORMAT == 5)       // Q2_1: 2-bit unsigned
+        qv = (float) ((qr[c >> 2] >> (2 * (c & 3))) & 0x3);
+    else                                  // FORMAT == 6: Q2_0: 2-bit signed
+    {
+        const int u = (qr[c >> 2] >> (2 * (c & 3))) & 0x3;
+        qv = (float) (u >= 2 ? u - 4 : u);
+    }
+    out[(int64_t) row * CB_RANK + c] = __float2half_rn(qv * d + m);
+}
+
+/*
+q:      (vocab, qbytes+1) uint8 packed integer values (1 pad byte per row)
+scales: (vocab, rank/32) fp16 per-block scales
+mins:   (vocab, rank/32) fp16 per-block mins (optional; absent for Q8_0)
+ids:    (n,) int64 rows to gather
+out:    (n, rank) fp16 dequantized rows
+*/
+void dflash2_cb_gather_int
+(
+    const at::Tensor& q,
+    const at::Tensor& scales,
+    const c10::optional<at::Tensor>& mins,
+    const at::Tensor& ids,
+    at::Tensor& out
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DIM(q, 2);
+    TORCH_CHECK_DIM(scales, 2);
+    TORCH_CHECK_DIM(ids, 1);
+    TORCH_CHECK_DIM(out, 2);
+    TORCH_CHECK_DTYPE(q, kByte);
+    TORCH_CHECK_DTYPE(scales, kHalf);
+    TORCH_CHECK_DTYPE_OPT(mins, kHalf);
+    TORCH_CHECK_DTYPE(ids, kLong);
+    TORCH_CHECK_DTYPE(out, kHalf);
+    TORCH_CHECK(q.is_contiguous() && scales.is_contiguous() && ids.is_contiguous() && out.is_contiguous(),
+                "dflash2_cb_gather_int: inputs must be contiguous");
+    TORCH_CHECK(out.size(0) == ids.numel() && out.size(1) == CB_RANK,
+                "dflash2_cb_gather_int: out must be (n, ", CB_RANK, ")");
+    TORCH_CHECK(scales.size(1) == CB_BLOCKS,
+                "dflash2_cb_gather_int: scales must be (vocab, ", CB_BLOCKS, ")");
+
+    const int64_t n = ids.numel();
+    if (!n) return;
+
+    const int qstride = (int) q.size(1);
+    const int qbytes = qstride - 1;
+    const half* mins_p = mins.has_value() ? (const half*) mins.value().data_ptr() : nullptr;
+
+    #define GATHER_INT(F) \
+        dflash2_cb_gather_int_kernel<F><<<n, CB_RANK, 0, stream>>>( \
+            (const uint8_t*) q.data_ptr(), (const half*) scales.data_ptr(), mins_p, \
+            (const int64_t*) ids.data_ptr(), (half*) out.data_ptr(), qstride);
+    switch (qbytes)
+    {
+        case 256: GATHER_INT(0) break;                                  // Q8_0
+        case 128: if (mins_p) GATHER_INT(1) else GATHER_INT(2) break;   // Q4_1 / Q4_0
+        case 96:  if (mins_p) GATHER_INT(3) else GATHER_INT(4) break;   // Q3_1 / Q3_0
+        case 64:  if (mins_p) GATHER_INT(5) else GATHER_INT(6) break;   // Q2_1 / Q2_0
+        default: TORCH_CHECK(false, "dflash2_cb_gather_int: unsupported codebook width ", qbytes);
+    }
+    #undef GATHER_INT
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// Staged variant of the selector walk for quantized codebooks. The Python side dequantizes the rows the
+// walk can touch (dflash2_cb_gather_int; both id sets are known before the walk starts) and passes them
+// here; only the per-position pred row selection stays in-kernel (slot addressing below). The integer
+// gather folds the per-32-block scale+min into each row, so the staged rows are the full fp16 codebook
+// values and the walk's column scale svh_AB is a no-op (ones). The fp32 walk score, per row i:
+//
+//     score[c] = unary[i, c] + < p_a * (gate[i] * svh_AB), p_b[c] >
+//
+// stagedA:   [bsz, 1 + (rows-1)*k, rank] fp16, pred_cb rows: slot 0 = anchor, slot 1 + (i-1)*k + c = row
+//            of cands[i-1, c]
+// stagedB:   [bsz, rows, k, rank] fp16, succ_cb rows
+// svh_AB:    [rank] fp16, ones (the integer dequant already folded the per-block scale+min in)
+
+template <typename TG>
+__global__ __launch_bounds__(WALK_THREADS)
+void dflash2_selector_walk_staged_kernel
+(
+    const float* __restrict__ unary,
+    const int64_t* __restrict__ cands,
+    const TG* __restrict__ gate,
+    const half* __restrict__ stagedA,
+    const half* __restrict__ stagedB,
+    const half* __restrict__ svh_AB,
+    const int64_t* __restrict__ anchor,
+    int64_t* __restrict__ out,
+    float* __restrict__ conf,
+    const int rows,
+    const int k
+)
+{
+    extern __shared__ float smem[];               // [CB_RANK + k]: a_g + scores
+    float* a_g = smem;                            // [CB_RANK]
+    float* scores = smem + CB_RANK;               // [k]
+    __shared__ int64_t s_pred;
+    __shared__ int s_slot;
+
+    const int b = blockIdx.x;
+    const int t = threadIdx.x;
+    const int warp = t / 32, lane = t % 32;
+    const int a_slots = 1 + (rows - 1) * k;
+
+    if (t == 0)
+    {
+        s_pred = anchor[b];
+        s_slot = 0;
+        out[(int64_t) b * (rows + 1)] = s_pred;
+        if (conf) conf[(int64_t) b * (rows + 1)] = 0.0f;
+    }
+    __syncthreads();
+
+    const half* stA = stagedA + (int64_t) b * a_slots * CB_RANK;
+    const half* stB = stagedB + (int64_t) b * rows * k * CB_RANK;
+
+    for (int i = 0; i < rows; ++i)
+    {
+        const half* a_row = stA + (int64_t) s_slot * CB_RANK;
+        const TG* g_row = gate + ((int64_t) b * rows + i) * CB_RANK;
+        a_g[t] = to_f(a_row[t]) * to_f(g_row[t]) * to_f(svh_AB[t]);
+        __syncthreads();
+
+        const int64_t* c_row = cands + ((int64_t) b * rows + i) * k;
+        const float* u_row = unary + ((int64_t) b * rows + i) * k;
+        for (int c = warp; c < k; c += WALK_THREADS / 32)
+        {
+            const half* b_row = stB + ((int64_t) i * k + c) * CB_RANK;
+            float dot = 0.0f;
+            for (int r = lane; r < CB_RANK; r += 32)
+                dot += a_g[r] * to_f(b_row[r]);
+            for (int offset = 16; offset > 0; offset /= 2)
+                dot += __shfl_xor_sync(0xffffffff, dot, offset);
+            if (lane == 0) scores[c] = u_row[c] + dot;
+        }
+        __syncthreads();
+
+        if (t == 0)
+        {
+            int best = 0;
+            float best_score = scores[0];
+            for (int c = 1; c < k; ++c)
+                if (scores[c] > best_score) { best_score = scores[c]; best = c; }
+            s_pred = c_row[best];
+            s_slot = 1 + i * k + best;
+            out[(int64_t) b * (rows + 1) + i + 1] = s_pred;
+            if (conf) conf[(int64_t) b * (rows + 1) + i + 1] = best_score;
+        }
+        __syncthreads();
+    }
+}
+
+/*
+unary, cands, gate, anchor, out, conf: as dflash2_selector_walk
+stagedA, stagedB, svh_AB: see dflash2_selector_walk_staged_kernel
+*/
+
+void dflash2_selector_walk_staged
+(
+    const at::Tensor& unary,
+    const at::Tensor& cands,
+    const at::Tensor& gate,
+    const at::Tensor& stagedA,
+    const at::Tensor& stagedB,
+    const at::Tensor& svh_AB,
+    const at::Tensor& anchor,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& conf
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(unary.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DIM(unary, 3);
+    TORCH_CHECK_DIM(cands, 3);
+    TORCH_CHECK_DIM(gate, 3);
+    TORCH_CHECK_DIM(stagedA, 3);
+    TORCH_CHECK_DIM(stagedB, 4);
+    TORCH_CHECK_DIM(svh_AB, 1);
+    TORCH_CHECK_DIM(anchor, 1);
+    TORCH_CHECK_DIM(out, 2);
+    TORCH_CHECK_DTYPE(unary, kFloat);
+    TORCH_CHECK_DTYPE(cands, kLong);
+    TORCH_CHECK_DTYPE(anchor, kLong);
+    TORCH_CHECK_DTYPE(out, kLong);
+    TORCH_CHECK_DTYPE_OPT(conf, kFloat);
+    TORCH_CHECK_DTYPE(stagedA, kHalf);
+    TORCH_CHECK_DTYPE(stagedB, kHalf);
+    TORCH_CHECK_DTYPE(svh_AB, kHalf);
+    TORCH_CHECK(gate.dtype() == at::kHalf || gate.dtype() == at::kFloat, "dflash2_selector_walk_staged: gate must be fp16 or fp32");
+    TORCH_CHECK(unary.is_contiguous() && cands.is_contiguous() && gate.is_contiguous() && stagedA.is_contiguous() &&
+                stagedB.is_contiguous() && svh_AB.is_contiguous() && anchor.is_contiguous() && out.is_contiguous(),
+                "dflash2_selector_walk_staged: inputs must be contiguous");
+
+    int bsz = unary.size(0);
+    int rows = unary.size(1);
+    int k = unary.size(2);
+    TORCH_CHECK_SHAPES_FULL(unary, cands);
+    TORCH_CHECK(gate.size(0) == bsz && gate.size(1) == rows && gate.size(2) == CB_RANK,
+                "dflash2_selector_walk_staged: gate must be (bsz, rows, ", CB_RANK, ")");
+    TORCH_CHECK(svh_AB.numel() == CB_RANK, "dflash2_selector_walk_staged: svh_AB must be (", CB_RANK, ",)");
+    TORCH_CHECK(stagedA.size(0) == bsz && stagedA.size(1) == 1 + (rows - 1) * k && stagedA.size(2) == CB_RANK,
+                "dflash2_selector_walk_staged: stagedA must be (bsz, 1 + (rows-1)*k, rank)");
+    TORCH_CHECK(stagedB.size(0) == bsz && stagedB.size(1) == rows && stagedB.size(2) == k && stagedB.size(3) == CB_RANK,
+                "dflash2_selector_walk_staged: stagedB must be (bsz, rows, k, rank)");
+    TORCH_CHECK(anchor.size(0) == bsz, "dflash2_selector_walk_staged: anchor must be (bsz,)");
+    TORCH_CHECK(out.size(0) == bsz && out.size(1) == rows + 1, "dflash2_selector_walk_staged: out must be (bsz, rows + 1)");
+    TORCH_CHECK(!conf.has_value() || (conf.value().is_contiguous() && conf.value().sizes() == out.sizes()),
+                "dflash2_selector_walk_staged: conf must be (bsz, rows + 1), contiguous");
+    TORCH_CHECK(k >= 1 && rows >= 1, "dflash2_selector_walk_staged: empty candidate list or rows");
+    if (!bsz || !rows) return;
+
+    size_t smem = (CB_RANK + k) * sizeof(float);
+    float* conf_ptr = conf.has_value() ? (float*) conf.value().data_ptr() : nullptr;
+
+    #define LAUNCH(TG) \
+        dflash2_selector_walk_staged_kernel<TG><<<bsz, WALK_THREADS, smem, stream>>> \
+        ( \
+            (const float*) unary.data_ptr(), (const int64_t*) cands.data_ptr(), (const TG*) gate.data_ptr(), \
+            (const half*) stagedA.data_ptr(), (const half*) stagedB.data_ptr(), (const half*) svh_AB.data_ptr(), \
+            (const int64_t*) anchor.data_ptr(), \
+            (int64_t*) out.data_ptr(), conf_ptr, rows, k \
+        );
+    if (gate.dtype() == at::kHalf) { LAUNCH(half) } else { LAUNCH(float) }
     #undef LAUNCH
     cuda_check(cudaPeekAtLastError());
 }

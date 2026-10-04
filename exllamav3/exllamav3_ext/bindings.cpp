@@ -274,6 +274,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
     m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
     m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
+    m.def("dflash2_cb_gather_int", &dflash2_cb_gather_int, "dflash2_cb_gather_int");
+    m.def("dflash2_selector_walk_staged", &dflash2_selector_walk_staged, "dflash2_selector_walk_staged");
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");

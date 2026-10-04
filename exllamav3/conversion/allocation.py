@@ -224,6 +224,7 @@ def create_q_strategy_from_recipe(
     The recipe must cover the budgeted tensors exactly.
     """
     from ..modules.linear import Linear
+    from ..modules.arch_specific.dflash2 import DFlash2Selector
 
     targets = {}
     sum_numel = 0
@@ -250,6 +251,15 @@ def create_q_strategy_from_recipe(
                 targets[module.key] = mtp_bpw
             else:
                 raise ValueError("Logic error in create_q_strategy_from_recipe")
+        elif isinstance(module, DFlash2Selector):
+            # Codebooks are not budgeted by default; a recipe key opts in (16 or absent keeps
+            # them raw). Quantized by DFlash2Selector.convert_codebooks at conversion time
+            for key, numel in module.codebook_targets():
+                bpw = recipe_tensors.get(key)
+                if bpw is not None and bpw != 16:
+                    targets[key] = bpw
+                    sum_numel += numel
+                    sum_bits += numel * bpw
         for sm in module.modules:
             _add(sm, fixed_bpw)
 

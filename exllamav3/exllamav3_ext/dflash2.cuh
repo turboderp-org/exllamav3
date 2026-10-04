@@ -33,3 +33,25 @@ void dflash2_topk
     at::Tensor& values,
     at::Tensor& indices
 );
+
+void dflash2_cb_gather_int
+(
+    const at::Tensor& q,
+    const at::Tensor& scales,
+    const c10::optional<at::Tensor>& mins,
+    const at::Tensor& ids,
+    at::Tensor& out
+);
+
+void dflash2_selector_walk_staged
+(
+    const at::Tensor& unary,
+    const at::Tensor& cands,
+    const at::Tensor& gate,
+    const at::Tensor& stagedA,
+    const at::Tensor& stagedB,
+    const at::Tensor& svh_AB,
+    const at::Tensor& anchor,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& conf
+);

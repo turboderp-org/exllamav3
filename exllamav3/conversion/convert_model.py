@@ -4,6 +4,7 @@ import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
+from ..modules.arch_specific.dflash2 import DFlash2Selector
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
@@ -1464,6 +1465,11 @@ def main(args, job_state):
             else:
                 quantize_linears_single(
                     args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state, out_sens)
+
+            # DFlash2 codebook quantization (no-op unless the recipe names the codebook keys)
+            for m in module:
+                if isinstance(m, DFlash2Selector):
+                    m.convert_codebooks(args, idx, devices, strategy)
 
             # Collect converted module tensors
             for m in module:
