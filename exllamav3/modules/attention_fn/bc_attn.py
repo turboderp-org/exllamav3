@@ -72,6 +72,14 @@ class BCKernelTooLarge(RuntimeError):
 # to scratch, where 4 / 2 does
 _SPLIT_WARPS, _SPLIT_STAGES = (8, 1) if torch.version.hip else (4, 2)
 
+def _split_launch(device, hd_pad: int) -> tuple[int, int]:
+    """(num_warps, num_stages) for the split-decode kernel: gfx1100 runs the head_dim <= 128 tile faster
+    at 4 warps (still a single stage)"""
+    from .triton_paged import gfx_arch
+    if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
+        return 4, 1
+    return _SPLIT_WARPS, _SPLIT_STAGES
+
 
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int, pointer_range_32: bool = False):
@@ -347,7 +355,7 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, _SPLIT_WARPS, _SPLIT_STAGES,
+        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, *_split_launch(dev, hd_pad),
                                   pointer_range_32 = self._pointer_range_32())
 
         sig_c = {

@@ -275,9 +275,12 @@ def test_topk_cuda_matches_torch():
             ref_v, ref_i = torch.topk(ref, k, dim = -1)
             for b in range(2):
                 for r in range(7):
-                    assert sorted(indices[b, r].tolist()) == sorted(ref_i[b, r].tolist()), (k, dtype, b, r)
-                    got = values[b, r][indices[b, r].argsort()]
-                    exp = ref_v[b, r][ref_i[b, r].argsort()]
+                    # Compared by value: fp16 inputs tie exactly at the k-th place often enough, and which
+                    # of the tied ids torch.topk keeps is unspecified. Every kept id must carry its value
+                    assert len(set(indices[b, r].tolist())) == k, (k, dtype, b, r)
+                    torch.testing.assert_close(values[b, r], ref[b, r][indices[b, r]], rtol = 1e-5, atol = 1e-5)
+                    got = values[b, r].sort(descending = True).values
+                    exp = ref_v[b, r].sort(descending = True).values
                     torch.testing.assert_close(got, exp, rtol = 1e-5, atol = 1e-5)
             # every kept id is inside the valid vocab
             assert int(indices.max()) < vocab

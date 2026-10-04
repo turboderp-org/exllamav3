@@ -1170,6 +1170,14 @@ class Attention(Module):
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            # Prefill-sized chunks otherwise take the bound from the host copy of cache_seqlens when
+            # the caller has one (the generator builds it on the CPU, so no sync): the kernels' fallback
+            # bound is the block table's width plus the chunk, which counts the chunk twice once the
+            # table covers it and can push a short context into the kv-split regime
+            if max_kv_len is None and seqlen > 16:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             o = attn_dispatch(
                 q = q,
                 k = k,
