@@ -1,7 +1,7 @@
 """
 Decode-GEMV coverage at K=7/K=8 and above-cap K.
 
-The RDNA3 port compiles int8 msq instances for k7/k8 that are unreachable at the
+The RDNA3 port compiles int8 GEMV instances for k7/k8 that are unreachable at the
 default EXL3_INT8_GEMV_MAX_K=6, and K above the cap dispatches small-m rows to
 the fp16 GEMV path whose m16n8k16 MMA is __shfl-emulated on ROCm (ptx.cuh) --
 none of which any existing test or gate exercises (models on hand are K<=~4).
@@ -88,7 +88,8 @@ def _case(K, cap, m_values):
 
 @pytest.mark.parametrize("K", [7, 8])
 def test_int8_gemv_k7_k8(K):
-    """K=7/8 on the int8 path: forces the compiled-but-unreachable msq instances."""
+    """K=7/8 on the int8 path: forces the compiled-but-unreachable int8 GEMV instances
+    (single-matrix calls go through the cooperative kernel, not msq)."""
     r = _case(K, cap=K, m_values=[1, 2, 3, 4])
     assert r.returncode == 0, f"exit {r.returncode}\n{r.stdout}\n{r.stderr[-2000:]}"
 
