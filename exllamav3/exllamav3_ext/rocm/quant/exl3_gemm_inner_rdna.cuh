@@ -62,19 +62,9 @@
 #include "../rdna_wmma.cuh"
 #include "../../quant/exl3_dq.cuh"
 #include "../../quant/hadamard_inner.cuh"
-// For EXL3_GEMM_SH_B_DQ_STRIDE. The host-side LDS accounting in
-// exl3_gemm_smem_bytes() has to agree with this kernel's indexing exactly, so
-// both take the stride from that one macro rather than repeating the literal.
-#include "exl3_kernel_map_rdna.cuh"
-
-#define EXL3_GEMM_BASE_THREADS 256
-
-// SMEM_MAX is established by exl3_kernel_map_rdna.cuh (64 KB). It is
-// defined unconditionally at quant/exl3_gemm_inner.cuh:7, which is one of
-// the reasons this file has to exist rather than being shimmed.
-#ifndef SMEM_MAX
-#define SMEM_MAX (64 * 1024)
-#endif
+// EXL3_GEMM_BASE_THREADS, SMEM_MAX, EXL3_GEMM_SH_B_DQ_STRIDE and exl3_gemm_smem_bytes(), the shared
+// definition of this kernel's LDS footprint (asserted against the layout below)
+#include "../../quant/exl3_kernel_map.cuh"
 
 template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
 inline __device__
@@ -115,9 +105,7 @@ void exl3_gemm_kernel_inner
     // uint16 per 16x16 trellis tile; a half-integer rate (bits + 0.5, mul1) carries 16 * bits + 8
     constexpr int TILE_U16 = 16 * bits + (half_k ? 8 : 0);
     constexpr int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;  // uint16s
-    // 18, not 17 -- see EXL3_GEMM_SH_B_DQ_STRIDE in exl3_kernel_map_rdna.cuh
-    // for why 18, and why this must not be retyped as a literal
-    // here (the host-side LDS accounting drifted from it once already).
+    // 18, not 17 -- see EXL3_GEMM_SH_B_DQ_STRIDE in exl3_kernel_map.cuh
     constexpr int SH_B_DQ_STRIDE  = EXL3_GEMM_SH_B_DQ_STRIDE;
     // One 16x16 staging block per warp IN THE BLOCK, which is NUM_WARPS *
     // TILEBLOCKS_K -- not NUM_WARPS. NUM_WARPS counts warps per sub_k group
@@ -159,6 +147,15 @@ void exl3_gemm_kernel_inner
                   + 2 * sh_b_dq_size
                   + 4 * sh_c_size,
         "Invalid kernel params (insufficient LDS for shape -- RDNA has 64 KB)"
+    );
+    // The host filters shapes by asking exl3_gemm_smem_bytes() what this layout costs; assert the two
+    // agree per instantiation, as the CUDA inner does
+    static_assert
+    (
+        exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
+                             bits, half_k, shmem_out_had)
+            == 2 * SH_STAGES * sh_a_stage_size + 2 * SH_STAGES * sh_b_stage_size + 2 * sh_b_dq_size + 4 * sh_c_size,
+        "exl3_gemm_smem_bytes() disagrees with the kernel's LDS layout"
     );
 
     // Shared memory

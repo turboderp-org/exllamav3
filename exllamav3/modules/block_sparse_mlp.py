@@ -23,8 +23,9 @@ from .block_sparse_mlp_routing import (
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
-# ROCm: the RDNA fused MoE kernel (rocm/quant/exl3_moe_rdna.cu) pipelines and tiles the rows itself, so it
-# takes experts up to 512 rows, and the batched reconstruct tier and the wide row tiles below default off
+# ROCm: the RDNA fused MoE kernel (rocm/quant/exl3_moe_inner_rdna.cuh) pipelines and tiles the rows itself,
+# so it takes experts up to 512 rows, and the batched reconstruct tier and the wide row tiles below default
+# off
 _rocm = bool(torch.version.hip)
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned

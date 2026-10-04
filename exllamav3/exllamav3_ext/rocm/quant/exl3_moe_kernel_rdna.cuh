@@ -14,22 +14,15 @@
 //                                (see below). Everything else in that file is
 //                                inline PTX and will not compile here.
 //   exl3_gemm_inner.cuh       -> exl3_gemm_inner_rdna.cuh
-//   exl3_kernel_map.cuh       -> exl3_kernel_map_rdna.cuh
 //
 // PIPE = true instances run the g/u/d GEMMs through the pipelined mainloop
 // in exl3_moe_inner_rdna.cuh (moe_gemm_rows_pipe below), one call site in a loop over
 // the three matrices; PIPE = false is the CUDA body with the shared inner, unchanged.
-//
-// Include order is load-bearing: exl3_kernel_map_rdna.cuh must be first,
-// because exl3_moe_common.cuh defines SMEM_MAX to 90 KB behind an #ifndef and
-// whichever header lands first wins. On a 64 KB part the 90 KB value would let
-// the inner's static_assert pass shapes that cannot be launched.
 // =============================================================================
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#include "exl3_kernel_map_rdna.cuh"      // FIRST: establishes SMEM_MAX
 #include "../../quant/exl3_moe_common.cuh"
 #include "exl3_moe_shape_rdna.cuh"   // AFTER common: overrides MOE_TILESIZE_K
 #include "../../util.h"
@@ -146,7 +139,7 @@ void moe_gemm_rows_pipe
         else
         {
             // Half-bit units as above. The pipelined mainloop decodes integer K only: the host
-            // (exl3_moe_rdna.cu) routes any half-integer rate to the non-pipelined kernel, so odd codes
+            // (exl3_moe.cu) routes any half-integer rate to the non-pipelined kernel, so odd codes
             // never reach this switch
             switch (K)
             {

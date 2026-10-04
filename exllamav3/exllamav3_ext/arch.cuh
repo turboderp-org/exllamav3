@@ -25,8 +25,13 @@
     #define EXL3_SM75 0
 #endif
 
-// Dynamic shared memory per block. SMEM_MAX stays at the sm_86 value because it only bounds
-// the compile-time static_assert in exl3_gemm_inner.cuh, which must keep accepting every
-// template instantiation. What actually gets requested at launch is the per-device value.
+// Dynamic shared memory per block the EXL3 kernels are compiled against (SMEM_MAX in
+// quant/exl3_kernel_map.cuh): the sm_86 value on CUDA, which only bounds the compile-time
+// static_asserts in the inner kernels and must keep accepting every template instantiation, and
+// the RDNA workgroup LDS on ROCm. What actually gets requested at launch is the per-device value.
+#if defined(USE_ROCM)
+#define EXL3_SMEM_MAX_DEFAULT (64 * 1024)
+#else
 #define EXL3_SMEM_MAX_DEFAULT (90 * 1024)
+#endif
 #define EXL3_SMEM_MAX_SM75    (64 * 1024)

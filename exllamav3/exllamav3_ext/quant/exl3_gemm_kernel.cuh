@@ -1,15 +1,13 @@
 #pragma once
 
-// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) are shared; the backend
-// supplies the tile inner and its shape table: tensor-core MMA with cp.async pipelines (CUDA) or
-// WMMA on RDNA (rocm/quant)
+// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) and the shape table
+// (exl3_kernel_map.cuh) are shared; the backend supplies the tile inner: tensor-core MMA with cp.async
+// pipelines (CUDA) or WMMA on RDNA (rocm/quant)
+#include "exl3_kernel_map.cuh"
+#include "hadamard_inner.cuh"
 #if defined(USE_ROCM)
-    #include "../rocm/quant/exl3_kernel_map_rdna.cuh"
-    #include "hadamard_inner.cuh"
     #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
 #else
-    #include "exl3_kernel_map.cuh"
-    #include "hadamard_inner.cuh"
     #include "exl3_gemm_inner.cuh"
 #endif
 #include "exl3_devctx.cuh"

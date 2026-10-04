@@ -289,11 +289,11 @@ int exl3_gemm_gr
     // RDNA: blocks request only the LDS the compatible shapes need rather than the whole workgroup allocation,
     // so several fit per WGP (see the grid bound in the candidate loop below)
     {
-        size_t need = 0;
+        int need = 0;
         for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
             if (exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k))
-                need = MAX(need, exl3_gemm_smem_bytes(K, s, half_k));
-        if (need > 0 && need < (size_t) smem_max) smem_max = (int) need;
+                need = MAX(need, exl3_gemm_shape_smem(s, K, half_k));
+        if (need > 0 && need < smem_max) smem_max = need;
     }
 #endif
 
