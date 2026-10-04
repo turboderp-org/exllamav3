@@ -1,4 +1,6 @@
+import gc
 import pytest
+import weakref
 import torch
 from collections import namedtuple
 from types import SimpleNamespace
@@ -217,6 +219,33 @@ def test_ranks_pin_their_buffers(tp_cache):
         assert buffers, "rank allocated no buffers for the slot"
         if not rank["cpu_page_cache"].pageable:
             assert all(b.is_pinned() for b in buffers)
+
+
+def test_a_new_tier_releases_the_previous_rank_pools(tp_cache):
+    # A Generator built on the same model (TabbyAPI recreates one after a latch) replaces each rank's pool.
+    # The old pools must go with their pinned slabs, not stay alive through their own pinning threads
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    old_pools = [weakref.ref(rank["cpu_page_cache"]) for rank in ranks]
+    old_threads = [rank["cpu_page_cache"]._alloc_thread for rank in ranks]
+
+    build(model, caches, 64 * 4096)
+    gc.collect()
+
+    assert not any(thread.is_alive() for thread in old_threads)
+    assert all(ref() is None for ref in old_pools)
+    assert all(rank["cpu_page_cache"] is not None for rank in ranks)
+
+
+def test_closing_a_rank_pool_stops_its_thread(tp_cache):
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    pool = ranks[0]["cpu_page_cache"]
+
+    pool.close()
+
+    assert not pool._alloc_thread.is_alive()
+    assert not pool.slots and not pool._spare
 
 
 def test_a_draft_cache_on_its_own_model_is_dispatched_separately():
