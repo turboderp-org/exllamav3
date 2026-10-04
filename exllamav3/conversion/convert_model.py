@@ -17,7 +17,7 @@ from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
 from .ngram import quantize_embedding
-from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
+from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES, CODEBOOK_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -210,13 +210,18 @@ def prepare(args) -> (dict, dict, bool, str):
         recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
         if not isinstance(recipe_tensors, dict) or not recipe_tensors:
             return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
-        # Integer bitrates 1-8 (or 16 = unquantized), plus the half-integer trellis rates (mul1 codebook)
-        def ok(v):
+        # Integer bitrates 1-8 (or 16 = unquantized), plus the half-integer trellis rates (mul1
+        # codebook). Selector codebook keys accept the integer row-gather rates (Q8_0..Q2_0)
+        def ok(k, v):
             if isinstance(v, bool) or not isinstance(v, (int, float)): return False
-            return (float(v).is_integer() and (1 <= v <= 8 or v == 16)) or float(v) in HALF_RATES
-        bad = [k for k, v in recipe_tensors.items() if not ok(v)]
+            if float(v).is_integer() and (1 <= v <= 8 or v == 16): return True
+            if float(v) in HALF_RATES: return True
+            if k.endswith("predecessor_codebook") or k.endswith("successor_codebook"):
+                return float(v) in CODEBOOK_RATES
+            return False
+        bad = [k for k, v in recipe_tensors.items() if not ok(k, v)]
         if bad:
-            return None, None, False, f"Recipe bitrates must be integers 1-8, 16, or one of {HALF_RATES}; bad keys e.g.: {bad[:5]}"
+            return None, None, False, f"Recipe bitrates must be integers 1-8, 16, one of {HALF_RATES}, or (for codebooks) one of {CODEBOOK_RATES}; bad keys e.g.: {bad[:5]}"
         recipe_bits = recipe.get("achieved_bpw") or recipe.get("target_bpw")
         if args.bits is None and recipe_bits is None:
             return None, None, False, "Recipe has no target_bpw/achieved_bpw; pass --bits for reporting"
@@ -297,7 +302,7 @@ def prepare(args) -> (dict, dict, bool, str):
             return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
     if in_args["embed_bits"] != 16 and not 1 <= in_args["embed_bits"] <= 8:
         return None, None, False, f"--embed_bits must be an integer 1-8, or 16, got {in_args['embed_bits']}"
-    if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
+    if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for k, v in recipe_tensors.items() if not (k.endswith("predecessor_codebook") or k.endswith("successor_codebook"))):
         return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file

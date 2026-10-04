@@ -9,6 +9,9 @@ if TYPE_CHECKING:
 
 # Half-integer trellis rates with kernel instances (mul1 codebook only); above 3.5 bpw the steps are whole bits
 HALF_RATES = (1.5, 2.5, 3.5)
+# Selector codebook rates (per-32-block integer row-gather, dflash2.cu): actual bpw incl. the
+# per-block scale/min overhead. The _1 (asymmetric) form is the denser rate, _0 the half-step below.
+CODEBOOK_RATES = (8.5, 5.0, 4.5, 4.0, 3.5, 3.0, 2.5)
 
 
 def _as_rate(r: float):
