@@ -50,3 +50,26 @@ struct TensorLoadJob {
 
 void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs);
 void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_chunk_size);
+
+// Row layout of the loads tensor taken by stloader_deferred_batch
+enum StloaderBatchColumn
+{
+    STLOADER_COL_FILE = 0,          // index into file_handles
+    STLOADER_COL_OFFSET,            // byte offset in the file
+    STLOADER_COL_SIZE,              // bytes to read
+    STLOADER_COL_DEST,              // destination pointer
+    STLOADER_COL_DEST_SIZE,         // capacity at the destination pointer
+    STLOADER_COL_FLAGS,             // STLOADER_FLAG_* bits
+    STLOADER_COL_DEVICE,            // CUDA device index, -1 for host destinations
+    STLOADER_NUM_COLS
+};
+#define STLOADER_FLAG_BF16_TO_FP16 1
+#define STLOADER_FLAG_FP32_TO_FP16 2
+#define STLOADER_FLAG_CUDA 4
+
+void stloader_deferred_batch
+(
+    std::vector<std::vector<uintptr_t>> const& file_handles,
+    at::Tensor const& loads,
+    size_t max_chunk_size
+);

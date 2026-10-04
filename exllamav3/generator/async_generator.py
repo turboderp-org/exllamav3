@@ -182,6 +182,26 @@ class AsyncJob:
         """
         self.job.constrain_output_now(output)
 
+    def set_sampler(self, sampler):
+        """
+        Replace the sampler mid-generation; see Job.set_sampler. Safe to call from any coroutine on the
+        generator's event loop, including the body of an `async for` over this job. Results already queued
+        for this consumer were sampled before the change.
+        """
+        self.job.set_sampler(sampler)
+
+    def set_filters(self, filters):
+        """
+        Replace the filters mid-generation; see Job.set_filters and set_sampler above.
+        """
+        self.job.set_filters(filters)
+
+    def set_banned_strings(self, banned_strings):
+        """
+        Replace the banned strings mid-generation; see Job.set_banned_strings and set_sampler above.
+        """
+        self.job.set_banned_strings(banned_strings)
+
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,
         # then mark this iterator as closed for any current or future consumers.
