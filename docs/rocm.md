@@ -75,7 +75,7 @@ fp16 once (the residual stream's own precision; measured worst model-level KLD
 
 ## Known issues
 
-- CDNA (MI-series, wave64) is not supported and fails fast at import.
+- CDNA (MI-series, wave64) is not supported and fails on first device use.
 - No WMMA path: mma.m16n8k16 is emulated via shuffles. A hardware WMMA
   prototype measured slower and had correctness issues on M>=3 shapes; it is
   not included.
