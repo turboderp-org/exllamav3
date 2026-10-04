@@ -7,14 +7,7 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
-#if defined(USE_ROCM)
-    // RDNA: the WMMA GEMM kernels and their shape table (rocm/quant), same host interface
-    #include "../rocm/quant/exl3_gemm_kernel_rdna.cuh"
-    #include "../rocm/quant/exl3_kernel_map_rdna.cuh"
-#else
-    #include "exl3_gemm_kernel.cuh"
-    #include "exl3_kernel_map.cuh"
-#endif
+#include "exl3_gemm_kernel.cuh"      // selects the backend's inner and shape table (CUDA MMA / RDNA WMMA)
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
@@ -330,7 +323,7 @@ int exl3_gemm_gr
             int tilesize_n = exl3_gemm_tilesize_n_g[candidate_shape_idx];
             int max_slices = MAX(size_k / tilesize_k * size_n / tilesize_n, 1);
 #if defined(USE_ROCM)
-            // RDNA: the plain launch only needs every block resident (device barrier, exl3_gemm_kernel_rdna.cuh),
+            // RDNA: the plain launch only needs every block resident (device barrier, EXL3_GRID_SYNC in exl3_gemm_kernel.cuh),
             // so the grid may reach the occupancy limit; multiProcessorCount counts WGPs
             int occ = 1;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, (const void*) candidate_kernel, exl3_gemm_blockdim_g[candidate_shape_idx], smem_max);

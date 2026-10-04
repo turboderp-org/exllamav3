@@ -45,9 +45,12 @@ HIP_EXCLUDED_SOURCES = {
     # Replaced on ROCm by an implementation of the same interface under rocm/
     "exl3_gemv.cu",         # -> rocm/quant/exl3_gemv_rdna.cu (exl3_gemv.cuh)
     "quant/exl3_kernel_map.cu",                 # -> rocm/quant/exl3_kernel_map_rdna.cu (WMMA GEMM shapes)
-    "quant/comp_units/exl3_comp_unit_*.cu",     # -> rocm/quant/comp_units_rdna/ (WMMA GEMM instances)
     "quant/exl3_moe.cu",                        # -> rocm/quant/exl3_moe_rdna.cu (pipelined fused MoE)
-    "quant/comp_units/exl3_moe_inst_*.cu",      # -> rocm/quant/comp_units_rdna/exl3_moe_inst_*
+    # The GEMM comp units and MoE instance units are shared: their kernel headers select the backend's
+    # inner (quant/exl3_gemm_kernel.cuh, quant/comp_units/exl3_moe_inst_common.cuh). The M-tiled MoE
+    # instances exist for the CUDA kernel only (EXL3_MOE_MTILE)
+    "quant/comp_units/exl3_moe_inst_*_m32.cu",
+    "quant/comp_units/exl3_moe_inst_*_m64.cu",
 }
 
 

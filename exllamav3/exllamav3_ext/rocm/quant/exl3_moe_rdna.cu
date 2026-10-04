@@ -148,7 +148,7 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe[] =
 };
 
 // Half-integer rates on the pipelined mainloop: [K - 1][N_off], mul1 only, uniform
-// gate / up / down (comp_units_rdna/exl3_moe_inst_h*_cb2.cu)
+// gate / up / down (quant/comp_units/exl3_moe_inst_h*_cb2.cu, ROCm arm)
 fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe_half[] =
 {
     exl3_moe_kernel_h1_n128_cb2_pipe(), exl3_moe_kernel_h1_n256_cb2_pipe(),

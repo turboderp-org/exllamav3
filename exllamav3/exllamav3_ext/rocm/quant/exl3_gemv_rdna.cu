@@ -397,7 +397,7 @@ bool exl3_gemv_try_launch
     // Half-integer bitrates (1.5 / 2.5 / 3.5 bpw, mul1): the CUDA path has GEMV instances for
     // them (exl3_gemv_half_inst.cu). The RDNA dot cores (direct / LDS / tiles) decode integer K
     // only, so decline: the caller falls through to the cooperative GEMM, which has half_k
-    // instances (comp_units_rdna/exl3_comp_unit_h*.cu). Correct, not the fast path.
+    // instances (quant/comp_units/exl3_comp_unit_h*.cu). Correct, not the fast path.
     if (half_k) return false;
 
     int mode = exl3_gemv_env_mode();

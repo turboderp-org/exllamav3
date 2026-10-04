@@ -1,8 +1,17 @@
 #pragma once
 
-#include "exl3_kernel_map.cuh"
-#include "hadamard_inner.cuh"
-#include "exl3_gemm_inner.cuh"
+// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) are shared; the backend
+// supplies the tile inner and its shape table: tensor-core MMA with cp.async pipelines (CUDA) or
+// WMMA on RDNA (rocm/quant)
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_kernel_map_rdna.cuh"
+    #include "hadamard_inner.cuh"
+    #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
+#else
+    #include "exl3_kernel_map.cuh"
+    #include "hadamard_inner.cuh"
+    #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 
 // Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
@@ -226,7 +235,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         // Column slices write into a wider row (their source matrix's full width)
         int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
         int size_m_ = size_m;
-        half* A_ = A_had + (had_src_list ? had_src_list[mat_index] : j) * size_m * size_k;
+        // Idle z-slots past bszm carry mat_index -1 and never touch A_; guard the table read anyway
+        half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
         if (C_list && mat_index >= 0) C_ = C_list[mat_index];
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);

@@ -6,7 +6,7 @@
 //
 // Generated from quant/exl3_kernel_map.cuh. Everything matches it except the
 // shape table and SMEM_MAX below; the extern/instance macros keep its
-// per-(K, cb) translation-unit layout so comp_units_rdna/ defines exactly the
+// per-(K, cb) translation-unit layout so the shared quant/comp_units/ define exactly the
 // symbols quant/comp_units/exl3_comp_unit_N.cuh already declares.
 //
 // Why the shapes differ from the CUDA map
@@ -241,7 +241,7 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     EXL3_MGEMM_INST_S4(_bits, _c_fp32, cb)
 
 // Half-integer bitrates (bits + 0.5), mul1 codebook. Same symbols as quant/exl3_kernel_map.cuh's
-// EXL3_KERNEL_INSTANCES_H / EXL3_KERNEL_EXTERNS_H, instantiated by comp_units_rdna/exl3_comp_unit_h{1,2,3}.cu
+// EXL3_KERNEL_INSTANCES_H / EXL3_KERNEL_EXTERNS_H, instantiated by quant/comp_units/exl3_comp_unit_h{1,2,3}.cu
 #if EXL3_RDNA_SHAPE4_N
     #define EXL3_GEMM_INST_S4_H(_bits, _c_fp32)  exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
     #define EXL3_MGEMM_INST_S4_H(_bits, _c_fp32) exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
