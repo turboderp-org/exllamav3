@@ -1342,7 +1342,7 @@ class Job:
         return new_pages
 
 
-    def prefill(self, results: list):
+    def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
 
@@ -1350,6 +1350,9 @@ class Job:
         sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
         model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
         recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+
+        chunk_size, if given, bounds the forward pass of this call below the generator's max_chunk_size (fair
+        scheduling while other jobs are generating). It does not bound the cached-page skip.
         """
 
         if self.time_first_prefill is None:
@@ -1395,6 +1398,12 @@ class Job:
                 if page.kv_position == PAGE_SIZE:
                     prefill_end = local_idx * PAGE_SIZE
                     break
+
+            # A reduced chunk bounds the forward pass only, after the cached pages above were skipped at the
+            # full max_chunk_size window, so a job resuming a cached prompt walks it as fast as before. Prompts
+            # with embeddings keep the full chunk so their multimodal spans are chunked as usual
+            if chunk_size is not None and not self.embeddings:
+                prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue

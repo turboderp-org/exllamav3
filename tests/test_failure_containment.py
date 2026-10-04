@@ -56,7 +56,7 @@ class StubJob:
         if self.fail_in == "allocate_pages":
             raise RuntimeError(f"allocation failure for {self.name}")
 
-    def prefill(self, results):
+    def prefill(self, results, chunk_size=None):
         if self.fail_in == "prefill":
             raise RuntimeError(f"prefill failure for {self.name}")
 
@@ -144,6 +144,8 @@ class FailureContainmentTest(unittest.TestCase):
         generator.draft_model = None
         generator.ngram_match_min = 0
         generator.visualizer = None
+        generator.fair_gen_rounds = 1
+        generator.fair_chunk_size = None
         generator.iterate_gen = lambda results: None
         results = generator.iterate()
         self.assertNotIn(bad, generator.active_jobs)

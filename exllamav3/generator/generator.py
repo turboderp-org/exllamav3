@@ -47,6 +47,8 @@ class Generator:
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
+        fair_gen_rounds: int = 1,
+        fair_chunk_size: int | None = None,
         **kwargs
     ):
         """
@@ -136,6 +138,20 @@ class Generator:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
             multiple of the page size. Default is 32768 tokens
 
+        :param fair_gen_rounds:
+            Generation steps to run per iteration while some active job is still ingesting its prompt and
+            another is already generating. The default (1) runs one step per prefill chunk, so a streaming job
+            slows to one token per chunk while a long prompt is ingested. Higher values keep streaming jobs
+            responsive at the cost of a slower ingest. No effect while no job is generating or no job is
+            prefilling
+
+        :param fair_chunk_size:
+            Prefill chunk size to use instead of max_chunk_size while another job is generating. Must be a
+            multiple of the page size (256). Shortens each pause of the generating jobs further than
+            fair_gen_rounds alone, at the cost of prefill efficiency during the overlap; solo prefill keeps the
+            full max_chunk_size. Not applied to prompts with multimodal embeddings. Default is None (always
+            use max_chunk_size)
+
         :param kwargs:
         """
 
@@ -193,6 +209,14 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+
+        # Fair scheduling between prompt ingestion and generation, see iterate()
+        assert fair_gen_rounds >= 1, \
+            "fair_gen_rounds must be at least 1"
+        assert fair_chunk_size is None or (fair_chunk_size > 0 and fair_chunk_size % PAGE_SIZE == 0), \
+            "fair_chunk_size must be a positive multiple of the page size (256)"
+        self.fair_gen_rounds = fair_gen_rounds
+        self.fair_chunk_size = fair_chunk_size
 
         # Job queues
         self.job_serial = 0
@@ -538,37 +562,64 @@ class Generator:
         results = []
         self.iterate_start_jobs(results)
 
+        # Fair scheduling applies while the active set mixes jobs that still have prompt to ingest with jobs
+        # that are already generating. With the default settings this is never checked and the loop below
+        # runs exactly once, as before
+        fair = False
+        if self.fair_gen_rounds > 1 or self.fair_chunk_size is not None:
+            num_generating = sum(1 for job in self.active_jobs if job.is_prefill_done())
+            fair = 0 < num_generating < len(self.active_jobs)
+
         # Perform one round of prefill
+        chunk_size = self.fair_chunk_size if fair else None
+        num_results = len(results)
         for job in list(self.active_jobs):
             try:
-                job.prefill(results)
+                job.prefill(results, chunk_size)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
 
-        # Recurrent checkpoints
-        if self.recurrent_cache is not None:
-            self.recurrent_checkpoint()
+        # Extra generation rounds compensate for the forward pass the prefill round just spent on another
+        # job's prompt. A round that only walked cached pages (a requeued job resuming, a prompt cache hit)
+        # emits no progress and gets none, so a job resuming a cached prompt is not held back
+        gen_rounds = 1
+        if fair and any(r["stage"] == "prefill" for r in results[num_results:]):
+            gen_rounds = self.fair_gen_rounds
 
-        # Generation with draft model
-        if self.draft_model:
-            if self.dflash_draft:
-                draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+        for gen_round in range(gen_rounds):
+
+            # Recurrent checkpoints
+            if self.recurrent_cache is not None:
+                self.recurrent_checkpoint()
+
+            # Generation with draft model
+            if self.draft_model:
+                if self.dflash_draft:
+                    draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+                    self.iterate_gen(results, draft_tokens)
+                elif self.mtp_draft:
+                    draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                    self.iterate_gen(results, draft_tokens)
+                else:
+                    draft_tokens = self.iterate_draftmodel_gen(results)
+                    self.iterate_gen(results, draft_tokens)
+
+            # Generation with n-gram draft
+            elif self.ngram_match_min:
+                draft_tokens = self.iterate_ngram_gen(results)
                 self.iterate_gen(results, draft_tokens)
-            elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
-                self.iterate_gen(results, draft_tokens)
+
+            # Regular generation
             else:
-                draft_tokens = self.iterate_draftmodel_gen(results)
-                self.iterate_gen(results, draft_tokens)
+                self.iterate_gen(results)
 
-        # Generation with n-gram draft
-        elif self.ngram_match_min:
-            draft_tokens = self.iterate_ngram_gen(results)
-            self.iterate_gen(results, draft_tokens)
-
-        # Regular generation
-        else:
-            self.iterate_gen(results)
+            # Stop early once the contention is over: the generating job may have finished or requeued (it
+            # left active_jobs and resumes on the next call), or the prefill round may have completed the
+            # other job's prompt, in which case it joins generation on equal terms from here
+            if gen_round + 1 < gen_rounds:
+                num_generating = sum(1 for job in self.active_jobs if job.is_prefill_done())
+                if not 0 < num_generating < len(self.active_jobs):
+                    break
 
         # Visualization
         if self.visualizer:
