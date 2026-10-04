@@ -7,12 +7,23 @@ import torch
 import os, glob
 import numpy as np
 import json
+import itertools
 from ..util import Timer
 from ..ext import exllamav3_ext as ext
 from functools import cached_property
 import time
 
 MAX_DEFERRED_LOAD_CHUNK = 4*1024**2
+
+# Row layout and flags for ext.stloader_deferred_batch (mirrors StloaderBatchColumn in stloader.h)
+_COL_FILE, _COL_OFFSET, _COL_SIZE, _COL_DEST, _COL_DEST_SIZE, _COL_FLAGS, _COL_DEVICE = range(7)
+_NUM_COLS = 7
+_FLAG_BF16_TO_FP16 = 1
+_FLAG_FP32_TO_FP16 = 2
+_FLAG_CUDA = 4
+
+# Shared EXL3 codebook marker tensors, by value (see SafetensorsCollection.get_codebook_marker)
+_codebook_markers = {}
 if MAX_DEFERRED_LOAD_CHUNK % 2:
     raise ValueError("MAX_DEFERRED_LOAD_CHUNK must be even")
 
@@ -408,13 +419,14 @@ class SafetensorsCollection:
         self.metrics = STCMetrics()
         self.first_open_time = None
         self.disk_handles = []
+        self.checked_markers = set()
 
         self.tensor_files = []
         self.add_tensor_files(directory)
 
         self.new_tensors = None
         self.deferred_mode = False
-        self.deferred_loads = []
+        self._reset_deferred()
 
         # Load-time slab arena (per CUDA device): weight tensors loaded inside a deferred-load
         # bracket carve out of large shared blocks instead of one allocation each. MoE models
@@ -477,17 +489,24 @@ class SafetensorsCollection:
         if isinstance(key, list):
             return all(self.has_tensor_group(k, subkeys) for k in key)
 
-        sources = [self.tensor_file_map]
-        if self.new_tensors:
-            sources += [self.new_tensors]
-        return any(
-            all(
-                (
-                    f"{key}.{subkey}" in source if isinstance(subkey, str) else
-                    any(f"{key}.{sk}" in source for sk in subkey)
-                ) for subkey in subkeys
-            ) for source in sources
-        )
+        # Called once per linear during a bulk load, so plain loops rather than nested generators.
+        # True when one source holds every subkey (a list subkey: any one of its alternatives)
+        sources = (self.tensor_file_map, self.new_tensors) if self.new_tensors else (self.tensor_file_map,)
+        prefix = key + "."
+        for source in sources:
+            for subkey in subkeys:
+                if isinstance(subkey, str):
+                    if prefix + subkey not in source:
+                        break
+                else:
+                    for sk in subkey:
+                        if prefix + sk in source:
+                            break
+                    else:
+                        break
+            else:
+                return True
+        return False
 
 
     def get_tensor_sizes(
@@ -612,6 +631,40 @@ class SafetensorsCollection:
         return handle
 
 
+    def get_codebook_marker(self, key: str, value: int) -> torch.Tensor | None:
+        """
+        Fetch an EXL3 codebook marker (.mcg / .mul1): an int32 scalar holding the codebook's hash
+        multiplier, which the quantizer writes as a fixed constant and the kernels only test for.
+        Every quantized linear carries one, so loading each through get_tensor costs as much
+        bookkeeping as the trellis itself. Instead, one shared CPU tensor per value is returned for
+        every marker. The stored value is still checked, once per file, so a file holding anything
+        else is reported rather than silently replaced. Anything that is not a plain int32 scalar
+        on disk takes the regular get_tensor path.
+        """
+        if self.new_tensors and key in self.new_tensors:
+            return self.get_tensor(key, "cpu")
+        filename = self.tensor_file_map.get(key)
+        if filename is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        if h["dtype"] != "I32" or h["shape"] != []:
+            return self.get_tensor(key, "cpu")
+        if (filename, value) not in self.checked_markers:
+            beg, end = h["data_offsets"]
+            with open(filename, "rb") as fp:
+                fp.seek(header["_header_offset"] + beg)
+                stored = int.from_bytes(fp.read(end - beg), "little")
+            if stored != value:
+                raise ValueError(f"Codebook marker {key} in {filename} holds {stored:#x}, expected {value:#x}")
+            self.checked_markers.add((filename, value))
+        marker = _codebook_markers.get(value)
+        if marker is None:
+            marker = torch.tensor(value, dtype = torch.uint32).view(torch.int)
+            _codebook_markers[value] = marker
+        return marker
+
+
     def get_tensors(
         self,
         prefix: str,
@@ -655,32 +708,43 @@ class SafetensorsCollection:
         bump block, a dense model's 32-64MB projections left GBs of dead tails). The open list
         is bounded: blocks are dropped once effectively full, and past ARENA_MAX_OPEN the
         smallest remainder is dropped, so load/unload churn cannot pin unbounded tails (the
-        weight tensors themselves keep their blocks alive)."""
-        device = torch.device(device)
+        weight tensors themselves keep their blocks alive).
+
+        Runs once per loaded tensor, so the block entries carry their storage and capacity as
+        plain values ([block, used, storage, capacity]) and the slice is made with a single set_
+        rather than a slice and two views."""
+        if type(device) is not torch.device:
+            device = torch.device(device)
         nbytes = math.prod(shape) * dtype.itemsize
         if not (enabled and self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
                 and 0 < nbytes <= self.ARENA_MAX_TENSOR):
             return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
         blocks = self.arena.setdefault(device.index, [])
+        align = self.ARENA_ALIGN
         for entry in blocks:
-            blk = entry[0]
-            off = -(-entry[1] // self.ARENA_ALIGN) * self.ARENA_ALIGN
-            if off + nbytes <= blk.numel():
+            off = -(-entry[1] // align) * align
+            if off + nbytes <= entry[3]:
                 break
         else:
-            blk, off = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0
-            entry = [blk, 0]
+            entry = self._arena_entry(torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0)
+            off = 0
             blocks.append(entry)
             if len(blocks) > self.ARENA_MAX_OPEN:
                 # index-based removal: list.remove would compare entries elementwise (tensors)
-                del blocks[min(range(len(blocks)), key = lambda i: blocks[i][0].numel() - blocks[i][1])]
+                del blocks[min(range(len(blocks)), key = lambda i: blocks[i][3] - blocks[i][1])]
         entry[1] = off + nbytes
-        if blk.numel() - entry[1] < self.ARENA_PRUNE:
+        if entry[3] - entry[1] < self.ARENA_PRUNE:
             blocks[:] = [e for e in blocks if e is not entry]
-        t = blk[off : off + nbytes].view(dtype).view(shape)
+        # off is ARENA_ALIGN-aligned, so a whole number of elements of any dtype
+        t = torch.empty(0, dtype = dtype, device = device).set_(entry[2], off // dtype.itemsize, shape)
         if zeros:
             t.zero_()
         return t
+
+
+    @staticmethod
+    def _arena_entry(block: torch.Tensor, used: int) -> list:
+        return [block, used, block.untyped_storage(), block.numel()]
 
     def get_tensor(
         self,
@@ -788,19 +852,30 @@ class SafetensorsCollection:
                         temp_tensor = torch.empty(load_shape, dtype = load_dtype, device = device)
                     else:
                         temp_tensor = None
-                    self.deferred_loads.append({
-                        "key": key,
-                        "filename": filename,
-                        "file_offset": offset + beg,
-                        "bytesize": bytesize,
-                        "temp_tensor": temp_tensor,
-                        "dest_tensor": tensor,
-                        "bf16_to_fp16": bf16_to_fp16,
-                        "fp32_to_fp16": fp32_to_fp16,
-                        "cuda": tensor.is_cuda,
-                        "device_id": tensor.device.index if tensor.is_cuda else -1,
-                        "transpose": transpose,
-                    })
+                    # One row per load for the C++ batch front end (column layout in stloader.h).
+                    # The engine writes through the raw pointer, so the tensor written to is kept
+                    # alive here until the pass has run
+                    dest = tensor if temp_tensor is None else temp_tensor
+                    file_idx = self.deferred_file_index.get(filename)
+                    if file_idx is None:
+                        file_idx = len(self.deferred_files)
+                        self.deferred_file_index[filename] = file_idx
+                        self.deferred_files.append(filename)
+                    is_cuda = dest.is_cuda
+                    self.deferred_rows.append((
+                        file_idx,
+                        offset + beg,
+                        bytesize,
+                        dest.data_ptr(),
+                        dest.nbytes,
+                        (_FLAG_BF16_TO_FP16 if bf16_to_fp16 else 0) |
+                        (_FLAG_FP32_TO_FP16 if fp32_to_fp16 else 0) |
+                        (_FLAG_CUDA if is_cuda else 0),
+                        dest.device.index if is_cuda else -1,
+                    ))
+                    self.deferred_keep.append(dest)
+                    if temp_tensor is not None:
+                        self.deferred_finalize.append((key, temp_tensor, tensor, transpose))
                     self.metrics.deferred_tensors += 1
 
                 case "mt_fread":
@@ -931,110 +1006,59 @@ class SafetensorsCollection:
 
         with (Timer() as timer):
 
-            cpu_loads = {}
-            cuda_loads = {}
-            for load in self.deferred_loads:
-                filename = load["filename"]
-                cuda = load["cuda"]
-                if cuda:
-                    if not filename in cuda_loads:
-                        cuda_loads[filename] = []
-                    cuda_loads[filename].append(load)
-                else:
-                    if not filename in cpu_loads:
-                        cpu_loads[filename] = []
-                    cpu_loads[filename].append(load)
-
-            def make_workload(l):
-                wl = []
-                append = wl.append
-                job = ext.TensorLoadJob
-                handles = self.handles
+            rows = self.deferred_rows
+            if rows:
+                # Rows sorted by file, then offset, so reads are sequential and the C++ loader can
+                # coalesce adjacent tensors/chunks into single reads. All files go in one pass to
+                # avoid a join barrier per file. File indices follow first use, so sorting on them
+                # keeps the files in the order they were first requested
+                loads = np.fromiter(itertools.chain.from_iterable(rows), dtype = np.int64,
+                                    count = len(rows) * _NUM_COLS).reshape(-1, _NUM_COLS)
+                loads = loads[np.lexsort((loads[:, _COL_OFFSET], loads[:, _COL_FILE]))]
                 chunk = MAX_DEFERRED_LOAD_CHUNK
-                for w in l:
-                    temp = w["temp_tensor"]
-                    # Without transpose, padding or fp32->fp16 conversion, load directly
-                    dest = temp if temp is not None else w["dest_tensor"]
-                    dst = dest.data_ptr()
-                    bytesize = w["bytesize"]
-                    if bytesize == 0:
-                        continue
-                    # Jobs reach C++ as a bare pointer, so the room at that pointer travels with
-                    # them; cap tracks what is left of it as the chunk loop walks dst forward
-                    cap = dest.numel() * dest.element_size()
-                    if bytesize > cap:
-                        raise ValueError(
-                            f"Load of {bytesize} bytes into a {cap}-byte tensor "
-                            f"({w['filename']} @ {w['file_offset']})"
-                        )
-                    src = w["file_offset"]
-                    h = handles[w["filename"]]
-                    bf16 = w["bf16_to_fp16"]
-                    fp32 = w["fp32_to_fp16"]
-                    cuda = w["cuda"]
-                    dev = w["device_id"]
-                    while bytesize > chunk:
-                        append(job(h, src, chunk, dst, cap, bf16, fp32, cuda, dev))
-                        src += chunk
-                        dst += chunk
-                        cap -= chunk
-                        bytesize -= chunk
-                    append(job(h, src, bytesize, dst, cap, bf16, fp32, cuda, dev))
-                return wl
+                self.metrics.total_chunks += int(((loads[:, _COL_SIZE] + chunk - 1) // chunk).sum())
+                ext.stloader_deferred_batch(
+                    [self.handles[f] for f in self.deferred_files],
+                    torch.from_numpy(np.ascontiguousarray(loads)),
+                    chunk,
+                )
 
-            # Jobs are sorted by file offset so reads are sequential and the C++ loader can
-            # coalesce adjacent tensors/chunks into single reads. All files go in one pass to
-            # avoid a join barrier per file.
-            def flatten(loads_by_file):
-                flat = []
-                for filename, loads in loads_by_file.items():
-                    flat += sorted(loads, key = lambda c: c["file_offset"])
-                return flat
-
-            def finalize(loads):
-                for w in loads:
-                    if w["temp_tensor"] is not None:
-                        src = w["temp_tensor"]
-                        if w["transpose"]:
-                            src = src.T
-                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
-                        try:
-                            w["dest_tensor"][unpadded_idx].copy_(src)
-                        except RuntimeError as e:
-                            raise ValueError(
-                                f"Deferred load of {w['key']}: source shape {tuple(src.shape)} "
-                                f"(transpose = {w['transpose']}) does not fit destination "
-                                f"{tuple(w['dest_tensor'].shape)}"
-                            ) from e
-
-            if cpu_loads:
-                loads = flatten(cpu_loads)
-                workload = make_workload(loads)
-                self.metrics.total_chunks += len(workload)
-                ext.stloader_deferred_cpu(workload)
-                finalize(loads)
-
-            if cuda_loads:
-                loads = flatten(cuda_loads)
-                workload = make_workload(loads)
-                self.metrics.total_chunks += len(workload)
-                ext.stloader_deferred_cuda(workload, MAX_DEFERRED_LOAD_CHUNK)
-                finalize(loads)
+            # Loads that went through a staging tensor (transpose, padding or fp32->fp16)
+            for key, src, dest, transpose in self.deferred_finalize:
+                if transpose:
+                    src = src.T
+                unpadded_idx = tuple(slice(0, s) for s in src.shape)
+                try:
+                    dest[unpadded_idx].copy_(src)
+                except RuntimeError as e:
+                    raise ValueError(
+                        f"Deferred load of {key}: source shape {tuple(src.shape)} "
+                        f"(transpose = {transpose}) does not fit destination "
+                        f"{tuple(dest.shape)}"
+                    ) from e
 
         self.metrics.time_elapsed += timer.interval
         self.metrics.deferred_passes += 1
 
         self.deferred_mode = False
-        self.deferred_loads = []
+        self._reset_deferred()
+
+
+    def _reset_deferred(self):
+        self.deferred_rows = []
+        self.deferred_files = []
+        self.deferred_file_index = {}
+        self.deferred_keep = []
+        self.deferred_finalize = []
 
 
     def abort_deferred_load(self):
         self.deferred_mode = False
-        self.deferred_loads = []
+        self._reset_deferred()
         snapshot = getattr(self, "arena_snapshot", None)
         if snapshot is not None:
             # Every slab slice handed out since the bracket opened belongs to the aborted module
-            self.arena = {d: [[b, off] for b, off in saved] for d, saved in snapshot.items()}
+            self.arena = {d: [self._arena_entry(b, off) for b, off in saved] for d, saved in snapshot.items()}
             self.arena_snapshot = None
 
 
@@ -1211,6 +1235,10 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     ) -> DiskTensorHandle | None:
         stc = self.find_stc(key)
         return stc.get_tensor_handle(key, *args, **kwargs)
+
+
+    def get_codebook_marker(self, key: str, value: int) -> torch.Tensor | None:
+        return self.find_stc(key).get_codebook_marker(key, value)
 
 
     def close(self):

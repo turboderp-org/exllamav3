@@ -85,6 +85,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, size_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
+    m.def("stloader_deferred_batch", &stloader_deferred_batch, py::arg("file_handles"), py::arg("loads"), py::arg("max_chunk_size"));
 
     m.def("cuda_host_register", &cuda_host_register, py::arg("ptr"), py::arg("nbytes"), py::arg("flags"));
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));

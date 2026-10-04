@@ -125,12 +125,10 @@ class Embedding(Module):
             return
         weight = stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
-        self.embedding = nn.Embedding(
-            self.vocab_size,
-            self.hidden_size,
-            device = "meta"
-        )
-        self.embedding.weight = nn.Parameter(weight, requires_grad = False)
+        # Built around the loaded weight: constructing on the meta device and swapping the weight in
+        # runs the default initializer there, and the first meta-device op in a process imports
+        # a large part of torch's Python decomposition machinery
+        self.embedding = nn.Embedding(*weight.shape, _weight = weight, _freeze = True)
 
     @override
     def unload(self):
@@ -343,11 +341,6 @@ class Embedding(Module):
                 consumer.recv(signs, cuda = True) if signs is not None else None)
             return module
         module.device = exported["device"]
-        module.embedding = nn.Embedding(
-            module.vocab_size,
-            module.hidden_size,
-            device = "meta"
-        )
         emb = consumer.recv(exported["embedding.weight"], cuda = False)
-        module.embedding.weight = nn.Parameter(emb, requires_grad = False)
+        module.embedding = nn.Embedding(*emb.shape, _weight = emb, _freeze = True)
         return module
