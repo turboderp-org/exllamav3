@@ -1,6 +1,7 @@
 import os
 
 import torch
+from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -68,17 +69,8 @@ class BCKernelTooLarge(RuntimeError):
     walks a config ladder per device instead, so the builders decline and let it run."""
 
 
-# Split-decode attention launch config: AMD's backend runs these at 8 warps / 1 stage without spilling
-# to scratch, where 4 / 2 does
-_SPLIT_WARPS, _SPLIT_STAGES = (8, 1) if torch.version.hip else (4, 2)
-
-def _split_launch(device, hd_pad: int) -> tuple[int, int]:
-    """(num_warps, num_stages) for the split-decode kernel: gfx1100 runs the head_dim <= 128 tile faster
-    at 4 warps (still a single stage)"""
-    from .triton_paged import gfx_arch
-    if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
-        return 4, 1
-    return _SPLIT_WARPS, _SPLIT_STAGES
+# Split-decode attention launch config (util/backend.py); the pair serves the QSA sparse split kernel
+_SPLIT_WARPS, _SPLIT_STAGES = ATTN_SPLIT_WARPS_STAGES
 
 
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
@@ -115,7 +107,7 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
             # The compiled module: a cubin from the CUDA backend, an hsaco code object from the AMD one
-            image = ck.asm["hsaco" if torch.version.hip else "cubin"]
+            image = ck.asm["hsaco" if ROCM else "cubin"]
             k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
@@ -298,7 +290,7 @@ class BCAttn:
         """Whether the split kernels may assume 32-bit buffer offsets (AMD buffer loads): every
         allocation they address is under 2 GB. The caches are the only ones that can be larger; the
         rest are graph statics, partials and the block table"""
-        if not torch.version.hip:
+        if not ROCM:
             return False
         caches = (self.cache_k, self.cache_v, self.k_scales, self.v_scales)
         return all(t.untyped_storage().nbytes() < 2 ** 31 for t in caches if isinstance(t, torch.Tensor))
@@ -319,7 +311,7 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd_pad)
+        block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
         block_m = triton.next_power_of_2(q_len)
         block_h = max(16 // block_m, 1)
         block_rows = block_m * block_h
@@ -355,7 +347,7 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, *_split_launch(dev, hd_pad),
+        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
 
         sig_c = {

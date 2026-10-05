@@ -8,6 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -17,7 +18,7 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
 # the cooperative GEMM)
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
+_qkv_slice_enable = QKV_SLICE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):

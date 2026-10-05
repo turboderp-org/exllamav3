@@ -6,6 +6,7 @@ from .module import Module
 from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
+from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
 import os
 import math
@@ -14,10 +15,10 @@ import math
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
-# ROCm, decode row counts: launch-count folds for the mHC sites (hc_mix_fused, rocm/hc_fuse_rdna.cuh). apply_
-# defers its residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside
-# its finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD=0 disables both
-_hc_fold = bool(torch.version.hip) and hasattr(ext, "hc_mix_fused") and os.environ.get("EXL3_HC_FOLD", "1") != "0"
+# Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
+# residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
+# finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
+_hc_fold = HC_FOLD
 _HC_FOLD_MAX_R = 32
 
 

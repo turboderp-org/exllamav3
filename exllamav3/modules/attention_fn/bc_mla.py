@@ -1,4 +1,5 @@
 import torch
+from ...util.backend import DSA_SPLIT_WARPS
 from ...util.device_copy import to_device
 
 from ...ext import exllamav3_ext as ext
@@ -481,7 +482,7 @@ class BCMLA:
                 QC = self.k_bits if self.quant else 0,
             )
             # ROCm: 8 warps spill far less to scratch on these parts
-            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 8 if torch.version.hip else 4, 2)
+            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
             sig_c = {
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",

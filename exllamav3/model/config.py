@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC
 import os, json
 import torch
+from ..util.backend import INT8_GEMV_MODE
 from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
@@ -29,7 +30,7 @@ class InferParams:
         # int8 gate); narrow same-input pairs stay fused, where batching is what restores
         # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
         # (the int8 mode is off by default on ROCm, see exl3_gemv_int8.cu)
-        if int(os.environ.get("EXL3_INT8_GEMV", 0 if torch.version.hip else 2)) > 0:
+        if INT8_GEMV_MODE > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
         self.mgemm_K_env = "EXL3_MGEMM_K_THRESHOLD" in os.environ

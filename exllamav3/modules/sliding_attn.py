@@ -11,6 +11,7 @@ from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_trit
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..cache import Cache
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
@@ -20,12 +21,11 @@ from ..cache.recurrent import (
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..cache.recurrent import host_copy
-import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
 # the cooperative GEMM)
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
+_qkv_slice_enable = QKV_SLICE
 
 
 class SWAExportedState:

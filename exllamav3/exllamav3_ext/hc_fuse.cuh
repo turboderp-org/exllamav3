@@ -4,11 +4,13 @@
 //
 // A decode step runs two hyper-connection sites per layer, each an apply_ (one hc_apply launch, in place on the
 // residual streams) followed by the next site's mix (partials + finalize) and the RMSNorm the block runs on the
-// collapsed output. On RDNA every launch also pays a dispatch gap that is a large part of these small kernels'
-// cost, so:
+// collapsed output. Every launch pays a dispatch gap that is a large part of these small kernels' cost (most of
+// it on RDNA, where the folds are on by default), so:
 //   - the pending apply runs inside the next mix's partials kernel (hc_apply_partials_kernel), and
 //   - the norm runs at the end of the finalize kernel (hc_finalize_norm_row), one block per row.
 // Both reproduce the unfused kernels' arithmetic in the same order, so the results are bit-identical.
+
+#include "hc_lanes.cuh"
 
 // The RMSNorm folded into the finalize: rms_norm with RES_NONE, half in and out, half or bf16 weight
 struct HcNormArgs
@@ -109,14 +111,14 @@ __device__ __forceinline__ void hc_finalize_norm_row
         f4.w = CLAMP_FP16(HIGH_TO_FLOAT(h4.y));
         return f4;
     };
-    // xor butterfly 16, 8, 4, 2, 1 on DPP (every lane ends with the same sum, as with the shuffles)
+    // xor butterfly 16, 8, 4, 2, 1 (reduce_dyn's order; every lane ends with the same sum)
     auto bfly = [&] (float v) -> float
     {
-        v += hc_permlanex16(v);
-        v += hc_xor16<8>(v);
-        v += hc_xor16<4>(v);
-        v += hc_xor16<2>(v);
-        v += hc_xor16<1>(v);
+        v += hc_xor<16>(v);
+        v += hc_xor<8>(v);
+        v += hc_xor<4>(v);
+        v += hc_xor<2>(v);
+        v += hc_xor<1>(v);
         return v;
     };
 

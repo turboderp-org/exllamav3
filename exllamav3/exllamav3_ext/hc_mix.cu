@@ -33,10 +33,8 @@ Two launches, no grid-wide sync, deterministic (fixed reduction order, no atomic
 #define NUM_THREADS 256
 #define NUM_THREADS_A 64
 
-#if defined(USE_ROCM)
-    #include "rocm/hc_dpp_rdna.cuh"
-    #include "rocm/hc_fuse_rdna.cuh"
-#endif
+#include "hc_lanes.cuh"
+#include "hc_fuse.cuh"
 
 __device__ __forceinline__ float sigmoidf_(float x)
 {
@@ -99,13 +97,7 @@ void hc_mix_partials_kernel
     #pragma unroll
     for (int k = 0; k <= M; ++k)
     {
-        float v = acc[k];
-#if defined(USE_ROCM)
-        v = hc_warp_sum_lane0(v);
-#else
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_down_sync(0xffffffffu, v, offset);
-#endif
+        float v = hc_warp_sum_lane0(acc[k]);
         if (lane == 0) red[warp][k] = v;
     }
     __syncthreads();
@@ -124,13 +116,9 @@ void hc_mix_partials_kernel
     }
 }
 
-#if defined(USE_ROCM)
-// NORM (ROCm, decode rows): one block per row covers all D columns and runs the following RMSNorm on the
-// collapsed row (rocm/hc_fuse_rdna.cuh)
+// NORM (decode rows): one block per row covers all D columns and runs the following RMSNorm on the collapsed
+// row (hc_fuse.cuh)
 template <int H, int M_, bool HEAD, bool HALF_OUT, bool NORM = false>
-#else
-template <int H, int M_, bool HEAD, bool HALF_OUT>
-#endif
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_mix_finalize_kernel
 (
@@ -146,10 +134,8 @@ void hc_mix_finalize_kernel
     const int chunk_cols_c,              // multiple of 4
     const float rms_eps,
     const float hc_eps,
-    const int sinkhorn_iters
-#if defined(USE_ROCM)
-    , const HcNormArgs norm = {}
-#endif
+    const int sinkhorn_iters,
+    const HcNormArgs norm = {}
 )
 {
     constexpr int M = M_;
@@ -209,73 +195,27 @@ void hc_mix_finalize_kernel
             const unsigned mask = (H * H == 32) ? 0xffffffffu : ((1u << (H * H)) - 1u);
             float v = fmaf(mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x]);
 
-#if defined(USE_ROCM)
-            if constexpr (H == 4)
-            {
-                // The same butterflies on DPP (rocm/hc_dpp_rdna.cuh): H * H = 16 lanes, one row
-                float m = v;
-                m = fmaxf(m, hc_xor16<1>(m));
-                m = fmaxf(m, hc_xor16<2>(m));
-                v = __expf(v - m);
-                float s = v;
-                s += hc_xor16<1>(s);
-                s += hc_xor16<2>(s);
-                v = __fdividef(v, s) + hc_eps;
-                float cs = v;
-                cs += hc_xor16<4>(cs);
-                cs += hc_xor16<8>(cs);
-                v = __fdividef(v, cs + hc_eps);
-                for (int it = 0; it < sinkhorn_iters - 1; ++it)
-                {
-                    float rs = v;
-                    rs += hc_xor16<1>(rs);
-                    rs += hc_xor16<2>(rs);
-                    v = __fdividef(v, rs + hc_eps);
-                    cs = v;
-                    cs += hc_xor16<4>(cs);
-                    cs += hc_xor16<8>(cs);
-                    v = __fdividef(v, cs + hc_eps);
-                }
-                comb[(size_t) r * H * H + threadIdx.x] = v;
-                (void) mask;
-            }
-            else
-#endif
-            {
             // softmax over rows
-            float m = v;
-            #pragma unroll
-            for (int o = 1; o < H; o <<= 1) m = fmaxf(m, __shfl_xor_sync(mask, m, o));
+            float m = hc_xor_max<1, H>(v, mask);
             v = __expf(v - m);
-            float s = v;
-            #pragma unroll
-            for (int o = 1; o < H; o <<= 1) s += __shfl_xor_sync(mask, s, o);
+            float s = hc_xor_sum<1, H>(v, mask);
             v = __fdividef(v, s) + hc_eps;
 
             // column normalize, then (iters - 1) x (row, column)
-            float cs = v;
-            #pragma unroll
-            for (int o = H; o < H * H; o <<= 1) cs += __shfl_xor_sync(mask, cs, o);
+            float cs = hc_xor_sum<H, H * H>(v, mask);
             v = __fdividef(v, cs + hc_eps);
             for (int it = 0; it < sinkhorn_iters - 1; ++it)
             {
-                float rs = v;
-                #pragma unroll
-                for (int o = 1; o < H; o <<= 1) rs += __shfl_xor_sync(mask, rs, o);
+                float rs = hc_xor_sum<1, H>(v, mask);
                 v = __fdividef(v, rs + hc_eps);
-                cs = v;
-                #pragma unroll
-                for (int o = H; o < H * H; o <<= 1) cs += __shfl_xor_sync(mask, cs, o);
+                cs = hc_xor_sum<H, H * H>(v, mask);
                 v = __fdividef(v, cs + hc_eps);
             }
             comb[(size_t) r * H * H + threadIdx.x] = v;
-            }
         }
-#if defined(USE_ROCM)
         // the folded norm needs every thread of the block for its reductions
         if constexpr (!NORM)
-#endif
-        return;
+            return;
     }
 
     // Phase C: collapsed chunk, weighted sum over the H stream rows. In the sinkhorn
@@ -291,14 +231,12 @@ void hc_mix_finalize_kernel
     const int c1 = min(c0 + chunk_cols_c, D);
     const float4* s4 = (const float4*) (streams + (size_t) r * row_len);
     const int D4 = D / 4;
-#if defined(USE_ROCM)
     if constexpr (NORM)
     {
         static_assert(HALF_OUT && !HEAD, "hc_mix_finalize_kernel: the folded norm is for the half-output mix");
         hc_finalize_norm_row<H>(s4, pre_r, sink_warp, tid, nth, D, (half*) collapsed + (size_t) r * D, norm, r);
         return;
     }
-#endif
     for (int c = c0 / 4 + tid; c < c1 / 4; c += nth)
     {
         float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -934,11 +872,9 @@ static void hc_mix_launch
     at::Tensor* post,
     at::Tensor* comb,
     at::Tensor& collapsed,
-    Graph* graph
-#if defined(USE_ROCM)
-    , const HcPendingApply* pend = nullptr     // fold a preceding hc_apply on these streams into the partials
-    , const HcNormArgs* nrm = nullptr          // fold the following RMSNorm into the finalize
-#endif
+    Graph* graph,
+    const HcPendingApply* pend = nullptr,      // fold a preceding hc_apply on these streams into the partials
+    const HcNormArgs* nrm = nullptr            // fold the following RMSNorm into the finalize
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -981,7 +917,6 @@ static void hc_mix_launch
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
         D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
-#if defined(USE_ROCM)
     if (pend || nrm)
     {
         TORCH_CHECK(!head && half_out, "hc_mix: folds are for the half-output mix");
@@ -1039,7 +974,6 @@ static void hc_mix_launch
         cuda_check(cudaPeekAtLastError());
         return;
     }
-#endif
     if (!head)
     {
         if (fn_half)
@@ -1110,8 +1044,7 @@ void hc_mix
     );
 }
 
-#if defined(USE_ROCM)
-// hc_mix with the launch-count folds (rocm/hc_fuse_rdna.cuh): y / post_a / comb_a describe a pending hc_apply
+// hc_mix with the launch-count folds (hc_fuse.cuh): y / post_a / comb_a describe a pending hc_apply
 // on these streams (all or none), run inside the partials kernel; norm_y receives the RMSNorm of the collapsed
 // output, run inside the finalize (norm_w may be none for an unweighted norm). collapsed is always written
 void hc_mix_fused
@@ -1179,7 +1112,6 @@ void hc_mix_fused
     hc_mix_launch(x, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
                   partials, &post, &comb, collapsed, nullptr, pend_p, nrm_p);
 }
-#endif
 
 void hc_head
 (

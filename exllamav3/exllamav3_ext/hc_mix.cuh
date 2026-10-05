@@ -23,7 +23,6 @@ void hc_mix
     at::Tensor collapsed
 );
 
-#if defined(USE_ROCM)
 void hc_mix_fused
 (
     at::Tensor x,
@@ -46,7 +45,6 @@ void hc_mix_fused
     double norm_bias,
     double norm_scale
 );
-#endif
 
 void hc_head
 (

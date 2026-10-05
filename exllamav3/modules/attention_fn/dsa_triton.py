@@ -29,6 +29,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 
 import os
 import torch
+from ...util.backend import DSA_MQA
 from ...util.tensor import g_tensor_cache
 
 # EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
@@ -1086,7 +1087,7 @@ def dsa_attn(
                 _, ws_ml, ws_acc = workspace(bh)
                 return shared_bytes(_dsa_attn_split_kernel, s_args(ws_ml, ws_acc), **s_consts(bh, bn), num_warps = num_warps, num_stages = ns)
             # ROCm: the MQA decode kernel (dsa_mqa.py) where the shape allows it, at its own tiling
-            mqa = dsa_mqa.decode_eligible(s_consts(dsa_mqa.DECODE_BLOCK_H, dsa_mqa.DECODE_BLOCK_N)) if torch.version.hip else None
+            mqa = dsa_mqa.decode_eligible(s_consts(dsa_mqa.DECODE_BLOCK_H, dsa_mqa.DECODE_BLOCK_N)) if DSA_MQA else None
             if mqa is not None:
                 block_h = dsa_mqa.DECODE_BLOCK_H
                 hb, ws_ml, ws_acc = workspace(block_h)
@@ -1137,7 +1138,7 @@ def dsa_attn(
             QC = qc_bits,
         )
     # ROCm: the MQA prefill kernel (dsa_mqa.py) where the shape allows it, at its own tiling
-    if torch.version.hip:
+    if DSA_MQA:
         c = m_consts((block_h, block_n, num_stages))
         mqa = dsa_mqa.prefill_eligible(c)
         if mqa is not None:

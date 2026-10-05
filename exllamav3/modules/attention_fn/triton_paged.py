@@ -8,26 +8,13 @@ import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
 from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
 def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
 
-_gfx_arch_cache = {}
-
-def gfx_arch(device) -> str:
-    """ROCm: the device's gfx target without feature flags (e.g. "gfx1100"), for per-architecture tunings
-    measured on that target; "" on CUDA"""
-    if not torch.version.hip:
-        return ""
-    idx = device.index if isinstance(device, torch.device) else device
-    if idx is None:
-        idx = torch.cuda.current_device()
-    arch = _gfx_arch_cache.get(idx)
-    if arch is None:
-        arch = _gfx_arch_cache[idx] = torch.cuda.get_device_properties(idx).gcnArchName.split(":")[0]
-    return arch
 
 
 @triton.jit
@@ -1182,8 +1169,8 @@ def paged_attn_triton_decode(
     qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
     n_kv_heads_override: int | None = None,
-    num_warps: int = 4,
-    num_stages: int = 2,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1243,8 +1230,14 @@ def paged_attn_triton_decode(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile
-    candidates = halving_ladder(max(16, 8192 // hd_pad)) if block_n is None else [block_n]
+    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile. Tile and
+    # launch shape per backend / architecture (util/backend.py) unless the caller sets them
+    cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, hd_pad)
+    if num_warps is None:
+        num_warps = cfg_warps
+    if num_stages is None:
+        num_stages = cfg_stages
+    candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
     block_m = triton.next_power_of_2(q_len)
@@ -1928,7 +1921,7 @@ def paged_attn_triton_prefill(
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
     # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
     # (HIP reports the gfx generation as the major version, so the threshold only applies to CUDA)
-    blackwell = not torch.version.hip and torch.cuda.get_device_capability(q.device)[0] >= 10
+    blackwell = not ROCM and torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
         cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
     elif hd_pad <= 256:
@@ -1937,7 +1930,7 @@ def paged_attn_triton_prefill(
         cfg = (32, 16, 4, 2)
     # RDNA (wave32): eight warps over a 128-row q tile, so each wave still owns whole 16-row WMMA tiles;
     # at head_dim 256 (fp16 cache) a single stage keeps the tile inside the 64 KB LDS.
-    if torch.version.hip:
+    if ROCM:
         if hd_pad <= 128:
             cfg = (128, 32, 8, 2)
         elif hd_pad <= 256 and qc is None:

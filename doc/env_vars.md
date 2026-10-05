@@ -7,6 +7,18 @@ Boolean-ish variables treat `0` as off and any other value as on unless noted. C
 variables are read once (on first use) and cached; Python-side variables are read at import
 time. Either way, set them before loading a model.
 
+A few defaults differ between the CUDA and ROCm builds. They are collected in
+`exllamav3/util/backend.py` (the C++ side holds the same values where it reads a variable itself):
+
+| Variable | CUDA | ROCm | Why |
+|---|---|---|---|
+| `EXL3_QKV_SLICE` | `1` | `0` | the RDNA multi-matrix GEMV has no sliced form |
+| `EXL3_INT8_GEMV` | `2` | `0` | the RDNA fdot2 GEMVs are faster at these shapes |
+| `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
+| `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
+| `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
+| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
+
 ## Attention
 
 ### `EXL3_BC_ATTN` (default: `1`)
@@ -59,6 +71,15 @@ of its own graph; the routed launch merges the result as before. Applies to EXL3
 shared experts with 128-aligned widths and no post-norm. Under tensor parallelism such a shared
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
+
+### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+
+Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
+(up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
+mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
+fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
+the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
 
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 

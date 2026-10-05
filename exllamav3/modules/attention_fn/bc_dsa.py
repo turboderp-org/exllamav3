@@ -1,6 +1,7 @@
 import os
 
 import torch
+from ...util.backend import DSA_MQA, DSA_N_SPLITS, DSA_SPLIT_WARPS
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -28,22 +29,21 @@ _bc_debug = os.environ.get("EXL3_BC_DSA_DEBUG", "0") != "0"
 
 MAX_QLEN = 16
 MAX_S = 16        # tokens per job per batched step; must match BC_DSV4BatchAttention::MAX_S
-# Key splits per decode row; ROCm's MQA split kernel (dsa_mqa.py) prefers fewer
-N_SPLITS = 8 if torch.version.hip else 16
+# Key splits per decode row (util/backend.py)
+N_SPLITS = DSA_N_SPLITS
 BLOCK_H = 16
 
 
 def _compile_split(dev, sig_s: dict, consts_s: dict):
     """The decode split kernel: on ROCm the MQA kernel (dsa_mqa.py) where the shape allows it, else upstream's
     at 8 warps, which spills far less to scratch on these parts"""
-    if torch.version.hip:
+    if DSA_MQA:
         t = dsa_mqa.decode_eligible(consts_s)
         if t is not None:
             sig = dict(sig_s) | {n: "constexpr" for n in ("HP", "BD", "KC", "KSTAGES")}
             return _compile_kernel(dev, dsa_mqa._dsa_decode_mqa_kernel, sig, dsa_mqa.decode_consts(consts_s, t),
                                    dsa_mqa.DECODE_WARPS, 1)
-        return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 8, 2)
-    return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+    return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
 
 def _exl3_bc(lin):
