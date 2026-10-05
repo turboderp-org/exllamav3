@@ -45,6 +45,20 @@
 #include "exl3_gemm_inner_rdna.cuh"
 #include "exl3_gemv_tiles_rdna.cuh"
 
+// EXL3_MOE_PIPE_DB: B register-ring depth, k-tiles in flight per wave (2, 4 or 8)
+#ifndef EXL3_MOE_PIPE_DB
+#define EXL3_MOE_PIPE_DB 4
+#endif
+static_assert(EXL3_MOE_PIPE_DB == 2 || EXL3_MOE_PIPE_DB == 4 || EXL3_MOE_PIPE_DB == 8,
+    "EXL3_MOE_PIPE_DB must be 2, 4 or 8");
+
+// EXL3_MOE_PIPE_WPE: waves per SIMD the pipelined kernel is register-budgeted for. 8 (= 1536 / 8 = 192
+// VGPRs) lets two 512-thread blocks share a WGP; the host still asks the runtime occupancy query before
+// using it
+#ifndef EXL3_MOE_PIPE_WPE
+#define EXL3_MOE_PIPE_WPE 8
+#endif
+
 namespace moe_pipe {
 
 typedef __attribute__((address_space(1))) const uint32_t g_u32;
@@ -124,14 +138,8 @@ void moe_gemm_pipe
     const int size_k,
     const int size_n,
     int* __restrict__ locks
-#ifdef EXL3_MOE_PIPE_PROF
-    , uint64_t* prof
-#endif
 )
 {
-#ifdef EXL3_MOE_PIPE_PROF
-    uint64_t pt0 = wall_clock64(), pt_red = 0;
-#endif
     // The 64-row tile carries 64 accumulator VGPRs: a 2-deep B ring keeps it under the
     // 192-VGPR budget of two blocks per WGP (B latency is not its limit, WMMA is). The
     // 48-row tile keeps DB: a 2-deep ring costs it throughput, and at DB = 4 the few
@@ -479,13 +487,7 @@ void moe_gemm_pipe
             if (s % AG == AG - 1) a_buf ^= 1;
             if ((c_k == tiles_k - 1) || (c_j == slice_len - 1)) [[unlikely]]
             {
-#ifdef EXL3_MOE_PIPE_PROF
-                uint64_t pr0 = wall_clock64();
-#endif
                 reduce(BT_SETS == 2 ? s % 2 : 0);
-#ifdef EXL3_MOE_PIPE_PROF
-                pt_red += wall_clock64() - pr0;
-#endif
                 if (c_j == slice_len - 1) goto done;
                 c_j++;
                 if (++c_k == tiles_k) { c_k = 0; c_n++; }
@@ -499,9 +501,6 @@ void moe_gemm_pipe
         }
     }
     done:;
-#ifdef EXL3_MOE_PIPE_PROF
-    if (threadIdx.x == 0) { prof[0] += wall_clock64() - pt0; prof[1] += pt_red; prof[2] += slice_len; prof[3] += 1; }
-#endif
 }
 
 // Dynamic LDS the pipelined kernel is launched with: the largest row tile's need. Kept

@@ -13,7 +13,6 @@ namespace cg = cooperative_groups;
 #include <set>
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_moe_pipe_instances_rdna.cuh"
-    #include "../rocm/quant/exl3_moe_shape_rdna.cuh"   // after exl3_moe_common.cuh: blockDim below derives from its MOE_TILESIZE_K
     #include "../rocm/quant/exl3_moe_inner_rdna.cuh"   // moe_pipe::smem_launch_bytes
     #include <map>
 #endif
