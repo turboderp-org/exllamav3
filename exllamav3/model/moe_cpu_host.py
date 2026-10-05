@@ -546,7 +546,7 @@ class _HugeArena:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
                   f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
-    def rehome(self, tensor, band_swizzle = 0):
+    def rehome(self, tensor, band_swizzle = 0, planar = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
         returned view stays valid.
@@ -554,7 +554,10 @@ class _HugeArena:
         band_swizzle: repack a [k/16, n/16, 16K] trellis tensor band-contiguous during the
         copy with the given tile group (2 or 8, from exl3_moe_cpu_swizzle_group; 0 = native
         order) -- physical order becomes (group n/(16*g), k-tile, member, tile), one strided
-        copy_. The returned view keeps the original logical shape; only the byte order differs
+        copy_. planar: additionally transpose each tile's dwords for the AVX2 planar kernels
+        (exl3_moe_cpu_planar_layout; integer rates only -- dword w = bits*m + j moves to
+        8*j + m, i.e. the trailing (8, bits) dword dims swap), folded into the same copy.
+        The returned view keeps the original logical shape; only the byte order differs
         (consumed by the swz-aware kernels in moe_mul1.cpp)."""
         import torch
         if tensor is None or tensor.numel() == 0:
@@ -576,8 +579,16 @@ class _HugeArena:
         if band_swizzle:
             tk, tn, ps = tensor.shape
             g = band_swizzle
-            dst.view(tensor.dtype).view(tn // g, tk, g, ps) \
-               .copy_(tensor.view(tk, tn // g, g, ps).permute(1, 0, 2, 3))
+            if planar:
+                # int32 (dword) view: (tk, tn, g? ...) per tile 8*bits dwords, dims (8, bits)
+                # transposed into the destination's (bits, 8); group permute as below
+                assert ps % 16 == 0, "planar repack requires an integer rate"
+                wd = ps // 2
+                dst.view(torch.int32).view(tn // g, tk, g, wd // 8, 8) \
+                   .copy_(tensor.view(torch.int32).view(tk, tn // g, g, 8, wd // 8).permute(1, 0, 2, 4, 3))
+            else:
+                dst.view(tensor.dtype).view(tn // g, tk, g, ps) \
+                   .copy_(tensor.view(tk, tn // g, g, ps).permute(1, 0, 2, 3))
         else:
             dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
         return dst.view(tensor.dtype).view(tensor.shape)
@@ -643,8 +654,12 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         def swz_group(t):
             return cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
 
+        def planar_layout(t):
+            # AVX2 tier only; nonzero only where swz_group > 0 (C++ rule couples the two)
+            return swz and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0) != 0
+
         def rehome_trellis(t):
-            return arena.rehome(t, band_swizzle = swz_group(t))
+            return arena.rehome(t, band_swizzle = swz_group(t), planar = planar_layout(t))
 
         def nbytes(t):
             return t.numel() * t.element_size()
@@ -740,8 +755,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 grp = swz_group(v_tr)
                 if grp:
                     tk, tn, ps = new.shape
-                    v_tr.view(tn // grp, tk, grp, ps) \
-                        .copy_(new.view(tk, tn // grp, grp, ps).permute(1, 0, 2, 3))
+                    if planar_layout(v_tr):
+                        wd = ps // 2
+                        v_tr.view(torch.int32).view(tn // grp, tk, grp, wd // 8, 8) \
+                           .copy_(new.view(torch.int32).view(tk, tn // grp, grp, 8, wd // 8).permute(1, 0, 2, 4, 3))
+                    else:
+                        v_tr.view(tn // grp, tk, grp, ps) \
+                            .copy_(new.view(tk, tn // grp, grp, ps).permute(1, 0, 2, 3))
                 else:
                     v_tr.copy_(new)
                 v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
@@ -1787,7 +1807,8 @@ class MoeCpuHost:
                         k, n, K = pd[name]
                         ext.moe_unswizzle_trellis(
                             st["vram_slots"][ws], native[ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, ext.exl3_moe_cpu_swizzle_group(K))
+                            k // 16, n // 16, K, ext.exl3_moe_cpu_swizzle_group(K),
+                            ext.exl3_moe_cpu_planar_layout(K))
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 

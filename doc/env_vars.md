@@ -434,10 +434,29 @@ roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather 
 leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
 (+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
 and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
+with the tier forced on a 7960X). The `avx2` tier bands integer rates in a group-2 layout
+(+6-204% cold decode measured on a 5950X, see `bench/swz_findings.md`); the `scalar` tier
+reads the native layout. K8 tensors always stay in the native layout on the AVX-512 tiers
+(they route to the dword kernel). The GPU-streaming prefill path un-swizzles during staging,
+so staged bytes reaching the GPU dequant are
 unaffected. Set to `0` to keep the native layout.
+
+### `EXL3_MOE_CPU_PLANAR` (default: `1`)
+
+On top of the swizzle, repack each tile's 32-bit words into the "planar" order
+(dword `w` moves to `8 * (w % bits) + w / bits`) on the `avx2` tier, where it matters:
+under the tc-perm layout a half-row's 8 source dwords advance by exactly `bits` per
+column, so the planar order puts them all in one 8-dword register and every weight-gather
+in the AVX2 kernels collapses to a single `vpermd` instead of walking the tile's registers.
+Removes the rate-proportional ALU wall of the walk (warm 1T m=1 vs the old kernels,
+Zen 5: K3 +21% K4 +40% K5 +117% K6 +143% K7 +219% K8 +89%, all rates landing at the
+accumulate ceiling) and, with the register pressure gone, brings the group-2 band kernel
+to the rates it spilled on before (cold m=1 vs production: K3 +90% K4 +137% K5 +142%
+K6 +245% K7 +313% K8 +102%; K2 +7% over the adopted swizzle; measurements and the
+bit-exactness gate in `bench/bench_planar.cpp` / `bench/bench_e2e.cpp`,
+see `bench/planar_findings.md`). Applies to integer rates 2-8; K1's permutation is the
+identity and half-integer rates are never planar. `0` reverts the AVX2 swizzle set and
+dword order to the pre-planar behaviour verbatim (also the A/B toggle).
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

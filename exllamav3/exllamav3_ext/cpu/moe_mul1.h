@@ -30,6 +30,13 @@ struct MoeCpuMatrix
     // k-stream. Group g is tier-specific (8 for the AVX-512 band kernels, 2 for the AVX2
     // band-2 kernel) and per-matrix gating lives in exl3_moe_cpu_swizzle_group.
     int swz = 0;
+    // Planar (register-local) dword order within each tile, on top of the swizzle: dword w
+    // moves to 8 * (w % bits) + w / bits, so every half-row's 8 source dwords (which advance
+    // by exactly `bits` per column under the tc-perm layout) live in ONE 8-dword register and
+    // each AVX2 gather collapses to a single vpermd instead of the O(bits) register walk.
+    // Integer rates, AVX2 tier, swizzled matrices only; rule lives in
+    // exl3_moe_cpu_planar_layout, applied to the bytes by the loader.
+    int planar = 0;
 };
 
 struct MoeCpuLayer
@@ -138,3 +145,10 @@ bool exl3_moe_cpu_has_avx512_vbmi();
 // value); kernels dispatch on it. Single source of truth for the per-tier/per-rate rule --
 // query this instead of duplicating the gate.
 int exl3_moe_cpu_swizzle_group(double K);
+
+// Planar dword order (see MoeCpuMatrix.planar) for one rate under the current tier: 1 = the
+// loader must apply the intra-tile dword permute after the tile-group swizzle (integer rates
+// 2..8 on the AVX2 tier only; the GPU staging path un-does it alongside the tile-order
+// restore). Only meaningful where exl3_moe_cpu_swizzle_group returns > 0. Kill switch:
+// EXL3_MOE_CPU_PLANAR=0 (restores the old swizzle set and layout verbatim).
+int exl3_moe_cpu_planar_layout(double K);

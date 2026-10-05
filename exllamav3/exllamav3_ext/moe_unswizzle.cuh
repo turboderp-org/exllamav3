@@ -12,5 +12,6 @@ void moe_unswizzle_trellis
     int64_t tiles_k,
     int64_t tiles_n,
     double K,
-    int64_t group                 // swizzle group (0/2/8, exl3_moe_cpu_swizzle_group); 0: plain copy
+    int64_t group,                  // swizzle group (0/2/8, exl3_moe_cpu_swizzle_group); 0: plain copy
+    int64_t planar = 0              // 1: invert the planar dword order too (exl3_moe_cpu_planar_layout)
 );

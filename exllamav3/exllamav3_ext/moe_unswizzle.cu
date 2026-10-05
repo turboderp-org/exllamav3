@@ -13,6 +13,11 @@
 // group) the g tiles of a group are contiguous in both layouts, so each block moves such
 // runs -- one read + one write of the bytes at VRAM bandwidth, instead of tiles_k * groups
 // scattered memcpys on the stager thread. group = 0 (matrix never swizzled) is a plain copy.
+//
+// planar = 1 (AVX2 tier only, integer rates; exl3_moe_cpu_planar_layout) additionally means
+// each staged tile's dwords are in the planar order: dword q holds native word
+// bits*(q % 8) + q / 8. The restore then inverts that per-dword within each tile (4-byte
+// accesses inside a tile of 32*bits bytes; the pass stays bandwidth-bound).
 
 #define NUM_THREADS 128
 
@@ -26,7 +31,8 @@ void moe_unswizzle_kernel
     const int tiles_k,
     const int tiles_n,
     const int tile_b,
-    const int group               // 0 (native) | 2 | 8
+    const int group,              // 0 (native) | 2 | 8
+    const int planar              // 1: also invert the planar dword order (group > 0, integer K)
 )
 {
     const int groups = tiles_n / 8;             // launch granularity: 8-tile native runs (g | 8)
@@ -44,6 +50,25 @@ void moe_unswizzle_kernel
         const uint4* s0 = reinterpret_cast<const uint4*>(
             src + base + ((size_t) g * (8 / group) * tiles_k + kt) * sub_b);
         uint4* d0 = reinterpret_cast<uint4*>(dst + dst_off);
+        if (planar)
+        {
+            // Per-dword inverse of the planar repack within each tile (see file header);
+            // integer rates only: tile_b = 32 * bits, dword residue math in unsigned int
+            const int bits = tile_b / 32;
+            const int wd = 8 * bits;                       // dwords per tile
+            #pragma unroll
+            for (int sub = 0; sub < 8 / group; ++sub)
+            {
+                const uint32_t* s = reinterpret_cast<const uint32_t*>(s0 + (size_t) sub * tiles_k * (sub_b / 16));
+                uint32_t* d = reinterpret_cast<uint32_t*>(d0 + (size_t) sub * (sub_b / 16));
+                for (int i = threadIdx.x; i < (int) (sub_b / 4); i += NUM_THREADS)
+                {
+                    const int q = i % wd;
+                    d[(i / wd) * wd + bits * (q & 7) + (q >> 3)] = s[i];
+                }
+            }
+            return;
+        }
         #pragma unroll
         for (int sub = 0; sub < 8 / group; ++sub)
         {
@@ -70,7 +95,8 @@ void moe_unswizzle_trellis
     int64_t tiles_k,
     int64_t tiles_n,
     double K,
-    int64_t group                 // swizzle group of this projection (0/2/8); 0: plain copy
+    int64_t group,                // swizzle group of this projection (0/2/8); 0: plain copy
+    int64_t planar                // 1: planar dword order to invert (from exl3_moe_cpu_planar_layout)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(src.device());
@@ -79,8 +105,10 @@ void moe_unswizzle_trellis
     TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "moe_unswizzle: tensors must be contiguous");
     TORCH_CHECK(tiles_n % 8 == 0, "moe_unswizzle: tiles_n must be a multiple of 8");
     TORCH_CHECK(group == 0 || group == 2 || group == 8, "moe_unswizzle: group must be 0, 2 or 8");
+    TORCH_CHECK(!planar || group != 0, "moe_unswizzle: planar requires a swizzled projection");
     const BitsK bk = bits_from_K((float) K);
     const int tile_b = bk.bits * 32 + (bk.half ? 16 : 0);
+    TORCH_CHECK(!planar || !bk.half, "moe_unswizzle: planar is undefined for half-integer rates");
     const int64_t proj_b = tiles_k * tiles_n * tile_b;
     const int64_t need = (num_experts - 1) * expert_stride_b + proj_off_b + proj_b;
     TORCH_CHECK(num_experts >= 1 && need <= (int64_t) src.numel() * src.element_size()
@@ -90,6 +118,6 @@ void moe_unswizzle_trellis
     moe_unswizzle_kernel<<<grid, NUM_THREADS, 0, stream>>>(
         (const uint8_t*) src.data_ptr(), (uint8_t*) dst.data_ptr(),
         (size_t) expert_stride_b, (size_t) proj_off_b, (int) tiles_k, (int) tiles_n, tile_b,
-        (int) group);
+        (int) group, (int) planar);
     cuda_check(cudaPeekAtLastError());
 }

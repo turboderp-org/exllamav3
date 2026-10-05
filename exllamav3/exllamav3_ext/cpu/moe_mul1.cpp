@@ -1676,6 +1676,142 @@ void avx2_swz_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, 
 }
 
 // -------------------------------------------------------------------------------------------
+//   AVX2 planar (register-local) dword layout
+//
+// The gather above walks the tile's registers (one vpermd + blend per candidate) because a
+// row's source dwords are scattered through the tile. But within a half-row the tc-perm ring
+// index advances by 32 per column, so the source dwords advance by exactly `bits` per column:
+// they form ONE residue class mod bits of the tile's 8*bits dwords (compile-time asserted
+// below). Repacking each tile's dwords so every class lives in one 8-dword register --
+//     new[q] = old[bits * (q % 8) + q / 8]      (dwords; integer rates)
+// -- collapses every gather to a single vpermd (vpermd is full 256-bit cross-lane). That
+// removes the rate-proportional ALU wall the register walk imposes (bench/bench_planar.cpp,
+// Zen 5, warm 1T m=1 vs production avx2_tiles: K3 +21% K4 +40% K5 +117% K6 +143% K7 +219%
+// K8 +89%, all rates landing at the ~11.5 Gw/s accumulate ceiling) and, with the register
+// pressure gone, lets the band-2 kernel -- which spilled and lost 30-64% warm on K3/K4/K7
+// with the walking gather (bench/swz_findings.md) -- carry those rates too: cold m=1 vs
+// production, group-2 + planar gives K3 +90% K4 +137% K5 +142% K6 +245% K7 +313% K8 +102%
+// (K2 +66% over native, +7% over the adopted group-2 native-dword kernel). Codes are the
+// same values in the same order, so output is bit-exact vs avx2_tiles on the same fixture
+// (verified K2-K8 x m1-4 in bench_planar).
+//
+// The repack is applied by the loader on top of the group-2 tile order (rehome / install in
+// moe_cpu_host.py) and un-done by the GPU staging path alongside the tile-order restore
+// (moe_unswizzle.cu); exl3_moe_cpu_planar_layout is the single rule. Half-integer rates are
+// never planar (their word spread per column is not integral; the classes do not partition
+// the tile) and K1's permutation is the identity, so K1 stays on the existing kernels.
+// -------------------------------------------------------------------------------------------
+
+// Register holding a half-row's sources under the planar order (all 8 columns must agree:
+// the orbit property; a disagreement is a layout bug, caught at compile time)
+template <int bits, int row, bool second_word, int half>
+constexpr int planar_reg()
+{
+    constexpr auto idx = make_row_indices<bits, false, row, second_word>();
+    const int r = idx[half * 8] % bits;
+    for (int c = 1; c < 8; ++c)
+        if (idx[half * 8 + c] % bits != r) return -1;
+    return r;
+}
+
+template <int bits, int row, bool second_word, int half>
+M1_TARGET_AVX2
+inline __m256i avx2_gather_half_planar(const __m256i (&preg)[bits])
+{
+    static_assert(planar_reg<bits, row, second_word, half>() >= 0, "half-row words span registers");
+    constexpr auto idx = make_row_indices<bits, false, row, second_word>();
+    // planar position of dword w is 8*(w%bits) + w/bits: register w%bits (constexpr above),
+    // lane w/bits
+    const __m256i lane = _mm256_setr_epi32(
+        idx[half * 8 + 0] / bits, idx[half * 8 + 1] / bits, idx[half * 8 + 2] / bits,
+        idx[half * 8 + 3] / bits, idx[half * 8 + 4] / bits, idx[half * 8 + 5] / bits,
+        idx[half * 8 + 6] / bits, idx[half * 8 + 7] / bits);
+    return _mm256_permutevar8x32_epi32(preg[planar_reg<bits, row, second_word, half>()], lane);
+}
+
+template <int bits, int row>
+M1_TARGET_AVX2
+inline void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo, __m256i& codes_hi)
+{
+    const __m256i a_lo = avx2_gather_half_planar<bits, row, false, 0>(preg);
+    const __m256i b_lo = avx2_gather_half_planar<bits, row, true, 0>(preg);
+    const __m256i a_hi = avx2_gather_half_planar<bits, row, false, 1>(preg);
+    const __m256i b_hi = avx2_gather_half_planar<bits, row, true, 1>(preg);
+    const __m256i mask16 = _mm256_set1_epi32(0xffff);
+    constexpr int s0 = row_shift<bits, false, row>(0);
+    constexpr int s1 = row_shift<bits, false, row>(8);
+    codes_lo = _mm256_and_si256(_mm256_or_si256(
+        _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
+    codes_hi = _mm256_and_si256(_mm256_or_si256(
+        _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
+}
+
+template <int bits, int row = 0>
+M1_TARGET_AVX2
+inline void avx2_rows_accum_planar(
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i& mult, const __m256i& ones32)
+{
+    if constexpr (row < 16)
+    {
+        __m256i codes_lo, codes_hi;
+        avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
+        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum_planar<bits, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
+    }
+}
+
+// Group-2 band-2 kernel over the planar dword order: the production avx2_swz_tiles body with
+// planar gathers (bit-exact vs avx2_tiles by the same argument). tn0/tn1 even as in
+// avx2_swz_tiles (assign_gemvs 8-tile groups).
+template <int bits>
+M1_TARGET_AVX2
+void avx2_swz2_planar(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    const int tiles_k = mat.k / 16;
+    constexpr int packed_size = 16 * bits;
+    const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+    const size_t step = static_cast<size_t>(2) * packed_size;
+
+    for (int pair = tn0; pair < tn1; pair += 2)
+    {
+        __m256i accA[MAX_M][2], accB[MAX_M][2];
+        for (int i = 0; i < m; ++i)
+        {
+            accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
+            accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
+        }
+        const uint16_t* pA = mat.trellis
+            + static_cast<size_t>(pair >> 1) * tiles_k * 2 * packed_size;
+        const uint16_t* pB = pA + packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
+        {
+            const int32_t* dup = splat_dup + tile_k * 16;
+            __m256i preg[bits];
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
+            avx2_rows_accum_planar<bits>(preg, dup, mat.k, m, accA, mult, ones32);
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
+            avx2_rows_accum_planar<bits>(preg, dup, mat.k, m, accB, mult, ones32);
+        }
+        for (int i = 0; i < m; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* outA = tout + static_cast<size_t>(i) * mat.n + pair * 16;
+            float* outB = outA + 16;
+            _mm256_storeu_ps(outA, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outA + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][1]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 //   Scalar fallback
 // -------------------------------------------------------------------------------------------
 
@@ -1968,11 +2104,26 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         case Isa::Avx2:
         {
             // Swizzled matrices (group 2, exl3_moe_cpu_swizzle_group's pick for this tier's
-            // integer rates {1,2,5,6,8}) run the band-2 kernel; the loader repacks exactly
-            // those tensors, so swz and the rate cannot disagree here. Half-integer rates are
-            // never swizzled on this tier and take the hb branch below.
+            // integer rates) run the band-2 kernel -- the planar-dword one where the loader
+            // repacked the tile dwords (mat.planar), the walking-gather one otherwise; the
+            // loader repacks exactly those tensors, so the flags and the rate cannot disagree
+            // here. Half-integer rates are never swizzled on this tier and take the hb branch
+            // below.
             if (mat.swz)
             {
+                if (mat.planar)
+                {
+                    switch (mat.bits)
+                    {
+                        case 2: avx2_swz2_planar<2>(mat, in, tout, m, tn0, tn1); return;
+                        case 3: avx2_swz2_planar<3>(mat, in, tout, m, tn0, tn1); return;
+                        case 4: avx2_swz2_planar<4>(mat, in, tout, m, tn0, tn1); return;
+                        case 5: avx2_swz2_planar<5>(mat, in, tout, m, tn0, tn1); return;
+                        case 6: avx2_swz2_planar<6>(mat, in, tout, m, tn0, tn1); return;
+                        case 7: avx2_swz2_planar<7>(mat, in, tout, m, tn0, tn1); return;
+                        default: avx2_swz2_planar<8>(mat, in, tout, m, tn0, tn1); return;
+                    }
+                }
                 switch (mat.bits)
                 {
                     case 1: avx2_swz_tiles<1>(mat, in, tout, m, tn0, tn1); return;
@@ -2716,19 +2867,49 @@ bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 // Swizzle layout group for one trellis tensor's rate under the current tier: 0 = native tile
 // order, 8 = band-8 (AVX-512 banded kernels; K8 exempt -- the dword kernel gains nothing; the
 // half-integer rates ride the hb template instances like every other AVX-512 kernel), 2 =
-// band-2 (AVX2 avx2_swz_tiles; only the integer rates where it measures >= native:
-// {1,2,5,6,8}, see the kernel comment and bench/swz_findings.md -- no hb instances, so half
-// rates stay native). The child loader repacks each tensor with the group this returns and the
-// kernels dispatch on it -- the ONLY place the per-tier/per-rate rule lives, so loader and
-// kernels cannot drift.
+// band-2 (AVX2 avx2_swz_tiles / avx2_swz2_planar; with the planar dword layout on --
+// exl3_moe_cpu_planar_layout -- every integer rate measures >= native and takes group 2: the
+// planar gather removes the register pressure that made the band-2 body spill at K3/K4/K7,
+// see bench/bench_planar.cpp; with planar off, the historical set {1,2,5,6,8} from
+// bench/swz_findings.md. No hb instances, so half rates stay native either way). The child
+// loader repacks each tensor with the group this returns and the kernels dispatch on it -- the
+// ONLY place the per-tier/per-rate rule lives, so loader and kernels cannot drift.
+
+// EXL3_MOE_CPU_PLANAR=0: revert the AVX2 swizzle set and dword order to the pre-planar
+// behaviour verbatim (kill switch for the layout change; also the A/B toggle)
+inline bool planar_enabled()
+{
+    static const bool v = []{
+        const char* e = std::getenv("EXL3_MOE_CPU_PLANAR");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 int exl3_moe_cpu_swizzle_group(double K)
 {
     const int bits = static_cast<int>(K);
     const bool hb = (K != static_cast<double>(bits));
     if (g_isa >= Isa::Bw) return bits != 8 ? 8 : 0;
     if (g_isa == Isa::Avx2)
+    {
+        if (!hb && planar_enabled() && bits >= 1 && bits <= 8) return 2;
         return !hb && (bits == 1 || bits == 2 || bits == 5 || bits == 6 || bits == 8) ? 2 : 0;
+    }
     return 0;
+}
+
+// Planar dword order (see MoeCpuMatrix.planar and the kernel-section comment): AVX2 tier, the
+// swizzled integer rates 2..8 (K1's permutation is the identity and its existing band-2
+// kernel measured a few % better cold than the planar instantiation). Only meaningful where
+// swizzle_group returns > 0; the loader applies it on top of the tile-group repack and
+// make_matrix re-derives the flag from the same rule, so bytes and dispatch cannot drift.
+int exl3_moe_cpu_planar_layout(double K)
+{
+    const int bits = static_cast<int>(K);
+    const bool hb = (K != static_cast<double>(bits));
+    return g_isa == Isa::Avx2 && !hb && planar_enabled() && exl3_moe_cpu_swizzle_group(K) > 0
+        && bits >= 2 && bits <= 8 ? 1 : 0;
 }
 
 static MoeCpuMatrix make_matrix
@@ -2757,6 +2938,7 @@ static MoeCpuMatrix make_matrix
     // this matrix's rate (band-8 on the AVX-512 tiers minus K8, band-2 on AVX2 for the integer
     // rates {1,2,5,6,8}); apply the same rule here so the flag matches the bytes per tensor
     m.swz = swizzled && exl3_moe_cpu_swizzle_group(tile_w / 16.0) ? 1 : 0;
+    m.planar = m.swz && exl3_moe_cpu_planar_layout(tile_w / 16.0) ? 1 : 0;
     TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
@@ -3063,6 +3245,8 @@ bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+int exl3_moe_cpu_swizzle_group(double) { return 0; }
+int exl3_moe_cpu_planar_layout(double) { return 0; }
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
