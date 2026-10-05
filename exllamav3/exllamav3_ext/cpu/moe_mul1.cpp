@@ -3165,6 +3165,7 @@ void exl3_moe_cpu_forward_raw(
     // exl3_moe_cpu_set_prof (MoeCpuTuning.cpu_prof in moe_cpu_host.py, EXL3_MOE_CPU_PROF env)
     const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
     static double phase_us[6] = {};
+    static double phase_bytes[6] = {};
     static long prof_jobs = 0;
 
     const int num_phases = rows == 1 ? 5 : 6;
@@ -3172,9 +3173,22 @@ void exl3_moe_cpu_forward_raw(
         ctx.phase = phase;
         if (prof)
         {
+            // Trellis bytes the phase must stream (per-job, summed over chunks): the GEMV
+            // phases' GB/s = bytes/us below says whether the phase runs at the machine's
+            // read-bandwidth wall (bandwidth-bound: only byte-reducing levers remain) or
+            // well under it (job structure still costs time)
+            double jb = 0;
+            if (phase == 1)
+                for (const Chunk& ch : ctx.chunks)
+                    jb += trellis_bytes(layer->ups[ch.expert])
+                        + (layer->gates.empty() ? 0.0 : (double)trellis_bytes(layer->gates[ch.expert]));
+            else if (phase == 3)
+                for (const Chunk& ch : ctx.chunks)
+                    jb += trellis_bytes(layer->downs[ch.expert]);
             const auto t0 = std::chrono::steady_clock::now();
             g_pool.run(&forward_phase, &ctx, n_run);
             phase_us[phase] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            phase_bytes[phase] += jb;
         }
         else
         {
@@ -3183,10 +3197,13 @@ void exl3_moe_cpu_forward_raw(
     }
     if (prof && ++prof_jobs % 512 == 0)
     {
-        printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f | act+prep_d %.1f"
-               " | gemv_d %.1f | tf_d/finish %.1f | accum %.1f\n",
-               prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs, phase_us[2] / prof_jobs,
-               phase_us[3] / prof_jobs, phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
+        // GB/s = bytes/us / 1000
+        printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f (%.1f GB/s)"
+               " | act+prep_d %.1f | gemv_d %.1f (%.1f GB/s) | tf_d/finish %.1f | accum %.1f\n",
+               prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs,
+               phase_bytes[1] / phase_us[1] / 1000.0, phase_us[2] / prof_jobs,
+               phase_us[3] / prof_jobs, phase_bytes[3] / phase_us[3] / 1000.0,
+               phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
         fflush(stdout);
     }
 }
