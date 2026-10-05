@@ -132,6 +132,8 @@ class Glm4VVisionPatchMerger(Module):
         self.act_limit = act_limit
         self.gelu_approx = gelu_approx
 
+        # Padded to the EXL3 tile grid like GatedMLP: GLM-4.6V's merger is 10944 wide. gate / up keep
+        # their padded columns (their pad values only ever meet zero rows of the padded down weight)
         self.proj = Linear(
             config = config,
             key = f"{key}.{key_proj}",
@@ -139,7 +141,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.hidden_size,
             qmap = qmap + ".input",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.gate = Linear(
             config = config,
@@ -148,7 +149,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.interm_size,
             qmap = qmap + ".post_norm",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.up = Linear(
             config = config,
@@ -157,7 +157,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.interm_size,
             qmap = qmap + ".post_norm",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.down = Linear(
             config = config,
@@ -167,7 +166,7 @@ class Glm4VVisionPatchMerger(Module):
             qmap = qmap + ".down",
             out_dtype = self.out_dtype,
             allow_input_padding = True,
-            pad_to = 1
+            trim_padded_out = True,
         )
 
         self.register_submodule(self.proj)

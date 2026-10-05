@@ -110,6 +110,7 @@ def read_glm4v_vision_config(config_dict: dict):
         v.post_conv_norm = False
         v.pos_embedding = False
         v.merger_interm_size = config_dict.get("projection_intermediate_size")
+        v.block_interm_size = v.intermediate_size
         v.gelu_approx = "none"
         v.downsample_out = v.out_hidden_size
 
@@ -120,6 +121,9 @@ def read_glm4v_vision_config(config_dict: dict):
         v.post_conv_norm = True
         v.pos_embedding = True
         v.merger_interm_size = v.intermediate_size
+        # HF's Glm4vVisionMlp sizes the block MLP by out_hidden_size, not intermediate_size (which is
+        # the merger's width): GLM-4.6V has 4096-wide blocks against a 10944 intermediate_size
+        v.block_interm_size = v.out_hidden_size
         v.gelu_approx = "tanh"
         v.downsample_out = v.hidden_size
 
@@ -277,14 +281,13 @@ class Glm4VVisionModel(Model):
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.mlp",
                         hidden_size = v.hidden_size,
-                        intermediate_size = v.intermediate_size,
+                        intermediate_size = v.block_interm_size,
                         key_gate = "gate_proj",
                         key_up = "up_proj",
                         key_down = "down_proj",
                         activation_fn = "silu",
                         act_limit = v.act_limit or 0.0,
                         qmap = "block.mlp",
-                        pad_to = 1,
                     ),
                 )
             ]
