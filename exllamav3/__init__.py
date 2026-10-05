@@ -1,3 +1,12 @@
+import os
+
+# ROCm: the profiler tool registration torch loads for torch.profiler leaves the HSA runtime's event
+# thread spinning on a core for the life of the process, from the first device operation on. Off unless
+# the variable is already set (ROCPROFILER_REGISTER_ENABLED=1 restores it, and with it the device events
+# in torch.profiler traces). Has no effect on CUDA builds. Set before torch is imported so it is in place
+# however early the host touches the device
+os.environ.setdefault("ROCPROFILER_REGISTER_ENABLED", "0")
+
 try:
     import torch
 except ImportError as e:

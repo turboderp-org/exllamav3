@@ -863,6 +863,15 @@ between the main process and child workers reaching their first kernel launch.
 
 ## Debug
 
+### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
+
+Not an ExLlamaV3 variable: it belongs to the ROCm profiler registration layer that torch loads for
+`torch.profiler`. With registration active, the HSA runtime's event thread spins on one CPU core
+from the first device operation until the process exits, including while it is idle. Importing
+`exllamav3` therefore sets it to `0` when it is not already in the environment. Export
+`ROCPROFILER_REGISTER_ENABLED=1` for profiling runs: without registration `torch.profiler` records
+no device events. Ignored by CUDA builds.
+
 ### `EXL3_NGRAM_GATHER_PROF` (default: unset)
 
 Windows only: print per-gather statistics from the streamed n-gram table path (unique rows,
