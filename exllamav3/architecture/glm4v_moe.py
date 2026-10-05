@@ -1,6 +1,6 @@
 from __future__ import annotations
 from ..model.config import Config, no_default
-from ..util.rope import RopeStyle
+from ..util.rope import RopeStyle, RoPE
 from .glm4_moe import Glm4MoeModel
 import os, json
 from .glm4v import read_glm4v_vision_config, read_glm4v_pp_config, Glm4VVisionModel
@@ -76,3 +76,7 @@ class Glm4VMoeModel(Glm4MoeModel):
         **kwargs
     ):
         super().__init__(config, key_prefix = "model.language_model", **kwargs)
+
+        # Generator needs MRoPE freqs when using MMEmbeddings (the dense Glm4Model base sets these itself)
+        self.caps.update({"mrope": True})
+        self.g_rope = RoPE("cpu", config.rope_settings)
