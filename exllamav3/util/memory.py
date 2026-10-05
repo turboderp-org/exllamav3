@@ -717,3 +717,14 @@ def windows_memory_status() -> tuple[int, int]:
     if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
         raise ctypes.WinError(ctypes.get_last_error())
     return status.ullAvailPhys, status.ullAvailPageFile
+
+
+def release_pinned_host_cache():
+    """
+    Return freed pinned host memory to the OS. Torch's pinned allocator keeps every block it has handed out
+    for reuse, so dropping a large pinned buffer (a CPU page cache tier) leaves it locked in RAM until this
+    runs. Blocks still in use are unaffected.
+    """
+    empty = getattr(torch._C, "_host_emptyCache", None)
+    if empty is not None:
+        empty()

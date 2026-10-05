@@ -5,6 +5,7 @@ import weakref
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
+from ..util.memory import release_pinned_host_cache
 
 
 def _align(n: int, a: int) -> int:
@@ -17,30 +18,45 @@ def _stop_worker(cond: threading.Condition, stop: threading.Event):
         cond.notify_all()
 
 
+def _release(cond: threading.Condition, stop: threading.Event, pinned: list):
+    # Runs from close() or when the tier is collected. The lists are the tier's own (slabs, views, spares),
+    # emptied in place so the pinned memory is free by the time the host cache is released; the worker does
+    # the same on its way out for a slab it was pinning meanwhile
+    _stop_worker(cond, stop)
+    with cond:
+        for holder in pinned:
+            holder.clear()
+    release_pinned_host_cache()
+
+
 def _alloc_worker(ref: weakref.ref, cond: threading.Condition, stop: threading.Event):
     # Pins slabs until the configured budget is reached, then sleeps until a slab is consumed. Holds the tier
     # only through a weak reference, and only while touching it, so dropping the Generator releases the cache
     # tensors and the pinned slabs even if nobody calls close(); the tier's finalizer wakes this thread so it
     # exits instead of waiting forever
     with torch.inference_mode():
-        while not stop.is_set():
-            with cond:
-                while True:
-                    tier = ref()
-                    if tier is None or stop.is_set():
-                        return
-                    full = len(tier.slot_slabs) + len(tier._spare) >= tier.max_slots
-                    del tier
-                    if not full:
-                        break
-                    cond.wait()
-            tier = ref()
-            if tier is None:
-                return
-            sv = tier._make_slab()  # slow part, outside the lock
-            with cond:
-                tier._spare.append(sv)
-            del tier
+        try:
+            while not stop.is_set():
+                with cond:
+                    while True:
+                        tier = ref()
+                        if tier is None or stop.is_set():
+                            return
+                        full = len(tier.slot_slabs) + len(tier._spare) >= tier.max_slots
+                        del tier
+                        if not full:
+                            break
+                        cond.wait()
+                tier = ref()
+                if tier is None:
+                    return
+                sv = tier._make_slab()  # slow part, outside the lock
+                with cond:
+                    tier._spare.append(sv)
+                # Neither may outlive the iteration: the thread parks on the condition next
+                del tier, sv
+        finally:
+            release_pinned_host_cache()
 
 
 class CPUPageCache:
@@ -183,7 +199,10 @@ class CPUPageCache:
                 daemon = True,
             )
             self._alloc_thread.start()
-            weakref.finalize(self, _stop_worker, self._spare_cond, self._stop_event)
+            self._release = weakref.finalize(
+                self, _release, self._spare_cond, self._stop_event,
+                [self.slot_slabs, self.slot_views, self._spare],
+            )
 
 
     def attach(self, pagetable):
@@ -360,19 +379,16 @@ class CPUPageCache:
 
     def close(self):
         """
-        Stop the pinning thread and drop the slabs and cache tensor references. Optional: the same happens when
-        the tier is garbage collected, this just makes it deterministic.
+        Stop the pinning thread, drop the slabs and cache tensor references and return the pinned memory to
+        the OS. Optional: the same happens when the tier is garbage collected, this just makes it deterministic.
         """
         _stop_worker(self._spare_cond, self._stop_event)
         if self._alloc_thread is not None:
             self._alloc_thread.join()
             self._alloc_thread = None
-        with self._spare_cond:
-            self._spare.clear()
+            self._release()
         self.segments = []
         self.entries = {}
-        self.slot_slabs = []
-        self.slot_views = []
         self.free_slots.clear()
         self.num_slots = 0
         self.pagetable = None

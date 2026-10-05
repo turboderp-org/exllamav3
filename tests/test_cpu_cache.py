@@ -134,3 +134,27 @@ def test_close_stops_worker_and_releases_slabs():
     cache.close()
     assert not thread.is_alive()
     assert not cache._spare and not cache.slot_slabs and not cache.segments and not cache.entries
+
+
+def _pinned_reserved():
+    return torch.cuda.host_memory_stats()["allocated_bytes.current"]
+
+
+@pytest.mark.parametrize("how", ["close", "drop"])
+def test_released_tier_returns_pinned_memory(how):
+    # Torch's pinned allocator keeps freed blocks for reuse, so a closed or collected tier used to leave its
+    # whole budget locked in RAM. Both ways out must hand it back
+    import gc
+    torch._C._host_emptyCache()
+    before = _pinned_reserved()
+    cache = build(8)
+    _wait_pinned(cache)
+    cache.store(page(1, 0), serial = 1)
+    thread = cache._alloc_thread
+    assert _pinned_reserved() >= before + 8 * cache.slab_size
+    if how == "close":
+        cache.close()
+    del cache
+    gc.collect()
+    thread.join(5.0)
+    assert _pinned_reserved() == before

@@ -18,6 +18,7 @@ _stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 
 from ..util.misc import install_parent_death_signal
+from ..util.memory import release_pinned_host_cache
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -615,9 +616,7 @@ class PseudoParentConn:
         if self.local_context.get("cpu_page_cache") is not None:
             self.local_context["cpu_page_cache"].close()
             self.local_context["cpu_page_cache"] = None
-            # Freed pinned slabs go back to torch's host allocator cache, not to the OS
-            if hasattr(torch._C, "_host_emptyCache"):
-                torch._C._host_emptyCache()
+            release_pinned_host_cache()
         self.local_context = {}
         log_tp(self.device, f"Pseudoprocess closed")
 

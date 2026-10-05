@@ -122,7 +122,8 @@ class Generator:
         :param cpu_cache_size:
             Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
             K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
-            being recomputed by prefill. Not currently supported in tensor-parallel mode
+            being recomputed by prefill. In tensor-parallel mode each rank pins its own shard of the tier and
+            the budget counts whole pages across all of them
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
