@@ -242,7 +242,7 @@ python convert.py \
 Both flags work independently: `-cd` alone converts a uniform-bitrate model with in-domain
 calibration; `-rcp` alone applies a recipe with the default calibration mix.
 
-See also: [convert.md]
+See also: [convert.md](convert.md)
 
 ### 6. Evaluate on held-out data
 
