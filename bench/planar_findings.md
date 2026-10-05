@@ -105,3 +105,36 @@ harness's known cold-regime variance on non-shipping variants; SWZP was monotone
 sweep. The narrower issue width vs Zen 5 amplifies the walk's cost exactly as predicted --
 the gains are LARGER on the shipping tier than on the dev box. (5950X-class DDR4 host; fill
 in exact model here when recording.)
+
+## MT roofline (bench_mt.cpp, 32-logical/16-physical AVX2 host, ~40 GB/s read reference)
+
+Aggregate cold GEMV, one expert split across T pinned workers in production 8-tile groups
+(Gw/s, medians of 3 sweeps; production decode runs T=16):
+
+    T=1   K2 5.2/13.3/14.8   K4 8.1/6.4/14.5    K6 3.8/4.6/13.9     (PROD/SWZG/SWZP)
+    T=4   K2 41/47/51        K4 29/23/49        K6 14/17/45
+    T=8   K2 65/75/80        K4 47/42/74        K6 25/28/48
+    T=16  K2 92/93/95        K4 76/61/90        K6 42/48/71
+    T=32  K2 75/83/76        K4 67/53/79        K6 40/44/58
+
+Read roofline in Gw/s: K2 ~160, K4 ~80, K6 ~53 (@40 GB/s). Pattern:
+
+- K4/K6: PROD and SWZG feed memory at only 60-70% of the wall even at full concurrency --
+  the core cannot issue the walking gather fast enough to keep DRAM saturated. SWZP REACHES
+  (and in these short-window measurements nominally exceeds) the roofline at every rate.
+  The kernel is no longer the limiter anywhere.
+- K2: all three converge at T>=16 (bandwidth-bound already); SWZP leads at T<=8.
+- T=32 (SMT) numbers are muted by per-measure thread launch overhead on short runs; the
+  T=16 column is the production regime.
+
+End-to-end (Qwen3-Next-Flash 2.05bpw, K2 experts, 48L offload, 16 worker threads):
+planar 32.5 tok/s vs old swizzle 31.7 (+2.8%) vs mainline native 30.3 (+7.4% total).
+4.05bpw: E2E flat although the bench shows K4 headroom at T16 -- the decode job shape
+(nc ~= topk GEMVs, six barriers, straggler tails) apparently does not pull the full-
+concurrency kernel rate; remaining slack is job structure, not extraction. Decision
+unchanged: ship planar default ON -- dominant or tied below the wall everywhere, and at
+the wall it converts ~2-4x fewer instructions per weight into power/headroom.
+
+Corollary: EXL3_MOE_CPU_SMALL_WORKERS is inert for this workload (the cap applies only
+when nc <= 2; topk-8 decode is always nc ~= 8). If barrier cost is ever shown to matter,
+the gate in exl3_moe_cpu_forward_raw is the thing to revisit, not the cap value.
