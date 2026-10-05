@@ -3,9 +3,7 @@ import traceback
 import os
 import signal
 import sys
-import threading
 import time
-from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
@@ -18,7 +16,7 @@ _stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 
 from ..util.misc import install_parent_death_signal
-from ..util.memory import release_pinned_host_cache
+from ..util.pinned_arena import PinnedArena
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -423,23 +421,19 @@ def mp_rotate_cache_pages(
 # CPU page cache in TP mode. The main process owns the page table, the slot table and the eviction policy but
 # holds no cache tensors, so it names a slot by index and every rank keeps its own shard of that slot here. A
 # slot is one whole page image of this rank's shard, across every attached cache, in ONE pinned slab with a
-# view carved per cache tensor (never one allocation per tensor): a slot touches every layer's K and V, so
-# per-tensor pinning is O(layers) cudaHostAlloc calls per slot, and across a real budget that overruns
-# vm.max_map_count (~65k mappings by default) long before it runs out of memory, silently degrading the whole
-# pool to pageable buffers.
+# view carved per cache tensor. The slabs are slices of one registered arena rather than pinned tensors of
+# their own: torch's pinned allocator rounds each request up to a power of two, and per-tensor pinning is
+# O(layers) mappings per slot, which across a real budget overruns vm.max_map_count (~65k by default) long
+# before it runs out of memory.
 
 class RankSlotPool:
     """
-    This rank's half (or third, or...) of the CPU page cache: one pinned slab per slot index.
-
-    Pinning host memory manages only ~2.5 GB/s and serializes with copy submission on the driver, so slabs
-    are pinned ahead of demand by a background thread, mirroring what the single-process cache does. A store
-    that outruns the thread pins synchronously and says so, since that stall lands on the generator's own
-    dispatch path.
+    This rank's half (or third, or...) of the CPU page cache: one pinned arena holding a slab per slot
+    index, committed and locked when the tier is built.
     """
 
     def __init__(self, cache_tensors: list, max_slots: int):
-        # Segment layout of one slab, mirroring CPUPageCache._make_slab
+        # Segment layout of one slab, mirroring CPUPageCache
         self.segments = []
         offset = 0
         for t in cache_tensors:
@@ -449,74 +443,28 @@ class RankSlotPool:
         self.slab_size = (offset + 4095) & ~4095
         self.max_slots = max_slots
         self.slots = {}
-        self.cold_allocs = 0
-        self.pageable = False
-
-        self._spare = deque()
-        self._spare_cond = threading.Condition()
-        self._stop = False
-        self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
-        self._alloc_thread.start()
-
-
-    def _make_buffers(self):
-        try:
-            slab = torch.empty((self.slab_size,), dtype = torch.uint8, pin_memory = True)
-        except RuntimeError:
-            # Out of lockable memory on this rank. Pageable buffers still work, at roughly half the transfer
-            # bandwidth (and stores into them synchronize), which beats failing the store outright (but it
-            # is a real degradation, so warn once)
-            if not self.pageable:
-                self.pageable = True
-                print(" !! CPU page cache: rank out of pinnable memory, falling back to pageable buffers",
-                      flush = True)
-            slab = torch.empty((self.slab_size,), dtype = torch.uint8)
-        return [slab[offset : offset + nbytes].view(dtype).view(shape)
-                for offset, shape, dtype, nbytes in self.segments]
-
-
-    def _alloc_worker(self):
-        with torch.inference_mode():
-            while True:
-                with self._spare_cond:
-                    while not self._stop and len(self.slots) + len(self._spare) >= self.max_slots:
-                        self._spare_cond.wait()
-                    if self._stop:
-                        return
-                buffers = self._make_buffers()  # slow part, outside the lock
-                with self._spare_cond:
-                    self._spare.append(buffers)
+        self.arena = PinnedArena(max_slots * self.slab_size, "CPU page cache (TP rank)")
 
 
     def close(self):
         """
-        Stop the pinning thread and drop every slab. The thread holds the pool through its bound target, so
-        until this runs a replaced pool and everything it pinned stay alive.
+        Drop the slot views and return the arena to the OS
         """
-        with self._spare_cond:
-            self._stop = True
-            self._spare_cond.notify_all()
-        self._alloc_thread.join()
-        with self._spare_cond:
-            self._spare.clear()
         self.slots = {}
+        if self.arena is not None:
+            self.arena.close()
+            self.arena = None
 
 
     def get(self, slot: int):
         buffers = self.slots.get(slot)
-        if buffers is not None:
-            return buffers
-        with self._spare_cond:
-            if self._spare:
-                buffers = self._spare.popleft()
-                self.slots[slot] = buffers
-                self._spare_cond.notify()
-                return buffers
-        buffers = self._make_buffers()
-        self.cold_allocs += 1
-        with self._spare_cond:
-            self.slots[slot] = buffers
-            self._spare_cond.notify()
+        if buffers is None:
+            assert 0 <= slot < self.max_slots
+            base = slot * self.slab_size
+            buffers = self.slots[slot] = [
+                self.arena.tensor[base + offset : base + offset + nbytes].view(dtype).view(shape)
+                for offset, shape, dtype, nbytes in self.segments
+            ]
         return buffers
 
 
@@ -551,7 +499,6 @@ def mp_cpu_cache_store(local_context: dict, cache_ids: list[int], slot: int, pag
     buffers = pool.get(slot)
     for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
         buffer.copy_(tensor[page_index], non_blocking = True)
-    return pool.cold_allocs
 
 
 def mp_cpu_cache_fetch(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
@@ -612,11 +559,10 @@ class PseudoParentConn:
 
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
-        # This rank lives in the main process, so its pool's pinning thread would keep it alive past unload
+        # This rank lives in the main process, so nothing else returns its arena on unload
         if self.local_context.get("cpu_page_cache") is not None:
             self.local_context["cpu_page_cache"].close()
             self.local_context["cpu_page_cache"] = None
-            release_pinned_host_cache()
         self.local_context = {}
         log_tp(self.device, f"Pseudoprocess closed")
 
