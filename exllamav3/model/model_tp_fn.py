@@ -453,6 +453,7 @@ class RankSlotPool:
 
         self._spare = deque()
         self._spare_cond = threading.Condition()
+        self._stop = False
         self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
         self._alloc_thread.start()
 
@@ -477,11 +478,27 @@ class RankSlotPool:
         with torch.inference_mode():
             while True:
                 with self._spare_cond:
-                    while len(self.slots) + len(self._spare) >= self.max_slots:
+                    while not self._stop and len(self.slots) + len(self._spare) >= self.max_slots:
                         self._spare_cond.wait()
+                    if self._stop:
+                        return
                 buffers = self._make_buffers()  # slow part, outside the lock
                 with self._spare_cond:
                     self._spare.append(buffers)
+
+
+    def close(self):
+        """
+        Stop the pinning thread and drop every slab. The thread holds the pool through its bound target, so
+        until this runs a replaced pool and everything it pinned stay alive.
+        """
+        with self._spare_cond:
+            self._stop = True
+            self._spare_cond.notify_all()
+        self._alloc_thread.join()
+        with self._spare_cond:
+            self._spare.clear()
+        self.slots = {}
 
 
     def get(self, slot: int):
@@ -517,6 +534,9 @@ def mp_cpu_cache_init(local_context: dict, cache_ids: list[int], max_slots: int)
     """
     cache_tensors = mp_cpu_cache_tensors(local_context, cache_ids)
     if max_slots:
+        # One pool per rank: a new Generator's tier replaces the previous Generator's
+        if local_context.get("cpu_page_cache") is not None:
+            local_context["cpu_page_cache"].close()
         local_context["cpu_page_cache"] = RankSlotPool(cache_tensors, max_slots)
     return sum(t[0].numel() * t.element_size() for t in cache_tensors)
 
@@ -591,6 +611,13 @@ class PseudoParentConn:
 
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
+        # This rank lives in the main process, so its pool's pinning thread would keep it alive past unload
+        if self.local_context.get("cpu_page_cache") is not None:
+            self.local_context["cpu_page_cache"].close()
+            self.local_context["cpu_page_cache"] = None
+            # Freed pinned slabs go back to torch's host allocator cache, not to the OS
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
         self.local_context = {}
         log_tp(self.device, f"Pseudoprocess closed")
 
