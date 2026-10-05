@@ -611,6 +611,13 @@ class PseudoParentConn:
 
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
+        # This rank lives in the main process, so its pool's pinning thread would keep it alive past unload
+        if self.local_context.get("cpu_page_cache") is not None:
+            self.local_context["cpu_page_cache"].close()
+            self.local_context["cpu_page_cache"] = None
+            # Freed pinned slabs go back to torch's host allocator cache, not to the OS
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
         self.local_context = {}
         log_tp(self.device, f"Pseudoprocess closed")
 

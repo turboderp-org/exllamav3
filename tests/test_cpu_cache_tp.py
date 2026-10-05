@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.model.model_tp_fn import (
+    PseudoParentConn,
     mp_cpu_cache_init,
     mp_cpu_cache_store,
     mp_cpu_cache_fetch,
@@ -246,6 +247,24 @@ def test_closing_a_rank_pool_stops_its_thread(tp_cache):
 
     assert not pool._alloc_thread.is_alive()
     assert not pool.slots and not pool._spare
+
+
+def test_unloading_releases_the_main_process_rank_pool(tp_cache):
+    # Worker ranks exit on unload, but the main process's PseudoParentConn must close its pool itself
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    pool = weakref.ref(ranks[0]["cpu_page_cache"])
+    thread = ranks[0]["cpu_page_cache"]._alloc_thread
+
+    conn = PseudoParentConn.__new__(PseudoParentConn)
+    conn.device = 0
+    conn.local_context = dict(ranks[0], inf_consumer = SimpleNamespace(close = lambda: None))
+    ranks[0]["cpu_page_cache"] = None
+    conn.close()
+    gc.collect()
+
+    assert not thread.is_alive()
+    assert pool() is None
 
 
 def test_a_draft_cache_on_its_own_model_is_dispatched_separately():
