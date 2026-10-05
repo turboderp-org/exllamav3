@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
-from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, use_rocm_sdk_devel
+from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -163,6 +163,10 @@ else:
     # Load extension
 
     maybe_set_arch_list_env()
+    if torch.version.hip:
+        # Dependency files for the HIP compile rule (header edits rebuild their includers) and the
+        # ccache/sccache wrapper torch applies to CUDA builds only
+        patch_hip_ninja_file_writer(torch.utils.cpp_extension)
     try:
         exllamav3_ext = load(
             name = extension_name,

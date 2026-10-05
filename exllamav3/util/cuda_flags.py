@@ -8,6 +8,7 @@ from __future__ import annotations
 import fnmatch
 import importlib.util
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -126,6 +127,63 @@ def use_rocm_sdk_devel(cpp_extension) -> None:
     devel = os.path.dirname(os.path.realpath(spec.origin))
     if has_libs(devel):
         cpp_extension.ROCM_HOME = devel
+
+
+def hip_compiler_wrapper() -> str | None:
+    """
+    The compiler wrapper torch itself puts in front of nvcc and the host compiler on CUDA builds (ccache or
+    sccache, whichever is on PATH; TORCH_NO_COMPILER_WRAPPER disables it). torch skips it on ROCm over an old
+    hipcc incompatibility that ccache no longer has, so the ROCm build applies the same rule here.
+    """
+    if os.environ.get("TORCH_NO_COMPILER_WRAPPER"):
+        return None
+    for wrapper in ("ccache", "sccache"):
+        if shutil.which(wrapper):
+            return wrapper
+    return None
+
+
+def rewrite_hip_ninja_file(content: str, wrapper: str | None) -> str:
+    """
+    Adjust the build.ninja torch writes for a ROCm build.
+
+    torch's HIP compile rule has no dependency file (its comment says -MD is unsupported by ROCm, which
+    hipcc, being clang, does support), so a header edit rebuilt nothing until an including .cu changed or
+    the objects were deleted by hand. Add the -MD -MF / depfile lines the CUDA rule gets; the hipified
+    header copies (*_hip.cuh) the depfile lists are rewritten only when their source changes, so their
+    mtimes are meaningful. With a wrapper, prefix the host and device compilers with it (see
+    hip_compiler_wrapper).
+    """
+    if "rule cuda_compile" in content:
+        head, _, tail = content.partition("rule cuda_compile\n")
+        rule, _, rest = tail.partition("\n\n")
+        if "depfile" not in rule:
+            rule = rule.replace("$nvcc  $cuda_cflags", "$nvcc -MD -MF $out.d $cuda_cflags")
+            rule = "  depfile = $out.d\n  deps = gcc\n" + rule
+        content = head + "rule cuda_compile\n" + rule + "\n\n" + rest
+    if wrapper:
+        content = re.sub(r"^(cxx|nvcc) = (?!" + re.escape(wrapper) + r" )", r"\1 = " + wrapper + " ", content, flags = re.M)
+    return content
+
+
+def patch_hip_ninja_file_writer(cpp_extension) -> None:
+    """
+    Route torch's build.ninja through rewrite_hip_ninja_file. torch writes the file with its own
+    _maybe_write, which leaves an unchanged file untouched (so no spurious rebuilds); wrapping that keeps
+    the behavior, since the rewritten content is the same every time.
+    """
+    if getattr(cpp_extension, "_exllamav3_ninja_patched", False):
+        return
+    orig = cpp_extension._maybe_write
+    wrapper = hip_compiler_wrapper()
+
+    def _maybe_write(filename, new_content):
+        if os.path.basename(filename) == "build.ninja":
+            new_content = rewrite_hip_ninja_file(new_content, wrapper)
+        return orig(filename, new_content)
+
+    cpp_extension._maybe_write = _maybe_write
+    cpp_extension._exllamav3_ninja_patched = True
 
 
 def hip_include_flags(sources_dir: str) -> list[str]:

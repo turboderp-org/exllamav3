@@ -874,6 +874,20 @@ extension on a driver that predates compressed images. `require` makes the build
 does not offer the option instead of silently building uncompressed; the release wheels are built
 this way. Not used for ROCm builds.
 
+### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
+
+torch's own switch: the JIT build puts ccache or sccache (whichever is on PATH) in front of the
+host and device compilers, so a translation unit whose preprocessed input was compiled before is
+taken from the cache; a rebuild of unchanged sources in a fresh extension directory then takes
+seconds. torch does this for CUDA builds; ExLlamaV3 applies the same rule to ROCm builds, where
+torch still skips it over an old hipcc incompatibility that ccache no longer has. The wrapper is
+part of every compile command the build records, so installing or removing it (or toggling this
+variable) rebuilds the extension once.
+
+Header edits rebuild only the translation units that include them on both backends: the HIP
+compile rule torch writes has no dependency file (its comment says `-MD` is unsupported by ROCm,
+which is no longer true of hipcc), so the JIT build adds one.
+
 ### `CUDAHOSTCXX` (default: unset)
 
 Host compiler passed to nvcc (`-ccbin`), for systems whose default compiler is too new for the
