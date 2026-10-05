@@ -658,7 +658,7 @@ def _dsa_indexer_kernel(
     acc = acc * scale
     bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
-    tl.store(scores + offs_m[:, None] * S_stride + offs_n[None, :], acc.to(tl.float16),
+    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
              mask = valid_m[:, None] & valid_n[None, :])
 
 
