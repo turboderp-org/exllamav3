@@ -847,9 +847,9 @@ comparison is only meaningful if the fp16-wire run actually used it.
 Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce
 helper (persistent workers, spin-parked between jobs; both the AVX-512 and the AVX2 path). The
 default of one thread per participating rank covers the cases where a single thread's wire rate
-(~31 GB/s with AVX-512, about 10 GB/s with AVX2 on a Zen 2 host) falls behind: three or more ranks
-(multiple adds per chunk) and PCIe 5.0 links. Set to `1` to force the single-threaded accumulate.
-Decode-size reduces are always single-threaded.
+falls behind: three or more ranks (multiple adds per chunk), PCIe 5.0 links, and hosts limited to
+AVX2. Set to `1` to force the single-threaded accumulate. Decode-size reduces are always
+single-threaded.
 
 ### `EXL3_TP_SPIN_RECV` (default: `0`)
 
