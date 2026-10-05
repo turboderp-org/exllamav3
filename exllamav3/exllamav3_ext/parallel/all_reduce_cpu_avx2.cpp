@@ -275,6 +275,22 @@ void perform_cpu_reduce_avx2
     // the striped bandwidth kernel (per-(device, block) flags). Must match the launch choice
     const bool multi = num_chunks > 1;
 
+    // Local patch (day-vault): accumulate threads, same policy as the AVX-512 path. One thread per
+    // participating rank for multi-chunk (prefill-size) payloads, capped by the slice pool;
+    // EXL3_TP_REDUCE_THREADS overrides. Decode-size reduces stay single-threaded
+    static const int env_threads = [] { const char* e = getenv("EXL3_TP_REDUCE_THREADS"); return e ? atoi(e) : 0; }();
+    int acc_threads = 1;
+    if (multi)
+    {
+        #ifdef __linux__
+            int num_ranks = __builtin_popcount(device_mask);
+        #else
+            int num_ranks = (int) __popcnt(device_mask);
+        #endif
+        acc_threads = env_threads > 0 ? env_threads : num_ranks;
+        acc_threads = MAX(acc_threads, 1);
+    }
+
     // Sync
     atomic_ref<uint32_t> stage_(&ctx->cpusum_stage_cpu);
     uint32_t stage = stage_.load_acquire();
@@ -356,10 +372,15 @@ void perform_cpu_reduce_avx2
                         else
                         {
                             size_t elem_count = CEIL_DIVIDE(stage_size, 64) * 32;
-                            if (wire_dtype == REDUCE_WIRE_FP16)
-                                fp16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
-                            else
-                                bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
+                            cpu_reduce_parallel(
+                                nullptr,
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx2 : bf16_add_inplace_avx2,
+                                (uint16_t*) dst,
+                                nullptr,
+                                (uint16_t*) src,
+                                elem_count,
+                                acc_threads
+                            );
                         }
                     }
                 }
