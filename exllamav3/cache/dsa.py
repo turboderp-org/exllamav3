@@ -81,7 +81,7 @@ class CacheLayer_dsa(CacheLayer):
         D_r = attention.rope_head_dim
         self.D_c = D - D_r
         self.D_r = D_r
-        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.D_i = attention.index_head_dim if getattr(attention, "indexer_mode", None) == "full" else 0
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -331,7 +331,7 @@ class DSV4LayerState:
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
 
-        if self.layer_type in ("csa", "hca"):
+        if module.compressor is not None:
             m = module.compress_rate
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
