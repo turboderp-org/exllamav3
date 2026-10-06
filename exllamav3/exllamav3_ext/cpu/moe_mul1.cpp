@@ -1959,8 +1959,15 @@ typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 // UNVERIFIED: no Windows toolchain was available to compile-test this branch; check it (e.g. via
 // EXL3_MOE_CPU_PROF timing before/after, or Task Manager's per-core view during a CPU-offloaded
 // pass) before relying on it on a real system, particularly one with multiple processor groups.
+// n_phys counts the physical-core prefix of order (entries before the first SMT sibling).
+struct CoreOrder
+{
+    std::vector<int> order;
+    int n_phys = 0;
+};
+
 #ifdef __linux__
-inline std::vector<int> physical_core_order()
+inline CoreOrder physical_core_order()
 {
     std::vector<int> order;
     std::map<std::pair<int, int>, int> seen;
@@ -1981,19 +1988,20 @@ inline std::vector<int> physical_core_order()
         if (seen.find(key) == seen.end()) { seen[key] = cpu; order.push_back(cpu); }
         else smt_siblings.push_back(cpu);
     }
+    const int n_phys = static_cast<int>(order.size());
     order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
-    return order;
+    return { order, n_phys };
 }
 #else
-inline std::vector<int> physical_core_order()
+inline CoreOrder physical_core_order()
 {
     std::vector<int> order, smt_siblings;
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) return order;
+    if (len == 0) return {};
     std::vector<char> buf(len);
     auto* first_rec = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first_rec, &len)) return order;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first_rec, &len)) return {};
     size_t off = 0;
     while (off < len)
     {
@@ -2017,8 +2025,9 @@ inline std::vector<int> physical_core_order()
         }
         off += rec->Size;
     }
+    const int n_phys = static_cast<int>(order.size());
     order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
-    return order;
+    return { order, n_phys };
 }
 #endif
 
@@ -2106,7 +2115,7 @@ struct Pool
 
     void ensure(int n)
     {
-        if (pin_threads_enabled() && core_order.empty()) core_order = physical_core_order();
+        if (pin_threads_enabled() && core_order.empty()) core_order = physical_core_order().order;
         while (spawned < n - 1)
         {
             std::thread(&Pool::worker_loop, this, spawned + 1).detach();
@@ -2713,6 +2722,15 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     return g_layers[handle];
 }
 
+// Topology as the pool sees it: physical-core-first order and the physical core count, so the
+// Python host can keep its own threads off the worker LPs. Empty when pinning is disabled.
+std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order()
+{
+    if (!pin_threads_enabled()) return { {}, 0 };
+    const CoreOrder co = physical_core_order();
+    return { std::vector<int64_t>(co.order.begin(), co.order.end()), co.n_phys };
+}
+
 // Prime from the handoff worker before its GPU payload is ready.
 void exl3_moe_cpu_pool_prime(int threads)
 {
@@ -2923,6 +2941,7 @@ void exl3_moe_cpu_forward
 void exl3_moe_cpu_set_prof(bool) {}
 void exl3_moe_cpu_pool_prime(int) {}
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { NO_MOE_CPU(); return 0; }
+std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order() { return { {}, 0 }; }
 void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { NO_MOE_CPU(); }
 bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }

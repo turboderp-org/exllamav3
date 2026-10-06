@@ -326,7 +326,7 @@ Fallback value for when `-mcl` is not set.
 Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
 `draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
 
-### `EXL3_MOE_CPU_THREADS` (default: `cpu_count // 2`)
+### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
 
@@ -687,6 +687,24 @@ pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidt
 to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
 own balancing across other processes. Falls back to no pinning if the CPU topology can't be
 read.
+
+### `EXL3_MOE_HOST_CORES` (default: `1`)
+
+Physical cores kept free of worker threads and reserved for the host process. With `EXL3_MOE_CPU_PIN`
+on, the pool pins one compute thread per physical core; the parent process (the thread driving the
+forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
+worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
+every per-phase barrier. The default worker count leaves this many cores free, and once the worker
+has started the host process is confined to them (both SMT siblings). If an explicit thread count
+covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
+shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
+(Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host
+unpinned, 30–36 tok/s with a reserved core. The placement is planned once per process, from the
+first worker started; workers spawned later (draft model, reload) restore the original mask before
+pinning. `0` disables the reservation and the pinning. Windows applies the mask process-wide
+(single processor group only; boxes with more than 64 logical processors are left unpinned with a
+notice); Linux pins every current thread, and later threads inherit it. Never fails a load: OS
+errors print a notice and leave the host unpinned.
 
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
