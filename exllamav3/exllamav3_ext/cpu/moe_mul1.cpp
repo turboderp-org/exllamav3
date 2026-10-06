@@ -1948,9 +1948,12 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 
 // Physical-core-first CPU ordering: one logical CPU per distinct physical core, SMT siblings
-// appended after. Without this, spawned std::thread workers are placed wherever the scheduler
-// puts them, which on an SMT host can silently collide two workers onto one physical core.
-// EXL3_MOE_CPU_PIN=0 disables.
+// appended after. Pinning the workers to it keeps two of them off one physical core and, with
+// the host process confined to the reserved core (EXL3_MOE_HOST_CORES), off the host's spinning
+// threads. Whether that beats the OS scheduler depends on the scheduler: on Windows it does; on
+// Linux CFS places the host's spin-waits and the workers onto distinct cores by itself and the
+// fixed placement only pins each run to whichever layout it started with, so the default is
+// per platform (EXL3_MOE_CPU_PIN overrides either way).
 //
 // Linux: entries are plain logical CPU indices (as taken by CPU_SET). Windows: entries encode
 // (processor group << 16) | bit-within-group, decoded by Pool::pin_self -- SetThreadAffinityMask
@@ -2035,7 +2038,11 @@ inline bool pin_threads_enabled()
 {
     static const bool v = [] {
         const char* e = std::getenv("EXL3_MOE_CPU_PIN");
+#ifdef __linux__
+        return e && *e == '1';
+#else
         return !(e && *e == '0');
+#endif
     }();
     return v;
 }

@@ -12,7 +12,19 @@ from exllamav3.ext import exllamav3_ext as ext
 
 
 def test_core_order_binding_shape():
+    # The binding reports the pool's topology only while pinning is on (EXL3_MOE_CPU_PIN, default off on
+    # Linux), so the shape is checked in a process that enables it; this process just has to agree
+    # with its own setting
+    import subprocess, json
     order, n_phys = ext.exl3_moe_cpu_core_order()
+    pin = os.environ.get("EXL3_MOE_CPU_PIN", "0" if sys.platform != "win32" else "1") == "1"
+    assert bool(order) == pin and (n_phys > 0) == pin
+    out = subprocess.run(
+        [sys.executable, "-c", "import json, sys; from exllamav3.ext import exllamav3_ext as ext; "
+                               "o, n = ext.exl3_moe_cpu_core_order(); print(json.dumps([list(o), n]))"],
+        env = os.environ | {"EXL3_MOE_CPU_PIN": "1", "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.abspath(__file__)))},
+        capture_output = True, text = True, check = True)
+    order, n_phys = json.loads(out.stdout.strip().splitlines()[-1])
     ncpu = os.cpu_count() or 1
     assert 1 <= n_phys <= len(order) <= ncpu
     assert len(set(order)) == len(order)

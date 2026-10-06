@@ -5,10 +5,8 @@ The worker pool (cpu/moe_mul1.cpp Pool) pins one compute thread per physical cor
 physical_core_order(): one LP per core first, then every SMT sibling. The parent process (the
 thread driving the forward pass, CUDA's driver threads, an API server's executor threads) is
 not pinned, so the scheduler can drop it on a worker's LP. A pinned worker cannot move away,
-so it becomes the straggler at every per-phase barrier of the job: measured on a 12-core
-Ryzen 9 7900X / RTX 4090 running Qwen3.8-Flash-Next with 408 of 512 experts per layer on the
-CPU, decode swung 11-32 tok/s with the host unpinned and settled at 30-36 tok/s once the host
-was kept off the worker LPs. This module plans and applies that placement.
+so it becomes the straggler at every per-phase barrier of the job. This module plans and applies
+that placement.
 """
 import os
 import sys

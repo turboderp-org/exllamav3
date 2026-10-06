@@ -676,22 +676,24 @@ Seconds the parent waits for the CPU worker to signal ready after every offloade
 been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
 so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
-### `EXL3_MOE_CPU_PIN` (default: `1`)
+### `EXL3_MOE_CPU_PIN` (default: `1` on Windows, `0` on Linux)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
-SMT siblings last, instead of leaving placement to the OS scheduler. On an SMT host, unpinned
-placement is a real source of run-to-run throughput variance, two workers can land on the same
-physical core (contending for its execution resources) on one run and not the next; measured on
-a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s run to run,
-pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
-to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
-own balancing across other processes. Falls back to no pinning if the CPU topology can't be
-read.
+SMT siblings last, instead of leaving placement to the OS scheduler, and reserve cores for the
+host process (`EXL3_MOE_HOST_CORES`). Two workers sharing a physical core, or a worker sharing
+one with the host's spin-waiting threads, becomes the straggler at every per-phase barrier of a
+job. Which side of that trade-off wins depends on the scheduler. On Windows the pinned layout
+with a reserved host core is faster and far steadier than floating threads. On Linux the
+opposite was measured end to end: CFS keeps the workers and the host's spin-waits on distinct
+cores by itself, while a pinned layout cannot adapt to whatever else lands on its cores and so
+settles on a different throughput level each run; unpinned runs are faster and repeatable.
+Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
+pinning if the CPU topology can't be read.
 
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
-Physical cores kept free of worker threads and reserved for the host process. With `EXL3_MOE_CPU_PIN`
-on, the pool pins one compute thread per physical core; the parent process (the thread driving the
+Physical cores kept free of worker threads and reserved for the host process. Only in effect with
+`EXL3_MOE_CPU_PIN` on (the Windows default): the pool then pins one compute thread per physical core; the parent process (the thread driving the
 forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
 worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
 every per-phase barrier. The default worker count leaves this many cores free, and once the worker
