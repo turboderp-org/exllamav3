@@ -19,6 +19,9 @@ Graph::Graph()
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
+    #ifdef USE_ROCM
+        param_updates = 0;
+    #endif
 }
 
 Graph::~Graph()
@@ -170,9 +173,29 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         if (n == graph_node_sites.size()) TORCH_CHECK(false, "Graph update failed");
     }
 
+    #ifdef USE_ROCM
+        // Each hipGraphExecKernelNodeSetParams call grows the exec's device memory by about 4 kB (up to about
+        // 1 GB per exec, seen on gfx1201 with ROCm 7.1.1 and 7.2.1), freed only when the exec is destroyed
+        // (ROCm/rocm-systems#10713). Re-instantiate every EXL3_GRAPH_REINST updates (0 disables) and set every
+        // patched node again from node_params, which hold the current values
+        static const long reinst_every = [](){ const char* e = getenv("EXL3_GRAPH_REINST"); return e ? atol(e) : 10000L; }();
+        if (reinst_every > 0 && param_updates >= reinst_every)
+        {
+            cuda_check(cudaStreamSynchronize(stream));
+            cuda_check(cudaGraphExecDestroy(graph_exec));
+            cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+            for (auto& site : graph_node_sites)
+                if (std::get<1>(site) != GP_end) node_needs_update[std::get<0>(site)] = true;
+            param_updates = 0;
+        }
+    #endif
+
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;
+        #ifdef USE_ROCM
+            param_updates++;
+        #endif
         if (node_is_driver[n])
         {
             CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);

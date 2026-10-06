@@ -43,6 +43,15 @@ Print one line per attention module/cache-layer pair when the graph-captured dec
 built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
 `EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
 
+### `EXL3_GRAPH_REINST` (ROCm; default: `10000`)
+
+On ROCm, every graph node parameter update (`hipGraphExecKernelNodeSetParams`) grows the executable
+graph's device memory by about 4 kB, up to about 1 GB per graph, and only destroying the executable
+graph frees it (seen on gfx1201 with ROCm 7.1.1 and 7.2.1,
+[ROCm/rocm-systems#10713](https://github.com/ROCm/rocm-systems/issues/10713)). Each graph is therefore
+re-instantiated after this many node updates (about 40 MB at the default), which syncs its stream once.
+`0` disables. Ignored by CUDA builds.
+
 ### `EXL3_BC_DSA` (default: `1`)
 
 DeepSeek-V4 counterpart of `EXL3_BC_ATTN`: for decode steps (bsz 1, q_len ≤ 16) the whole DSA

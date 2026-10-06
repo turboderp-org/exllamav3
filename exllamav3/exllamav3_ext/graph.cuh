@@ -119,6 +119,9 @@ public:
     std::vector<char> node_is_driver;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
+    #ifdef USE_ROCM
+        long param_updates;     // node updates since graph_exec was instantiated (ROCm, see launch())
+    #endif
 
     bool need_cublas;
     bool ready;
