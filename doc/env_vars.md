@@ -145,11 +145,15 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
-  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
-  pass, so the space is reserved at load time rather than discovered at the first long prefill.
-  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
-  1M tokens with 8 kv heads of dim 128).
+  a per-call transient sized to the referenced window (the job's block-table span, bucketed by
+  `EXL3_QC_STAGING_BUCKET`), not to the whole cache pool. The autosplit measuring pass budgets
+  the batch-1 worst case (a window spanning the pool, rounded up to the staging bucket)
+  where it runs; loads that pass an explicit `device=` (and tensor-parallel loads) skip the
+  measuring pass, so there the scratch is mapped at the first long prefill instead. The reserve
+  covers windows within the pool at batch size 1: batched block tables pad every row to the
+  batch's max page count, so a skewed batch (one long row, one short) can map more than the
+  reserve, transiently and unbudgeted. The peak is fp16 K and V of the window (~4 bytes per
+  cached value), so for very large contexts it is the tradeoff to weigh against `0`.
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
@@ -160,6 +164,15 @@ affects quantized caches.
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
 over long contexts at low cache bitrates). Tuning/testing knob.
+
+### `EXL3_QC_STAGING_BUCKET` (default: `16`)
+
+Page granularity of the staging scratch size at `EXL3_QC_STAGING=1`: the allocator sees distinct
+scratch sizes only in multiples of this many pages (256 tokens each). The earlier sizing rounded
+the referenced window up to the next power of two in pages, which mapped up to 2x the needed
+fp16 (a 257-page window reserved 512 pages); with `expandable_segments` that padding stays
+physically committed for the life of the process even though the scratch itself is freed per
+call, so it inflates the driver's committed-memory high-water mark. `1` sizes exactly.
 
 ### `EXL3_DRAFT_RING` (default: `1`)
 
