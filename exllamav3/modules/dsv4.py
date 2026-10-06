@@ -12,6 +12,7 @@ from .rmsnorm import RMSNorm
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle, yarn_inv_freq
 from ..util.tensor import g_tensor_cache, get_for_device
+from ..util.device_copy import to_device
 from .quant.exl3 import LinearEXL3
 from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
@@ -1185,12 +1186,15 @@ class DSV4Attention(Module):
                     iovl = g_tensor_cache.get(device, (1, 2, m, idx_hd), torch.float, "dsv4_nc_iovl")
                     self.indexer.forward_fused(x[b:b + 1], params, iring_kv, iring_gate, iovl, pool_idx, None, 0)
             elif self.kv_source is not None:
+                if sh["pool"][0].device != device:
+                    sh["pool"] = tuple(None if t is None else to_device(t, device) for t in sh["pool"])
                 pool_c, pool_r, pool_idx, bt = sh["pool"]
-                assert pool_c.device == device, "DSV4Attention: shared pool on another device"
             if self.indexer_mode is not None and T > self.index_topk:
                 if self.indexer_mode == "full":
                     sh["topk"] = self._indexer_topk(
                         x[b:b + 1], params, q_res[b:b + 1], pool_idx[:T], T, position, shared = sh)
+                elif sh["topk"][0].device != device:
+                    sh["topk"] = to_device(sh["topk"][0], device), sh["topk"][1]
                 indices, k_len = sh["topk"]
 
             out = dsa_attn(
@@ -1253,7 +1257,7 @@ class DSV4Attention(Module):
                 top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
                 shared["cand"] = torch.ones_like(blk, dtype = torch.bool).scatter_(1, top.indices, top.values == ninf)
             else:
-                drop = shared["cand"]
+                drop = shared["cand"] = to_device(shared["cand"], x.device)
                 full.masked_fill_(drop[:, :nf, None], ninf)
                 tail.masked_fill_(drop[:, nf:], ninf)
         k = min(self.index_topk, ec)
@@ -1282,6 +1286,9 @@ class DSV4Attention(Module):
         if self.candidate_mode == "source" and ec > self.candidate_topk_blocks * bs:
             # Block maxima, live twice while the tail block is appended
             n += 2 * rows * (ec // bs + 1)
+        elif self.candidate_mode == "use" and ec > self.candidate_topk_blocks * bs:
+            # Candidate mask, one byte per block, when its source is on another device
+            n += rows * (ec // bs + 1) // 2
         t = torch.empty((n,), dtype = torch.half, device = self.device)
         del t
 
@@ -1846,6 +1853,8 @@ class DSV4Attention(Module):
                 sh["topk"] = self._indexer_topk(
                     x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
                     block_table = bt_row, epp = epp, shared = sh)
+            elif sh["topk"][0].device != device:
+                sh["topk"] = to_device(sh["topk"][0], device), sh["topk"][1]
             indices, k_len = sh["topk"]
 
         qc = None
