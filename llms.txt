@@ -6,7 +6,7 @@ Requires PyTorch 2.6.0+ with CUDA 12.4 or later; install via prebuilt wheels fro
 
 ## Docs
 
-- [exllamav3 README](https://raw.githubusercontent.com/turboderp-org/exllamav3/master/README.md): Overview of ExLlamaV3 features, supported models, installation methods, quantization, and the TabbyAPI server.
-- [Convert](https://raw.githubusercontent.com/turboderp-org/exllamav3/master/doc/convert.md): Reference of convert.py arguments for EXL3 conversion: directories, shard size, bits, head and MTP bits.
-- [Environment variables](https://raw.githubusercontent.com/turboderp-org/exllamav3/master/doc/env_vars.md): Runtime and build-time environment variables for attention, debugging and platform workarounds, with defaults and behavior notes.
-- [Optimized quantization recipes](https://raw.githubusercontent.com/turboderp-org/exllamav3/master/doc/optimize.md): Experimental pipeline for per-tensor bitrate recipes and in-domain calibration data, with rationale and runtime estimates.
+- [exllamav3 README](README.md): Overview of ExLlamaV3 features, supported models, installation methods, quantization, and the TabbyAPI server.
+- [Convert](doc/convert.md): Reference of convert.py arguments for EXL3 conversion: directories, shard size, bits, head and MTP bits.
+- [Environment variables](doc/env_vars.md): Runtime and build-time environment variables for attention, debugging and platform workarounds, with defaults and behavior notes.
+- [Optimized quantization recipes](doc/optimize.md): Experimental pipeline for per-tensor bitrate recipes and in-domain calibration data, with rationale and runtime estimates.
