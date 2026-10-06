@@ -299,6 +299,7 @@ class BCAttn:
         import triton
         from .triton_paged import (
             combine_subtiles,
+            decode_row_layout,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -312,10 +313,7 @@ class BCAttn:
         group_size = qh // kvh
 
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
-        block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
-        block_rows = block_m * block_h
-        h_blocks = triton.cdiv(group_size, block_h)
+        block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
@@ -338,14 +336,14 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
@@ -355,13 +353,12 @@ class BCAttn:
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
-            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+            "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = self.v_head_dim,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
-            ROWS_SUB = rows_sub, D_SUB = d_sub,
+            BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
         k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
@@ -424,7 +421,7 @@ class BCAttn:
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            block_n, splits_cap,
+            block_n, splits_cap, programs,
             xp, yp,
         )
 
@@ -569,13 +566,13 @@ class BCAttn:
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
                     "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
-                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
+                    "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim,
                      BLOCK_ROWS = block_h, ROWS_SUB = sp_rows_sub, D_SUB = sp_d_sub), 4, 1)
             k_sp_combine.grid_y = (block_h // sp_rows_sub) * (self.head_dim // sp_d_sub)
 

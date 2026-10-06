@@ -287,6 +287,7 @@ struct BC_Attention
         std::shared_ptr<TritonKernel> k_update,
         int block_n,
         int splits_cap,
+        int programs,
         c10::optional<at::Tensor> xp,
         c10::optional<at::Tensor> yp
     );

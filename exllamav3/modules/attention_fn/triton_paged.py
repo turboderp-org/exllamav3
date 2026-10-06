@@ -918,28 +918,28 @@ def _paged_attn_decode_split_kernel(
     SOFTCAP: tl.constexpr,
     FINAL: tl.constexpr,       # num_splits == 1: skip the combine pass, store directly to out
     HAS_SINKS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Flash-decoding phase 1: one program per (batch, kv_head, h_block, kv split). GQA sibling
-    q heads and query positions share the row axis so K/V tiles are read once per group."""
+    """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
+    kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
+    program reads and dequantizes each K/V tile once for up to BLOCK_ROWS of them."""
     pid = tl.program_id(0)
     split = tl.program_id(1)
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = tl.cdiv(q_len * group_size, BLOCK_ROWS)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
     rows = tl.arange(0, BLOCK_ROWS)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    row_idx = h_block * BLOCK_ROWS + rows
+    row_q = row_idx % q_len
+    row_h_local = row_idx // q_len
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
+    valid_row = row_idx < q_len * group_size
 
     offs_d = tl.arange(0, HD_PAD)
     d_mask = offs_d < head_dim
@@ -1059,8 +1059,6 @@ def _paged_attn_decode_combine_kernel(
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,
     V_DIM: tl.constexpr,       # output lanes per head (< head_dim when V rides zero-padded in the cache)
-    BLOCK_M: tl.constexpr,
-    BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     ROWS_SUB: tl.constexpr,
     D_SUB: tl.constexpr,
@@ -1077,17 +1075,19 @@ def _paged_attn_decode_combine_kernel(
     d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = tl.cdiv(q_len * group_size, BLOCK_ROWS)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
+    # Same dense (query, head) rows as the split kernel
     rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    row_idx = h_block * BLOCK_ROWS + rows
+    row_q = row_idx % q_len
+    row_h_local = row_idx // q_len
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
+    valid_row = row_idx < q_len * group_size
 
     offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
     d_mask = offs_d < head_dim
@@ -1133,6 +1133,20 @@ def _paged_attn_decode_combine_kernel(
         out_tile = _rot_h32(out_tile, h32, ROWS_SUB, D_SUB)   # 32-wide groups: D_SUB % 32 == 0
     out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * V_DIM
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
+
+
+def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, int]:
+    """(BLOCK_ROWS, row blocks per kv head) for the decode split / combine kernels.
+
+    A kv head's rows are its q_len * group_size (query position, sibling q head) pairs, packed densely
+    and cut into programs of up to 32 rows, each of which reads and dequantizes the head's K/V tiles
+    once. (Padding query positions up to a power of two and giving a program 16 / that many heads used
+    to split a 6-head group across three programs for a 5-token verify step, tripling the tile work.)
+    32 rows pays off at every head_dim up to 256 on Ampere, Blackwell and RDNA3 alike, the fp32
+    accumulator notwithstanding, since the tile loads dominate; at least 16 rows, the dots' minimum."""
+    rows = q_len * group_size
+    block_rows = max(16, min(32, triton.next_power_of_2(rows)))
+    return block_rows, triton.cdiv(rows, block_rows)
 
 
 def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
@@ -1240,10 +1254,7 @@ def paged_attn_triton_decode(
     candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
-    block_m = triton.next_power_of_2(q_len)
-    block_h = max(16 // block_m, 1)
-    block_rows = block_m * block_h
-    h_blocks = triton.cdiv(group_size, block_h)
+    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
     num_pages_per_seq = block_table.shape[1]
 
     # Upper bound on kv length: caller-provided hint, else from the block table shape
@@ -1278,12 +1289,12 @@ def paged_attn_triton_decode(
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
+            splits == 1, has_sinks, block_rows, block_n,
         )
         return args, splits, partial_o, partial_ml
 
     with torch.cuda.device(q.device):
-        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
+        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_rows, h_blocks, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
         block_n = pick_config(
             q.device, "paged_attn_decode", pick_key, candidates,
@@ -1304,7 +1315,7 @@ def paged_attn_triton_decode(
             _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
                 num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
-                block_m, block_h, block_rows, rows_sub, d_sub,
+                block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
     return out
