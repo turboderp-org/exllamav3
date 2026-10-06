@@ -1,10 +1,14 @@
 from __future__ import annotations
 from typing import Callable
+import copy
 import os
+import queue
+import threading
 import torch
 
 from ..modules.attn import prepare_for_attn
-from ..cache.recurrent_util import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence, advance_recurrent_states
+from ..constants import PAGE_SIZE
 from ..util.memory import (
     set_memory_fraction_reserve,
     set_memory_fraction_use,
@@ -17,6 +21,12 @@ from ..util.progress import ProgressBar
 from ..util.tensor import g_tensor_cache
 from .config import Config
 from abc import ABC, abstractmethod
+
+# Params a prefill call may carry and still be cut into pieces (see prefill_ls_pipelined)
+_pipeline_keys = {
+    "attn_mode", "block_table", "cache", "cache_seqlens", "recurrent_states", "indexed_embeddings", "inv_freq",
+    "mm_span_prefix", "export_state_layers",
+}
 
 
 class Model_LSMixin(ABC):
@@ -320,6 +330,7 @@ class Model_LSMixin(ABC):
 
         config.stc.close()
         self.active_devices = active_devices
+        self.max_chunk_size = max_chunk_size
 
         # Python will not run anything in an async function without at least one yield statement
         if 'yield' in locals():
@@ -343,6 +354,115 @@ class Model_LSMixin(ABC):
                 break
         del params["prefill"]
         return None
+
+
+    def prefill_ls_pipelined(self, input_ids: torch.Tensor, params: dict) -> bool:
+        """
+        Prefill a call longer than the max_chunk_size the split was loaded for in pieces of that size, each device
+        of the split working on a different piece. A device takes its next piece once the following device has run
+        its first module on the current one. Returns False, having done nothing, if the call is not eligible.
+        """
+        n = self.max_chunk_size // PAGE_SIZE * PAGE_SIZE
+        rows = input_ids.shape[-1]
+        if not self.caps.get("prefill_pipeline") or not 0 < n < rows or rows % PAGE_SIZE or input_ids.shape[0] != 1 \
+                or params.keys() - _pipeline_keys or params.get("attn_mode") != "flash_attn" \
+                or params.get("cache_seqlens") is None or params.get("indexed_embeddings") \
+                or params.get("inv_freq") is not None or params.get("mm_span_prefix"):
+            return False
+        rs = params.get("recurrent_states")
+        cuts, devs = [], []
+        for i, (module, instance, idx) in enumerate(self.fwd_modules):
+            if module.device.type == "cuda" and module.device not in devs[-1:]:
+                cuts.append(i)
+                devs.append(module.device)
+            if (idx, instance) == self.last_kv_module_idx_instance:
+                break
+        # The CPU MoE worker takes one caller at a time, so its layers must all be on one device; with recurrent
+        # states the first device needs a layer that sets their ring shift before they are advanced
+        if len(devs) < 2 or len(set(devs)) < len(devs) \
+                or len({m.device for m in self if getattr(m, "cpu_offload", False)
+                        or getattr(m, "cpu_split_first", None) is not None}) > 1 \
+                or (rs and devs[0] not in {m.device for m in self.get_recurrent_layers() if (m.layer_idx or 0) >= 0}):
+            return False
+        cuts = [0] + cuts[1:] + [i + 1]
+        qs = [queue.Queue() for _ in cuts[2:]]
+        err, taps = [], []
+
+        def step(x, p, i):
+            module, instance, idx = self.fwd_modules[i]
+            p["layer_instance"] = instance
+            p["prefill"] = (idx, instance) == self.last_kv_module_idx_instance
+            x = module.prepare_for_device(x, p)
+            return module.forward(x, p)
+
+        def emit(s, x, p):
+            if s < len(qs):
+                qs[s].put((x, p))
+                qs[s].join()
+            else:
+                # Exported states leave the device with their piece
+                taps.append([t.cpu() for t in p.get("export_states") or ()])
+
+        def stage(s):
+            with torch.inference_mode():
+                for x, p in iter(qs[s - 1].get, None):
+                    try:
+                        try:
+                            if not err:
+                                x = step(x, p, cuts[s])
+                        finally:
+                            qs[s - 1].task_done()
+                        for i in range(cuts[s] + 1, cuts[s + 1]):
+                            if err:
+                                break
+                            x = step(x, p, i)
+                        if not err:
+                            emit(s, x, p)
+                    except BaseException as e:
+                        err.append(e)
+            if s < len(qs):
+                qs[s].put(None)
+
+        threads = [threading.Thread(target = stage, args = (s,), daemon = True) for s in range(1, len(cuts) - 1)]
+        try:
+            for t in threads:
+                t.start()
+            for c, ids in enumerate(input_ids.split(n, dim = -1)):
+                if err:
+                    break
+                for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+                    h.begin_pass()
+                p = dict(params, cache_seqlens = params["cache_seqlens"] + c * n)
+                x = self.prepare_inputs(ids, p)
+                for i in range(cuts[1]):
+                    x = step(x, p, i)
+                # Later devices run this piece with the states as its first layers left them (they set the ring
+                # shift); the caller's are advanced for the next piece
+                p["recurrent_states"] = rs and [copy.copy(r) for r in rs]
+                advance_recurrent_states(ids, params, self)
+                emit(0, x, p)
+                del x
+        except BaseException as e:
+            err.insert(0, e)
+        finally:
+            # No stage may still be running when this returns, a second interrupt included
+            while True:
+                try:
+                    qs[0].put(None)
+                    for t in threads:
+                        if t.is_alive():
+                            t.join()
+                    break
+                except BaseException as e:
+                    err.insert(0, e)
+        if err:
+            try:
+                raise err[0]
+            finally:
+                err.clear()
+        if taps[0]:
+            params["export_states"] = [torch.cat(t, dim = -2) for t in zip(*taps)]
+        return True
 
 
     def forward_ls(
