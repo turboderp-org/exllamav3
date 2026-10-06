@@ -118,6 +118,7 @@ class DeepseekV41Model(Model):
 
         self.first_block_idx = len(self.modules)
 
+        kv_owners = {}
         for idx in range(config.num_hidden_layers):
             key = f"layers.{idx}"
             ratio = config.compress_ratios[idx]
@@ -170,12 +171,14 @@ class DeepseekV41Model(Model):
                 out_dtype = torch.float,
                 select_hq_bits = 2,
                 kv_source = kv_source,
+                kv_owner = kv_owners.get(kv_source),
                 indexer_mode = ("full" if full else "shared") if ratio else None,
                 q_head_norm = False,
                 candidate_mode = "source" if idx == cand else "use" if full and 0 <= cand < idx else None,
                 candidate_topk_blocks = config.candidate_topk_blocks,
                 candidate_block_size = config.candidate_block_size,
             )
+            kv_owners[idx] = attn
             mlp = BlockSparseMLP(
                 config = config,
                 key = f"{key}.ffn",

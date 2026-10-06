@@ -378,6 +378,7 @@ class DSV4Attention(Module):
         idx_weights: Linear | None = None,
         tp_defer_compressors: bool = False,
         kv_source: int | None = None,
+        kv_owner: DSV4Attention | None = None,
         indexer_mode: str | None = None,
         q_head_norm: bool = True,
         candidate_mode: str | None = None,
@@ -425,6 +426,8 @@ class DSV4Attention(Module):
         self.idx_weights = None
         self.idx_wk = self.idx_k_norm = None
         self.kv_source = None if layer_type == "sliding" else layer_idx if kv_source is None else kv_source
+        self.kv_owner = kv_owner
+        self.kv_mirror = False
         self.indexer_mode = indexer_mode or ("full" if layer_type == "csa" else None)
         self.q_head_norm = q_head_norm
         self.candidate_mode = candidate_mode
@@ -663,10 +666,19 @@ class DSV4Attention(Module):
             rl.alloc(device)
         for cl in self.cache_layers:
             cl.alloc(device)
+        if self.kv_owner is not None:
+            for cl in self.kv_owner.cache_layers:
+                if cl.device not in (None, device) and device not in cl.mirrors:
+                    self.kv_mirror = True
+                    cl.alloc_mirror(device)
 
 
     @override
     def unload(self):
+        if self.kv_mirror:
+            for cl in self.kv_owner.cache_layers:
+                cl.mirrors.pop(self.device, None)
+            self.kv_mirror = False
         super().unload()
         for cl in self.cache_layers:
             cl.free()
@@ -1322,6 +1334,13 @@ class DSV4Attention(Module):
                 assert 0 <= bmin and bmax < kl.num_pages, \
                     f"DSA block table content OOB: [{bmin}, {bmax}] vs {kl.num_pages} pages " \
                     f"(layer {self.layer_idx})"
+            if self.kv_owner is not None and kl.device != self.device:
+                src, kl = kl, kl.mirrors.get(self.device, kl)
+                bt = to_device(bt, self.device)
+                if self.kv_mirror:
+                    m, pages = self.compress_rate, params.get("block_table", bt)
+                    for i in range(bsz):
+                        kl.pull(src, pages[i], rsg[i].position // m, (rsg[i].position + x.shape[1]) // m)
         if bsz == 1:
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
