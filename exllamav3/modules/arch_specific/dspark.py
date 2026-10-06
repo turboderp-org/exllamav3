@@ -83,16 +83,7 @@ class DSparkAttention(DSV4Attention):
         positions = get_for_device(params, "cache_seqlens", device)
 
         # Projections + fused unweighted q head norm / weighted kv norm / partial rope
-        q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
-        q = self.q_b.forward(q_res, params).view(bsz, s, H, D)
-        kv = self.wkv.forward(x, params).view(bsz, s, 1, D)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), 0, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1, D - rd,
-        )
-        kv = kv.view(bsz, s, D)
+        _, q, kv = self._project_qkv(x, params, 0, positions)
         if dspark_fp8_kv:
             fp8_fake_quant_(kv[..., : D - rd])
 

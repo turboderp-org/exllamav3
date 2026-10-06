@@ -30,12 +30,12 @@ from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
 
-def _ext_rope(x, inv_freq, position = 0, position_ids = None):
+def _ext_rope(x, inv_freq, position = 0, position_ids = None, positions = None):
     # In-place GPT-J rotation of a (bsz, seq, heads, rope_dim) tensor via ext.rope. x may be
     # a trailing-slice VIEW of wider heads. De-rotation (paper eq. 26) uses a negated inv_freq
     # table. attn_factor is 1.0 by V4 semantics (yarn mscale never applied to cos/sin).
     ext.rope(
-        x, x, None, None, inv_freq, position, None, position_ids,
+        x, x, None, None, inv_freq, position, positions, position_ids,
         int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0,
     )
 
@@ -948,7 +948,7 @@ class DSV4Attention(Module):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
 
-    def _project_qkv(self, x, params, position):
+    def _project_qkv(self, x, params, position, positions = None):
         """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
         applies both head norms (unweighted per-head q norm via a ones weight, weighted
         kv_norm) before rotating the trailing rope slice (rotate_offset)."""
@@ -958,17 +958,17 @@ class DSV4Attention(Module):
         q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
         kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
         if not self.q_head_norm:
-            _ext_rope(q[..., -rd:], self._rope_type(), position)
+            _ext_rope(q[..., -rd:], self._rope_type(), position, positions = positions)
             ext.rope(
                 kv, kv, None, None,
-                self._rope_type(), position, None, None,
+                self._rope_type(), position, positions, None,
                 int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
                 self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
             )
             return q_res, q, kv.view(bsz, seq, self.head_dim)
         ext.rope(
             q, q, kv, kv,
-            self._rope_type(), position, None, None,
+            self._rope_type(), position, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
             self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
         )
