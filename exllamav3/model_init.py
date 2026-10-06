@@ -56,6 +56,7 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-lpd", "--layers_per_device", type = str, help = "Number of layers to load on each device, example: 2,12,26 (must add up to the model's number of layers, 0 skips a device). Layer-split mode only; --gpu_split still limits the VRAM used per device")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -328,6 +329,7 @@ def init(
         split = None
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
+    layers = [int(n) for n in args.layers_per_device.split(",")] if getattr(args, "layers_per_device", None) else None
 
     # Parallelism options
     tp_options = {
@@ -366,6 +368,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        layers_per_device = layers,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
