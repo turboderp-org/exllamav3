@@ -38,6 +38,10 @@
     #define EXL3_WMMA_DEV_ARCH EXL3_WMMA_ARCH_GFX1151
 #elif defined(__gfx1100__) || defined(__gfx1101__)
     #define EXL3_WMMA_DEV_ARCH EXL3_WMMA_ARCH_GFX1100
+#elif defined(__gfx11_generic__)
+    // One code object for the whole gfx11 family: every table's kernels are compiled, the
+    // running device's gcnArchName picks the table at runtime (wmma_gemm.cu)
+    #define EXL3_WMMA_DEV_ARCH (EXL3_WMMA_ARCH_GFX1151 | EXL3_WMMA_ARCH_GFX1100)
 #else
     #define EXL3_WMMA_DEV_ARCH 0   // host pass, and every arch without a table
 #endif

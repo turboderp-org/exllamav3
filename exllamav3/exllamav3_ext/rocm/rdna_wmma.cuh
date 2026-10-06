@@ -240,8 +240,8 @@ __device__ __forceinline__ void mma_sync
     const WmmaFragB& b
 )
 {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    // RDNA4: the gfx11 encoding does not exist, so use the gfx12 form. This
+#if defined(__GFX12__)
+    // RDNA4 (any gfx12 target, the gfx12-generic family one included): the gfx11 encoding does not exist, so use the gfx12 form. This
     // wrapper is reached by the dense quantized GEMM (exl3_gemm_inner_rdna.cuh,
     // every EXL3 matmul past the GEMV row limit) as well as the fused-MoE comp
     // units.

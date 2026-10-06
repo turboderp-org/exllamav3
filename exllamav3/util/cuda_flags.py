@@ -130,10 +130,18 @@ def use_rocm_sdk_devel(cpp_extension) -> None:
             return
     # Current SDK wheels ship their development tree as an archive. The SDK CLI expands it
     # and returns its root; the expanded package name can vary by SDK version and platform.
+    # The expansion is a one-time write of the whole tree into site-packages, hence the notice;
+    # a failing CLI (unwritable site-packages, a broken SDK install) leaves torch's root in
+    # place, and the build then reports the missing headers itself
     if importlib.util.find_spec("rocm_sdk_devel") is not None:
-        devel = subprocess.check_output(
-            [sys.executable, "-m", "rocm_sdk", "path", "--root"], text = True
-        ).strip()
+        print(" -- Locating the ROCm SDK development files (expanding them on first use)", flush = True)
+        try:
+            devel = subprocess.check_output(
+                [sys.executable, "-m", "rocm_sdk", "path", "--root"], text = True
+            ).strip()
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f" !! ROCm SDK development files not found ({e}); run `rocm-sdk init` or set ROCM_HOME", flush = True)
+            return
         if has_libs(devel):
             cpp_extension.ROCM_HOME = devel
 
