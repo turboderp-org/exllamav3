@@ -195,7 +195,7 @@ __device__ __forceinline__ float exl3_gemv_dot_tile
                     my_sh_b[k * SH_STRIDE + lane],
                     my_sh_b[(k + 1) * SH_STRIDE + lane]
                 );
-                accum = __builtin_amdgcn_fdot2(a2, b2, accum, false);
+                accum = exl3_fdot2(a2, b2, accum);
             }
         }
 
@@ -274,10 +274,10 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_direct
         half2 a01 = a2[r0 >> 1];             // (A[r0],   A[r0+1])
         half2 a89 = a2[(r0 >> 1) + 4];       // (A[r0+8], A[r0+9])
 
-        accA = __builtin_amdgcn_fdot2(a01, frag0[0], accA, false);
-        accA = __builtin_amdgcn_fdot2(a89, frag0[1], accA, false);
-        accB = __builtin_amdgcn_fdot2(a01, frag1[0], accB, false);
-        accB = __builtin_amdgcn_fdot2(a89, frag1[1], accB, false);
+        accA = exl3_fdot2(a01, frag0[0], accA);
+        accA = exl3_fdot2(a89, frag0[1], accA);
+        accB = exl3_fdot2(a01, frag1[0], accB);
+        accB = exl3_fdot2(a89, frag1[1], accB);
     }
 
     // Quad reduction: after two xor hops every lane of quad g holds the full

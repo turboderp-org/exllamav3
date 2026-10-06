@@ -1,4 +1,5 @@
 #pragma once
+#include "rdna_wmma_emu.cuh"
 
 // ROCm side of det_gemm.cuh (included at its end on ROCm only): the int8 GEMM blocks as RDNA WMMA warp tiles
 // (v_wmma_i32_16x16x16_iu8) reading the kernels' swizzled LDS tiles directly, plus the copy helpers the
@@ -53,6 +54,8 @@ __device__ __forceinline__ det_v8i det_wmma_iu8(det_wmma_op a, det_wmma_op b, de
 {
 #if defined(__GFX12__)
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#elif defined(EXL3_WMMA_EMULATED)
+    return rdna_wmma_emu::mma_i32_i8<true, true, false>(a, b, c);
 #else
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
 #endif

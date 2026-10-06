@@ -217,10 +217,10 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
             const half2* a2 = (const half2*) (A + a_row[r] + k_tile * 16);
             half2 a01 = a2[r0 >> 1];
             half2 a89 = a2[(r0 >> 1) + 4];
-            accA[r] = __builtin_amdgcn_fdot2(a01, frag0[0], accA[r], false);
-            accA[r] = __builtin_amdgcn_fdot2(a89, frag0[1], accA[r], false);
-            accB[r] = __builtin_amdgcn_fdot2(a01, frag1[0], accB[r], false);
-            accB[r] = __builtin_amdgcn_fdot2(a89, frag1[1], accB[r], false);
+            accA[r] = exl3_fdot2(a01, frag0[0], accA[r]);
+            accA[r] = exl3_fdot2(a89, frag0[1], accA[r]);
+            accB[r] = exl3_fdot2(a01, frag1[0], accB[r]);
+            accB[r] = exl3_fdot2(a89, frag1[1], accB[r]);
         }
     }
 

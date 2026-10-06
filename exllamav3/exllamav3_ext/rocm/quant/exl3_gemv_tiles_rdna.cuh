@@ -547,10 +547,10 @@ __device__ __forceinline__ void exl3_tiles_step
                 half2_uint32 a89(w89[u][r]);
                 float& aA = accA[t * M + r];
                 float& aB = accB[t * M + r];
-                aA = __builtin_amdgcn_fdot2(a01.as_half2, frag0[0], aA, false);
-                aA = __builtin_amdgcn_fdot2(a89.as_half2, frag0[1], aA, false);
-                aB = __builtin_amdgcn_fdot2(a01.as_half2, frag1[0], aB, false);
-                aB = __builtin_amdgcn_fdot2(a89.as_half2, frag1[1], aB, false);
+                aA = exl3_fdot2(a01.as_half2, frag0[0], aA);
+                aA = exl3_fdot2(a89.as_half2, frag0[1], aA);
+                aB = exl3_fdot2(a01.as_half2, frag1[0], aB);
+                aB = exl3_fdot2(a89.as_half2, frag1[1], aB);
             }
         }
 }

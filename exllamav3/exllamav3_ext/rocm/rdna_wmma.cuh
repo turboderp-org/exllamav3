@@ -5,6 +5,7 @@
 // fork; the vector types and bitfield/memory helpers it also carried come from ptx.cuh here.
 
 #include "../ptx.cuh"
+#include "rdna_wmma_emu.cuh"
 
 // A traditional include guard rather than `#pragma once`, since this header is
 // reached through several relative paths from rocm/quant/ and rocm/cpu/.
@@ -282,6 +283,8 @@ __device__ __forceinline__ void mma_sync
         c.data[t]     = h ? r : g[2 * t];
         c.data[4 + t] = h ? g[2 * t + 1] : r;
     }
+#elif defined(EXL3_WMMA_EMULATED)
+    c.data = rdna_wmma_emu::mma_f32_f16(b.data, a.data, c.data);
 #else
     c.data = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b.data, a.data, c.data);
 #endif
@@ -521,7 +524,11 @@ __device__ __forceinline__ void mma_sync_bf16
     const WmmaFragB_bf16& b
 )
 {
+#if defined(EXL3_WMMA_EMULATED)
+    c.data = rdna_wmma_emu::mma_f32_bf16(&b.data, &a.data, c.data);
+#else
     c.data = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b.data, a.data, c.data);
+#endif
 }
 
 // =============================================================================
@@ -545,7 +552,11 @@ __device__ __forceinline__ void mma_sync_f16
     const WmmaFragB& b
 )
 {
+#if defined(EXL3_WMMA_EMULATED)
+    c.data = rdna_wmma_emu::mma_f16_f16<opsel>(b.data, a.data, c.data);
+#else
     c.data = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(b.data, a.data, c.data, opsel);
+#endif
 }
 
 template <bool opsel = false>
@@ -655,12 +666,16 @@ __device__ __forceinline__ void mma_sync_i8
     const WmmaFragB_i8& b
 )
 {
+#if defined(EXL3_WMMA_EMULATED)
+    c.data = rdna_wmma_emu::mma_i32_i8<signed_b, signed_a, clamp>(b.data, a.data, c.data);
+#else
     c.data = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32
     (
         signed_b, b.data,     // first flag/vector pair is B
         signed_a, a.data,
         c.data, clamp
     );
+#endif
 }
 
 __device__ __forceinline__ void store_matrix_c_i32

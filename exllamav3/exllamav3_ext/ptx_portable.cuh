@@ -51,19 +51,15 @@ __device__ __forceinline__ uint32_t exl3_mul_hi_u32(uint32_t x, uint32_t y)
 // dp4a.u32.s32 d, a, b, c: the four unsigned bytes of a times the four signed bytes of b, summed onto c
 __device__ __forceinline__ int exl3_dp4a_us(uint32_t a, uint32_t b, int c)
 {
-    // (nested so that __has_builtin is only evaluated by the HIP compiler)
-    #if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__)
-        #if __has_builtin(__builtin_amdgcn_sudot4)
-            #define EXL3_HAS_SUDOT4 1
-        #endif
+    // v_dot4_u32_i8 is a gfx11+ instruction (dot8-insts); the invocability test is per target, where
+    // __has_builtin would be true for every AMD device pass
+    #if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__) && !defined(EXL3_FORCE_SCALAR_DOT)
+        if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_sudot4))
+            return __builtin_amdgcn_sudot4(false, static_cast<int>(a), true, static_cast<int>(b), c, false);
     #endif
-    #if defined(EXL3_HAS_SUDOT4)
-        return __builtin_amdgcn_sudot4(false, static_cast<int>(a), true, static_cast<int>(b), c, false);
-    #else
-        int d = c;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            d += static_cast<int>((a >> (8 * i)) & 0xffu) * static_cast<int>(static_cast<int8_t>(b >> (8 * i)));
-        return d;
-    #endif
+    int d = c;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        d += static_cast<int>((a >> (8 * i)) & 0xffu) * static_cast<int>(static_cast<int8_t>(b >> (8 * i)));
+    return d;
 }

@@ -163,7 +163,29 @@ __device__ __forceinline__ void __nanosleep(unsigned int)
 
 __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c)
 {
-    return __builtin_amdgcn_udot4(a, b, c, false);
+#if !defined(EXL3_FORCE_SCALAR_DOT)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_udot4))
+        return __builtin_amdgcn_udot4(a, b, c, false);
+#endif
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) c += ((a >> (8 * i)) & 0xffu) * ((b >> (8 * i)) & 0xffu);
+    return c;
+}
+
+// v_dot2_f32_f16 (d = a.x b.x + a.y b.y + c), the GEMV kernels' inner product. RDNA1 without the dot
+// extensions (gfx1010) has no such instruction; the compiler's invocability test selects the FMA form there.
+// EXL3_FORCE_SCALAR_DOT (and EXL3_FORCE_WMMA_EMULATION, rdna_wmma_emu.cuh) build the fallbacks on a part
+// that has the instructions, to test them
+template <typename T>
+__device__ __forceinline__ float exl3_fdot2(T a, T b, float c)
+{
+#if !defined(EXL3_FORCE_SCALAR_DOT)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2))
+        return __builtin_amdgcn_fdot2(a, b, c, false);
+#endif
+    typedef _Float16 h2v __attribute__((ext_vector_type(2)));
+    h2v av = __builtin_bit_cast(h2v, a), bv = __builtin_bit_cast(h2v, b);
+    return fmaf((float) av.x, (float) bv.x, fmaf((float) av.y, (float) bv.y, c));
 }
 
 // Correctly rounded fp32 arithmetic for the deterministic kernels (det_gemm.cuh and its users), whose results

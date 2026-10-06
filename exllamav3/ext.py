@@ -159,6 +159,9 @@ else:
         use_rocm_sdk_devel(torch.utils.cpp_extension)
         extra_cflags += hip_include_flags(sources_dir)
         extra_cuda_cflags += hip_include_flags(sources_dir)
+        # Flags hipcc would add from its environment go on the command line instead, where the ccache wrapper
+        # (hip_compiler_wrapper) hashes them; left to hipcc, a changed define is a cache hit on the old object
+        extra_cuda_cflags += os.environ.get("HIPCC_COMPILE_FLAGS_APPEND", "").split()
 
     # Load extension
 
