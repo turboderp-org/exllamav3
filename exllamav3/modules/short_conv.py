@@ -174,14 +174,24 @@ class ShortConvLayerState:
 
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
+        assert num_tokens >= 0, f"ShortConv rewind: negative num_tokens {num_tokens}"
+        # last_history == 0 means the forward that advanced this state recorded no per-token
+        # history, so there is nothing to copy from; the rewind is a position correction only
+        # and the re-fed tokens recompute the contents. Callers do arrive with last_history == 0
+        # whenever a rewind follows a forward that recorded no history (e.g. the prefill-
+        # overshoot rewind in job.py, reaching this class through ShortConvState.rewind or
+        # _collect_rewind_jobs' non-GDN fallback); no in-tree short-conv architecture triggers
+        # that combination today, but the guard is the contract: without it the assert below
+        # fires (or the copy reads a negative slice) on any architecture that adds one.
+        if last_history == 0:
+            return
         assert num_tokens <= last_history
         cdim = self.module.conv_kernel_size
-        if last_history > 0:
-            c_state = self.conv_state[slot, :, :cdim]
-            p = self.conv_state.shape[-1] - num_tokens
-            c_state_rewind = self.conv_state[slot, :, p - cdim : p]
-            temp = c_state_rewind.clone()
-            c_state.copy_(temp)
+        c_state = self.conv_state[slot, :, :cdim]
+        p = self.conv_state.shape[-1] - num_tokens
+        c_state_rewind = self.conv_state[slot, :, p - cdim : p]
+        temp = c_state_rewind.clone()
+        c_state.copy_(temp)
 
 
     def stash(self, slot, position: int = 0):
