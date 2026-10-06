@@ -923,7 +923,10 @@ supports it (CUDA 12.8 and later). Compression is applied to the finished images
 themselves are identical either way. `0` disables it, which may be needed to run a locally built
 extension on a driver that predates compressed images. `require` makes the build fail when nvcc
 does not offer the option instead of silently building uncompressed; the release wheels are built
-this way. Not used for ROCm builds.
+this way.
+
+On ROCm the device code objects are compressed with hipcc's `--offload-compress` (`0` disables it);
+the wheels carry one code object per RDNA family and would be several times larger without it.
 
 ### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
 

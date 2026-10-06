@@ -102,8 +102,14 @@ def hip_cflags(debug: bool = False) -> list[str]:
 
     -fgpu-flush-denormals-to-zero matches the fp32 flush-to-zero that --use_fast_math gives the CUDA build,
     which the deterministic kernels need to agree with it bit for bit (det_gemm.cuh).
+
+    The device code objects are stored compressed (--offload-compress, the counterpart of nvcc's
+    --compress-mode) unless EXLLAMA_EXT_COMPRESS=0: a wheel carrying every RDNA family would otherwise be
+    several times the size of a single-target build.
     """
     flags = ["-O3", "-Wno-register", "-DHIPBLAS_USE_HIP_HALF", "-fgpu-flush-denormals-to-zero"]
+    if os.environ.get("EXLLAMA_EXT_COMPRESS", "1") != "0":
+        flags += ["--offload-compress"]
     if debug:
         flags += ["-g"]
     return flags

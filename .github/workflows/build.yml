@@ -20,6 +20,7 @@ on:
           - windows_smoke
           - cu132
           - torch_212_213
+          - rocm
           - sdist
 
 permissions:
@@ -73,6 +74,17 @@ jobs:
           for os_, pyver, torch in itertools.product(oses, pyvers, torches_cu13):
               combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = torch, cudaarch = cudaarch))
 
+          # ROCm wheels (Linux): AMD's pip ROCm SDK with its own torch build, one torch per SDK
+          # release and the Python versions TabbyAPI installs. One wheel covers every RDNA
+          # generation through the compiler's family targets (one code object per generation,
+          # loaded on any member chip); CDNA parts run wave64 and are not supported by the
+          # kernels. Kept minimal until the ROCm port has had wider use
+          rocm_pyvers = ["3.12", "3.13.3", "3.14"]
+          rocmarch = "gfx10-1-generic;gfx10-3-generic;gfx11-generic;gfx12-generic"
+          for pyver in rocm_pyvers:
+              combos.append(dict(os = "ubuntu-22.04", pyver = pyver, cuda = "", rocm = "10.0.0", torch = "2.13.0",
+                                 cudaarch = rocmarch))
+
           if target == "windows":
               combos = [c for c in combos if c["os"] == "windows-2022"]
           elif target == "windows_smoke":
@@ -86,17 +98,20 @@ jobs:
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
           elif target == "torch_212_213":
               # Temporary: just the new Torch 2.12 / 2.13 wheels
-              combos = [c for c in combos if c["torch"] in torches_cu13]
+              combos = [c for c in combos if c["cuda"] and c["torch"] in torches_cu13]
+          elif target == "rocm":
+              combos = [c for c in combos if c["rocm"]]
 
           print(f"{len(combos)} jobs:")
           for c in combos:
-              print(f"  {c['os']} P{c['pyver']} CUDA {c['cuda']} T{c['torch']}")
+              backend = f"CUDA {c['cuda']}" if c["cuda"] else f"ROCm {c['rocm']}"
+              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": combos}) + "\n")
 
   build_wheels:
-    name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
+    name: ${{ matrix.os }} P${{ matrix.pyver }} ${{ matrix.cuda && format('CUDA {0}', matrix.cuda) || format('ROCm {0}', matrix.rocm) }} T${{ matrix.torch }}
     needs: define_matrix
     runs-on: ${{ matrix.os }}
     defaults:
@@ -320,7 +335,7 @@ jobs:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
           method: "network"
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.cuda != ''
 
       - name: Install CUDA build dependencies
         if: matrix.cuda != ''
@@ -340,6 +355,26 @@ jobs:
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
+
+      - name: Install ROCm build dependencies
+        if: matrix.rocm != ''
+        id: rocm_deps
+        run: |
+          # AMD's pip ROCm distribution: torch from the pytorch index, the SDK (runtime libraries plus
+          # the development tree with hipcc and the headers) from the core index. Both indexes also
+          # list torch's plain dependencies, hence best-match across indexes. No GPU is needed to build
+          $rocmVersion = '${{ matrix.rocm }}'
+          $rocmShort = $rocmVersion.Remove($rocmVersion.LastIndexOf('.'))
+          Write-Output "ROCM_VERSION_BUILD=$rocmShort" >> "$env:GITHUB_OUTPUT"
+
+          uv pip install --index-strategy unsafe-best-match `
+            --extra-index-url https://stable.repo.amd.com/rocm/pytorch/whl-next/ `
+            --extra-index-url https://stable.repo.amd.com/rocm/core/whl-next/ `
+            "torch==${{ matrix.torch }}+rocm$rocmVersion" "rocm[libraries,devel]==$rocmVersion"
+          # Expand the development tree (shipped as an archive inside the devel wheel)
+          python -m rocm_sdk init
+          python -m rocm_sdk version
           uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
       - name: Compute Torch requirement pin
@@ -402,8 +437,20 @@ jobs:
 
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
+      - name: Build for ROCm
+        if: matrix.rocm != ''
+        run: |
+          # The HIP compile is clang: no VS shell, no arch list to expand. The device code objects are
+          # stored compressed (hip_cflags), one per RDNA family target
+          $BUILDTAG = "+rocm${{ steps.rocm_deps.outputs.ROCM_VERSION_BUILD }}-torch${{ matrix.torch }}"
+          $env:BUILD_TARGET = "rocm"
+          $env:PYTORCH_ROCM_ARCH = '${{ matrix.cudaarch }}'
+          $env:EXLLAMA_EXT_COMPRESS = "1"
+
+          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
       - name: Verify extension size
-        if: matrix.cuda != ''
+        if: matrix.cuda != '' || matrix.rocm != ''
         run: |
           $verifyScript = @'
           from pathlib import Path
@@ -430,6 +477,17 @@ jobs:
 
           Set-Content -Path verify_ext_size.py -Value $verifyScript -Encoding UTF8
           python verify_ext_size.py
+
+      - name: Import the ROCm wheel
+        if: matrix.rocm != ''
+        run: |
+          # A prebuilt extension loads without a GPU (the HIP runtime only enumerates devices on first use),
+          # so this catches unresolved symbols and a wheel that would fall back to a JIT build
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          uv pip install $wheel.FullName
+          Push-Location $env:RUNNER_TEMP
+          python -c "import exllamav3, exllamav3.ext, exllamav3.version; assert exllamav3.ext.is_precompiled_extension_available(), 'extension not prebuilt'; print('import ok', exllamav3.version.__version__)"
+          Pop-Location
 
       - name: Verify wheel dependency metadata
         run: |
@@ -503,7 +561,7 @@ jobs:
         if: inputs.target == 'windows_smoke'
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
+          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}${{ matrix.rocm && format('rocm{0}', matrix.rocm) || '' }}-torch${{ matrix.torch }}
           path: dist/*.whl
 
   build_sdist:
