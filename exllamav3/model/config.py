@@ -48,7 +48,7 @@ class InferParams:
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
         self.moe_cpu_component = "text"
-        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
+        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)
         self.moe_cpu_threads = None
         self.draft_moe_cpu_threads = None

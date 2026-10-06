@@ -10,6 +10,7 @@ from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
+from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -79,9 +80,19 @@ class MoeCpuTuning:
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
         assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
+        # Physical cores kept free of pool workers for the host process when the pool pins its
+        # workers (EXL3_MOE_CPU_PIN); the host is confined to them once the worker has started,
+        # see moe_cpu_affinity.py. 0 disables the reservation and the pinning
+        self.host_cores = int(os.environ.get("EXL3_MOE_HOST_CORES", 1))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
-        # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__)
-        self.threads = int(os.environ.get("EXL3_MOE_CPU_THREADS", max(1, (os.cpu_count() or 2) // 2)))
+        # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
+        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0, pinning
+        # is off or the topology is unreadable
+        _, n_phys = ext.exl3_moe_cpu_core_order()
+        self.threads = int(os.environ.get(
+            "EXL3_MOE_CPU_THREADS",
+            default_worker_threads(n_phys, self.host_cores) if n_phys and self.host_cores > 0
+            else max(1, (os.cpu_count() or 2) // 2)))
         self.num_wslots = min(int(os.environ.get("EXL3_MOE_CPU_WSLOTS", 2)), MOE_MAX_WSLOTS)
         self.wslot_size = int(os.environ.get("EXL3_MOE_CPU_WSLOT_MB", 32)) * 1024 * 1024
         self.stage_threads = int(os.environ.get("EXL3_MOE_CPU_STAGE_THREADS", 4))
@@ -145,6 +156,42 @@ class MoeCpuTuning:
 
 TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
+
+# Host placement is per process: planned for the first started host's worker count and kept
+# for later hosts (MTP head, draft model, reload). Workers spawned after it restore the
+# pre-pin mask (_HOST_ORIG_CPUS) so their pool can pin outside the host's LPs
+_HOST_AFFINITY_THREADS: int | None = None
+_HOST_ORIG_CPUS: list[int] | None = None
+
+
+def _apply_host_affinity(threads: int, host_cores: int):
+    """Confine the host process to the CPUs the worker pool leaves free. Never raises: an OS
+    failure leaves the host unpinned with a notice."""
+    global _HOST_AFFINITY_THREADS, _HOST_ORIG_CPUS
+    if _HOST_AFFINITY_THREADS is not None:
+        if threads > _HOST_AFFINITY_THREADS:
+            print(f" -- CPU MoE host affinity: placement planned for {_HOST_AFFINITY_THREADS} workers, "
+                  f"kept for a {threads}-thread worker")
+        return
+    _HOST_AFFINITY_THREADS = threads
+    order, n_phys = ext.exl3_moe_cpu_core_order()
+    cpus = plan_host_cpus(order, n_phys, threads, host_cores)
+    if cpus is None:
+        if host_cores > 0 and n_phys:
+            print(" -- CPU MoE host affinity: no LP free of workers in one processor group; "
+                  "host threads left unpinned")
+        return
+    try:
+        orig = process_cpus()
+    except OSError as e:
+        print(f" !! CPU MoE host affinity: {e}; host threads left unpinned")
+        return
+    err = apply_process_affinity(cpus)
+    if err is not None:
+        print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
+        return
+    _HOST_ORIG_CPUS = orig
+    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
 
 
 # memfd_create only ships in CPython when the interpreter was built against glibc >= 2.27; conda
@@ -533,7 +580,7 @@ class _HugeArena:
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
-def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = ""):
+def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
@@ -551,6 +598,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
     # orchestrated by the parent (quit flag) or the kernel (PDEATHSIG), never by SIGINT
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     ipds()
+
+    if cpus is not None:
+        # Spawned after the host was confined: drop the inherited host mask, or the pool's
+        # worker pins fail (Windows refuses a thread mask outside the process mask)
+        err = apply_process_affinity(cpus)
+        if err is not None:
+            print(f" !! CPU MoE worker affinity: {err}; worker confined to the host's LPs")
 
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
@@ -775,7 +829,7 @@ class MoeCpuHost:
         self.cap_rows = TUNING.cap_rows
         # Per-component thread override: config.infer_params.moe_cpu_threads for the main model,
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
-        # tuning default (EXL3_MOE_CPU_THREADS env, else cpu_count/2)
+        # tuning default (EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)
         comp = getattr(config.infer_params, "moe_cpu_component", "text")
         cfg_threads = getattr(config.infer_params,
             "moe_cpu_threads" if comp == "text" else "draft_moe_cpu_threads", None)
@@ -810,7 +864,7 @@ class MoeCpuHost:
         self.proc = ctx.Process(
             target = _moe_cpu_child_main,
             args = (child_conn, self.model_dir, self.threads, self.stage_threads,
-                    self.pinned, TUNING.arena_huge if self.pinned else ""),
+                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS),
             daemon = True,
         )
         self.proc.start()
@@ -1057,6 +1111,8 @@ class MoeCpuHost:
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
+        # The worker was spawned before this and pins its own threads; keep the host off them
+        _apply_host_affinity(self.threads, TUNING.host_cores)
 
     def _start_watchdog(self):
         """
