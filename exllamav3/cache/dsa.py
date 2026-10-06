@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
 from .cache import Cache, CacheLayer
-from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash
+from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash, host_copy
 
 """
 Cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers, split along the
@@ -399,14 +399,14 @@ class DSV4LayerState:
 
 
     def stash(self, slot, position):
-        out = [self.ring[slot, :min(self.ring_rows, position)].cpu()]
+        out = [host_copy(self.ring[slot, :min(self.ring_rows, position)])]
         if self.comp_buf_kv is not None:
-            out.append(self.comp_buf_kv[slot].cpu())
-            out.append(self.comp_buf_gate[slot].cpu())
+            out.append(host_copy(self.comp_buf_kv[slot]))
+            out.append(host_copy(self.comp_buf_gate[slot]))
             if self.idx_buf_kv is not None:
-                out.append(self.idx_buf_kv[slot].cpu())
-                out.append(self.idx_buf_gate[slot].cpu())
-                out.append(self.comp_ovl[slot].cpu())
+                out.append(host_copy(self.idx_buf_kv[slot]))
+                out.append(host_copy(self.idx_buf_gate[slot]))
+                out.append(host_copy(self.comp_ovl[slot]))
                 out.append(self.idx_ovl[slot].cpu())
         return out
 

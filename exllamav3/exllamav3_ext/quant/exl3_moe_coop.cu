@@ -73,7 +73,12 @@ static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
 
 // Split-k factor: blocks per column chunk, partial outputs summed by the last-arriving block.
 // Measured ineffective.
-static int moe_coop_pick_ksplit(int max_split)
+// Split-k factor for one stage. The grid is slots x column tiles, which fills the device for a
+// routed launch (bsz x top-k slots) but not for a single-slot launch such as the shared expert
+// (one expert's tiles on a 100+ SM device): split k until there is a block per SM, keeping at
+// least 64 k-slices (1024 columns) per split so the partials and their reduction stay cheap.
+// EXL3_MOE_COOP_KSPLIT forces one factor for every stage (testing)
+static int moe_coop_pick_ksplit(int base, int kslices, int max_split, int device)
 {
     static int forced = -2;
     if (forced == -2)
@@ -81,7 +86,10 @@ static int moe_coop_pick_ksplit(int max_split)
         const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT");
         forced = env ? atoi(env) : 0;
     }
-    return forced > 0 ? std::min(forced, max_split) : 1;
+    if (forced > 0) return std::min(forced, max_split);
+    const int want = CEIL_DIVIDE(DevCtx::instance().get_num_sms(device), std::max(base, 1));
+    const int kcap = std::max(kslices / 64, 1);
+    return std::max(1, std::min(std::min(want, kcap), max_split));
 }
 
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
@@ -134,8 +142,8 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
     const int max_split = std::max(1, p.slots_max / slots);
-    p.ksplit_a = moe_coop_pick_ksplit(max_split);
-    p.ksplit_b = moe_coop_pick_ksplit(max_split);
+    p.ksplit_a = moe_coop_pick_ksplit(base_a, p.Hi / 16, max_split, device);
+    p.ksplit_b = moe_coop_pick_ksplit(base_b, p.I / 16, max_split, device);
     const int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
 

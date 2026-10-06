@@ -593,7 +593,7 @@ def ldlq(
 
         buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
         assert buf_size_k % 16 == 0
-        assert size_n % buf_size_k == 0
+        assert size_k % buf_size_k == 0
 
         p_row = 0
 
@@ -1048,8 +1048,9 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         H *= su
         blockwise_preapply_had_l_(H, had_k)
 
-        # Get block LDL decomposition of H, zero diagonal
-        if q_fallback:
+        # Get block LDL decomposition of H, zero diagonal. With scaled Hessians every tensor factors its
+        # own copy after regularize (see scaled_ldl), so nothing is kept here
+        if q_fallback or quant_args.get("scaled_hessian"):
             L = None
         else:
             L, H = block_ldl(H, 16, quant_args, verbose, debug_info = {
@@ -1289,6 +1290,68 @@ def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 
     return diff_sq.item() / (sq.item() + 1e-20)
 
 
+def out_scales_ratio(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> float | None:
+    """
+    Predicted loss with output channel scales relative to the loss without them.
+
+    Quantization error is uniform in the rotated domain, so the scales don't change how much error there is but
+    where it lands: with scales every output channel gets the same relative error (error energy proportional to
+    the channel's energy), without them the same absolute error. For a per-channel sensitivity s (loss per unit
+    of error energy) and channel energy e, the ratio of the two losses is E[s * e] / (E[s] * E[e]): below one
+    when the sensitive channels are the low-energy ones, above one when they are the high-energy ones.
+
+    Returns None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    e = out_channel_scales.flatten().double().square()
+    s = out_sensitivity.flatten().to(e.device).double()
+    if s.shape[0] > e.shape[0]:
+        s = s[:e.shape[0]]
+    elif s.shape[0] < e.shape[0]:
+        s = F.pad(s, (0, e.shape[0] - s.shape[0]))
+    den = s.mean() * e.mean()
+    if not torch.isfinite(s).all() or not torch.isfinite(den) or den.item() <= 0.0:
+        return None
+    return ((s * e).mean() / den).item()
+
+
+# In auto mode, output scales are dropped for tensors whose sensitivity predicts a loss above this with them,
+# relative to without
+out_scales_max_ratio = 1.05
+
+# Added to the mean-normalized sensitivity when scales are derived from it, so channels the estimate saw
+# nothing of don't take scales without bound
+out_sensitivity_floor = 0.02
+
+
+def sensitivity_out_scales(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> torch.Tensor | None:
+    """
+    Output channel scales that minimize the predicted loss for a per-channel sensitivity.
+
+    With scale t on a channel its error energy is proportional to t^2, and the total error in the rotated domain
+    to sum(sigma^2 / t^2) for channel RMS sigma. For sensitivity s (loss per unit of error energy) the loss
+    (sum s t^2) (sum sigma^2 / t^2) is minimal at t ~ (sigma^2 / s)^(1/4). Plain output scales, t = sigma, are
+    that optimum for s ~ 1 / sigma^2.
+
+    out_channel_scales: the plain scales (channel RMS), (1, n). Returns the scales in the same shape, mean one over
+    the nonzero channels, or None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    sigma = out_channel_scales.flatten().double()
+    s = out_sensitivity.flatten().to(sigma.device).double()
+    if s.shape[0] > sigma.shape[0] or not torch.isfinite(s).all():
+        return None
+    s = s.clamp(min = 0.0)
+    mean = s.mean().item()
+    if mean <= 0.0:
+        return None
+    # Channels past the sensitivity's length are padding
+    s = F.pad(s / mean, (0, sigma.shape[0] - s.shape[0]), value = 1.0) + out_sensitivity_floor
+    t = (sigma.square() / s).pow(0.25)
+    live = t > 0
+    if not live.any():
+        return None
+    return (t / t[live].mean()).to(out_channel_scales.dtype).view_as(out_channel_scales)
+
+
 def regularize(
     weight: torch.Tensor,
     su: torch.Tensor,
@@ -1307,8 +1370,17 @@ def regularize(
     matrix, applies blockwise Hadamard transforms, and optionally searches for a global scale that minimizes sample
     quantization error. It returns the transformed weight plus the scale metadata needed to reconstruct the original
     linear layer behavior after quantization.
+
+    Output-channel scaling is forced on or off by quant_args["apply_out_scales"] (True/False). With None (auto)
+    it is on, except for tensors that come with a per-channel output sensitivity in quant_args["out_sensitivity"]
+    (gate and up projections of gated MLPs, see modules/mlp.py) and whose sensitive channels are the high-energy
+    ones (see out_scales_ratio).
+
+    A tensor that comes with the diagonal of its output-side Hessian in quant_args["out_hessian_diag"] takes its
+    scales from that instead (see sensitivity_out_scales), and quant_args["out_scales_hessian"] reports it
     """
     force_out_scales = quant_args["apply_out_scales"]
+    quant_args["out_scales_hessian"] = False
 
     # dist_ref = torch.empty((512,), dtype = torch.float, device = weight.device)
     # dist_r = torch.empty_like(dist_ref)
@@ -1319,28 +1391,7 @@ def regularize(
              F.kl_div((h2 + eps).log(), m, reduction = "sum")
         return js / 2
 
-    # From experiments, it seems the deciding factor in when scaling output channels is beneficial is when
-    # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
-    # on 2% of the channels
-    # TODO: More science
-    if not q_fallback and H_diag is not None:
-        diag = H_diag.sqrt()
-        diag, _ = torch.sort(diag, descending = True)
-        cutoff = diag.shape[0] // 50
-        skew_factor = diag[:cutoff].sum() / diag.sum()
-        if verbose:
-            print(f"     - input state skew: {skew_factor.item():.6f}")
-
-        if force_out_scales is None:
-            apply_out_scales = skew_factor.item() < 0.15
-        else:
-            apply_out_scales = force_out_scales
-
-    else:
-        apply_out_scales = True if force_out_scales is None else force_out_scales
-
-    if q_fallback:
-        apply_out_scales = force_out_scales
+    apply_out_scales = True if force_out_scales is None else force_out_scales
 
     # Apply output scales
     out_channel_scales = block_rms(weight, dim = 0, keepdim = True)
@@ -1348,6 +1399,24 @@ def regularize(
     if mean > 1e-30:
         out_channel_scales /= mean
         quant_args["zeros"] = False
+
+        out_hessian_diag = quant_args.get("out_hessian_diag")
+        out_sensitivity = quant_args.get("out_sensitivity")
+        hessian_scales = None
+        if out_hessian_diag is not None and force_out_scales is None and not q_fallback:
+            hessian_scales = sensitivity_out_scales(out_channel_scales, out_hessian_diag)
+        if hessian_scales is not None:
+            ratio = out_scales_ratio(out_channel_scales, out_hessian_diag)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f} (output Hessian)")
+            out_channel_scales = hessian_scales
+            quant_args["out_scales_hessian"] = True
+        elif out_sensitivity is not None and not q_fallback:
+            ratio = out_scales_ratio(out_channel_scales, out_sensitivity)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f}")
+            if force_out_scales is None and ratio is not None:
+                apply_out_scales = ratio <= out_scales_max_ratio
     else:
         quant_args["zeros"] = True
         if force_out_scales is not None:
@@ -1411,17 +1480,83 @@ def unrotate_H(H_rot: torch.Tensor, su_signs: torch.Tensor) -> torch.Tensor:
     return H
 
 
+# Torch loads its CUDA linalg library on the first linalg call of the process and swaps the dispatch
+# stubs while doing so; two threads making that first call together fail with "lazy wrapper should
+# be called at most once". finalize_capture_H's factorization runs under its mutex, but scaled_ldl
+# runs on the device worker threads, so the library is loaded once under a lock before they start
+_linalg_load_lock = threading.Lock()
+_linalg_loaded = False
+
+def load_linalg(device):
+    global _linalg_loaded
+    if _linalg_loaded:
+        return
+    with _linalg_load_lock:
+        if not _linalg_loaded:
+            torch.linalg.cholesky(torch.eye(16, device = device))
+            _linalg_loaded = True
+
+
+def original_H(H_data: dict, device, cache: bool = False) -> torch.Tensor:
+    """The damped Hessian in the original basis, on device (undoing finalize_capture_H's rotation). With
+    `cache` the copy is kept in the H_data's per-device cache, for a Hessian many tensors share"""
+    dev_cache = H_data.setdefault("dev_cache", {}) if cache else None
+    H = dev_cache.get(("H_orig", device.index)) if cache else None
+    if H is None:
+        H = unrotate_H(H_data["H"].to(device), H_data["su"])
+        if cache:
+            dev_cache[("H_orig", device.index)] = H
+    return H
+
+
+def scaled_ldl(H_orig: torch.Tensor, su: torch.Tensor, quant_args: dict) -> torch.Tensor:
+    """
+    Block LDL of the Hessian in the domain LDLQ actually quantizes in. finalize_capture_H factors the
+    sign-flipped, rotated Hessian once per input (shared by q/k/v, gate/up, experts), but regularize
+    then divides each tensor's rows by that tensor's own input scales, so an error left in a heavily
+    scaled row comes back at full size in the output while the shared factorization weights every row
+    alike. The metric for the regularized weight is P diag(su) H diag(su) P with the full su (signs and
+    scales, the global scale cancels), which takes one factorization per tensor. H_orig is the damped
+    Hessian in the original basis (original_H), left untouched. Returns L with a zero diagonal, as
+    ldlq() expects
+    """
+    load_linalg(H_orig.device)
+    s = su.view(-1).float().to(H_orig.device)
+    H = H_orig * s.unsqueeze(0)
+    H *= s.unsqueeze(1)
+    blockwise_preapply_had_r_(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
+    L, _ = block_ldl(H, 16, quant_args, False)
+    dr = torch.arange(L.shape[0], device = L.device)
+    L[dr, dr] = 0
+    return L
+
+
+def damping_share(quant_args: dict) -> float:
+    """finalize_capture_H adds sigma_reg x the mean diagonal to H; as a share of the damped mean diagonal"""
+    r = quant_args.get("sigma_reg", 0.025)
+    return r / (1.0 + r)
+
+
 def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
-                 rounds: int = 2, chunk: int = 16384):
+                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
     """
     Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
     the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
     W, Q (k, n) in the original basis: per output column c_n = (q_n^T H w_n) / (q_n^T H q_n) (closed form);
     per input row r solves ((Q Q^T) o H) r = rowsum(Q o (H W)); alternated. Returns the rescaled weight_q
-    and the proxy error before / after (trace(E H E^T) / trace(W H W^T)).
+    and the output error before / after, trace(E H E^T) / trace(W H W^T) = |X E|^2 / |X W|^2 over the
+    calibration rows. The fits use H as given (damped); `damping` is the share of H's mean diagonal that
+    finalize_capture_H added, taken back out of the diagonal for the reported error only
     """
     dev = weight_q.device
     H = H.to(dev)
+    if damping > 0.0:
+        d_off = damping * H.diagonal().mean().item()
+        H_err = H.clone()
+        H_err.diagonal().sub_(d_off)
+    else:
+        H_err = H
     W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
@@ -1437,13 +1572,20 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         wc = cols(weight, a, b)
         HW[:, a:b] = H @ wc
         den += (wc * HW[:, a:b]).sum().item()
+    den_err = den
+    if H_err is not H:
+        den_err = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            den_err += (wc * (H_err @ wc)).sum().item()
     def err(Qx):
         e = 0.0
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             E = cols(weight, a, b) - Qx[:, a:b]
-            e += (E * (H @ E)).sum().item()
-        return e / max(den, 1e-30)
+            e += (E * (H_err @ E)).sum().item()
+        return e / max(den_err, 1e-30)
     e_before = err(Q)
     for _ in range(rounds):
         # output-side scales
@@ -1587,6 +1729,10 @@ def quantize_exl3(
         if weight_r.numel() > 5e8:
             weight_r = weight_r.cpu()
 
+        # The input scales regularize folded into the weight belong in the Hessian too (see scaled_ldl)
+        if not q_fallback and quant_args.get("scaled_hessian"):
+            L = scaled_ldl(original_H(H_data, device), su, quant_args)
+
         # Quantize. An external output-side Hessian factor (YAQA-style Kronecker approximation, see ldlq_2hess)
         # switches to error feedback along both axes
         H_out_r = None
@@ -1647,12 +1793,17 @@ def quantize_exl3(
         # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
         if not q_fallback and H is not None and not quant_args.get("no_refit"):
             H_orig = unrotate_H(H, H_data["su"])
-            weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv)
+            weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv,
+                                                                   damping = damping_share(quant_args))
             del H_orig
             su = su_f.view(-1, 1).to(su.dtype)
             sv = sv_f.view(1, -1).to(sv.dtype)
             if verbose:
+                print(f"     - regularized-domain proxy err: {proxy_err:.6f}")
                 print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+            # Report the output error of what is stored, in the original basis. The regularized-domain
+            # figure weights every row and column alike, which is off by the input and output scales
+            proxy_err = e_after
         del weight_orig
 
         if verbose:
@@ -1864,12 +2015,13 @@ def quantize_exl3_batch(
         pb.new_task(progress_text, tiles_k)
 
         # Quantize
-        if shared_H:
-            # A shared H_data serves many groups spread over several device threads; cache the
-            # device copies of L (and H, below) in the dict so each device pays the transfer
-            # once per layer instead of once per group. A benign race can duplicate a copy;
-            # the loser's tensor is simply collected
-            dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {})
+        scaled = qa0.get("scaled_hessian")
+        # A shared H_data serves many groups spread over several device threads; cache the
+        # device copies of L (and H, below) in the dict so each device pays the transfer
+        # once per layer instead of once per group. A benign race can duplicate a copy;
+        # the loser's tensor is simply collected
+        dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {}) if shared_H else None
+        if shared_H and not scaled:
             L = dev_cache.get(("L", device.index))
             if L is None:
                 L = finalized[batch_idx[0]][1].to(device)
@@ -1884,15 +2036,33 @@ def quantize_exl3_batch(
             weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
             encodeds = list(torch.split(encoded_cat, [w // 16 for w in widths], dim = 1))
         else:
-            Ls = torch.stack([finalized[t][1].to(device) for t in batch_idx])
-            weight_r_stack = torch.stack([regs[t][0] for t in batch_idx])
+            # Per-tensor L: same-shape tensors stack into one batched pass. With scaled Hessians a shared
+            # H no longer means a shared L, so the concatenated layout above is replaced by stacks per
+            # shape (gate/up of a group of experts are one stack; q/k/v fall into two). Each stack's L
+            # is factored here and released with the pass, so the extra memory is one stack's worth
+            by_shape = {}
             for t in batch_idx:
-                regs[t][0] = None
-            weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb)
-            del Ls
-            weight_rs = list(weight_r_stack.unbind(0))
-            weight_qs = list(weight_q_stack.unbind(0))
-            encodeds = list(encoded_stack.unbind(0))
+                by_shape.setdefault(tuple(regs[t][0].shape), []).append(t)
+            outs = {}
+            for ts in by_shape.values():
+                if scaled:
+                    Ls = torch.stack([
+                        scaled_ldl(original_H(H_datas[t], device, cache = shared_H), regs[t][1], quant_args_list[t])
+                        for t in ts
+                    ])
+                else:
+                    Ls = torch.stack([finalized[t][1].to(device) for t in ts])
+                weight_r_stack = torch.stack([regs[t][0] for t in ts])
+                for t in ts:
+                    regs[t][0] = None
+                weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb if len(by_shape) == 1 else None)
+                del Ls
+                for t, wr, wq, enc in zip(ts, weight_r_stack.unbind(0), weight_q_stack.unbind(0), encoded_stack.unbind(0)):
+                    outs[t] = (wr, wq, enc)
+            weight_rs = [outs[t][0] for t in batch_idx]
+            weight_qs = [outs[t][1] for t in batch_idx]
+            encodeds = [outs[t][2] for t in batch_idx]
+            del outs
 
         pb.update(tiles_k)
 
@@ -1928,12 +2098,14 @@ def quantize_exl3_batch(
                 wq = preapply_had_r(wq, had_n)
                 wq *= sv
                 H_orig = unrotate_H(Hd, H_datas[t]["su"])
-                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv)
+                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
+                                                                damping = damping_share(qa))
                 del wq, H_orig
                 su = su_f.view(-1, 1).to(su.dtype)
                 sv = sv_f.view(1, -1).to(sv.dtype)
                 if verbose:
                     print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+                proxy_err = e_after
             origs[t] = None
             weight_qs[bi] = None
 

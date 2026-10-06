@@ -395,7 +395,7 @@ class Tokenizer:
             for ids in list_ids:
                 padding_length = max_length - len(ids)
                 padding = torch.full((padding_length,), self.pad_token_id)
-                padded_ids.append(torch.cat((padding, torch.tensor(ids)), dim=0))
+                padded_ids.append(torch.cat((padding, torch.tensor(ids, dtype = torch.long)), dim=0))
                 offsets.append(-padding_length)
 
             stacked_ids = torch.stack(padded_ids, dim=0)

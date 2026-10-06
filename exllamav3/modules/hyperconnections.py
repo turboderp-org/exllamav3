@@ -187,7 +187,7 @@ class HyperConnection(Module):
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
-            ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H))
+            ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
             return x
         return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
 
@@ -234,8 +234,8 @@ class GatedResidual(Module):
     standalone module whose forward() collapses the stack.
 
     Three compute paths: small R (decode) runs the fused ext.gr_mix pair (per-stream partial
-    dots on the raw streams + a finalize that derives the low-rank gate inline); large R
-    (prefill) runs the tiled ext.gr_mix_tiled kernels (hc_mix_tiled.cu: int8 tensor-core
+    dots on the unnormalized streams + a finalize that derives the low-rank gate inline); large
+    R (prefill) runs the tiled ext.gr_mix_tiled kernels (hc_mix_tiled.cu: int8 tensor-core
     tiles over the row stack with exact integer accumulation and a fixed fp32 combination, so
     replicated TP ranks of any sm_80+ architecture produce identical streams and any
     replicated decision downstream agrees — the tiled int8 kernels need cp.async and
@@ -245,6 +245,15 @@ class GatedResidual(Module):
     a few elementwise ops. apply_() is ext.hc_apply without a comb (x[h] += post[h] * y),
     shared with mHC. _mix_ref() keeps the fp32 torch reference the parity tests compare
     against.
+
+    One resident table set serves both kernel paths: the fp16 projection (proj_h, unfolded) and
+    the repacked up table. The tiled path derives its int8 hi/lo tables from them per call (a
+    deterministic per-row split, so the tables are the same bytes every call), and the decode
+    kernel takes the norm weight on the stream side instead of folded into the table: apply_()
+    of the preceding site writes the next site's weighted stream copy while the updated streams
+    are in its registers (link_sites wires the successors), handed over through params; a mix
+    that finds no copy for itself (first site after the stream expansion, a PLE layer or device
+    boundary in between, MTP drafts) lets the kernel apply the weight in its inner loop.
 
     Tensors: {key}.hc_norm.weight, {key}.input_mix_weight_down.weight,
     {key}.input_mix_weight_up.weight and, for the site form, {key}.block_inject_weight.weight.
@@ -275,16 +284,12 @@ class GatedResidual(Module):
         self.up_h = None            # (hc_mult * hidden, rank) half, checkpoint orientation
         self.upx_h = None           # (hc_mult, hidden / 4, rank, 4) half (fused-kernel layout)
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
-        self.proj_h = None          # cat(down, inject) half, unfolded, zero-padded to a multiple
-                                    # of 64 rows for the tiled path (GEMM paths use [:proj_m])
+        self.proj_h = None          # cat(down, inject) half, zero-padded to a multiple of 64
+                                    # rows for the tiled path (other paths use [:proj_m])
         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
-        self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
-        self.proj_i8 = None         # (2, Mpad, hc_mult * hidden) int8 hi/lo slices (tiled path)
-        self.proj_sb = None         # (Mpad) fp32 row scales
-        self.up_i8 = None           # (2, hc_mult * hidden, rank) int8
-        self.up_sb = None           # (hc_mult * hidden) fp32
+        self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
 
     @override
     def load(self, device: torch.device, keep_source_weights: bool = False, **kwargs):
@@ -303,12 +308,9 @@ class GatedResidual(Module):
         self._prepare(down, up, inject, keep_source_weights)
 
     def _prepare(self, down, up, inject, keep_source_weights: bool = False):
-        # Derived buffers are deduplicated (down/inject live as views of proj_h; up is kept in
-        # its checkpoint orientation and the GEMM path transposes by view), and the fp32 folding
-        # intermediates go through a REUSED scratch: load interleaves these preparations with
-        # the persistent weight allocations, and per-site transient churn splinters the
-        # allocator's segments (measured ~15 GB reserved-not-allocated on the full model)
-        from ..util.tensor import g_tensor_cache
+        # Derived buffers are deduplicated: down/inject live as views of proj_h, up is kept in
+        # its checkpoint orientation (the GEMM path transposes by view) only while the sources
+        # are wanted, and the fused decode kernel reads the repacked copy
         dev = down.device
         H, Dh = self.hc_mult, self.hidden_size
         self.norm_w = (self.norm_w_raw.float() + 1.0).view(H, Dh).contiguous()
@@ -336,33 +338,20 @@ class GatedResidual(Module):
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
             and Mpad <= 512 and not torch.version.hip and dev.type == "cuda" \
             and torch.cuda.get_device_capability(dev)[0] >= 8
-        tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
-            .view(M, H * Dh)
-        tmp.copy_(self.proj_h[: M])
-        tmp *= self.w_h.float()
-        self.fn_h = tmp.half().contiguous()
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
-        if self.tiled:
-            self.proj_i8 = torch.empty((2, Mpad, H * Dh), dtype = torch.int8, device = dev)
-            self.proj_sb = torch.empty((Mpad,), dtype = torch.float, device = dev)
-            ext.det_quant_weight(self.proj_h, self.proj_i8, self.proj_sb)
-            self.up_i8 = torch.empty((2, H * Dh, self.rank), dtype = torch.int8, device = dev)
-            self.up_sb = torch.empty((H * Dh,), dtype = torch.float, device = dev)
-            ext.det_quant_weight(self.up_h, self.up_i8, self.up_sb)
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
         if self.tiled and not keep_source_weights:
-            # Every inference consumer now reads the int8 tables (tiled path) or the folded and
-            # repacked copies (fused decode path): release the fp16 sources
-            self.proj_h = self.down_h = self.inject_h = self.up_h = None
+            # Every inference consumer reads proj_h directly or the repacked up (the tiled path
+            # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
+            self.up_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
-        self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
-        self.proj_i8 = self.proj_sb = self.up_i8 = self.up_sb = None
+        self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
 
     @override
     def get_tensors(self):
@@ -386,7 +375,7 @@ class GatedResidual(Module):
         return []
 
     def _require_source_weights(self, what):
-        assert self.down_h is not None, \
+        assert self.up_h is not None, \
             f"GatedResidual {self.key}: {what} needs the fp16 source weights, released after load " \
             f"(load with keep_source_weights = True, as conversion does)"
 
@@ -404,7 +393,64 @@ class GatedResidual(Module):
             if self.use_combine else None
         return post, mixed
 
-    def _mix(self, streams: torch.Tensor, cached: bool = True):
+    @staticmethod
+    def link_sites(modules: list):
+        """Wire each site's successor for the weighted-copy handoff (apply_ -> next mix), from
+        the model's module list in forward order: the two sites of a block, the mlp site to the
+        next block's attn site, the last to the final mixer. Any other module between two sites
+        (PLE layers add into the streams in place) breaks the chain, so that site's successor
+        falls back to the in-kernel weighting."""
+        prev = None
+        for m in modules:
+            attn_hc, mlp_hc = getattr(m, "attn_hc", None), getattr(m, "mlp_hc", None)
+            if isinstance(m, GatedResidual):
+                sites = [m]
+            elif isinstance(attn_hc, GatedResidual) or isinstance(mlp_hc, GatedResidual):
+                sites = [hc for hc in (attn_hc, mlp_hc) if isinstance(hc, GatedResidual)]
+            else:
+                if prev is not None:
+                    prev.next_site = None
+                prev = None
+                continue
+            for site in sites:
+                if prev is not None:
+                    prev.next_site = site
+                prev = site
+        if prev is not None:
+            prev.next_site = None
+
+    def _weighted_copy(self, s3: torch.Tensor, params: dict | None):
+        """The weighted stream copy the previous site's apply_ left for this mix, or None. The
+        entry is consumed either way (a mix without its copy would otherwise leave a stale one
+        behind) and only honored for the same stream tensor on the same device."""
+        if params is None:
+            return None
+        ent = params.pop("gr_weighted", None)
+        if ent is None or ent[0] is not self or ent[1] != s3.data_ptr():
+            return None
+        xw = ent[2]
+        if xw.device != s3.device or xw.shape != s3.shape:
+            return None
+        return xw
+
+    def _tiled_tables(self, ws):
+        """Per-call int8 hi/lo tables (+ per-row fp32 scales) for the tiled kernel, derived from
+        the resident fp16 tables: det_quant_weight is a deterministic per-row split, so the
+        bytes match a stored copy. up goes back to its checkpoint orientation first."""
+        H, Dh = self.hc_mult, self.hidden_size
+        Mpad = self.proj_h.shape[0]
+        proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
+        proj_sb = ws((Mpad,), torch.float)
+        ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
+        up = ws((H * Dh, self.rank), torch.half).view(H, Dh // 4, 4, self.rank)
+        up.copy_(self.upx_h.permute(0, 1, 3, 2))
+        up = up.view(H * Dh, self.rank)
+        up_i8 = ws((2, H * Dh, self.rank), torch.int8)
+        up_sb = ws((H * Dh,), torch.float)
+        ext.det_quant_weight(up, up_i8, up_sb)
+        return proj_i8, proj_sb, up_i8, up_sb
+
+    def _mix(self, streams: torch.Tensor, cached: bool = True, params: dict | None = None):
         """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half).
         cached: small-R outputs may come from the per-device static workspaces (see below);
         callers that hold the result across another mix on the device pass False."""
@@ -416,23 +462,24 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
+        xw = self._weighted_copy(s3, params)
 
         if R <= self.FUSED_MAX_R:
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
             # workspaces from the per-device static cache, shared by every GatedResidual site
             # on the device: a site's outputs are consumed (block input, apply_) before the
             # next site mixes on the same stream, so one set per device suffices and no
-            # per-site statics are needed. Sized by numel, so a rebuilt fn_h with another rank
+            # per-site statics are needed. Sized by numel, so a rebuilt proj_h with another rank
             # simply lands in a different bucket; nearby R share a backing via slices.
             def ws(numel, dtype, tag):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            M = self.proj_m + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics
@@ -440,13 +487,14 @@ class GatedResidual(Module):
                 numel = math.prod(shape)
                 buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
                 return buf[: numel].view(shape)
-            Mpad = self.proj_i8.shape[1]
+            Mpad = self.proj_h.shape[0]
+            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
             S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
             Rpad = -(-R // 64) * 64
             post = ws((R, H), torch.float) if self.use_combine else None
             mixed = ws((R, Dh), torch.half)
             ext.gr_mix_tiled(
-                s3, self.w_h, self.proj_i8, self.proj_sb, self.up_i8, self.up_sb, self.rms_eps, self.proj_m,
+                s3, self.w_h, proj_i8, proj_sb, up_i8, up_sb, self.rms_eps, self.proj_m,
                 ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
                 ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
             )
@@ -469,7 +517,7 @@ class GatedResidual(Module):
     def mix(self, streams: torch.Tensor, params: dict):
         """(b, s, H, D) fp32 -> (inject gates (b, s, H) fp32, None, collapsed (b, s, D) half)."""
         b, s = streams.shape[:2]
-        post, mixed = self._mix(streams)
+        post, mixed = self._mix(streams, params = params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
 
     def apply_(
@@ -486,15 +534,28 @@ class GatedResidual(Module):
         if "quant_preserve" in params or "capture" in params:
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
         b, s = x.shape[:2]
-        y2 = y.reshape(b * s, self.hidden_size)
+        R = b * s
+        y2 = y.reshape(R, self.hidden_size)
         if y2.dtype not in (torch.half, torch.float):
             y2 = y2.half()
+        x3 = x.view(R, self.hc_mult, self.hidden_size)
+        # Decode-class rows: also emit the successor's weighted stream copy for its fused mix
+        # (the prefill path applies the weight itself). Same static bucket for every site on
+        # the device: the copy is consumed by the very next mix on the stream.
+        nxt = self.next_site
+        xw = None
+        if nxt is not None and R <= self.FUSED_MAX_R and nxt.w_h is not None and nxt.w_h.device == x.device:
+            xw = g_tensor_cache.get_bucketed(x.device, x3.numel(), torch.float, "gr_apply_xw").view(x3.shape)
         ext.hc_apply(
-            x.view(b * s, self.hc_mult, self.hidden_size),
+            x3,
             y2.contiguous(),
-            post.reshape(b * s, self.hc_mult).contiguous(),
+            post.reshape(R, self.hc_mult).contiguous(),
             None,
+            nxt.w_h if xw is not None else None,
+            xw,
         )
+        if xw is not None:
+            params["gr_weighted"] = (nxt, x3.data_ptr(), xw)
         return x
 
     @override
@@ -510,7 +571,7 @@ class GatedResidual(Module):
             states.append(x.flatten(-2).half())
         b, s = x.shape[:2]
         # Conversion passes hold this output while other modules run; give them fresh tensors
-        _, mixed = self._mix(x, cached = "capture" not in params and "quant_preserve" not in params)
+        _, mixed = self._mix(x, cached = "capture" not in params and "quant_preserve" not in params, params = params)
         mixed = mixed.view(b, s, self.hidden_size)
         dt = out_dtype or self.out_dtype
         return mixed if dt is None else mixed.to(dt)

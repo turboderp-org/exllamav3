@@ -23,6 +23,8 @@ does.
 
 - **-ngb / --ngram_bits *int***: Bits per weight for hashed n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next). Must be an integer from 1 to 8, default is `--bits` rounded to the nearest integer. The table is quantized (without calibration) before the layer-by-layer conversion and written as a standalone `ngram_embedding.safetensors` in the output directory; calibration forwards then run against the quantized table. Table quantization is resumable together with the rest of the job.
 
+- **-eb / --embed_bits *int***: Bits per weight for the token embedding table. Must be an integer from 1 to 8, or 16 (the default) to store the table unquantized. Each embedding is split into 256-wide groups that are rotated and trellis-coded without calibration, and the following layers are calibrated against the quantized table. A quantized table is decoded on the GPU at inference, and can be held in system RAM or streamed from disk (`--embed_disk` in `model_init`-based scripts). The table of an existing EXL3 model can be quantized with `util/recompile.py --embed_bits`.
+
 - **-ngf / --ngram_file *file***: Pre-quantized n-gram table (from `util/convert_ngram.py`) to copy into the output model instead of quantizing the table as part of the job. Overrides `--ngram_bits`.
 
 - **-hq / --hq**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. 
@@ -33,7 +35,13 @@ does.
 
 #### Advanced (generally disregard these options)
 
-- **--out_scales *str***: Force enable or disable output channel scales. Options are "always" (default), "never" and "auto". Mostly for debug purposes. 
+- **--out_scales *str***: Output channel scales. Options are "auto" (default), "always", "never" and "yaqa". In auto mode every tensor gets output scales, except gate and up projections of gated MLPs (including MoE experts) where calibration statistics show that the channels the MLP's output is most sensitive to are also the ones with the largest weights. Scaling would concentrate the quantization error in exactly those channels. In yaqa mode the scales of each tensor follow how much the model's output depends on each of its output channels, taken from the diagonal of the tensor's output-side Hessian in `--hessians`, so the quantization error lands in the channels where it costs the least. Tensors without a Hessian file are treated as in auto mode. See `science/yaqa.md`.
+
+- **-hess / --hessians *directory***: Precomputed per-tensor Hessians from `util/yaqa_hessians.py`, one file per tensor. Files with an output-side factor (`hout`) switch the rounding of that tensor to two-sided LDLQ, files with an input-side factor (`hin`) replace the calibration passes, and `hout` or its diagonal (`hout_diag`) feeds `--out_scales yaqa`. An export made with `--diag` holds the diagonal only, which is enough for the output scales and leaves the rounding alone.
+
+- **-h1 / --hessians_one_sided**: Keep the regular one-sided LDLQ for tensors that have `hout`, so that `--hessians` only serves `--out_scales yaqa`.
+
+- **-hreg / --hessians_reg *float***: Diagonal regularization of the output-side Hessian in two-sided LDLQ, relative to its mean diagonal. Larger values blend toward one-sided LDLQ. Default is 0.025.
 
 - **-cb / --codebook *str***: Trellis codebook: "mul1" (default), "mcg" or "3inst". The mul1 codebook is required by some optimized inference paths (int8 GEMV, CPU expert offload); there is no reason to pick another codebook except for testing.
 

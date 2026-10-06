@@ -86,6 +86,19 @@ def unset_memory_fraction(active_devices: list[int]):
         torch.cuda.set_per_process_memory_fraction(1.0, device = i)
 
 
+# Automatic garbage collection paused for a block. Loading a module creates several Python objects
+# per weight tensor (records, jobs, views) and each automatic pass walks everything already alive,
+# so over a bulk load the passes add up; none of these objects form cycles that need collecting
+class gc_paused:
+    def __enter__(self):
+        self.was_enabled = gc.isenabled()
+        gc.disable()
+    def __exit__(self, *exc):
+        if self.was_enabled:
+            gc.enable()
+        return False
+
+
 # Free unused VRAM
 def free_mem():
     gc.collect()
@@ -593,7 +606,15 @@ def host_memory_available() -> int | None:
         import psutil
         return int(psutil.virtual_memory().available)
     except Exception:
-        return None
+        pass
+    # Windows without psutil: the available physical RAM psutil itself reports there
+    import os
+    if os.name == "nt":
+        try:
+            return int(windows_memory_status()[0])
+        except Exception:
+            pass
+    return None
 
 
 def check_host_memory(nbytes: int, what: str):

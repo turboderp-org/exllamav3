@@ -63,6 +63,24 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
     exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
 };
 
+// Uniform half-integer rates K + 0.5 (mul1 codebook only): [K - 1][N_off] and the wide row tiles [K - 1]
+fp_exl3_moe_kernel exl3_moe_kernel_instances_h[] =
+{
+    exl3_moe_kernel_h1_n128_cb2(), exl3_moe_kernel_h1_n256_cb2(),
+    exl3_moe_kernel_h2_n128_cb2(), exl3_moe_kernel_h2_n256_cb2(),
+    exl3_moe_kernel_h3_n128_cb2(), exl3_moe_kernel_h3_n256_cb2()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m32[] =
+{
+    exl3_moe_kernel_h1_n128_cb2_m32(), exl3_moe_kernel_h2_n128_cb2_m32(), exl3_moe_kernel_h3_n128_cb2_m32()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m64[] =
+{
+    exl3_moe_kernel_h1_n128_cb2_m64(), exl3_moe_kernel_h2_n128_cb2_m64(), exl3_moe_kernel_h3_n128_cb2_m64()
+};
+
 /*
 Fused mixture-of-experts MLP operation for EXL3 weights
 
@@ -241,13 +259,18 @@ void exl3_moe
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
-    // Bitrates: compile-time instances for uniform integer K, the runtime-switch instance (K = 0) otherwise; the
-    // kernel receives the rates in half-bit units (see bits_k.cuh)
+    // Bitrates: compile-time instances for a uniform K (integer, or half-integer K + 0.5), the runtime-switch
+    // instance (K = 0) for mixed rates; the kernel receives the rates in half-bit units (see bits_k.cuh)
     const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
     TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
                 "exl3_moe: half-integer bitrates require the mul1 codebook");
     int K = 0;
-    if (K2_gate == K2_up && K2_up == K2_down && K2_gate % 2 == 0) K = K2_gate / 2;
+    bool half_k = false;
+    if (K2_gate == K2_up && K2_up == K2_down)
+    {
+        K = K2_gate / 2;
+        half_k = (K2_gate % 2) != 0;
+    }
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -290,7 +313,8 @@ void exl3_moe
     fp_exl3_moe_kernel kernel;
     if (m_tile <= 16)
     {
-        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+        kernel = half_k ? exl3_moe_kernel_instances_h[2 * (K - 1) + N_off]
+                        : exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
     }
     else
     {
@@ -300,7 +324,10 @@ void exl3_moe
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
-        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+        if (half_k)
+            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
+        else
+            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
     }
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
@@ -483,13 +510,13 @@ void exl3_moe_gather
                 slot_base.is_contiguous() && slot_kind.is_contiguous() && weight_sorted.is_contiguous(),
                 "exl3_moe_gather: index tensors must be contiguous");
     int tokens = output_state.size(0);
+    if (!tokens) return;
     int hidden_dim = output_state.size(1);
     int num_assign = flat_expert.size(0);
     TORCH_CHECK(num_assign % tokens == 0, "exl3_moe_gather: assignments / tokens");
     int topk = num_assign / tokens;
     int num_experts = slot_kind.size(0);
     TORCH_CHECK(slot_base.size(0) >= num_experts && expert_start.size(0) >= num_experts, "exl3_moe_gather: table sizes");
-    if (!tokens) return;
     TORCH_CHECK(topk <= MOE_GATHER_MAX_TOPK, "exl3_moe_gather: top-k too large");
     int threads = MAX(MIN(hidden_dim, 1024), 32);
     exl3_moe_gather_kernel<<<tokens, threads, 0, stream>>>

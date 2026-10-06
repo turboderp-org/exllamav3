@@ -11,6 +11,7 @@ from ..util.memory import (
     unset_memory_fraction,
     free_mem,
     device_mem_info,
+    gc_paused,
 )
 from ..util.progress import ProgressBar
 from ..util.tensor import g_tensor_cache
@@ -41,13 +42,14 @@ class Model_LSMixin(ABC):
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
                 defer = module.can_defer_load()
-                if defer:
-                    # Pinned modules leave the arena alone: their slab slices would keep whole
-                    # blocks resident after the weights move to host memory
-                    config.stc.begin_deferred_load(arena = not pin)
-                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
-                if defer:
-                    config.stc.end_deferred_load()
+                with gc_paused():
+                    if defer:
+                        # Pinned modules leave the arena alone: their slab slices would keep whole
+                        # blocks resident after the weights move to host memory
+                        config.stc.begin_deferred_load(arena = not pin)
+                    module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+                    if defer:
+                        config.stc.end_deferred_load()
                 if pin:
                     # After the deferred fills have landed: linear weights move to pinned host
                     # memory (zero-copy aliases), everything else stays put
@@ -178,12 +180,13 @@ class Model_LSMixin(ABC):
                         defer = module.can_defer_load()
                         pin = config.infer_params.vision_pinned and \
                             getattr(self, "component", "text") == "vision"
-                        if defer:
-                            # Pinned modules leave the arena alone (see _load_single)
-                            config.stc.begin_deferred_load(arena = not pin)
-                        module.load(load_device, max_chunk_size = max_chunk_size)
-                        if defer:
-                            config.stc.end_deferred_load()
+                        with gc_paused():
+                            if defer:
+                                # Pinned modules leave the arena alone (see _load_single)
+                                config.stc.begin_deferred_load(arena = not pin)
+                            module.load(load_device, max_chunk_size = max_chunk_size)
+                            if defer:
+                                config.stc.end_deferred_load()
                         if pin:
                             # Before the measuring forward, so the VRAM accounting reflects the
                             # pinned (host-resident) weights

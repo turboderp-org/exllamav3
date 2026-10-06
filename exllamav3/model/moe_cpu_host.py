@@ -96,6 +96,11 @@ class MoeCpuTuning:
         # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
         # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
+        # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
+        # into loader tensors and then copied into the arena, so this bounds the transient host
+        # memory on top of the arena to a slice of a layer instead of the whole layer (~1.2 GiB
+        # per layer on a 512-expert model). 0 loads the whole layer in one pass
+        self.load_batch_experts = int(os.environ.get("EXL3_MOE_CPU_LOAD_BATCH", 32))
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
@@ -326,6 +331,7 @@ class _HugeArena:
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
     WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
+    CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
     def __init__(self, shared = False, huge = "", conn = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
@@ -338,6 +344,13 @@ class _HugeArena:
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        # A private anonymous chunk (Linux, not shared) only takes RAM for the pages rehome()
+        # writes, and the last chunk of a load is usually mostly unused, so the host-memory
+        # guard runs on bytes written (in CHECK_STEP slices) rather than on whole chunks.
+        # Shared, hugetlb and Windows chunks are committed up front and keep the per-chunk check
+        self.lazy = not shared and os.name != "nt"
+        self.written = 0
+        self.checked = 0
         self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
         # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
         # attempt: the size the last chunk was served at, or below the smallest size that failed
@@ -346,8 +359,9 @@ class _HugeArena:
     def _new_chunk(self, min_bytes):
         import mmap, os
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
-        check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
-                                f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
+        if not self.lazy:
+            check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
+                                    f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
         if self.shared and os.name == "nt":
             # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
             # trips on the layer tensors' exports at worker exit). It charges commit and gets
@@ -497,6 +511,12 @@ class _HugeArena:
             return tensor
         nbytes = tensor.numel() * tensor.element_size()
         aligned = (nbytes + 63) & ~63
+        if self.lazy:
+            if self.written + aligned > self.checked:
+                step = max(aligned, self.CHECK_STEP)
+                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                self.checked = self.written + step
+            self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
             self._new_chunk(aligned)
         off = self.cur_off
@@ -600,14 +620,23 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             msg = conn.recv()
             if msg[0] == "layer":
                 spec = msg[1]
-                stc.begin_deferred_load()
-                g = fetch(spec["gate_keys"])
-                u = fetch(spec["up_keys"])
-                d = fetch(spec["down_keys"])
-                stc.end_deferred_load()
-                # Copy into the hugepage-backed arena now that the deferred reads have actually
-                # populated these tensors
-                g, u, d, blocks = rehome_experts(g, u, d)
+                num_experts = len(spec["up_keys"])
+                batch = TUNING.load_batch_experts or num_experts
+                g, u, d, blocks = [], [], [], []
+                for e0 in range(0, num_experts, batch):
+                    sl = slice(e0, e0 + batch)
+                    stc.begin_deferred_load()
+                    bg = fetch(spec["gate_keys"][sl])
+                    bu = fetch(spec["up_keys"][sl])
+                    bd = fetch(spec["down_keys"][sl])
+                    stc.end_deferred_load()
+                    # Copy into the hugepage-backed arena now that the deferred reads have
+                    # actually populated these tensors; the loader tensors die with this batch
+                    bg, bu, bd, bb = rehome_experts(bg, bu, bd)
+                    g += bg
+                    u += bu
+                    d += bd
+                    blocks += bb
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -848,7 +877,7 @@ class MoeCpuHost:
                   flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None):
+                       proj_dims = None, aux = None, interm_fp32 = False):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -869,13 +898,14 @@ class MoeCpuHost:
             hi = hi, ho = ho, topk = topk,
             num_experts = len(up_keys),
             proj_dims = proj_dims,
+            interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
         )
         if proj_dims is not None:
             # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
             # stage function
             def tb(d):
                 k, n, K = d
-                return (k // 16) * (n // 16) * 16 * K * 2
+                return (k // 16) * (n // 16) * int(16 * K) * 2
             gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
             ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
             spec["proj_bytes"] = (gb, ub, db)
@@ -1384,14 +1414,17 @@ class MoeCpuHost:
         self.sstate[key] = st
         return st
 
-    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch):
-        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias)"""
+    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
+        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). out_dtype
+        follows the resident experts (fp32 for the down projection, the model's interm_dtype
+        for gate/up): on models with massive activations the output-side Hadamard concentrates
+        a 128-block past the fp16 range, and an in-place fp16 transform overflows to inf"""
         k, n, K = dims
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh, None, 1.0)
         w = w_scratch[:k * n].view(k, n)
         ext.reconstruct(w, trellis_view, K, False, True)
-        y = torch.empty((x.shape[0], n), dtype = torch.half, device = x.device)
+        y = torch.empty((x.shape[0], n), dtype = out_dtype, device = x.device)
         ext.hgemm(xh, w, y)
         ext.had_r_128(y, y, None, svh, 1.0)
         if bias is not None:
@@ -1782,24 +1815,28 @@ class MoeCpuHost:
                 we = wseg.float().unsqueeze(1)
                 def tview(off_b, dims):
                     k, n, K = dims
-                    numel = (k // 16) * (n // 16) * 16 * K
+                    numel = (k // 16) * (n // 16) * int(16 * K)
                     return vslot[boff + off_b // 2 : boff + off_b // 2 + numel] \
-                        .view(k // 16, n // 16, 16 * K)
+                        .view(k // 16, n // 16, int(16 * K))
+                # Same output dtypes as the resident experts: the intermediate as the model's
+                # interm_dtype, the down projection fp32 (the activation casts to half for the
+                # down GEMM either way)
+                idt = torch.float if spec.get("interm_fp32") else torch.half
                 if gated:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
-                                         st["w_scratch"])
+                                         st["w_scratch"], out_dtype = idt)
                 uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
-                                     st["w_scratch"])
+                                     st["w_scratch"], out_dtype = idt)
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
                 dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
-                                     st["w_scratch"])
-                out.index_add_(0, idx, dy[:, :h].float() * we)
+                                     st["w_scratch"], out_dtype = torch.float)
+                out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
         # Collect the CPU tail (by now usually complete) and merge

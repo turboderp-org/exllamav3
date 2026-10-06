@@ -69,7 +69,10 @@ tensor-parallel ranks compute identical streams (a prerequisite for replicating 
 MoE routing across ranks instead of broadcasting them). Precision matches the fp16 path and it is
 faster than the cuBLAS path it replaces. Set to `0` to fall back to the cuBLAS GEMM path
 (device-dependent kernel choice, not rank-consistent). Decode-sized mixes use the fused `gr_mix`
-kernel either way. The same int8 scheme covers the MoE router projection for batched rows
+kernel either way. Both kernels read the one resident fp16 table set; the tiled path derives its
+int8 operands from it per call (a deterministic per-row split, so the same bytes every call),
+and the decode kernel takes the norm weight on the stream side, written by the preceding site's
+residual update. The same int8 scheme covers the MoE router projection for batched rows
 (`routing_gemm.cu`), which has no switch.
 
 ### `EXL3_BC_GDN` (default: `1`)
@@ -372,6 +375,19 @@ Read once per process (parent and worker independently), so it must be set befor
 started. Note that capping below `bw` also disables the swizzled weight layout (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
+### `EXL3_MOE_CPU_WIDE` (default: `1`)
+
+The CPU expert kernels take int8 activations, scaled per row to the row's largest element. A row
+that is a few large elements over many small ones loses the small ones at that scale. Models
+whose early layers feed every expert a large component shared by all tokens, confined to a few
+dimensions, produce such rows: what distinguishes one token from the next is in the small
+elements, and the experts' gates, held deep in saturation by the shared component, turn the
+rounding error of their pre-activation into its exponential. A row of which more than one
+activation in sixteen would round to zero is therefore carried as two int8 rows, the high and
+low part of a 15-bit value, at the cost of a second row in the GEMVs that read it. Rows that
+int8 holds well are computed exactly as before. `0` keeps plain int8 rows throughout, for
+testing. Read once per process (parent and worker independently).
+
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
 Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
@@ -524,11 +540,24 @@ when it is created, or the load fails naming the chunk.
 
 Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
 held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
-psutil where that is unavailable) must cover the allocation plus this reserve, or the load
-fails with a message naming the allocation. Linux has no allocation-time failure for anonymous
-or shmem memory: an oversized arena only fails once the machine has swapped itself into a
-minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
-all. `0` disables the check.
+psutil where that is unavailable, or the available physical RAM from `GlobalMemoryStatusEx` on
+Windows without psutil) must cover the allocation plus this reserve, or the load fails with a
+message naming the allocation. Linux has no allocation-time failure for anonymous or shmem
+memory: an oversized arena only fails once the machine has swapped itself into a minutes-long
+stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at all.
+`0` disables the check. Plain (unpinned) arena chunks on Linux are private anonymous mappings
+that only take RAM for the pages actually written, so for those the guard runs on the bytes
+written, in 256 MiB steps, rather than on each whole 1 GiB chunk: a model whose experts fit no
+longer fails on its last, mostly empty chunk. Pinned (shared memfd, hugetlb) and Windows chunks
+are committed up front and keep the per-chunk check.
+
+### `EXL3_MOE_CPU_LOAD_BATCH` (default: `32`)
+
+Experts the CPU MoE worker reads per deferred-load pass while loading a layer. Each pass goes
+through loader tensors that are then copied into the arena, so this bounds the transient host
+memory on top of the arena to a slice of a layer instead of a whole layer (which is over a GiB
+on 512-expert models). The arena layout and contents do not depend on it. `0` reads the whole
+layer in one pass.
 
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
@@ -666,6 +695,15 @@ is tens of GB, and streaming costs little on SSD-class storage (decode is latenc
 only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
+
+### `EXL3_EMBED_STREAM` (default: `0`)
+
+Default for `Config.infer_params.embed_stream_from_disk`: stream the token embedding table from
+disk, gathering only the rows each forward pass touches, instead of holding the table in system
+RAM. Applies to quantized and unquantized tables alike. The generator announces each sampled
+token as soon as it is known, so the row is read while the host finishes the step (Linux; on
+Windows the row is read when the next forward pass asks for it). Also settable per load via
+`config.infer_params.embed_stream_from_disk` or `--embed_disk` in `model_init`-based scripts.
 
 ### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
 
@@ -842,12 +880,17 @@ this way. Not used for ROCm builds.
 ### `CUDAHOSTCXX` (default: unset)
 
 Host compiler passed to nvcc (`-ccbin`), for systems whose default compiler is too new for the
-installed CUDA toolkit.
+installed CUDA toolkit. On Windows, only `setup.py` builds use it; the JIT build prints a notice
+and leaves nvcc on the same `cl.exe` as the C++ sources: that of the active MSVC developer
+environment, or else the default toolset of the newest Visual Studio install, which torch sets up
+with `vcvarsall.bat`. To use another toolset, build from a prompt set up with
+`vcvarsall.bat x64 -vcvars_ver=<version>`.
 
 ### `TORCH_CUDA_ARCH_LIST` (default: auto)
 
 Standard PyTorch variable; overrides the compute architectures the extension is built for. When
-unset, ExLlamaV3 derives the list from the GPUs present in the system.
+unset, ExLlamaV3 derives the list from the GPUs present in the system, so building the extension
+(JIT or setup.py) on a machine with no visible GPU requires it.
 
 ## `EXL3_DSA_DEBUG_BOUNDS`
 

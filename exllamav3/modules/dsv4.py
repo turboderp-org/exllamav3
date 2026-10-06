@@ -422,6 +422,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -583,6 +585,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -657,6 +661,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
         self._bc_dsa_batch = {}
@@ -963,8 +969,6 @@ class DSV4Attention(Module):
         self._fan_scratch = {}
 
         from .multilinear import MultiLinear
-        self.qb_multi = self.wob_multi = None
-        self._one_idx = None
         try:
             if self.q_fan is None and self.q_b.quant_type == "exl3":
                 self.qb_multi = MultiLinear(self.device, [self.q_b])
@@ -1533,6 +1537,10 @@ class DSV4Attention(Module):
             q_idx = o2[1].view(1, rows, -1)
         elif self.qb_multi is not None and rows <= 32:
             q = self._mgemm1(self.qb_multi, q_res, torch.half, "dsv4_qb1_ah")
+            # qb_multi stands in when q_b and idx_wq_b can't share a fan, so the indexer query
+            # still needs its own projection
+            if need_q_idx:
+                q_idx = self.idx_wq_b.forward(q_res, params)
         else:
             q = self.q_b.forward(q_res, params)
             if need_q_idx:

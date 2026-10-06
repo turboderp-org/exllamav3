@@ -34,7 +34,8 @@ def generate_single(generator, tokenizer):
         stop_conditions = get_stop_conditions(prompt_format, tokenizer),
         max_new_tokens = 500,
         completion_only = True,
-        add_bos = True
+        encode_special_tokens = True,
+        # add_bos = True,
     )
     print("Response: " + response)
     print()

@@ -5209,6 +5209,53 @@ change to the offline preference trainer.
 
 ---
 
+### Session 56 — Upstream sync v1.5.4 (PR #166); upstream's Transformers "backprop" assessed, nothing to adopt
+
+> Written 2026-10-05 on branch `sync/upstream-v1.5.4`: 86 upstream commits
+> (v1.5.3 → v1.5.4, merge commit as usual). CPU-tested (realtime / preference /
+> chat_turns / chat_jinja / qlora_grad / fused_ce: 83 pass in a scratch CPU-torch
+> venv); **not box-verified** — smoke list below.
+
+**Merge:** two conflicts. `exllamav3/modules/block_sparse_mlp.py` — upstream
+added `capture_out_sensitivity` to the `.mlp` import line that sits next to our
+`has_runtime_lora` guard import; both kept. `exllamav3/integration/transformers.py`
+— upstream rewrote the module for Transformers 5 (`register()` through
+Transformers' own registration API, a v5 experts container, the backprop below);
+taken whole. Our two local edits there are gone: the frozen `nn.Parameter`
+stand-in for `.weight` (PR #33 workaround for `get_parameter()` walking tied
+keys during load finalization — upstream now drops the stale tied-weight keys of
+replaced modules at the root, and `finalize()` reassigns `.weight` as a bare
+tensor, which would have raised against a registered Parameter anyway) and the
+`is_trainable` comment (upstream returns True itself). Nothing in `training/`,
+`exllamav3/training/` or `tests/` imports the integration; the native path is
+untouched by it. README parity note bumped in both places.
+
+**Upstream "backprop" (3ff6eac6) vs ours:** it is `Exl3LinearFunction` in the
+Transformers integration — forward through the EXL3 kernel, backward
+`grad_out @ W_deq.T` with `W_deq` rebuilt by `get_weight_tensor()` on every
+call (or held as a full fp16 copy per layer via `cache_dequantized`), no weight
+grads. That is `EXL3LoRAFunction` minus the adapter grads, and its backward pays
+the four full-weight transform passes + cast that the Session 30 A1 fast path
+(`EXL3LoRAHadFunction`, activation-side `suh`/`H`/`svh`) removed. Nothing to
+adopt. The one difference worth noting: upstream's *forward* runs the fused
+kernel instead of materializing W, where our fast path reconstructs the inner
+weight for a plain matmul (`frozen_trellis_parts`). A kernel forward would save
+one inner reconstruction per linear per step on the forward side only (the
+backward still needs W^T, which the kernel can't supply), at the cost of the
+inference kernel's fp16-only output and losing the LoRA/PiSSA fusion in one
+Function — not pursued.
+
+**Box list:** (1) `qlora_validate_native.py` on a small dense quant — upstream
+reworked the loader (batch-created deferred jobs, GC paused during `load_gen`,
+embedding weight passed into the `Embedding` constructor) and the Gated
+DeltaNet / sliding-attn modules auto-merged; (2) a short `qlora_train_native.py`
+run on a MoE quant for the `block_sparse_mlp` merge (new `capture_out_sensitivity`
+import + CPU-offload `interm_dtype` fix); (3) optional, only if anyone uses the
+HF path: `examples/transformers_integration.py` under transformers >= 5 to confirm
+the dropped Parameter workaround isn't needed there anymore.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

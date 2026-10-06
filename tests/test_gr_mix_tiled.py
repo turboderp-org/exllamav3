@@ -141,13 +141,117 @@ class TestGrMixTiled(unittest.TestCase):
         m2.norm_w_raw = torch.randn(4 * 256, device = DEVICE) * 0.1
         m2._prepare(torch.randn(64, 1024, device = DEVICE), torch.randn(1024, 64, device = DEVICE), torch.randn(4, 1024, device = DEVICE))
         self.assertTrue(m2.tiled)
-        self.assertIsNone(m2.down_h); self.assertIsNone(m2.proj_h); self.assertIsNone(m2.up_h)
-        self.assertIsNotNone(m2.proj_i8); self.assertIsNotNone(m2.fn_h)
+        # One table set serves both kernel paths: the fp16 projection stays (the decode kernel
+        # reads it and the tiled path derives its int8 tables per call), the checkpoint-layout
+        # up goes (the repacked copy remains)
+        self.assertIsNone(m2.up_h)
+        self.assertIsNotNone(m2.proj_h); self.assertIsNotNone(m2.upx_h)
+        self.assertFalse(any(k for k in vars(m2) if k in ("fn_h", "proj_i8", "up_i8")))
         x = torch.randn(1, 100, 4, 256, device = DEVICE)
         m2._mix(x)                                   # tiled path still works
         m2._mix(x[:, :8])                            # fused decode path too
         with self.assertRaises(AssertionError):
             m2.get_tensors()
+        with self.assertRaises(AssertionError):
+            m2._mix_ref(x)
+
+    def test_tiled_tables_match_stored(self):
+        # The per-call int8 derivation reproduces what a load-time copy would hold, bit for bit
+        m = make_site(1024, 320, True)
+        from exllamav3.ext import exllamav3_ext as ext
+        def ws(shape, dtype):
+            return torch.empty(shape, dtype = dtype, device = DEVICE)
+        a = m._tiled_tables(ws)
+        b = m._tiled_tables(ws)
+        Mpad = m.proj_h.shape[0]
+        ref_i8 = torch.empty((2, Mpad, 4 * 1024), dtype = torch.int8, device = DEVICE)
+        ref_sb = torch.empty((Mpad,), dtype = torch.float, device = DEVICE)
+        ext.det_quant_weight(m.proj_h, ref_i8, ref_sb)
+        up_i8 = torch.empty((2, 4 * 1024, 320), dtype = torch.int8, device = DEVICE)
+        up_sb = torch.empty((4 * 1024,), dtype = torch.float, device = DEVICE)
+        ext.det_quant_weight(m.up_h, up_i8, up_sb)
+        for x, y in zip(a, (ref_i8, ref_sb, up_i8, up_sb)):
+            self.assertTrue(torch.equal(x, y))
+        for x, y in zip(a, b):
+            self.assertTrue(torch.equal(x, y))
+
+    def test_weighted_copy_handoff(self):
+        # apply_ of one site emits the next site's weighted stream copy; the next mix must use
+        # it and agree with the in-kernel weighting to fp32 rounding, and both with the reference
+        for D, rank in ((1024, 320), (2560, 320)):     # generic and shape-templated dots kernels
+            a, b = make_site(D, rank, True, seed = 1), make_site(D, rank, True, seed = 2)
+            GatedResidual.link_sites([a, b])
+            self.assertIs(a.next_site, b); self.assertIsNone(b.next_site)
+            for R in (1, 3, 8):
+                torch.manual_seed(R)
+                x = torch.randn(1, R, 4, D, device = DEVICE) * 3.0
+                y = torch.randn(1, R, D, device = DEVICE, dtype = torch.half)
+                post = torch.rand(1, R, 4, device = DEVICE) * 2
+                params = {}
+                x_ref = x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
+                a.apply_(x, y, post, None, params)
+                self.assertLess(rel(x, x_ref), 1e-6)            # (the kernel's update contracts to an FMA)
+                ent = params["gr_weighted"]
+                self.assertIs(ent[0], b)
+                self.assertTrue(torch.equal(ent[2], x.view(R, 4, D) * b.w_h.float().view(1, 4, D)))
+                post_h, _, mixed_h = (t.clone() if t is not None else None for t in b.mix(x, params))   # consumes the copy
+                self.assertNotIn("gr_weighted", params)
+                post_k, _, mixed_k = (t.clone() if t is not None else None for t in b.mix(x, {}))       # in-kernel weighting
+                ref_post, ref_mixed = b._mix_ref(x)
+                self.assertLess(rel(mixed_h, ref_mixed.view(R, D)), 3e-3, R)
+                self.assertLess(rel(post_h.view(R, 4), ref_post.view(R, 4)), 1e-3, R)
+                self.assertLess(rel(mixed_h, mixed_k), 1e-3, R)
+                self.assertLess(rel(post_h, post_k), 1e-4, R)
+                # and the kernel really reads the copy: a poisoned one changes the gates
+                a.apply_(x, torch.zeros_like(y), post, None, params)
+                params["gr_weighted"][2].mul_(0.0)
+                post_p, _, _ = b.mix(x, params)
+                self.assertGreater(rel(post_p, post_k), 1e-2, R)
+            # Prefill row counts take the tiled path and emit no copy
+            R = 100
+            x = torch.randn(1, R, 4, D, device = DEVICE); y = torch.randn(1, R, D, device = DEVICE, dtype = torch.half)
+            params = {}
+            a.apply_(x, y, torch.rand(1, R, 4, device = DEVICE), None, params)
+            self.assertNotIn("gr_weighted", params)
+
+    def test_weighted_copy_rejected_when_stale(self):
+        # A copy for another site, another stream tensor or another device is ignored (and
+        # consumed), and the mix falls back to the in-kernel weighting
+        D, rank = 1024, 320
+        a, b = make_site(D, rank, True, seed = 1), make_site(D, rank, True, seed = 2)
+        GatedResidual.link_sites([a, b])
+        R = 4
+        x = torch.randn(1, R, 4, D, device = DEVICE) * 3.0
+        y = torch.randn(1, R, D, device = DEVICE, dtype = torch.half)
+        params = {}
+        a.apply_(x, y, torch.rand(1, R, 4, device = DEVICE), None, params)
+        ref_post, ref_mixed = b._mix_ref(x)
+        # same site, different stream tensor (a moved copy): must not use the entry
+        x2 = x.clone()
+        xw = params["gr_weighted"][2]
+        xw.fill_(0)                                   # a used copy would give garbage
+        post, _, mixed = b.mix(x2, params)
+        self.assertNotIn("gr_weighted", params)
+        self.assertLess(rel(mixed, ref_mixed.view(R, D)), 3e-3)
+        # entry addressed to another site
+        a.apply_(x, y, torch.zeros(1, R, 4, device = DEVICE), None, params)
+        params["gr_weighted"][2].fill_(0)
+        post, _, mixed = a.mix(x, params)
+        self.assertNotIn("gr_weighted", params)
+        self.assertLess(rel(mixed, a._mix_ref(x)[1].view(R, D)), 3e-3)
+
+    def test_link_sites_chain(self):
+        class Block:
+            def __init__(self, attn_hc, mlp_hc):
+                self.attn_hc, self.mlp_hc = attn_hc, mlp_hc
+        class Other:
+            pass
+        s = [make_site(256, 64, True, seed = i) for i in range(6)]
+        mixer = make_site(256, 64, False, seed = 9)
+        GatedResidual.link_sites([Other(), Block(s[0], s[1]), Block(s[2], s[3]), Other(), Block(s[4], s[5]), mixer])
+        self.assertIs(s[0].next_site, s[1]); self.assertIs(s[1].next_site, s[2]); self.assertIs(s[2].next_site, s[3])
+        self.assertIsNone(s[3].next_site)              # the foreign module breaks the chain
+        self.assertIs(s[4].next_site, s[5]); self.assertIs(s[5].next_site, mixer); self.assertIsNone(mixer.next_site)
 
 
 if __name__ == "__main__":

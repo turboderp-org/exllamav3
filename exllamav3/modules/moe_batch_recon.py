@@ -107,6 +107,40 @@ def batch_cap(dims_g, dims_u, dims_d):
     return max(1, min(RECON_BATCH, (RECON_MB << 20) // per))
 
 
+def max_group_rows(dims_u, dims_d):
+    """Row cap for an expert to join the batched tier (see RECON_TILES / RECON_MAX_ROWS)"""
+    if RECON_MAX_ROWS > 0:
+        return RECON_MAX_ROWS
+    if RECON_TILES > 0:
+        n_min = min(dims_u[1], dims_d[1])
+        return max(128, (RECON_TILES * 128 * 128) // n_min)
+    return 1 << 30
+
+
+def worst_case_bytes(dims_g, dims_u, dims_d, interm_fp32: bool, assignments: int,
+                     slot_mode: bool) -> int:
+    """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
+    gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
+    scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
+    measure. Group rows are bounded by the batch cap, the row cap and the padding budget.
+    Depends on the projection shapes only, so the TP allocator can take it before load"""
+    ku, nu = dims_u[0], dims_u[1]
+    kd, nd = dims_d[0], dims_d[1]
+    kg, ng = (dims_g[0], dims_g[1]) if dims_g else (0, 0)
+    cap = batch_cap(dims_g, dims_u, dims_d)
+    cmax = min(max_group_rows(dims_u, dims_d), assignments)
+    rows = min(cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
+    total = 2 * cap * (max(kg * ng, kd * nd) + ku * nu)              # scratch1 + Wu
+    total += rows * ku * 2                                           # gathered input
+    idt = 4 if interm_fp32 else 2
+    total += rows * nu * idt * (2 if dims_g else 1)                  # u (+ g)
+    if interm_fp32:
+        total += rows * nu * 2                                       # fp16 activation
+    if not slot_mode:
+        total += rows * nd * 4                                       # down slab
+    return total
+
+
 class BatchReconLayer:
     """Per-layer constants for the batched path: projection dims, codebook flags, activation,
     and the stacked per-expert sign vectors. Trellis pointer tables are supplied per call (they
@@ -125,13 +159,7 @@ class BatchReconLayer:
         self.act_limit = float(act_limit or 0.0)
         self.device = device
         self.cap = batch_cap(dims_g, dims_u, dims_d)
-        if RECON_MAX_ROWS > 0:
-            self.max_rows = RECON_MAX_ROWS
-        elif RECON_TILES > 0:
-            n_min = min(dims_u[1], dims_d[1])
-            self.max_rows = max(128, (RECON_TILES * 128 * 128) // n_min)
-        else:
-            self.max_rows = 1 << 30
+        self.max_rows = max_group_rows(dims_u, dims_d)
         # Static per-expert trellis pointer tables ([E] int64, device) when the experts are
         # resident: the per-group tables are then a device-side gather by expert id instead of
         # a host-built list. Streamed experts (VRAM slot addresses) pass pointers per call.
@@ -155,24 +183,8 @@ class BatchReconLayer:
                 self.scales[p] = (_stacked(suh), _stacked(svh))
 
     def worst_case_bytes(self, assignments: int, slot_mode: bool) -> int:
-        """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
-        gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
-        scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
-        measure. Group rows are bounded by the batch cap, the row cap and the padding budget"""
-        ku, nu, _ = self.dims_u
-        kd, nd, _ = self.dims_d
-        kg, ng = (self.dims_g[0], self.dims_g[1]) if self.gated else (0, 0)
-        cmax = min(self.max_rows, assignments)
-        rows = min(self.cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
-        total = 2 * self.cap * (max(kg * ng, kd * nd) + ku * nu)        # scratch1 + Wu
-        total += rows * ku * 2                                           # gathered input
-        idt = 4 if self.interm_fp32 else 2
-        total += rows * nu * idt * (2 if self.gated else 1)              # u (+ g)
-        if self.interm_fp32:
-            total += rows * nu * 2                                       # fp16 activation
-        if not slot_mode:
-            total += rows * nd * 4                                       # down slab
-        return total
+        return worst_case_bytes(self.dims_g, self.dims_u, self.dims_d, self.interm_fp32, assignments,
+                                slot_mode)
 
     def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None):
         """x: [B, cmax, k] input slab, W: [B, k, n] -> [B, cmax, n]. Unfolded: the same

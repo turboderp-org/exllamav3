@@ -302,6 +302,7 @@ class Qwen4ExpModel(Model):
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
+        GatedResidual.link_sites(self.modules)
 
         self.calibration_all_experts = True
         self.caps.update({

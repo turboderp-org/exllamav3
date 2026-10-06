@@ -3,7 +3,7 @@ import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
-from ..cache.recurrent import RecurrentCache
+from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -588,6 +588,11 @@ class Generator:
         """
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
+            # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
+            # is actually returned (the next stash reallocates once)
+            host_pool.release()
+            if self.model.loaded_tp:
+                self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -1142,6 +1147,8 @@ class Generator:
                 launched.append((job, token_logits, sampled))
             if launched:
                 torch.cuda.synchronize(batch_logits.device)
+                # The sampled tokens are the next forward's inputs
+                self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
             for job, token_logits, (next_token, next_k_tokens, next_k_probs, next_prob) in launched:
                 eos, sampled_token, rq = job.receive_sample(
@@ -1247,8 +1254,11 @@ class Generator:
                             # Advance filters
                             for f in job.filters:
                                 if not f.is_active: continue
+                                # Both lists take one entry per active filter (prepare_logit_mask indexes them
+                                # in step)
                                 if f.use_background_worker():
                                     job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                                    job.logit_masks.append(None)
                                 else:
                                     job.logit_masks.append(f.get_next_logit_mask())
                                     job.filter_futures.append(None)
@@ -1270,6 +1280,9 @@ class Generator:
                             draft_tokens.shape[-1],
                             accepted_length - 1,
                         ))
+
+                # The last sampled token leads the next forward
+                self.model.prefetch_tokens([sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
                 j += 1
