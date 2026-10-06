@@ -8,6 +8,7 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
+from ..util.device_copy import to_device
 import os
 import math
 
@@ -254,7 +255,9 @@ class HyperConnection(Module):
 
     def _carry(self, streams: torch.Tensor, pre: torch.Tensor, params: dict):
         prev, params["hc_pre"] = params.get("hc_pre"), pre
-        return streams[:, :, 0] if prev is None else torch.matmul(prev.unsqueeze(-2), streams).squeeze(-2)
+        if prev is None:
+            return streams[:, :, 0]
+        return torch.matmul(to_device(prev, streams.device).unsqueeze(-2), streams).squeeze(-2)
 
     def apply_(
         self,
@@ -812,7 +815,7 @@ class HyperHead(Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         hc_flush(params)
         if self.carry_pre:
-            return torch.matmul(params["hc_pre"].unsqueeze(-2), x).squeeze(-2)
+            return torch.matmul(to_device(params["hc_pre"], x.device).unsqueeze(-2), x).squeeze(-2)
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape
