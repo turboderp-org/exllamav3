@@ -10,6 +10,7 @@ from ...modules.hyperconnections import hc_flush
 from ...ext import exllamav3_ext as ext
 from ...cache.recurrent import host_copy
 from ...constants import PAGE_SIZE
+from ...tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 
 @lru_cache(maxsize = 1)
@@ -124,7 +125,11 @@ class EngramLayer(Module):
         hc_flush(params)
         bsz, seq, H, D = x.shape
         ctx = self.embed.context_len
-        ids = self.token_map[params["input_ids"].to("cpu", torch.long)]
+        ids = params["input_ids"].to("cpu", torch.long)
+        mm = ids >= FIRST_MM_EMBEDDING_INDEX if params.get("indexed_embeddings") else None
+        if mm is not None:
+            ids = ids.masked_fill(mm, self.pad_token_id)
+        ids = self.token_map[ids]
         hist = torch.cat((ids.new_full((bsz, ctx), self.pad_id), ids), dim = 1)
         rsg = params.get("recurrent_states")
         if rsg:
@@ -144,4 +149,6 @@ class EngramLayer(Module):
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
         gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = x.device)
         ext.ple_gate(gate, kv[..., H * D:].contiguous(), gated, D ** -0.5)
+        if mm is not None and mm.any():
+            gated.masked_fill_(mm.to(x.device)[..., None, None], 0)
         return gated.add_(x)
