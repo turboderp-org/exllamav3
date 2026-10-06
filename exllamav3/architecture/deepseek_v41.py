@@ -10,6 +10,7 @@ from ..modules.dsv4 import DSV4Attention
 from ..modules.ngram_embedding import _find_nth_prime_after
 from ..modules.arch_specific.deepseek_v41 import EngramLayer
 from ..modules.attn import prepare_for_attn
+from .deepseek_v41_mtp import DeepseekV41MTPModel
 
 # DeepSeek-V4.1: DeepSeek-V4 blocks where runs of layers read one compressed KV pool and one
 # index selection (kv_source_layer_ids / index_source_layer_ids), every mHC site collapses with
@@ -26,7 +27,7 @@ class DeepseekV41Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": DeepseekV41Model},
+            {"text": DeepseekV41Model, "mtp": DeepseekV41MTPModel},
             **kwargs
         )
 
@@ -45,7 +46,8 @@ class DeepseekV41Config(Config):
         self.index_topk = self.read_cfg(int, "text_config->index_topk", 512)
 
         self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
-        self.compress_ratios = self.read_cfg(list, "text_config->compress_ratios", no_default)[:self.num_hidden_layers]
+        ratios = self.read_cfg(list, "text_config->compress_ratios", no_default)
+        self.compress_ratios = ratios[:self.num_hidden_layers]
         self.kv_source_layer_ids = self.read_cfg(list, "text_config->kv_source_layer_ids", no_default)
         self.index_source_layer_ids = self.read_cfg(list, "text_config->index_source_layer_ids", no_default)
         self.candidate_source_layer_id = self.read_cfg(int, "text_config->candidate_source_layer_id", -1)
@@ -90,6 +92,25 @@ class DeepseekV41Config(Config):
             rng = np.random.default_rng(10007 * idx)
             mult = rng.integers(0, bound, size = self.engram_ngram_size, dtype = np.int64) * 2 + 1
             self.engram_multipliers[idx] = mult.tolist()
+
+        self.dspark_block_size = self.read_cfg(int, "text_config->dspark_block_size", 0)
+        self.dspark_noise_token_id = self.read_cfg(int, "text_config->dspark_noise_token_id", 0)
+        self.dspark_markov_rank = self.read_cfg(int, "text_config->dspark_markov_rank", 256)
+        self.dspark_target_layer_ids = self.read_cfg(list, "text_config->dspark_target_layer_ids", [])
+        self.dspark_num_experts = self.read_cfg(int, "text_config->dspark_n_routed_experts", 0)
+        self.dspark_num_experts_per_tok = self.read_cfg(int, "text_config->dspark_num_experts_per_tok", 0)
+        self.block_size = self.dspark_block_size + 1
+        self.mtp_layer_types = ["hca" if r else "sliding" for r in ratios[self.num_hidden_layers:]]
+        self.num_mtp_layers = len(self.mtp_layer_types)
+        if not self.dspark_block_size or not self.num_mtp_layers or not any(
+            self.stc.has_tensor(f"mtp.0.attn.wkv.{t}") for t in ("weight", "trellis")):
+            del self.model_classes["mtp"]
+
+    def get_tensor_name_fixes(self):
+        return {
+            ".markov_head.embed.weight": ".markov_head.markov_w1.weight",
+            ".markov_head.head.weight": ".markov_head.markov_w2.weight",
+        }
 
 
 class DeepseekV41Model(Model):
