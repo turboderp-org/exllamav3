@@ -193,6 +193,17 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            # Recurrent (GDN / linear-attention) targets carry per-slot past states; speculative
+            # decoding replays verified positions through them and needs one history row per
+            # draft token. Without the reservation the first verify pass fails with an opaque
+            # shape error, so fail loudly at setup instead.
+            if getattr(cache, "recurrent_layers", None) and cache.max_history < self.num_draft_tokens:
+                raise ValueError(
+                    f"Draft model attached but the target cache reserves max_history="
+                    f"{cache.max_history} past states; speculative decoding on recurrent models "
+                    f"needs max_history >= {self.num_draft_tokens} (the number of draft tokens). "
+                    f"Create the cache with max_history={self.num_draft_tokens}."
+                )
             depths = draft_model.caps.get("mtp_depths")
             if depths is not None and self.num_draft_tokens > depths:
                 print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
