@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 
 def find_nvcc(cuda_home: str | None = None) -> list[str] | None:
@@ -122,11 +123,19 @@ def use_rocm_sdk_devel(cpp_extension) -> None:
     if cpp_extension.ROCM_HOME and has_libs(cpp_extension.ROCM_HOME):
         return
     spec = importlib.util.find_spec("_rocm_sdk_devel")
-    if spec is None or spec.origin is None:
-        return
-    devel = os.path.dirname(os.path.realpath(spec.origin))
-    if has_libs(devel):
-        cpp_extension.ROCM_HOME = devel
+    if spec is not None and spec.origin is not None:
+        devel = os.path.dirname(os.path.realpath(spec.origin))
+        if has_libs(devel):
+            cpp_extension.ROCM_HOME = devel
+            return
+    # Current SDK wheels ship their development tree as an archive. The SDK CLI expands it
+    # and returns its root; the expanded package name can vary by SDK version and platform.
+    if importlib.util.find_spec("rocm_sdk_devel") is not None:
+        devel = subprocess.check_output(
+            [sys.executable, "-m", "rocm_sdk", "path", "--root"], text = True
+        ).strip()
+        if has_libs(devel):
+            cpp_extension.ROCM_HOME = devel
 
 
 def hip_compiler_wrapper() -> str | None:
