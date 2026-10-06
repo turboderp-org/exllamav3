@@ -211,6 +211,7 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_update,
     int block_n,
     int splits_cap,
+    int programs,
     c10::optional<at::Tensor> xp,
     c10::optional<at::Tensor> yp
 )
@@ -313,11 +314,9 @@ void BC_Attention::configure_slot
         s.qkv_c_ptrs = at::tensor(ptrs, at::TensorOptions().dtype(at::kLong)).to(s.q.device());
     }
 
-    int group_size = num_q_heads / num_kv_heads;
-    int block_m = 1; while (block_m < q_len) block_m <<= 1;
-    int block_h = MAX(16 / block_m, 1);
-    int h_blocks = CEIL_DIVIDE(group_size, block_h);
-    s.programs = bsz * num_kv_heads * h_blocks;
+    // Split / combine grid width: the row layout is the Python side's (triton_paged.decode_row_layout),
+    // which compiled the kernels for it
+    s.programs = programs;
     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
 
     s.graph = std::make_unique<Graph>();

@@ -95,6 +95,12 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
 {
     if (const char* env = std::getenv("EXL3_QT_OPTIMIZED"))
         return env[0] == '1';
+#if defined(USE_ROCM)
+    // HIP's major is the gfx generation (major == 12 would read as sm_120 on RDNA4), so RDNA gets its own
+    // rule: the dense specializations win at K = 3, 4, 5 and 8; K = 1 and 2 do not fit 64 KB of LDS, and
+    // K = 6 and 7 run faster on the generic kernel
+    return K == 3 || K == 4 || K == 5 || K == 8;
+#endif
     if (major == 12) return true;
     if (major == 8 && minor == 9)
         return K == 1 || K == 2 || K == 4 || K == 5 || (K == 7 && cb == 0) || K == 8;
@@ -120,11 +126,17 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto* props = at::cuda::getDeviceProperties(device);
     const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
     const int edges = 65536 >> K;
-    const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
+    const int cost_arrays = optimized ? (K == 1 ? 1 : 2) : (K >= QT_SHARED_COSTS_MIN_K ? 2 : 0);
     const int shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
+#if defined(USE_ROCM)
+    // Fail with a usable error rather than the attribute call's exit()
+    TORCH_CHECK(shmem <= (int) props->sharedMemPerBlock,
+                "quantize_tiles: K = ", K, " needs ", shmem, " bytes of shared memory, the device has ",
+                (int) props->sharedMemPerBlock);
+#endif
     cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
     cuda_check(cudaFuncGetAttributes(&attr, kernel));

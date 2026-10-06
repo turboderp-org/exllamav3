@@ -26,6 +26,16 @@ const CudaDrv& CudaDrv::instance()
 {
     static CudaDrv d = []
     {
+        #if defined(USE_ROCM)
+            CudaDrv d{};
+            d.module_load_data                  = &cuModuleLoadData;
+            d.module_unload                     = &cuModuleUnload;
+            d.module_get_function               = &cuModuleGetFunction;
+            d.launch_kernel                     = &cuLaunchKernel;
+            d.graph_kernel_node_get_params      = &cuGraphKernelNodeGetParams;
+            d.graph_exec_kernel_node_set_params = &cuGraphExecKernelNodeSetParams;
+            return d;
+        #else
         #ifdef _WIN32
             void* lib = (void*) LoadLibraryA("nvcuda.dll");
         #else
@@ -43,6 +53,7 @@ const CudaDrv& CudaDrv::instance()
         d.graph_kernel_node_get_params      = (decltype(&cuGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeGetParams));
         d.graph_exec_kernel_node_set_params = (decltype(&cuGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(cuGraphExecKernelNodeSetParams));
         return d;
+        #endif
     }
     ();
     return d;

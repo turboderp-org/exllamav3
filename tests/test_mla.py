@@ -39,7 +39,7 @@ class FakeSTC:
 
     def get_tensor(self, key, device = None, optional = False, allow_bf16 = False,
                    float2half = False, no_defer = False, transpose = False, pad_to = None,
-                   fidx = None):
+                   fidx = None, arena = True):
         if key not in self.tensors:
             if optional:
                 return None
@@ -56,6 +56,9 @@ class FakeSTC:
             if any(pad):
                 x = torch.nn.functional.pad(x, pad)
         return x.contiguous()
+
+    def get_codebook_marker(self, key, value):
+        return self.get_tensor(key, optional = True)
 
 
 class FakeConfig:

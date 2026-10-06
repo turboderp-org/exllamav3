@@ -1,6 +1,7 @@
 import os
 
 import torch
+from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -68,10 +69,16 @@ class BCKernelTooLarge(RuntimeError):
     walks a config ladder per device instead, so the builders decline and let it run."""
 
 
+# Split-decode attention launch config (util/backend.py); the pair serves the QSA sparse split kernel
+_SPLIT_WARPS, _SPLIT_STAGES = ATTN_SPLIT_WARPS_STAGES
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
-                    num_warps: int, num_stages: int):
+                    num_warps: int, num_stages: int, pointer_range_32: bool = False):
+    """pointer_range_32 (AMD backend): every pointer argument addresses an allocation under 2 GB, which lets
+    the compiler use buffer loads/stores; the caller must have checked the allocations"""
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
-           tuple(sorted(signature.items())))
+           tuple(sorted(signature.items())), pointer_range_32)
     k = _kernel_cache.get(key)
     if k is None:
         import triton
@@ -88,6 +95,8 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                 attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
             else:
                 sig[name] = ty
+            if pointer_range_32 and isinstance(sig[name], str) and sig[name].startswith("*"):
+                attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
@@ -97,7 +106,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # The compiled module: a cubin from the CUDA backend, an hsaco code object from the AMD one
+            image = ck.asm["hsaco" if ROCM else "cubin"]
+            k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -275,10 +286,20 @@ class BCAttn:
             )
         self.slot_widths = {}
 
+    def _pointer_range_32(self) -> bool:
+        """Whether the split kernels may assume 32-bit buffer offsets (AMD buffer loads): every
+        allocation they address is under 2 GB. The caches are the only ones that can be larger; the
+        rest are graph statics, partials and the block table"""
+        if not ROCM:
+            return False
+        caches = (self.cache_k, self.cache_v, self.k_scales, self.v_scales)
+        return all(t.untyped_storage().nbytes() < 2 ** 31 for t in caches if isinstance(t, torch.Tensor))
+
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
             combine_subtiles,
+            decode_row_layout,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -291,11 +312,8 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd_pad)
-        block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
-        block_rows = block_m * block_h
-        h_blocks = triton.cdiv(group_size, block_h)
+        block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
+        block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
@@ -318,29 +336,29 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
+                                  pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
-            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+            "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = self.v_head_dim,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
-            ROWS_SUB = rows_sub, D_SUB = d_sub,
+            BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
         k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
@@ -403,7 +421,7 @@ class BCAttn:
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            block_n, splits_cap,
+            block_n, splits_cap, programs,
             xp, yp,
         )
 
@@ -540,7 +558,7 @@ class BCAttn:
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
-                4, 2)
+                _SPLIT_WARPS, _SPLIT_STAGES, pointer_range_32 = self._pointer_range_32())
 
             sp_rows_sub, sp_d_sub = combine_subtiles(block_h, self.head_dim)
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
@@ -548,13 +566,13 @@ class BCAttn:
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
                     "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
-                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
+                    "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim,
                      BLOCK_ROWS = block_h, ROWS_SUB = sp_rows_sub, D_SUB = sp_d_sub), 4, 1)
             k_sp_combine.grid_y = (block_h // sp_rows_sub) * (self.head_dim // sp_d_sub)
 

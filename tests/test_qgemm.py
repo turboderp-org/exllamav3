@@ -20,7 +20,7 @@ test_keys = [
 ]
 
 devices = [
-    "cuda:2"
+    os.environ.get("EXL3_TEST_DEVICE", "cuda:2")
 ]
 
 batch_sizes = [1, 2, 8, 16, 17, 31, 32, 33, 256, 2048]

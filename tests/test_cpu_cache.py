@@ -95,42 +95,57 @@ def test_a_large_protect_set_does_not_claim_protected_pages():
     assert cache.metrics["evictions"] == 1
 
 
-def _wait_pinned(cache, timeout = 10.0):
-    # The worker pins the whole budget in the background; wait until it has, so the test covers the state the
-    # tier spends its life in (worker parked on the condition)
-    import time
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        with cache._spare_cond:
-            if len(cache._spare) + len(cache.slot_slabs) >= cache.max_slots:
-                return
-        time.sleep(0.01)
-    raise AssertionError("pinning thread did not fill the spare pool")
-
-
-def test_dropped_tier_releases_cache_tensors_and_worker():
-    # The pinning thread used to run a bound method and wait on the condition forever once the budget was pinned,
-    # which kept the tier alive after the Generator was dropped, and with it every GPU cache tensor in the
-    # segment table and the whole pinned budget (one KV cache leaked per model reload with cpu_cache_size set)
+def test_dropped_tier_releases_cache_tensors_and_arena():
+    # A tier dropped without close() (the Generator going away) must not keep the GPU cache tensors in its
+    # segment table or its pinned arena alive
     import gc, weakref
     cache = build(8)
-    _wait_pinned(cache)
-    thread = cache._alloc_thread
+    cache.store(page(1, 0), serial = 1)
     tensor = cache.segments[0][0]
-    ref_cache, ref_tensor = weakref.ref(cache), weakref.ref(tensor)
+    unregister = cache.arena._unregister
+    ref_cache, ref_tensor, ref_arena = weakref.ref(cache), weakref.ref(tensor), weakref.ref(cache.arena)
     del cache, tensor
     gc.collect()
     assert ref_cache() is None, "tier kept alive after its last reference was dropped"
     assert ref_tensor() is None, "GPU cache tensor kept alive by a dropped tier"
-    thread.join(5.0)
-    assert not thread.is_alive(), "pinning thread did not exit when the tier was collected"
+    assert ref_arena() is None and not unregister.alive, "arena still locked after the tier was collected"
 
 
-def test_close_stops_worker_and_releases_slabs():
+def test_close_releases_arena():
     cache = build(8)
-    _wait_pinned(cache)
     cache.store(page(1, 0), serial = 1)
-    thread = cache._alloc_thread
+    arena = cache.arena
     cache.close()
-    assert not thread.is_alive()
-    assert not cache._spare and not cache.slot_slabs and not cache.segments and not cache.entries
+    assert arena.map is None and not arena.pinned
+    assert cache.arena is None and not cache.slot_views and not cache.segments and not cache.entries
+
+
+def test_tier_occupies_exactly_its_budget():
+    # The slabs are slices of one registered arena. Pinned tensors from torch's allocator would each be
+    # rounded up to a power of two (and kept by it after the tier is gone), so none may come from there
+    torch._C._host_emptyCache()
+    before = torch.cuda.host_memory_stats()["allocated_bytes.current"]
+    tensor = torch.zeros((NUM_PAGES, 1536 + 64), dtype = torch.float16, device = "cuda")   # 3200-byte pages
+    cache = CPUPageCache([SimpleNamespace(layers = {0: FakeCacheLayer([tensor, None])})], 5 * 4096)
+    assert cache.arena.size == cache.max_slots * cache.slab_size == 5 * 4096
+    for i in range(cache.max_slots + 2):   # past the budget: slots are recycled, never added
+        cache.store(page(i + 1, i % NUM_PAGES), serial = i + 1)
+    assert len(cache.slot_views) == cache.max_slots
+    assert torch.cuda.host_memory_stats()["allocated_bytes.current"] == before
+    cache.close()
+
+
+def test_slots_are_pinned_and_round_trip():
+    # Views into the arena must take the asynchronous copy path, and every slot must come back intact
+    tensor = torch.zeros((NUM_PAGES, 64), dtype = torch.float16, device = "cuda")
+    cache = CPUPageCache([SimpleNamespace(layers = {0: FakeCacheLayer([tensor, None])})], NUM_PAGES * 4096)
+    for i in range(NUM_PAGES):
+        tensor[i] = i + 1
+        cache.store(page(i + 1, i), serial = i + 1)
+    assert cache.arena.pinned and all(v.is_pinned() for views in cache.slot_views for v in views)
+    tensor.zero_()
+    for i in range(NUM_PAGES):
+        cache.fetch(page(i + 1, i).phash, NUM_PAGES - 1 - i, serial = 100 + i)
+    torch.cuda.synchronize()
+    assert torch.equal(tensor[:, 0].cpu(), torch.arange(NUM_PAGES, 0, -1, dtype = torch.float16))
+    cache.close()

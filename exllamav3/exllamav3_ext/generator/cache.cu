@@ -92,7 +92,7 @@ void cache_rotate
     else if (align %  8 == 0) cache_rotate_kernel<uint2>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
     else if (align %  4 == 0) cache_rotate_kernel<uint32_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
     else if (align %  2 == 0) cache_rotate_kernel<uint16_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
-    else                      cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else                    { cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len); }
     cuda_check(cudaPeekAtLastError());
 }
 

@@ -1,10 +1,13 @@
+import gc
 import pytest
+import weakref
 import torch
 from collections import namedtuple
 from types import SimpleNamespace
 
 from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.model.model_tp_fn import (
+    PseudoParentConn,
     mp_cpu_cache_init,
     mp_cpu_cache_store,
     mp_cpu_cache_fetch,
@@ -67,7 +70,8 @@ class FakeTPModel:
 
     def tp_cpu_cache_store(self, cache_ids, slot, page_index):
         self.dispatches += 1
-        return sum(mp_cpu_cache_store(r, cache_ids, slot, page_index) for r in self.ranks)
+        for r in self.ranks:
+            mp_cpu_cache_store(r, cache_ids, slot, page_index)
 
     def tp_cpu_cache_fetch(self, cache_ids, slot, page_index):
         self.dispatches += 1
@@ -108,8 +112,7 @@ def same(a, b):
 
 @pytest.fixture(autouse = True)
 def inference_mode():
-    # The generator and the TP workers both drive the tier under inference mode, and the pinned slabs the
-    # background threads produce are inference tensors; writing to them outside the mode is a RuntimeError
+    # The generator and the TP workers both drive the tier under inference mode
     with torch.inference_mode():
         yield
 
@@ -213,10 +216,71 @@ def test_ranks_pin_their_buffers(tp_cache):
     cache.store(page(1, 0), serial = 1)
 
     for rank in ranks:
-        buffers = rank["cpu_page_cache"].slots[0]
+        pool = rank["cpu_page_cache"]
+        buffers = pool.slots[0]
         assert buffers, "rank allocated no buffers for the slot"
-        if not rank["cpu_page_cache"].pageable:
+        assert pool.arena.size == pool.max_slots * pool.slab_size
+        if pool.arena.pinned:
             assert all(b.is_pinned() for b in buffers)
+
+
+def test_every_slot_holds_its_own_page(tp_cache):
+    # Slots are slices of each rank's arena, so a wrong offset would show up as one page reading back as another
+    ranks, cache_ids, model, caches = tp_cache
+    cache = build(model, caches, 64 * 4096)
+    expected = []
+    for i in range(6):
+        fill(ranks, cache_ids, i, 1000 * (i + 1))
+        expected.append(snapshot(ranks, cache_ids, i))
+        cache.store(page(i + 1, i), serial = i + 1)
+    for i in range(6):
+        fill(ranks, cache_ids, 7, -1)
+        cache.fetch(bytes([i + 1]), 7, serial = 10 + i)
+        assert same(snapshot(ranks, cache_ids, 7), expected[i]), f"slot {i}"
+
+
+def test_a_new_tier_releases_the_previous_rank_pools(tp_cache):
+    # A Generator built on the same model (TabbyAPI recreates one after a latch) replaces each rank's pool.
+    # The old pools' arenas must be returned, not left to whenever the pool is collected
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    old_pools = [weakref.ref(rank["cpu_page_cache"]) for rank in ranks]
+    old_arenas = [rank["cpu_page_cache"].arena for rank in ranks]
+
+    build(model, caches, 64 * 4096)
+    gc.collect()
+
+    assert all(arena.map is None and not arena.pinned for arena in old_arenas)
+    assert all(ref() is None for ref in old_pools)
+    assert all(rank["cpu_page_cache"].arena.map is not None for rank in ranks)
+
+
+def test_closing_a_rank_pool_releases_its_arena(tp_cache):
+    ranks, cache_ids, model, caches = tp_cache
+    cache = build(model, caches, 64 * 4096)
+    cache.store(page(1, 0), serial = 1)
+    pool = ranks[0]["cpu_page_cache"]
+    arena = pool.arena
+
+    pool.close()
+
+    assert arena.map is None and not arena.pinned
+    assert pool.arena is None and not pool.slots
+
+
+def test_unloading_releases_the_main_process_rank_pool(tp_cache):
+    # Worker ranks exit on unload, but the main process's PseudoParentConn must close its pool itself
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    arena = ranks[0]["cpu_page_cache"].arena
+
+    conn = PseudoParentConn.__new__(PseudoParentConn)
+    conn.device = 0
+    conn.local_context = dict(ranks[0], inf_consumer = SimpleNamespace(close = lambda: None))
+    ranks[0]["cpu_page_cache"] = None
+    conn.close()
+
+    assert arena.map is None and not arena.pinned
 
 
 def test_a_draft_cache_on_its_own_model_is_dispatched_separately():

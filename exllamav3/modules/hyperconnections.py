@@ -6,6 +6,7 @@ from .module import Module
 from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
+from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
 import os
 import math
@@ -13,6 +14,23 @@ import math
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
+
+# Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
+# residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
+# finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
+_hc_fold = HC_FOLD
+_HC_FOLD_MAX_R = 32
+
+
+def hc_flush(params: dict):
+    """Run a deferred HyperConnection.apply_ (held in params["hc_pending"]) before anything other than the
+    next site's mix reads its streams"""
+    p = params.pop("hc_pending", None)
+    if p is not None:
+        x, y, post, comb = p
+        b, s, H, D = x.shape
+        R = b * s
+        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -122,6 +140,64 @@ class HyperConnection(Module):
         """streams (b, s, H, D) fp32 -> (post (b,s,H), comb (b,s,H,H), collapsed (b,s,D)).
         Fused ext path (2 kernel launches, see benchmarks/hc_mix/) returns collapsed as HALF
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
+        post, comb, y, _ = self.mix_norm(streams, params, None)
+        return post, comb, y
+
+    def _fold_norm_ok(self, norm, D: int) -> bool:
+        from .rmsnorm import RMSNorm
+        return isinstance(norm, RMSNorm) and not norm.span_heads and norm.groups == 1 and D // 4 <= 1024 \
+            and (norm.weight is None or (norm.weight.dtype in (torch.half, torch.bfloat16) and norm.weight.numel() == D))
+
+    def mix_norm(self, streams: torch.Tensor, params: dict, norm):
+        """mix() followed by norm (the block's RMSNorm on the collapsed output, half out), returning (post,
+        comb, y, normed): y is the normed output when the norm could be folded into the mix (normed True),
+        otherwise the collapsed output for the caller to normalize. A deferred apply_ on these streams is
+        consumed here; any other pending apply is flushed first"""
+        hc = self.hc_mult
+        b, s, H, D = streams.shape
+        pend = params.get("hc_pending")
+        if pend is not None and pend[0] is not streams:
+            hc_flush(params)
+            pend = None
+        if _hc_fold and hc == 4 and b * s <= _HC_FOLD_MAX_R and streams.dtype == torch.float and D % 4 == 0 \
+                and streams.is_contiguous():
+            fold_norm = norm is not None and self._fold_norm_ok(norm, D)
+            if pend is not None or fold_norm:
+                params.pop("hc_pending", None)
+                R = b * s
+                chunks = ext.hc_mix_num_chunks(R, H * D)
+                M1 = 2 * H + H * H + 1
+                dev = streams.device
+                partials = g_tensor_cache.get_bucketed(dev, R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+                post = g_tensor_cache.get_bucketed(dev, R * H, torch.float, "hc_post").view(R, H)
+                comb = g_tensor_cache.get_bucketed(dev, R * H * H, torch.float, "hc_comb").view(R, H, H)
+                collapsed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_coll").view(R, D)
+                normed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_normed").view(R, D) if fold_norm else None
+                if self.fn_h is None:
+                    self.fn_h = self.fn.half()
+                py, ppost, pcomb = (pend[1].view(R, D), pend[2].view(R, H), pend[3].view(R, H, H)) if pend else (None, None, None)
+                ext.hc_mix_fused(
+                    streams.view(R, H, D), py, ppost, pcomb, self.fn_h, self.base, self.scale,
+                    self.rms_eps, self.hc_eps, self.sinkhorn_iters, partials, post, comb, collapsed,
+                    norm.weight if fold_norm else None, normed,
+                    norm.rms_norm_eps if fold_norm else 0.0,
+                    norm.constant_bias if fold_norm else 0.0,
+                    norm.constant_scale if fold_norm else 1.0,
+                )
+                if fold_norm:
+                    if norm.key in params.get("export_state_norm_keys", ()):
+                        states = params.get("export_states")
+                        if states is None:
+                            states = params["export_states"] = []
+                        states.append(normed.half())
+                    return post.view(b, s, H), comb.view(b, s, H, H), normed.view(b, s, D), True
+                return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D), False
+        if pend is not None:
+            hc_flush(params)
+        post, comb, y = self._mix_unfused(streams, params)
+        return post, comb, y, False
+
+    def _mix_unfused(self, streams: torch.Tensor, params: dict):
         hc = self.hc_mult
         b, s, H, D = streams.shape
         if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
@@ -183,10 +259,16 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
+        hc_flush(params)
         if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
+            # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
+            # partials kernel. Not while states are exported or under TP, where other readers see the streams
+            if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
+                params["hc_pending"] = (x, y, post, comb)
+                return x
             ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
             return x
         return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
@@ -333,10 +415,10 @@ class GatedResidual(Module):
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
         # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
-        # instructions — so the path is Ampere+ only; below that the cuBLAS
-        # fallback serves the projection.
+        # instructions — so on CUDA the path is Ampere+ only (ROCm runs it on RDNA's int8
+        # WMMA, rocm/det_gemm_rocm.cuh); elsewhere the cuBLAS fallback serves the projection.
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda" \
+            and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
             and torch.cuda.get_device_capability(dev)[0] >= 8
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
@@ -519,6 +601,11 @@ class GatedResidual(Module):
         b, s = streams.shape[:2]
         post, mixed = self._mix(streams, params = params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
+
+    def mix_norm(self, streams: torch.Tensor, params: dict, norm):
+        """HyperConnection.mix_norm interface: the norm is never folded here (normed False)"""
+        post, comb, y = self.mix(streams, params)
+        return post, comb, y, False
 
     def apply_(
         self,
@@ -705,7 +792,13 @@ class HyperHead(Module):
         return module
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+        hc_flush(params)
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape

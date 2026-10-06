@@ -145,12 +145,13 @@ class NGramEmbedding(Module):
                 "multipliers": f"{parent}.layer_multipliers",
             })
 
+        infer_params = getattr(self.config, "infer_params", None)
+        lock = infer_params is not None and infer_params.ngram_lock
         stream_from_disk = self.stream_from_disk
         if stream_from_disk is None:
-            infer_params = getattr(self.config, "infer_params", None)
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
-        table.open(stc, stream_from_disk, allow_bf16 = not quantized,
-                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)")
+        table.open(stc, stream_from_disk and not lock, allow_bf16 = not quantized,
+                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock)
         self._set_table(table, quantized)
 
     def _set_table(self, table: RowTable, quantized: bool):

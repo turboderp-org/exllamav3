@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..model.config import Config
+from ..util.device_copy import host_to_device
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
@@ -10,6 +11,7 @@ from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_trit
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..cache import Cache
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
@@ -19,10 +21,11 @@ from ..cache.recurrent import (
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..cache.recurrent import host_copy
-import os
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = QKV_SLICE
 
 
 class SWAExportedState:
@@ -869,7 +872,7 @@ class SlidingAttention(Module):
                 dtype = torch.int32, device = self.device
             )
             self.bt_cache[slots] = bt
-        cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
+        cache_seqlens = host_to_device(torch.tensor(positions_l, dtype = torch.int32), self.device)
         return bt, cache_seqlens
 
 
@@ -1052,7 +1055,7 @@ class SlidingAttention(Module):
                 [[rs.slot * pps + wposs[i] // PAGE_SIZE + j for j in range(pps)] for i, rs in enumerate(rsg)],
                 dtype = torch.int32, device = self.device
             )
-            cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
+            cache_seqlens = host_to_device(torch.tensor(hots, dtype = torch.int32), self.device)
 
             if not non_causal_spans:
                 o = paged_attn_triton_prefill(

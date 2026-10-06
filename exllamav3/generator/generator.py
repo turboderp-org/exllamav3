@@ -122,7 +122,8 @@ class Generator:
         :param cpu_cache_size:
             Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
             K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
-            being recomputed by prefill. Not currently supported in tensor-parallel mode
+            being recomputed by prefill. In tensor-parallel mode each rank pins its own shard of the tier and
+            the budget counts whole pages across all of them
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -576,6 +577,31 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def close(self):
+        """
+        Release the host memory a retired generator would otherwise hold until it is garbage collected,
+        which can be long after it stops being used: a generator sits in a reference cycle with its page
+        table, and the jobs that failed on it keep it reachable through their exception tracebacks. The
+        model and cache stay loaded for a replacement generator to use; this generator is not reusable
+        afterwards. Safe to call more than once.
+
+        Releases, in order of size: the recurrent checkpoint cache (up to recurrent_cache_size of system
+        RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
+        the pinned staging and draft buffers, and the filter thread pool.
+        """
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.close()
+        if self.cpu_page_cache is not None:
+            self.cpu_page_cache.close()
+            self.cpu_page_cache = None
+            self.pagetable.cpu_tier = None
+        self.sample_pinned = None
+        self.staging_buffers = {}
+        self.draft_input_ids_pinned = None
+        self.draft_ids_pinned = None
+        self.filter_pool.shutdown(wait = False)
 
 
     @torch.inference_mode()

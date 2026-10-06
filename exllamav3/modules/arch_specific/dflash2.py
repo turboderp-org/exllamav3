@@ -60,7 +60,8 @@ def _grouped_dynamic_convolve(
     [b, l, H]), is added into residual in place and residual is returned (the finish()
     variant's residual add, fused into the kernel).
     """
-    if not hidden.is_cuda:
+    # TODO: HIP version
+    if not hidden.is_cuda or not ext.HAS_DFLASH2:
         return _grouped_dynamic_convolve_torch(hidden, dynamic, base, group_size, residual)
     hidden = hidden.contiguous()
     if residual is not None:
@@ -355,7 +356,7 @@ class DFlash2Selector(Module):
         gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
         anchor_ids = anchor_ids.long()
         bsz, rows = logits.shape[:2]
-        cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
+        cuda = ext.HAS_DFLASH2 and hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
         if cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
             unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
             cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)

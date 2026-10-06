@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from ..ext import exllamav3_ext as ext
+from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -1604,7 +1605,7 @@ class MoeCpuHost:
         table = np.zeros(E + 1, dtype = np.bool_)
         for e in streamed:
             table[e + 1] = True
-        smask1 = torch.from_numpy(table).to(y.device, non_blocking = True)
+        smask1 = host_to_device(torch.from_numpy(table), y.device)
         is_streamed = smask1.index_select(0, shifted)
         sel_tail = flat.masked_fill(is_streamed, -1).view(rows, topk)
         tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
@@ -1735,9 +1736,8 @@ class MoeCpuHost:
                     # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
                     for i in (0, 1, 2):
                         tbl[i] = tbl[i + 3]
-                tblt = torch.tensor(tbl, dtype = torch.int64).to(y.device, non_blocking = True)
-                ec = torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0],
-                                  dtype = torch.long).to(y.device, non_blocking = True)
+                tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
+                ec = host_to_device(torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0], dtype = torch.long), y.device)
                 tok = torch.cat([seg for _, _, seg, _ in per_e])
                 wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
                 Ku, Kd = pd["u"][2], pd["d"][2]

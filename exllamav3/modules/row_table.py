@@ -66,6 +66,7 @@ class RowTable:
         self.num_rows = 0
         self.row_words = None       # elements per stored row
         self.row_dtype = None
+        self._locked = []           # mlock()ed (address, size) ranges of the stores
         self._pins = []             # pinned staging sets (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
         self._executor = None
@@ -96,8 +97,16 @@ class RowTable:
         self.row_words = shapes[0][1]
         self.row_dtype = stores[0].dtype
 
-    def open(self, stc, stream_from_disk: bool, allow_bf16: bool = False, what: str | None = None):
+    def open(self, stc, stream_from_disk: bool, allow_bf16: bool = False, what: str | None = None,
+             lock: bool = False):
+        """lock: hold the table in RAM and mlock() it there (stream_from_disk must be False); the locked-memory
+        limit is checked before anything loads"""
         keys = self.keys
+        if lock:
+            assert not stream_from_disk
+            from ..util.memory import prepare_host_lock, lock_host_tensors
+            nbytes = sum(stc.get_tensor_meta(k)[k]["n_bytes"] for k in keys)
+            prepare_host_lock(nbytes, f"Locking {self.key} in RAM")
         handles = [stc.get_tensor_handle(k, optional = True) for k in keys] if stream_from_disk else [None]
         if all(h is not None for h in handles):
             # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
@@ -137,9 +146,15 @@ class RowTable:
                 r0 += t.shape[0]
                 del t
             self._set_stores([slab])
+        if lock:
+            self._locked = lock_host_tensors(self.stores, f"Locking {self.key} in RAM")
 
     def close(self):
         self.drain_prefetch()       # queued workers still read the table; first
+        if self._locked:
+            from ..util.memory import unlock_host_ranges
+            unlock_host_ranges(self._locked)
+            self._locked = []
         self.stores = None
         self._pins = []
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 from abc import ABC
 import os, json
+import torch
+from ..util.backend import INT8_GEMV_MODE
 from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
@@ -27,7 +29,8 @@ class InferParams:
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
         # int8 gate); narrow same-input pairs stay fused, where batching is what restores
         # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
-        if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
+        # (the int8 mode is off by default on ROCm, see exl3_gemv_int8.cu)
+        if INT8_GEMV_MODE > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
         self.mgemm_K_env = "EXL3_MGEMM_K_THRESHOLD" in os.environ
@@ -57,6 +60,10 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Hold the n-gram table in RAM (implies ngram_stream_from_disk = False) and mlock() it there, so the kernel
+        # can neither swap it out nor reclaim it (a swapped row costs a page-in inside the forward). Linux; needs
+        # RLIMIT_MEMLOCK to cover the table or CAP_IPC_LOCK. Set before loading the model
+        self.ngram_lock = os.environ.get("EXL3_NGRAM_LOCK", "0") != "0"
         # Stream the token embedding table from disk with per-forward row gathers instead of
         # holding it in system RAM. Works for quantized and unquantized tables. Set before
         # loading the model

@@ -34,6 +34,13 @@ int DevCtx::get_cc(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!cc[device])
     {
+#if defined(USE_ROCM)
+        // HIP reports the gfx generation as the major version (gfx11 -> 11), which the NVIDIA thresholds
+        // below would read as Blackwell. Until RDNA devices get classes of their own, they take the
+        // conservative host-side choices of the oldest class (the device code is unaffected: the
+        // EXL3_SM75 gate in arch.cuh is compile-time and off for HIP)
+        cc[device] = CC_OLD;
+#else
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
@@ -41,6 +48,7 @@ int DevCtx::get_cc(int device)
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
         else if (prop.major >= 8) cc[device] = CC_AMPERE;
         else cc[device] = CC_OLD;
+#endif
     }
     return cc[device];
 }
@@ -84,7 +92,11 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         c10::cuda::CUDAGuard guard(device);
+#if defined(USE_ROCM)
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS) * sizeof(int);
+#else
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
+#endif
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);

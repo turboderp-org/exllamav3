@@ -174,6 +174,35 @@ class RecurrentCache(OrderedDict):
         return len(stranded)
 
 
+    def close(self):
+        """
+        Drop every checkpoint, return its buffers to the stash pool and release the pool, so the RAM goes
+        back to the OS now rather than when this object is garbage collected. For a generator being retired:
+        nothing restores from a closed cache, and a replacement generator's own cache would otherwise fill up
+        alongside the checkpoints still stashed here. Safe to call more than once.
+        """
+        seen = set()
+        freed = 0
+        while len(self):
+            _, popped = self.popitem(last = False)
+            # Several keys may share one stash
+            if id(popped) in seen:
+                continue
+            seen.add(id(popped))
+            host_pool.give(popped)
+            freed += popped["checkpoint_size"]
+            if self.model.loaded_tp:
+                self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+        self.current_size = 0
+        self.pagetable = None
+        if freed:
+            note_freed(freed)
+        host_pool.release()
+        if self.model.loaded_tp:
+            self.model.tp_dispatch_all(mp_host_pool_release, ())
+        malloc_trim()
+
+
     def update_total_size(self):
         seen = set()
         total = 0

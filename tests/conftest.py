@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+# Tests written for a particular GPU of a multi-GPU box (device = "cuda:N" at module level) take
+# EXL3_TEST_DEVICE in its place, e.g. EXL3_TEST_DEVICE=cuda:0 on a single-GPU machine
+
 
 @pytest.fixture(autouse = True)
 def _restore_current_cuda_device():

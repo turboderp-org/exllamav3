@@ -1,13 +1,9 @@
 #pragma once
 
 #include "../ptx.cuh"
-
-// Constants
-#define EXL3_GEMM_BASE_THREADS 256
-#define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
-
 #include "exl3_dq.cuh"
-// For exl3_gemm_smem_bytes(), the shared definition of this kernel's shared memory footprint
+// EXL3_GEMM_BASE_THREADS, SMEM_MAX and exl3_gemm_smem_bytes(), the shared definition of this kernel's
+// shared memory footprint
 #include "exl3_kernel_map.cuh"
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.

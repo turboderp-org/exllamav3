@@ -212,6 +212,83 @@ inline void fp16_add_inplace_avx2
     }
 }
 
+// Fused two-source adds, dst = src_a + src_b: the first two contributions to a chunk are summed
+// straight into the accumulator instead of copying the first and adding the second in place.
+// Same arithmetic as the in-place kernels. Assume count % 32 == 0.
+AVX2_TARGET
+inline void do16_twosrc(uint16_t* __restrict dst, const uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m256i va16 = _mm256_loadu_si256((const __m256i*)ap);
+    __m256i vb16 = _mm256_loadu_si256((const __m256i*)bp);
+
+    // Expand to FP32
+    __m256i a_lo32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(va16)), 16);
+    __m256i a_hi32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(va16, 1)), 16);
+    __m256i b_lo32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(vb16)), 16);
+    __m256i b_hi32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(vb16, 1)), 16);
+
+    // Add in FP32
+    __m256 s_lo = _mm256_add_ps(_mm256_castsi256_ps(a_lo32), _mm256_castsi256_ps(b_lo32));
+    __m256 s_hi = _mm256_add_ps(_mm256_castsi256_ps(a_hi32), _mm256_castsi256_ps(b_hi32));
+
+    // Round back to BF16, pack per-lane, fix the lane ordering
+    const __m256i rnd = _mm256_set1_epi32(0x8000);
+    __m256i u_lo = _mm256_srli_epi32(_mm256_add_epi32(_mm256_castps_si256(s_lo), rnd), 16);
+    __m256i u_hi = _mm256_srli_epi32(_mm256_add_epi32(_mm256_castps_si256(s_hi), rnd), 16);
+    __m256i packed = _mm256_packus_epi32(u_lo, u_hi);
+    __m128i p_lo = _mm256_castsi256_si128(packed);
+    __m128i p_hi = _mm256_extracti128_si256(packed, 1);
+    __m256i out = _mm256_castsi128_si256(_mm_unpacklo_epi64(p_lo, p_hi));
+    out = _mm256_inserti128_si256(out, _mm_unpackhi_epi64(p_lo, p_hi), 1);
+    _mm256_storeu_si256((__m256i*)dst, out);
+}
+
+// dst = src_a + src_b (BF16)
+AVX2_TARGET
+inline void bf16_add_twosrc_avx2
+(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_twosrc(dst + i, src_a + i, src_b + i);
+        do16_twosrc(dst + i + 16, src_a + i + 16, src_b + i + 16);
+    }
+}
+
+AVX2_F16C_TARGET
+inline void do16_fp16_twosrc(uint16_t* __restrict dst, const uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m256i va16 = _mm256_loadu_si256((const __m256i*)ap);
+    __m256i vb16 = _mm256_loadu_si256((const __m256i*)bp);
+    __m256 s_lo = _mm256_add_ps(_mm256_cvtph_ps(_mm256_castsi256_si128(va16)), _mm256_cvtph_ps(_mm256_castsi256_si128(vb16)));
+    __m256 s_hi = _mm256_add_ps(_mm256_cvtph_ps(_mm256_extracti128_si256(va16, 1)), _mm256_cvtph_ps(_mm256_extracti128_si256(vb16, 1)));
+    __m256i out = _mm256_castsi128_si256(_mm256_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT));
+    out = _mm256_inserti128_si256(out, _mm256_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT), 1);
+    _mm256_storeu_si256((__m256i*)dst, out);
+}
+
+// dst = src_a + src_b (FP16)
+AVX2_F16C_TARGET
+inline void fp16_add_twosrc_avx2
+(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_fp16_twosrc(dst + i, src_a + i, src_b + i);
+        do16_fp16_twosrc(dst + i + 16, src_a + i + 16, src_b + i + 16);
+    }
+}
+
 void enable_fast_fp()
 {
     if (is_avx512_supported())
@@ -275,6 +352,22 @@ void perform_cpu_reduce_avx2
     // the striped bandwidth kernel (per-(device, block) flags). Must match the launch choice
     const bool multi = num_chunks > 1;
 
+    // Accumulate threads, same policy as the AVX-512 path: one thread per
+    // participating rank for multi-chunk (prefill-size) payloads, capped by the slice pool;
+    // EXL3_TP_REDUCE_THREADS overrides. Decode-size reduces stay single-threaded
+    static const int env_threads = [] { const char* e = getenv("EXL3_TP_REDUCE_THREADS"); return e ? atoi(e) : 0; }();
+    int acc_threads = 1;
+    if (multi)
+    {
+        #ifdef __linux__
+            int num_ranks = __builtin_popcount(device_mask);
+        #else
+            int num_ranks = (int) __popcnt(device_mask);
+        #endif
+        acc_threads = env_threads > 0 ? env_threads : num_ranks;
+        acc_threads = MAX(acc_threads, 1);
+    }
+
     // Sync
     atomic_ref<uint32_t> stage_(&ctx->cpusum_stage_cpu);
     uint32_t stage = stage_.load_acquire();
@@ -288,8 +381,8 @@ void perform_cpu_reduce_avx2
     {
         // Stage 1: Participating devices are writing one chunk to their respective buffers and will
         // store/release their respective flags. Devices without a contribution to the sum will set
-        // flags right away, with MSB set. First device to signal ready with a contribution is copied
-        // to the output buffer. Subsequent contributions are added in the order they arrive. Proceed
+        // flags right away, with MSB set. The first two contributions to arrive are summed into the
+        // output buffer, subsequent ones are added in the order they arrive. Proceed
         // to next stage only when all devices signal ready, include non-contributors since they will
         // still need to sync before receiving the sum.
 
@@ -320,7 +413,7 @@ void perform_cpu_reduce_avx2
         }
 
         uint32_t rem_devices = device_mask;
-        bool first_contribution = true;
+        uint8_t* first_src = nullptr;  // Track first contribution for fused add
         int timeout_spin = 0;
         while (true)
         {
@@ -340,26 +433,39 @@ void perform_cpu_reduce_avx2
                         uint8_t* src = host_ptr(device, stage);
                         uint8_t* dst = host_ptr(MAX_DEVICES, stage);
 
-                        // First contribution to this chunk: copy
-                        if (first_contribution)
+                        size_t elem_count = CEIL_DIVIDE(stage_size, 64) * 32;
+
+                        if (first_src == nullptr)
                         {
-                            // Warm destination before first contribution
-                            // #if defined(__GNUC__) || defined(__clang__)
-                            //   __builtin_prefetch(dst, 1, 3);
-                            // #endif
-
-                            memcpy(dst, src, stage_size);
-                            first_contribution = false;
+                            // First contribution: just remember where it is
+                            first_src = src;
                         }
-
-                        // Subsequent contributions: accumulate
+                        else if (first_src != dst)
+                        {
+                            // Second contribution: fused add of first + second -> dst
+                            cpu_reduce_parallel(
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_twosrc_avx2 : bf16_add_twosrc_avx2,
+                                nullptr,
+                                (uint16_t*) dst,
+                                (uint16_t*) first_src,
+                                (uint16_t*) src,
+                                elem_count,
+                                acc_threads
+                            );
+                            first_src = dst;  // dst now holds accumulated data
+                        }
                         else
                         {
-                            size_t elem_count = CEIL_DIVIDE(stage_size, 64) * 32;
-                            if (wire_dtype == REDUCE_WIRE_FP16)
-                                fp16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
-                            else
-                                bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
+                            // Third+ contribution: accumulate into dst
+                            cpu_reduce_parallel(
+                                nullptr,
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx2 : bf16_add_inplace_avx2,
+                                (uint16_t*) dst,
+                                nullptr,
+                                (uint16_t*) src,
+                                elem_count,
+                                acc_threads
+                            );
                         }
                     }
                 }
@@ -383,6 +489,12 @@ void perform_cpu_reduce_avx2
                     TORCH_CHECK(false, "CPU reduce process timeout");
                 }
             }
+        }
+
+        // Handle case where only one device contributed (no add needed, just copy)
+        if (first_src != nullptr && first_src != host_ptr(MAX_DEVICES, stage))
+        {
+            memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }
 
         // Stage 2: Reduced sum is ready, publish and release. All devices are now waiting for the flag and will

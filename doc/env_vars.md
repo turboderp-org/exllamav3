@@ -7,6 +7,18 @@ Boolean-ish variables treat `0` as off and any other value as on unless noted. C
 variables are read once (on first use) and cached; Python-side variables are read at import
 time. Either way, set them before loading a model.
 
+A few defaults differ between the CUDA and ROCm builds. They are collected in
+`exllamav3/util/backend.py` (the C++ side holds the same values where it reads a variable itself):
+
+| Variable | CUDA | ROCm | Why |
+|---|---|---|---|
+| `EXL3_QKV_SLICE` | `1` | `0` | the RDNA multi-matrix GEMV has no sliced form |
+| `EXL3_INT8_GEMV` | `2` | `0` | the RDNA fdot2 GEMVs are faster at these shapes |
+| `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
+| `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
+| `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
+| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
+
 ## Attention
 
 ### `EXL3_BC_ATTN` (default: `1`)
@@ -60,6 +72,15 @@ shared experts with 128-aligned widths and no post-norm. Under tensor parallelis
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
 
+### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+
+Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
+(up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
+mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
+fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
+the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
+
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 
 Prefill-sized mixes of the Qwen3.8-style gated residual (`GatedResidual`, the low-rank
@@ -74,6 +95,10 @@ int8 operands from it per call (a deterministic per-row split, so the same bytes
 and the decode kernel takes the norm weight on the stream side, written by the preceding site's
 residual update. The same int8 scheme covers the MoE router projection for batched rows
 (`routing_gemm.cu`), which has no switch.
+
+On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.cuh`). The
+per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
+agree across RDNA generations as well.
 
 ### `EXL3_BC_GDN` (default: `1`)
 
@@ -696,6 +721,16 @@ only when the table lives on high-latency storage (e.g. HDD, where per-row seeks
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
 
+### `EXL3_NGRAM_LOCK` (default: `0`)
+
+Default for `Config.infer_params.ngram_lock`: hold the n-gram embedding table in RAM (as with
+`EXL3_NGRAM_STREAM=0`) and `mlock()` its pages in place, so they are never swapped out or
+reclaimed under memory pressure (a swapped-out row would cost a page-in inside the forward).
+Linux only. The process's `RLIMIT_MEMLOCK` must cover the table (the soft limit is raised to the
+hard limit when that suffices; `ulimit -l unlimited`, `LimitMEMLOCK=infinity` for systemd
+services) or the interpreter needs `CAP_IPC_LOCK`; this is checked before the table loads. Also
+`--ngram_lock` / `-ngl` in `model_init`-based scripts.
+
 ### `EXL3_EMBED_STREAM` (default: `0`)
 
 Default for `Config.infer_params.embed_stream_from_disk`: stream the token embedding table from
@@ -810,10 +845,11 @@ comparison is only meaningful if the fp16-wire run actually used it.
 ### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
 
 Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce
-helper (persistent workers, spin-parked between jobs; AVX-512 path only). The default of one
-thread per participating rank covers the cases where a single thread's ~31 GB/s wire rate falls
-behind: three or more ranks (multiple adds per chunk) and PCIe 5.0 links. Set to `1` to force
-the single-threaded accumulate. Decode-size reduces are always single-threaded.
+helper (persistent workers, spin-parked between jobs; both the AVX-512 and the AVX2 path). The
+default of one thread per participating rank covers the cases where a single thread's wire rate
+falls behind: three or more ranks (multiple adds per chunk), PCIe 5.0 links, and hosts limited to
+AVX2. Set to `1` to force the single-threaded accumulate. Decode-size reduces are always
+single-threaded.
 
 ### `EXL3_TP_SPIN_RECV` (default: `0`)
 
@@ -826,6 +862,15 @@ window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a
 between the main process and child workers reaching their first kernel launch.
 
 ## Debug
+
+### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
+
+Not an ExLlamaV3 variable: it belongs to the ROCm profiler registration layer that torch loads for
+`torch.profiler`. With registration active, the HSA runtime's event thread spins on one CPU core
+from the first device operation until the process exits, including while it is idle. Importing
+`exllamav3` therefore sets it to `0` when it is not already in the environment. Export
+`ROCPROFILER_REGISTER_ENABLED=1` for profiling runs: without registration `torch.profiler` records
+no device events. Ignored by CUDA builds.
 
 ### `EXL3_NGRAM_GATHER_PROF` (default: unset)
 
@@ -859,6 +904,20 @@ themselves are identical either way. `0` disables it, which may be needed to run
 extension on a driver that predates compressed images. `require` makes the build fail when nvcc
 does not offer the option instead of silently building uncompressed; the release wheels are built
 this way. Not used for ROCm builds.
+
+### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
+
+torch's own switch: the JIT build puts ccache or sccache (whichever is on PATH) in front of the
+host and device compilers, so a translation unit whose preprocessed input was compiled before is
+taken from the cache; a rebuild of unchanged sources in a fresh extension directory then takes
+seconds. torch does this for CUDA builds; ExLlamaV3 applies the same rule to ROCm builds, where
+torch still skips it over an old hipcc incompatibility that ccache no longer has. The wrapper is
+part of every compile command the build records, so installing or removing it (or toggling this
+variable) rebuilds the extension once.
+
+Header edits rebuild only the translation units that include them on both backends: the HIP
+compile rule torch writes has no dependency file (its comment says `-MD` is unsupported by ROCm,
+which is no longer true of hipcc), so the JIT build adds one.
 
 ### `CUDAHOSTCXX` (default: unset)
 

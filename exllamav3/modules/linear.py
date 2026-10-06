@@ -10,6 +10,7 @@ from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..util.pinned_arena import PinnedArena
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -487,9 +488,13 @@ class Linear(Module):
             return
 
         def pin_alias(t):
+            # An arena of the tensor's own size rather than a tensor from torch's pinned allocator, which
+            # rounds each request up to a power of two and keeps the block after the tower is unloaded
             if not t.is_contiguous():
                 t = t.contiguous()
-            p = torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            nbytes = t.numel() * t.element_size()
+            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 

@@ -169,7 +169,10 @@ class RoPE:
         # mrope_section next to whatever rope_type it uses (Qwen3.5 with YaRN context extension
         # as recommended by its model card, for one), so read it before dispatching on the type
         if rs.rope_scaling:
-            self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")  # Ignored in HF impl., always True
+            # Two layouts of the three position components over the rotary frequencies: interleaved
+            # (Qwen3-VL, Qwen3.5, Qwen3.8; their configs carry the flag) or contiguous sections (Qwen2.5-VL,
+            # GLM-4V; no flag). HF picks the layout by model class, see get_mrope_freqs
+            self.mrope_interleaved = bool(rs.rope_scaling.get("mrope_interleaved"))
             self.mrope_section = rs.rope_scaling.get("mrope_section")
         match t:
             case None:
@@ -455,15 +458,25 @@ class RoPE:
         if merge_size is None: merge_size = 1
         next_pos_idx = ext.gen_mrope_pos_ids(mrope_pos_ids, ids, merge_size, spans, grids)
 
-        # Interleave frequencies
         inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, 1, -1, 1)
         position_ids_expanded = mrope_pos_ids[:, None, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
         freqs_t = freqs[0]
-        for dim, offset in enumerate((1, 2), start = 1):  # H, W
-            length = self.mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
+        if self.mrope_interleaved:
+            # Qwen3-VL style (apply_interleaved_mrope): frequency index i takes component i % 3 within the
+            # first 3 * section[dim] frequencies of each spatial component, T everywhere else
+            for dim, offset in enumerate((1, 2), start = 1):  # H, W
+                length = self.mrope_section[dim] * 3
+                idx = slice(offset, length, 3)
+                freqs_t[..., idx] = freqs[dim, ..., idx]
+        else:
+            # Qwen2.5-VL / GLM-4V style (freq.split(mrope_section)): contiguous runs of section[0] T,
+            # section[1] H and section[2] W frequencies, highest to lowest
+            start = self.mrope_section[0]
+            for dim in (1, 2):  # H, W
+                end = start + self.mrope_section[dim]
+                freqs_t[..., start:end] = freqs[dim, ..., start:end]
+                start = end
 
         return freqs_t.contiguous(), next_pos_idx
 

@@ -37,6 +37,14 @@ namespace exl3_gemv_ns {
 // extra rounding at the k=8 boundary. See the longer note in ptx.cuh.
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
 {
+#if defined(USE_ROCM)
+    FragA a;
+    a.elems[0] = a01.elems[0];
+    a.elems[1] = a01.elems[1];
+    a.elems[2] = a23.elems[0];
+    a.elems[3] = a23.elems[1];
+    ptx_mma_m16n8k16(a, b, c);
+#else
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
@@ -67,6 +75,7 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
         :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
            "r"(bb[0]), "r"(bb[1])
     );
+#endif
 #endif
 }
 

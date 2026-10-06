@@ -305,16 +305,9 @@ class Model_TPMixin:
 
     def tp_cpu_cache_store(self, cache_ids: list[int], slot: int, page_index: int):
         """
-        Copy a cache page out to system RAM on every rank, stored under slot. Returns the number of stores that
-        had to pin memory synchronously, summed over ranks, since that stall happens out of sight of the main
-        process.
+        Copy a cache page out to system RAM on every rank, stored under slot
         """
-        cold = self.tp_worker_dispatch_wait_multi(
-            self.active_devices,
-            mp_cpu_cache_store,
-            (cache_ids, slot, page_index)
-        )
-        return sum(cold)
+        self.tp_dispatch_all(mp_cpu_cache_store, (cache_ids, slot, page_index))
 
 
     def tp_cpu_cache_fetch(self, cache_ids: list[int], slot: int, page_index: int):

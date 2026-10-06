@@ -7,6 +7,9 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#if defined(USE_ROCM)
+    #include "rocm/routing_gemv_rdna.cuh"
+#endif
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -261,11 +264,20 @@ void routing_gemv
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
 
+#if defined(USE_ROCM)
+    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
+    // with the deterministic projection available it only takes the smallest row counts, where it is faster;
+    // both are fixed-order and agree across devices
+    if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= 3) &&
+        routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
+#endif
+
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
-    else if (bsz1 && gate_t.has_value() && !(k & 1))
+    else
+    if (bsz1 && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (
@@ -647,6 +659,10 @@ routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 */
 
+#if defined(USE_ROCM)
+    #include "rocm/routing_fused_rdna.cuh"
+#endif
+
 void routing_ds3_nogroup
 (
     const at::Tensor& hidden,
@@ -664,6 +680,12 @@ void routing_ds3_nogroup
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+#if defined(USE_ROCM)
+    // RDNA: bsz 1 router GEMV + top-k in one launch (rocm/routing_fused_rdna.cuh)
+    if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights, scaling_factor, act_fn, stream))
+        return;
+#endif
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 

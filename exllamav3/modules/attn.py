@@ -8,6 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -15,7 +16,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = QKV_SLICE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -1168,6 +1171,14 @@ class Attention(Module):
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            # Prefill-sized chunks otherwise take the bound from the host copy of cache_seqlens when
+            # the caller has one (the generator builds it on the CPU, so no sync): the kernels' fallback
+            # bound is the block table's width plus the chunk, which counts the chunk twice once the
+            # table covers it and can push a short context into the kv-split regime
+            if max_kv_len is None and seqlen > 16:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             o = attn_dispatch(
                 q = q,
                 k = k,
