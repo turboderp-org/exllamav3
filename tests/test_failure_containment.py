@@ -72,6 +72,7 @@ def make_generator(pending, active=(), max_batch_size=16):
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
     generator.max_batch_size = max_batch_size
+    generator.draft_ring = None
     return generator
 
 

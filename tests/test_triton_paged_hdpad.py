@@ -16,8 +16,10 @@ from exllamav3.constants import PAGE_SIZE
 
 device = "cuda:0"
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 
-def ref_attn(q, k, v, causal, past, window = None):
+
+def ref_attn(q, k, v, causal, past, window = None, window_right = None):
     """q (B, Q, H, D) attends to k/v (B, T, KVH, D); rows are the last Q positions of T."""
     B, Q, H, D = q.shape
     T, KVH = k.shape[1], k.shape[2]
@@ -31,6 +33,8 @@ def ref_attn(q, k, v, causal, past, window = None):
         mask &= kpos <= qpos
     if window is not None:
         mask &= kpos >= qpos - window
+    if window_right is not None:
+        mask &= kpos <= qpos + window_right
     s = s.masked_fill(~mask.view(1, 1, Q, T), -float("inf"))
     return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(s, -1), vv)
 
@@ -63,6 +67,52 @@ def test_decode_hdpad(hd, q_len, past, kvh):
     out = paged_attn_triton_decode(q, k, v, kc, vc, bt, sl, causal = True)
     T = past + q_len
     ref = ref_attn(q, gather(kc, bt, T), gather(vc, bt, T), True, past)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 8e-3, f"rel err {err:.3e}"
+
+
+@pytest.mark.parametrize("hd", [96, 128])
+@pytest.mark.parametrize("q_len,past,window", [(1, 3000, 64), (8, 3000, 64), (8, 3000, 2047)])
+def test_decode_window_hdpad(hd, q_len, past, window):
+    """
+    Decode whose cache is far longer than the sliding window: the window, not the cache,
+    bounds the keys each row may see, and the out-of-window keys are a large fraction of
+    the span. Pins the decode-side left-window mask against the fp32 reference, which
+    materializes (and masks) the full span.
+    """
+    B, kvh = 2, 2
+    kc, vc, bt, sl, k, v, q = make_cache(B, past + q_len + 3, kvh, hd, past, q_len, hd * 7 + q_len)
+    out = paged_attn_triton_decode(q, k, v, kc, vc, bt, sl, causal = True, window_size = (window, 0))
+    T = past + q_len
+    ref = ref_attn(q, gather(kc, bt, T), gather(vc, bt, T), True, past, window)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 8e-3, f"rel err {err:.3e}"
+
+
+@pytest.mark.parametrize("hd", [96, 128])
+@pytest.mark.parametrize("q_len,past,left,right", [
+    (8, 3000, 64, 64),      # wide right window: bounds nothing this batch covers (control)
+    (1, 3000, 2047, 2047),  # single row: a right window can never exclude a key (control)
+    (8, 3000, 64, 2),       # first row (qpos = past) may only see keys up to past+2: the
+                            # right bound genuinely masks the trailing rows of this batch
+    (8, 3000, 2, 1),        # narrow both ways: every row sees a <= 4-key window
+])
+def test_decode_bidir_window_hdpad(hd, q_len, past, left, right):
+    """
+    Bidirectional (non-causal) decode with both window bounds, the dflash2 draft's block
+    attention shape: rows must see keys ahead of their own position within the right window,
+    which the eager path passes as a (left, right) pair. The wide-window params only pin
+    the non-causal part (with q_len rows ending at the cache tip, right >= q_len-1 excludes
+    no key), so the restrictive params below are what pin the right bound itself: with
+    right < q_len-1 the first rows' bound masks trailing keys the naive
+    "attend-to-everything-ahead" kernel would otherwise read.
+    """
+    B, kvh = 2, 2
+    kc, vc, bt, sl, k, v, q = make_cache(B, past + q_len + 3, kvh, hd, past, q_len, hd * 7 + q_len)
+    out = paged_attn_triton_decode(q, k, v, kc, vc, bt, sl, causal = False,
+                                   window_size = (left, right))
+    T = past + q_len
+    ref = ref_attn(q, gather(kc, bt, T), gather(vc, bt, T), False, past, left, right)
     err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert err < 8e-3, f"rel err {err:.3e}"
 

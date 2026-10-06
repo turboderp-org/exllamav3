@@ -462,6 +462,7 @@ def test_selector_chains_candidates_from_anchor_and_returns_scores():
     selector.hidden_proj = _Projection()
     selector.pred_codebook = torch.tensor([[1.0], [0.0], [-1.0], [0.0]])
     selector.succ_codebook = torch.tensor([[0.0], [0.0], [2.0], [2.0]])
+    selector.quantized = False
 
     hidden = torch.zeros(1, 2, 4)
     logits = torch.tensor([[[0.0, 3.0, 2.0, -1.0], [0.0, 3.0, -1.0, 2.0]]])
