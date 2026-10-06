@@ -115,6 +115,11 @@ class EngramLayer(Module):
         return self.wkv.optimizer_targets()
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         hc_flush(params)
         bsz, seq, H, D = x.shape
