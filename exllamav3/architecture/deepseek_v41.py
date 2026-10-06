@@ -11,6 +11,7 @@ from ..modules.ngram_embedding import _find_nth_prime_after
 from ..modules.arch_specific.deepseek_v41 import EngramLayer
 from ..modules.attn import prepare_for_attn
 from .deepseek_v41_mtp import DeepseekV41MTPModel
+from .deepseek_v41_vision import DeepseekV41VisionModel, read_deepseek_v41_vision_config
 
 # DeepSeek-V4.1: DeepSeek-V4 blocks where runs of layers read one compressed KV pool and one
 # index selection (kv_source_layer_ids / index_source_layer_ids), every mHC site collapses with
@@ -105,6 +106,13 @@ class DeepseekV41Config(Config):
         if not self.dspark_block_size or not self.num_mtp_layers or not any(
             self.stc.has_tensor(f"mtp.0.attn.wkv.{t}") for t in ("weight", "trellis")):
             del self.model_classes["mtp"]
+
+        self.vision = read_deepseek_v41_vision_config(self)
+        if self.vision is not None and any(
+            self.stc.has_tensor(f"vision.patch_embed.proj.{t}") for t in ("weight", "trellis")):
+            self.model_classes["vision"] = DeepseekV41VisionModel
+        else:
+            self.vision = None
 
     def get_tensor_name_fixes(self):
         return {
@@ -212,6 +220,7 @@ class DeepseekV41Model(Model):
                 key_down = "experts.{expert_idx}.w2",
                 key_routing_gate = "gate",
                 key_e_score_bias = "gate.bias",
+                key_e_score_bias_vl = "gate.bias_vl",
                 qmap = "block.mlp",
                 interm_dtype = torch.half,
                 out_dtype = torch.float,
