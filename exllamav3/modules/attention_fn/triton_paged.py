@@ -739,6 +739,14 @@ _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
 # path reads less gmem (short trailing chunks over long contexts, low bitrates)
 _qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
 
+# Page-bucket granularity for the staging scratch: the allocator sees distinct sizes only in
+# multiples of this many pages. The old sizing rounded the referenced window up to the next
+# power of two, mapping up to 2x the needed fp16 (a 257-page window reserved 512 pages); with
+# expandable segments that padding stays physically mapped for the life of the process, so it
+# shows up in the driver's committed-memory high-water mark even though the scratch itself is
+# a per-call transient. 1 = exact sizing
+_qc_staging_bucket = max(1, int(os.environ.get("EXL3_QC_STAGING_BUCKET", "16")))
+
 def _get_h32(device):
     if device not in _h32_cache:
         h = torch.ones(1, 1, dtype = torch.float32)
@@ -1897,12 +1905,15 @@ def paged_attn_triton_prefill(
         # scratch is a per-call transient sized to the referenced window: the block-table span
         # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
         # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
-        # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
-        # the allocator sees a handful of distinct sizes, but never past the pool itself: the
-        # rounding alone would double a 513-page window to 1024 pages. Context-shaped workspaces
+        # pool needs a 2k-token scratch there), and bucketed up in pages so the allocator
+        # sees a handful of distinct sizes (EXL3_QC_STAGING_BUCKET; the earlier power-of-two
+        # bucketing mapped up to 2x the needed fp16 and left that padding committed). Workspaces
         # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
-        # for the life of the process. The loader's autosplit budgets for the worst case (a window
-        # spanning the pool) through Attention.autosplit_extra_measure
+        # for the life of the process. The loader's autosplit budgets for the batch-1 worst case
+        # (a window spanning the pool, rounded up to the staging bucket) through
+        # Attention.autosplit_extra_measure; batched tables pad every row to the batch's max
+        # page count, so a skewed batch can reference more pages than the pool holds and maps
+        # above that reserve (transient, unbudgeted)
         if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
@@ -1912,7 +1923,7 @@ def paged_attn_triton_prefill(
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
             pages = bsz * npps_w
-            pages_alloc = min(max(1, 1 << (pages - 1).bit_length()), max(pages, k_cache.shape[0]))
+            pages_alloc = -(-pages // _qc_staging_bucket) * _qc_staging_bucket
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
