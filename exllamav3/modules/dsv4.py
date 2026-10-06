@@ -1263,6 +1263,29 @@ class DSV4Attention(Module):
         return indices, k
 
 
+    def autosplit_extra_measure(self, params):
+        """Indexer score matrix at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach: allocated (and dropped) here for the device budget"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        cache = params.get("cache")
+        if cache is None or self.device is None or self.indexer_mode != "full":
+            return
+        rows = params["batch_shape"][1]
+        ec = cache.layers[self.kv_source, params.get("layer_instance") or 0].capacity
+        if ec <= self.index_topk:
+            return   # cache too small to ever reach the top-k regime
+        n = rows * max(128, 1 << (ec - 1).bit_length())
+        # Attention and indexer queries, live while it is scored
+        n += rows * (self.num_q_heads * self.head_dim + self.index_n_heads * self.index_head_dim)
+        bs = self.candidate_block_size
+        if self.candidate_mode == "source" and ec > self.candidate_topk_blocks * bs:
+            # Block maxima, live twice while the tail block is appended
+            n += 2 * rows * (ec // bs + 1)
+        t = torch.empty((n,), dtype = torch.half, device = self.device)
+        del t
+
+
     def _forward_cached(self, x, params, out_dtype):
         """attn_mode flash_attn: kernel-based path over the per-job ring state and the paged
         pools. Each batch row appends to its slot's ring and, through its block-table row,
