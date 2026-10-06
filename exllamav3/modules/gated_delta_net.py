@@ -244,29 +244,21 @@ class GDNLayerState:
         )
 
 
-    def rewind(self, slot: int, last_history: int, num_tokens: int):
-        assert num_tokens <= last_history
-        if num_tokens > 0:
-            r_state = self.recurrent_state[slot, 0]
-            r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
-            r_state.copy_(r_state_rewind)
-        cdim = self.module.conv_kernel_size
-        if last_history > 0:
-            c_state = self.conv_state[slot, :, :cdim]
-            p = self.conv_state.shape[-1] - num_tokens
-            c_state_rewind = self.conv_state[slot, :, p - cdim : p]
-            temp = c_state_rewind.clone()
-            c_state.copy_(temp)
-
-
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched conv-state rewind kernel (ext.batched_conv_rewind),
-        computed without performing any copy. Same gating condition as rewind()'s conv branch.
-        Addresses are integer arithmetic on the base pointer: a rewind touches every GDN layer
+        computed without performing any copy. Addresses are integer arithmetic on the base
+        pointer: a rewind touches every GDN layer
         of the model, and indexing views cost ~10 us per layer in Python (issue: ~0.5 ms per
         rejected draft on a 48-layer model)."""
+        # The negativity check precedes the last_history == 0 gate: a negative count is an
+        # upstream accounting error and must be refused identically whether or not history was
+        # recorded (GDNState.rewind moves the position by -num_tokens either way).
+        assert num_tokens >= 0, \
+            f"GDN conv rewind: negative num_tokens {num_tokens}"
         if last_history == 0:
             return None
+        assert num_tokens <= last_history, \
+            f"GDN conv rewind: {num_tokens} tokens exceeds recorded history of {last_history}"
         cs = self.conv_state
         cdim = self.module.conv_kernel_size
         p = cs.shape[-1] - num_tokens
@@ -283,9 +275,24 @@ class GDNLayerState:
 
     def rewind_state_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched recurrent-state rewind kernel (ext.batched_state_rewind),
-        computed without performing any copy. Same gating condition as rewind()'s state branch."""
-        if num_tokens == 0:
+        computed without performing any copy. Same gating condition as the conv branch."""
+        # last_history == 0 means the forward that advanced this state recorded no per-token history.
+        # The history index used below, last_history + 1 - num_tokens, is then negative for any
+        # num_tokens >= 2, so the computed base walks backwards out of this slot into the neighbouring
+        # sequence's live state (or off the end of the allocation for slot 0). batched_state_rewind
+        # cannot detect this: it validates cdim and num_elements, never the offset. The result is a
+        # silent wrong-value copy that only surfaces much later as bad output or a fault in an
+        # unrelated kernel.
+        #
+        # A rewind with no history is only ever a position correction anyway -- the tokens are re-fed
+        # and recompute the contents -- so build no job at all. rewind_conv_job() has always gated on
+        # this same condition; the state branch did not, which is the whole defect.
+        assert num_tokens >= 0, \
+            f"GDN state rewind: negative num_tokens {num_tokens}"
+        if last_history == 0 or num_tokens == 0:
             return None
+        assert num_tokens <= last_history, \
+            f"GDN state rewind: {num_tokens} tokens exceeds recorded history of {last_history}"
         rs = self.recurrent_state
         es = rs.element_size()
         base = rs.data_ptr() + slot * rs.stride(0) * es
