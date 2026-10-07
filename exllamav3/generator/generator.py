@@ -170,6 +170,13 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            if draft_model.caps.get("dflash_draft") and \
+                    self.num_draft_tokens != draft_model.caps.get("default_draft_size"):
+                print(f" !! Warning: DFlash drafters are trained for exactly "
+                      f"{draft_model.caps.get('default_draft_size')} draft tokens (block_size - 1); "
+                      f"num_draft_tokens = {self.num_draft_tokens} runs the target verify pass wider "
+                      f"or narrower than the drafter's block, costing acceptance. Recommended: "
+                      f"{draft_model.caps.get('default_draft_size')}")
             depths = draft_model.caps.get("mtp_depths")
             if depths is not None and self.num_draft_tokens > depths:
                 print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "

@@ -220,6 +220,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan_out,
+    const c10::optional<at::Tensor>& slots_scan_in,
     bool history,
     Slot& s,
     Graph* graph
@@ -300,6 +302,10 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         graph
     );
 
+    // [Path A] The scan never records per-token history: on spec passes (history) it advances
+    // the scratch state from the base state (slots_scan_in) and the accepted prefix is rebuilt
+    // later by replaying the staged scan inputs (s.conv_out/s.beta/s.g, which the Python side
+    // allocates per layer for spec slots). Conv keeps its rewindable ring.
     cuda_recurrent_gated_delta_rule_gr
     (
         s.conv_out,
@@ -311,8 +317,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         num_v_heads,
         k_head_dim,
         v_head_dim,
-        slots,
-        history,
+        slots_scan_out,
+        false,
+        history ? slots_scan_in : c10::nullopt,
         graph
     );
 
@@ -330,6 +337,8 @@ void BC_GatedDeltaNetSplit::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan_out,
+    const c10::optional<at::Tensor>& slots_scan_in,
     bool history
 )
 {
@@ -343,10 +352,12 @@ void BC_GatedDeltaNetSplit::run_bszN
                 "BC_GatedDeltaNetSplit::run_bszN: shape out of range");
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
+    TORCH_CHECK(!history || slots_scan_in.has_value(),
+                "BC_GatedDeltaNetSplit::run_bszN: spec passes require slots_scan_in");
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
@@ -359,14 +370,14 @@ void BC_GatedDeltaNetSplit::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, s.graph.get());
         s.graph->capture_end();
     }
 
@@ -381,7 +392,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan_out.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
@@ -392,7 +403,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan_out.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else
@@ -404,9 +415,22 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan_out.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
+    // The spec-pass scan reads its initial state from the base slot; patch it every replay.
+    // Captured only in slots that recorded a non-null slots_in, i.e. spec (history) slots.
+    // Launch args must follow the recorded-site order: the scan kernel records slots_in
+    // before the o_proj GEMM, so this entry goes before GP_gemm_C, not at the end
+    auto insert_slots_in = [&]
+    {
+        if (!history)
+            return;
+        auto it = std::find_if(args.begin(), args.end(),
+            [](PPTR p) { return std::get<0>(p) == GP_gemm_C; });
+        args.insert(it, PPTR(GP_gdn_rule_slots_in, (void*) slots_scan_in.value().data_ptr()));
+    };
+    insert_slots_in();
     // The o_proj bias add runs in place on y, which is a different tensor every call
     if (o_proj->bias)
     {
@@ -480,6 +504,8 @@ void BC_Mamba2::run_bszN_gr
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan_out,
+    const c10::optional<at::Tensor>& slots_scan_in,
     bool history,
     Slot& s,
     Graph* graph
@@ -520,6 +546,7 @@ void BC_Mamba2::run_bszN_gr
         graph
     );
 
+    // [Path A] See BC_GatedDeltaNetSplit::run_bszN_gr: no scan-side history, base->scratch
     cuda_recurrent_mamba2_gr
     (
         s.conv_out,
@@ -532,8 +559,9 @@ void BC_Mamba2::run_bszN_gr
         num_v_heads,
         k_head_dim,
         v_head_dim,
-        slots,
-        history,
+        slots_scan_out,
+        false,
+        history ? slots_scan_in : c10::nullopt,
         graph
     );
 
@@ -565,6 +593,8 @@ void BC_Mamba2::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan_out,
+    const c10::optional<at::Tensor>& slots_scan_in,
     bool history
 )
 {
@@ -578,10 +608,12 @@ void BC_Mamba2::run_bszN
                 "BC_Mamba2::run_bszN: shape out of range");
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_Mamba2::run_bszN: slot not configured");
+    TORCH_CHECK(!history || slots_scan_in.has_value(),
+                "BC_Mamba2::run_bszN: spec passes require slots_scan_in");
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
@@ -594,14 +626,14 @@ void BC_Mamba2::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan_out, slots_scan_in, history, s, s.graph.get());
         s.graph->capture_end();
     }
 
@@ -614,7 +646,9 @@ void BC_Mamba2::run_bszN
     args.emplace_back(GP_conv1d_state,   (void*) conv_state.data_ptr());
     args.emplace_back(GP_conv1d_slots,   (void*) slots.data_ptr());
     args.emplace_back(GP_gdn_rule_state, (void*) recurrent_state.data_ptr());
-    args.emplace_back(GP_gdn_rule_slots, (void*) slots.data_ptr());
+    args.emplace_back(GP_gdn_rule_slots, (void*) slots_scan_out.data_ptr());
+    if (history)
+        args.emplace_back(GP_gdn_rule_slots_in, (void*) slots_scan_in.value().data_ptr());
     if (s.yp)
         args.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     else

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
 from .cache import Cache, CacheLayer
-from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash, host_copy
+from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash, resolve_recurrent_parity, host_copy
 
 """
 Cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers, split along the
@@ -261,25 +261,28 @@ class DSV4State:
             "checkpoint_size": self.checkpoint_size,
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                stashed[k] = l.stash(self.slot, self.position, parity)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(
-                mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
-            stashed["tp_handle"] = cp_handle
+                mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position, None))
         return stashed
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k], self.position)
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                l.unstash(self.slot, stashed[k], self.position, parity)
         else:
             cp_handle = stashed["tp_handle"]
             self.cache.model.tp_dispatch_all(
-                mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position))
+                mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position, None))
 
     def tp_export(self):
         return DSV4ExportedState(
@@ -398,7 +401,7 @@ class DSV4LayerState:
         pass  # all bookkeeping is position-derived; stale rows are overwritten on re-advance
 
 
-    def stash(self, slot, position):
+    def stash(self, slot, position, parity: int = 0):
         out = [host_copy(self.ring[slot, :min(self.ring_rows, position)])]
         if self.comp_buf_kv is not None:
             out.append(host_copy(self.comp_buf_kv[slot]))
@@ -411,7 +414,7 @@ class DSV4LayerState:
         return out
 
 
-    def unstash(self, slot, stashed, position):
+    def unstash(self, slot, stashed, position, parity: int = 0):
         it = iter(stashed)
         ring = next(it)
         self.ring[slot].zero_()  # never leave stale rows below the restored window
