@@ -2,10 +2,14 @@ from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
 from .model.config import moe_cpu_layers, moe_cpu_split_sizes
+from .util.misc import parse_int_list
+from .util.backend import ROCM
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
+import re
+import torch
 import yaml
 from pathlib import Path
 
@@ -57,6 +61,7 @@ def add_args(
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
     parser.add_argument("-lpd", "--layers_per_device", type = str, help = "Number of layers to load on each device, example: 2,12,26 (must add up to the model's number of layers, 0 skips a device). Layer-split mode only; --gpu_split still limits the VRAM used per device")
+    parser.add_argument("-placement", "--placement", type = str, help = "Where the model's parts go, as text that stands for the other placement arguments: clauses 'subject: setting' separated by ';'. Example: \"layers 0..11: on gpu 0; other layers: on gpu 1; gpu 0: at most 22 GB; gpu 1: at most 22 GB\"")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -155,6 +160,101 @@ def get_arg_sampler(args):
         adaptive_target = args.adaptive_target,
         adaptive_decay = args.adaptive_decay,
     )
+
+
+def placement_args(text: str, model) -> dict:
+    """
+    Expand a placement description into the arguments it stands for, as they are typed. Clauses are separated by
+    ';' or newlines and read 'subject: setting, setting'; their order does not matter:
+
+        layers 0..11: on gpu 0; other layers: on gpu 1      --layers_per_device (every layer, one run per gpu, in order)
+        gpu 0: at most 22 GB; gpu 1: unused                 --gpu_split (every gpu or none; per load, as the argument)
+
+    'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
+    is refused, so a word added later changes no text that loads today.
+    Returns {argument: value}.
+    """
+    def fail(msg):
+        raise ValueError(f"Placement: {msg}")
+
+    if len(text) > 4096:
+        fail("the text is longer than 4096 characters")
+    num_gpus = torch.cuda.device_count()
+    idx = [m.layer_idx for m in model.modules if m.layer_idx is not None and m.layer_idx >= 0]
+    n = len(idx)
+    if idx != list(range(n)):
+        fail("the model's layers are not numbered from 0 in order, use the arguments")
+    gpu, limits, other, out = {}, {}, None, {}
+    for clause in re.split(r"[;\n]", text.lower()):
+        clause = " ".join(clause.split())
+        if not clause:
+            continue
+        if clause.count(":") != 1:
+            fail(f"'{clause}' needs exactly one ':', as in 'layers 0..11: on gpu 0'")
+        subject, settings = (part.strip() for part in clause.split(":"))
+        settings = [setting.strip() for setting in settings.split(",")]
+        if m := re.fullmatch(r"(?:(all|other) )?layers?(?: (.+))?", subject):
+            which, spec = m[1], m[2]
+            if bool(which) == bool(spec):
+                fail(f"'{subject}': write 'layers 0..11', 'all layers' or 'other layers'")
+            layers = list(range(n))
+            if spec:
+                item = r"[0-9]{1,9}|[0-9]{0,9} ?\.\. ?[0-9]{0,9}"
+                if not all(re.fullmatch(item, part.strip()) for part in spec.split(",")):
+                    fail(f"'{subject}': layers are numbers and ranges, example: 0..10,12 (a range is 0..10, not 0-10)")
+                if bad := [int(i) for i in re.findall(r"[0-9]+", spec) if int(i) >= n]:
+                    fail(f"layer {bad[0]} does not exist, the model has layers 0..{n - 1}")
+                layers = parse_int_list(spec, min_value = 0, max_value = n - 1)
+                if layers != sorted(set(layers)):
+                    fail(f"'{subject}': list each layer once, in ascending order")
+            for setting in settings:
+                if not (m := re.fullmatch(r"on gpu ?([0-9]{1,9})", setting)):
+                    fail(f"'{setting}' is not valid after '{subject}', write 'on gpu <n>'")
+                if which == "other":
+                    if other is not None:
+                        fail("'other layers' is given twice")
+                    other = int(m[1])
+                    continue
+                for i in layers:
+                    if i in gpu:
+                        fail(f"layer {i} is given a gpu twice")
+                    gpu[i] = int(m[1])
+        elif m := re.fullmatch(r"gpu ?([0-9]{1,9})", subject):
+            g, m = int(m[1]), re.fullmatch(r"at most ([0-9]{1,6}(?:\.[0-9]{1,6})?) ?gb|unused", ",".join(settings))
+            if not m:
+                fail(f"'{clause}': a gpu takes 'at most <n> GB' (GB as in --gpu_split) or 'unused'")
+            if g in limits:
+                fail(f"gpu {g} has two limits")
+            limits[g] = m[1] or "0"
+        else:
+            fail(f"cannot read '{clause}'. Clauses: 'layers 0..11: on gpu 0', 'all layers: on gpu 0', "
+                 "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused'")
+    if other is not None:
+        if len(gpu) == n:
+            fail("'other layers' names no layer, every layer is already on a gpu")
+        gpu.update((i, other) for i in range(n) if i not in gpu)
+    used = [*gpu.values(), *limits]
+    if used and max(used) >= num_gpus:
+        fail(f"there is no gpu {max(used)}: {num_gpus} visible, numbered from 0")
+    if gpu:
+        if len(gpu) < n:
+            fail(f"layer {min(set(range(n)) - set(gpu))} is not given a gpu (add 'other layers: on gpu <n>')")
+        order = [gpu[i] for i in range(n)]
+        if order != sorted(order):
+            i = next(i for i in range(1, n) if order[i] < order[i - 1])
+            fail(f"layer {i} is on gpu {order[i]} but layer {i - 1} is on gpu {order[i - 1]}: the gpus take the layers in "
+                 f"order. For another order, reorder the visible gpus ({'HIP' if ROCM else 'CUDA'}_VISIBLE_DEVICES)")
+        out["layers_per_device"] = ",".join(str(order.count(g)) for g in range(order[-1] + 1))
+    if limits:
+        if len(limits) < num_gpus:
+            fail(f"gpu {min(set(range(num_gpus)) - set(limits))} has no limit: with one given, every visible gpu needs "
+                 "'at most <n> GB' or 'unused'")
+        if bad := [g for g in set(gpu.values()) if not float(limits[g])]:
+            fail(f"gpu {bad[0]} is 'unused' but holds layers")
+        if not any(float(x) for x in limits.values()):
+            fail("every gpu is 'unused'")
+        out["gpu_split"] = ",".join(limits[g] for g in range(num_gpus))
+    return out
 
 
 def init(
@@ -298,6 +398,18 @@ def init(
     else:
         cache = None
         draft_cache = None
+
+    # Placement
+    text = getattr(args, "placement", None)
+    if text:
+        names = ", ".join(f"gpu {i} = {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count()))
+        printp(not quiet and "gpu" in text.lower() and bool(names), f" -- Placement: {names}")
+        placed = placement_args(text, model)
+        for name, flag in placed.items():
+            given = getattr(args, name, None)
+            assert not given or given == flag, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
+            setattr(args, name, flag)
+        printp(not quiet and bool(placed), " -- Placement: " + " ".join(f"--{name} {flag}" for name, flag in placed.items()))
 
     # Offload
     if getattr(args, "moe_cpu_offload", 0):
