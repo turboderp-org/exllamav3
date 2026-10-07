@@ -594,12 +594,14 @@ class Model(Model_TPMixin, Model_LSMixin):
                 sm.key: m.layer_idx for m in self.modules if m.layer_idx is not None
                 for sm in m if hasattr(sm, "cpu_offload")
             }
-            name = "moe_cpu_offload" if ip.moe_cpu_component == "text" else "draft_moe_cpu_offload"
-            named, known = getattr(ip, name), set(ip.moe_cpu_layer_idx.values())
-            unknown = sorted(set(named) - known) if known and isinstance(named, list) else []
-            if unknown:
-                more = " and more" if unknown[8:] else ""
-                print(f" !! {name}: layers {unknown[:8]}{more} are not MoE layers of this model, ignored")
+            known = set(ip.moe_cpu_layer_idx.values())
+            for name in ("moe_cpu_offload", "moe_cpu_split") if ip.moe_cpu_component == "text" else \
+                    ("draft_moe_cpu_offload",):
+                named = getattr(ip, name)
+                unknown = sorted(set(named) - known) if known and isinstance(named, (list, dict)) else []
+                if unknown:
+                    more = " and more" if unknown[8:] else ""
+                    print(f" !! {name}: layers {unknown[:8]}{more} are not MoE layers of this model, ignored")
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
