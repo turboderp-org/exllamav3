@@ -327,6 +327,10 @@ struct BC_GatedDeltaNetSplit
         at::Tensor o_xh
     );
 
+    // slots indexes conv_state (pool slots); slots_scan_out / slots_scan_in index the doubled
+    // recurrent_state pool (Path A: the scan always writes scratch and reads base on spec
+    // passes, in-place on decode). The scan kernel never records per-token history anymore;
+    // rejected prefixes are rebuilt by replaying the staged scan inputs.
     void run_bszN_gr
     (
         const at::Tensor& x,
@@ -334,6 +338,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
+        const at::Tensor& slots_scan_out,
+        const c10::optional<at::Tensor>& slots_scan_in,
         bool history,
         Slot& s,
         Graph* graph
@@ -346,6 +352,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
+        const at::Tensor& slots_scan_out,
+        const c10::optional<at::Tensor>& slots_scan_in,
         bool history
     );
 };
@@ -489,6 +497,8 @@ struct BC_Mamba2
         at::Tensor o_xh
     );
 
+    // See BC_GatedDeltaNetSplit::run_bszN: conv reads pool slots, scan reads/writes the
+    // doubled recurrent_state pool via slots_scan_out / slots_scan_in
     void run_bszN_gr
     (
         const at::Tensor& x,
@@ -496,6 +506,8 @@ struct BC_Mamba2
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
+        const at::Tensor& slots_scan_out,
+        const c10::optional<at::Tensor>& slots_scan_in,
         bool history,
         Slot& s,
         Graph* graph
@@ -508,6 +520,8 @@ struct BC_Mamba2
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
+        const at::Tensor& slots_scan_out,
+        const c10::optional<at::Tensor>& slots_scan_in,
         bool history
     );
 };

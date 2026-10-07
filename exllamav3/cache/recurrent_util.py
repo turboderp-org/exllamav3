@@ -4,14 +4,18 @@ import torch
 # copies so each decode step doesn't rebuild and re-upload one
 _slot_tensors = {}
 
-def _get_slot_tensor(slots: tuple) -> torch.Tensor:
-    t = _slot_tensors.get(slots)
+# `key` distinguishes cached tensors over the same slot tuple: the scan-side tensors are the
+# pool slots doubled and offset by each state's base/scratch parity (Path A), so the parity has
+# to be part of the cache key.
+def _get_slot_tensor(slots: tuple, key: tuple = ()) -> torch.Tensor:
+    ck = (slots, key)
+    t = _slot_tensors.get(ck)
     if t is None:
         if len(_slot_tensors) > 4096:
             _slot_tensors.clear()
         t = torch.tensor(list(slots), dtype = torch.int32)
         t._static_dev_cache = True
-        _slot_tensors[slots] = t
+        _slot_tensors[ck] = t
     return t
 
 
@@ -58,9 +62,23 @@ def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torc
         if rs is not None:
             raise ValueError(f"recurrent_states given without bsz and seqlens")
 
-    # Create slot index tensor
+    # Create slot index tensors. `recurrent_slots` indexes conv_state (cache pool slots);
+    # `recurrent_slots_scan[_in]` index the doubled recurrent_state pool (Path A): flat row
+    # 2*slot + parity is the live base state, 2*slot + (1 - parity) the scratch buffer. The
+    # scan-side tensors name the kernel's WRITE (`_scan`) and READ (`_scan_in`) state rows:
+    # a spec pass advances scratch from base (out = 2s+1-p, in = 2s+p; scan-in only exists
+    # on spec passes), a non-spec pass runs in place on the live row (out = 2s+p, no scan-in).
     if rs is not None:
-        params["recurrent_slots"] = _get_slot_tensor(tuple(r.slot for r in rs))
+        pool = tuple(r.slot for r in rs)
+        params["recurrent_slots"] = _get_slot_tensor(pool)
+        parity = tuple(int(getattr(r, "parity", 0)) for r in rs)
+        spec = bool(params.get("recurrent_history"))
+        params["recurrent_slots_scan"] = _get_slot_tensor(
+            tuple(2 * s + ((1 - p) if spec else p) for s, p in zip(pool, parity)),
+            ("scan", parity, spec))
+        if spec:
+            params["recurrent_slots_scan_in"] = _get_slot_tensor(
+                tuple(2 * s + p for s, p in zip(pool, parity)), ("scan_in", parity))
 
 
 def advance_recurrent_states(input_ids: torch.Tensor, params: dict, model):
@@ -69,7 +87,12 @@ def advance_recurrent_states(input_ids: torch.Tensor, params: dict, model):
     if rs:
         bsz, seqlen = input_ids.shape
         assert len(rs) == bsz
-        for r in rs:
+        for i, r in enumerate(rs):
             r.position += seqlen
             r.last_history = (seqlen - 1) if history else 0
+            if history:
+                # [Path A] rewind() replays this pass's staged scan inputs (keyed by shape,
+                # batch-indexed) for the accepted prefix; i is the batch row this state held
+                r.spec_row = i
+                r.spec_shape = (bsz, seqlen)
             r.post_advance()

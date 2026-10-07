@@ -38,45 +38,61 @@ from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 from ..cache.recurrent import host_copy
 
+# Single-row scan slot tensors for replay_scan's per-row kernel launches; tiny and reused
+_scan_row_tensors = {}
 
-def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
-    """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
-    batched rewind kernels. With layer-split loading a single cache's GDN layers span multiple
-    devices, so jobs must be grouped by the device each layer's state actually lives on --
-    launching them all under one device index dereferences foreign pointers (illegal memory
-    access on any multi-GPU split). Only GDNLayerState instances (GDN and Mamba2 alike) are
-    batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
-    falls back to its own .rewind() call, unchanged."""
+def _get_scan_row_tensor(row: int, device) -> torch.Tensor:
+    key = (row, str(device))
+    t = _scan_row_tensors.get(key)
+    if t is None:
+        if len(_scan_row_tensors) > 4096:
+            _scan_row_tensors.clear()
+        t = torch.tensor([row], dtype = torch.int32, device = device)
+        _scan_row_tensors[key] = t
+    return t
+
+
+def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
+                   spec_row: int = None, spec_shape=None, base_row: int = None, scratch_row: int = None):
+    """Roll a recurrent cache row back `num_tokens` tokens after a speculative pass. Two
+    independent halves:
+    - conv rings: batched rewind-kernel jobs per device (with layer-split loading a single
+      cache's GDN layers span multiple devices, so jobs must be grouped by the device each
+      layer's state actually lives on -- launching them all under one device index
+      dereferences foreign pointers). Only GDNLayerState instances (GDN and Mamba2 alike) are
+      batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
+      falls back to its own .rewind() call, unchanged.
+    - recurrent state [Path A]: no snapshot to copy. The scan kernel only ever kept base and
+      scratch (2 rows per pool slot), so the committed prefix state is rebuilt by replaying
+      the staged scan inputs for the accepted prefix from the base row into the scratch row.
+      `spec_row` is the batch row this state occupied in the verify pass (the staging buffers
+      are batch-indexed), `spec_shape` keys them."""
+    prefix = last_history + 1 - num_tokens
+    replay = last_history > 0 and num_tokens > 0
+    if replay:
+        assert spec_shape is not None and spec_row is not None, \
+            "GDN rewind: history was recorded but no staged scan inputs for replay"
     jobs_by_device = {}
     for l in layers:
         if isinstance(l, GDNLayerState):
-            # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
-            # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
-            conv_jobs, state_jobs = jobs_by_device.setdefault(device_index, ([], []))
             cj = l.rewind_conv_job(slot, last_history, num_tokens)
             if cj is not None:
-                conv_jobs.append(cj)
-            sj = l.rewind_state_job(slot, last_history, num_tokens)
-            if sj is not None:
-                state_jobs.append(sj)
+                jobs_by_device.setdefault(device_index, []).append(cj)
+            if replay:
+                l.replay_scan(spec_row, prefix, spec_shape, base_row, scratch_row)
         else:
             l.rewind(slot, last_history, num_tokens)
-    return jobs_by_device
-
-
-def _dispatch_rewind_jobs(jobs_by_device):
-    for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
+    for device_index, conv_jobs in jobs_by_device.items():
         if conv_jobs:
             ext.batched_conv_rewind(conv_jobs, device_index)
-        if state_jobs:
-            ext.batched_state_rewind(state_jobs, device_index)
 
 
-def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
+def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens,
+                              spec_row = None, spec_shape = None, base_row = None, scratch_row = None):
     recurrent_modules = local_context["recurrent_modules"]
     layers = [module.tp_recurrent_lookup[cache_id] for module in recurrent_modules]
-    _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
+    _rewind_layers(layers, slot, last_history, num_tokens, spec_row, spec_shape, base_row, scratch_row)
 
 
 class GDNState:
@@ -90,12 +106,21 @@ class GDNState:
         stashed: dict = None,
         test_state: bool = False,
         exported: bool = False,
+        parity: int = 0,
     ):
         self.slot = slot
         self.position = position
         self.cache = cache
         self.last_history = 0
         self.exported = exported
+        # [Path A] The recurrent_state pool holds two rows per slot: 2*slot + parity is the
+        # live (base) state, 2*slot + (1 - parity) the scratch buffer speculative passes
+        # advance. Committing a speculative round swaps the roles (a parity flip, no copy).
+        self.parity = parity
+        # Batch row / shape of the last speculative pass, set by advance_recurrent_states;
+        # rewind() replays the staged scan inputs of that pass for the accepted prefix
+        self.spec_row = None
+        self.spec_shape = None
 
         if not exported:
             assert test_state or position == 0 or stashed is not None, \
@@ -122,14 +147,29 @@ class GDNState:
 
 
     def rewind(self, num_tokens: int):
+        last_history = self.last_history
+        parity = self.parity
+        if last_history > 0 and self.spec_shape is None:
+            raise RuntimeError("GDN rewind: per-token history was recorded but the pass "
+                               "recorded no replayable scan inputs")
         if not self.cache.model.loaded_tp:
-            _dispatch_rewind_jobs(_collect_rewind_jobs(
-                self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-            ))
+            _rewind_layers(
+                self.cache.get_all_recurrent_layers().values(), self.slot, last_history, num_tokens,
+                self.spec_row, self.spec_shape,
+                2 * self.slot + parity, 2 * self.slot + 1 - parity,
+            )
         else:
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (
+                id(self.cache), self.slot, last_history, num_tokens,
+                self.spec_row, self.spec_shape,
+                2 * self.slot + parity, 2 * self.slot + 1 - parity,
+            ))
         self.position -= num_tokens
         self.last_history = 0
+        if last_history > 0:
+            # The scratch row now holds the committed state (fully accepted pass, or the
+            # replayed accepted prefix); it becomes the new base
+            self.parity = 1 - parity
 
 
     def rollback_capacity(self):
@@ -141,26 +181,29 @@ class GDNState:
     def stash(self):
         stashed = {
             "position": self.position,
-            "checkpoint_size": self.checkpoint_size
+            "checkpoint_size": self.checkpoint_size,
+            "parity": self.parity,
         }
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot)
+                stashed[k] = l.stash(self.slot, self.position, parity = self.parity)
         else:
             cp_handle = new_checkpoint_handle()
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position, self.parity))
             stashed["tp_handle"] = cp_handle
         return stashed
 
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
+        parity = stashed.get("parity", 0)
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k])
+                l.unstash(self.slot, stashed[k], self.position, parity = parity)
         else:
             cp_handle = stashed["tp_handle"]
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position, parity))
+        self.parity = parity
 
 
     def post_advance(self):
@@ -173,14 +216,22 @@ class GDNState:
             slot = self.slot,
             position = self.position,
             exported = True,
+            parity = self.parity,
         )
 
 
     def reset(self):
         self.position = 0
+        self.parity = 0
+        self.spec_row = None
+        self.spec_shape = None
 
 
 class GDNLayerState:
+    # [Path A] The recurrent-state row is 2*slot + parity, so a checkpoint caller must own
+    # the parity; see cache.recurrent.resolve_recurrent_parity
+    parity_indexed = True
+
 
     def __init__(
         self,
@@ -195,8 +246,14 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        # [Path A] Recurrent-state pool: two rows per batch slot (base + scratch) instead of
+        # the old max_history+1 per-token snapshot ring. Spec passes advance the scratch row
+        # (2*slot + 1 - parity) from the base row (2*slot + parity) without recording
+        # snapshots; a rejected suffix is undone by replay_scan() rebuilding the committed
+        # prefix state from the staged scan inputs. max_history still sizes the conv rewind
+        # ring below.
         self.recurrent_state = torch.empty(
-            (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
+            (max_batch_size * 2, 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
             dtype = torch.float,
             device = "meta"
         )
@@ -204,6 +261,11 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        # Staged scan inputs of the last verify pass, keyed by (bsz, seqlen):
+        # (kind, post-conv qkv, beta-or-dt, g). BC graph slots carry per-layer statics at
+        # history=True, so the references stay valid until the rewind; the torch path stages
+        # the pass's fresh tensors.
+        self.spec_inputs = {}
 
 
     def get_checkpoint_size(self):
@@ -234,7 +296,7 @@ class GDNLayerState:
     def clear(self, idx: int):
         if self.device is not None:
             self.conv_state[idx].zero_()
-            self.recurrent_state[idx].zero_()
+            self.recurrent_state[2 * idx:2 * idx + 2].zero_()
 
 
     def get_state_tensors(self):
@@ -273,48 +335,57 @@ class GDNLayerState:
         )
 
 
-    def rewind_state_job(self, slot: int, last_history: int, num_tokens: int):
-        """Job descriptor for the batched recurrent-state rewind kernel (ext.batched_state_rewind),
-        computed without performing any copy. Same gating condition as the conv branch."""
-        # last_history == 0 means the forward that advanced this state recorded no per-token history.
-        # The history index used below, last_history + 1 - num_tokens, is then negative for any
-        # num_tokens >= 2, so the computed base walks backwards out of this slot into the neighbouring
-        # sequence's live state (or off the end of the allocation for slot 0). batched_state_rewind
-        # cannot detect this: it validates cdim and num_elements, never the offset. The result is a
-        # silent wrong-value copy that only surfaces much later as bad output or a fault in an
-        # unrelated kernel.
-        #
-        # A rewind with no history is only ever a position correction anyway -- the tokens are re-fed
-        # and recompute the contents -- so build no job at all. rewind_conv_job() has always gated on
-        # this same condition; the state branch did not, which is the whole defect.
-        assert num_tokens >= 0, \
-            f"GDN state rewind: negative num_tokens {num_tokens}"
-        if last_history == 0 or num_tokens == 0:
-            return None
-        assert num_tokens <= last_history, \
-            f"GDN state rewind: {num_tokens} tokens exceeds recorded history of {last_history}"
-        rs = self.recurrent_state
-        es = rs.element_size()
-        base = rs.data_ptr() + slot * rs.stride(0) * es
-        return ext.StateRewindJob(
-            base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
-            base,
-            rs.stride(1),
-        )
+    def replay_scan(self, row: int, prefix: int, shape, base_row: int, scratch_row: int):
+        """[Path A] Rebuild the committed-prefix recurrent state: rerun the sequential scan
+        kernel over the staged scan inputs (post-conv qkv and gates) of the last verify pass
+        for its first `prefix` tokens, advancing from the base row into the scratch row of
+        the recurrent-state pool. Bit-identical to the per-token snapshot the history ring
+        used to save at that prefix: same kernel, same inputs, same initial state. The scan
+        output activations are discarded; only the final state write matters."""
+        staged = self.spec_inputs.get(shape)
+        if staged is None:
+            raise RuntimeError(
+                f"GDN scan replay: no staged scan inputs for shape {shape}")
+        kind, mk, gate, g = staged
+        mk = mk[row:row + 1, :prefix].contiguous()
+        gate = gate[row:row + 1, :prefix].contiguous()
+        g = g[row:row + 1, :prefix].contiguous()
+        m = self.module
+        # Direct kernel call, bypassing gated_delta_rule_fn: the wrapper would route short
+        # replays (prefix >= num_v_heads) to the chunked fla kernels, which are not the
+        # kernel the verify pass ran and would break bit-identical replay.
+        core_attn_out = torch.empty(
+            (1, prefix, m.num_v_heads, m.v_head_dim), dtype = torch.bfloat16, device = self.device)
+        if kind == "gdn":
+            ext.cuda_recurrent_gated_delta_rule(
+                mk, g, gate, self.recurrent_state, core_attn_out,
+                m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim,
+                _get_scan_row_tensor(scratch_row, self.device), False,
+                _get_scan_row_tensor(base_row, self.device),
+            )
+        else:
+            ext.cuda_recurrent_mamba2(
+                mk, g, gate, m.d_skip_f, self.recurrent_state, core_attn_out,
+                m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim,
+                _get_scan_row_tensor(scratch_row, self.device), False,
+                _get_scan_row_tensor(base_row, self.device),
+            )
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, parity: int = 0):
         cdim = self.module.conv_kernel_size
+        row = 2 * slot + parity
         return (
-            host_copy(self.recurrent_state[slot, :1]),
+            host_copy(self.recurrent_state[row:row + 1]),
             host_copy(self.conv_state[slot, :, :cdim])
         )
 
 
-    def unstash(self, slot, stashed, position: int = 0):
+    def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
         cdim = self.module.conv_kernel_size
         s, c = stashed
-        self.recurrent_state[slot, :1].copy_(s)
+        row = 2 * slot + parity
+        self.recurrent_state[row:row + 1].copy_(s)
         self.conv_state[slot, :, :cdim].copy_(c)
 
 
@@ -601,6 +672,8 @@ class GatedDeltaNet(Module):
 
         self.bc = None
         self.bc_split = False
+        # [Path A] Per-(bsz, seqlen) scan-input statics of the spec (history=True) graph slots
+        self.bc_spec_statics = {}
         self.bsz1_pa_args = []
         self.ba_weight_t = None
         self.ba_bias = None
@@ -842,6 +915,7 @@ class GatedDeltaNet(Module):
             self.bc = None
             self.bc_split = False
             self.bsz1_pa_args = []
+            self.bc_spec_statics = {}
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
@@ -913,10 +987,17 @@ class GatedDeltaNet(Module):
         fa_out          = g_tensor_cache.get(device, (bsz, seqlen, hk), torch.float, "s_kfa")
         fb_out          = g_tensor_cache.get(device, (bsz, seqlen, nv * hk), torch.float, "s_kfb")
         ga_out          = g_tensor_cache.get(device, (bsz, seqlen, hv), torch.float, "s_kga")
-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
+        # [Path A] The scan-input statics (conv output, beta, g) back the staged replay inputs
+        # on spec passes; the default cache ids are shared across layers, so at history=True
+        # slots (the verify shapes) they are allocated per layer instead. Everything else
+        # stays shared.
+        sid = f"_{id(self)}" if history else ""
+        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta" + sid)
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4" + sid)
         mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv" + sid)
+        if history:
+            self.bc_spec_statics[(bsz, seqlen)] = (conv_out, beta, g)
         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
@@ -976,10 +1057,16 @@ class GatedDeltaNet(Module):
         qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
         z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
         ba              = g_tensor_cache.get(device, (bsz, seqlen, 2 * nv), torch.float, "s_ba")
-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
+        # [Path A] Scan-input statics back the staged replay inputs on spec passes; the
+        # default cache ids are shared across layers, so at history=True slots (the verify
+        # shapes) conv_out/beta/g are allocated per layer instead
+        sid = f"_{id(self)}" if history else ""
+        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta" + sid)
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g" + sid)
         mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv" + sid)
+        if history:
+            self.bc_spec_statics[(bsz, seqlen)] = (conv_out, beta, g)
         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
@@ -1079,7 +1166,15 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            # [Path A] conv indexes the cache pool; the scan reads/writes the doubled
+            # recurrent_state pool (base -> scratch on spec passes, in place otherwise)
+            slots_scan_out = get_for_device(params, "recurrent_slots_scan", self.device)
+            slots_scan_in = get_for_device(params, "recurrent_slots_scan_in", self.device, None) if save_history else None
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan_out, slots_scan_in, save_history)
+            if save_history:
+                # Graph statics are per layer at history=True slots; hold them as this
+                # round's replay inputs (rewind replays before the next pass overwrites them)
+                rsl.spec_inputs[(bsz, seqlen)] = ("gdn", *self.bc_spec_statics[(bsz, seqlen)])
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1180,15 +1275,20 @@ class GatedDeltaNet(Module):
             params = params,
             token_major = conv_token_major,
         )
+        # [Path A] Stage the scan inputs of a verify pass for the rewind replay; these torch-
+        # path tensors are freshly allocated per pass, so holding the references is enough
+        if save_history and save_state:
+            rsl.spec_inputs[(bsz, seqlen)] = ("gdn", mixed_qkv, beta, g)
 
-        # Delta rule
+        # Delta rule. The scan never records per-token history: it advances the scratch row
+        # from the base row (spec passes) or runs in place on the base row
         core_attn_out = gated_delta_rule_fn(
             mixed_qkv = mixed_qkv,
             beta = beta,
             g = g,
             recurrent_state = recurrent_state,
-            recurrent_slots = recurrent_slots,
-            history = save_history,
+            recurrent_slots = get_for_device(params, "recurrent_slots_scan", self.device) if save_state else None,
+            spec = save_history,
             save_state = save_state,
             num_k_heads = self.num_k_heads,
             num_v_heads = self.num_v_heads,
@@ -1196,6 +1296,7 @@ class GatedDeltaNet(Module):
             v_dim = self.v_dim,
             k_head_dim = self.k_head_dim,
             v_head_dim = self.v_head_dim,
+            slots_in = get_for_device(params, "recurrent_slots_scan_in", self.device, None) if save_history else None,
             params = params,
             channelwise_g = self.kda,
         )

@@ -198,6 +198,8 @@ class Mamba2(Module):
 
         self.bc = None
         self.bc_k_in = None
+        # [Path A] Per-(bsz, seqlen) scan-input statics of the spec (history=True) graph slots
+        self.bc_spec_statics = {}
         self.bc_n_in = None
         self.bc_n_out = None
         self.bc_padded_in = False
@@ -289,6 +291,7 @@ class Mamba2(Module):
     @override
     def unload(self):
         self.bc = None
+        self.bc_spec_statics = {}
         self.bc_k_in = None
         self.bc_n_in = None
         self.bc_n_out = None
@@ -322,10 +325,16 @@ class Mamba2(Module):
 
         proj            = g_tensor_cache.get(device, (bsz, seqlen, self.bc_n_in), torch.float, "m2_proj")
         mixed_xbc       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "m2_mx")
-        dt              = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.bfloat16, "m2_dt")
-        g               = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.float, "m2_g")
+        # [Path A] conv_out/dt/g back the staged scan-replay inputs on spec passes; the
+        # default cache ids are shared across layers, so at history=True slots (the verify
+        # shapes) they are allocated per layer instead
+        sid = f"_{id(self)}" if history else ""
+        dt              = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.bfloat16, "m2_dt" + sid)
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.float, "m2_g" + sid)
         z_gate          = g_tensor_cache.get(device, (bsz, seqlen, nh * hd), torch.float, "m2_zgate")
-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "m2_co")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "m2_co" + sid)
+        if history:
+            self.bc_spec_statics[(bsz, seqlen)] = (conv_out, dt, g)
         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nh, hd), torch.bfloat16, "m2_ca")
         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nh * hd), torch.half, "m2_caf")
         in_xh = g_tensor_cache.get(device, (bsz, seqlen, self.bc_k_in), torch.half, "m2_in_xh")
@@ -404,7 +413,13 @@ class Mamba2(Module):
             if self.bc.needs_configure(bsz, seqlen, save_history):
                 self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            # [Path A] conv indexes the cache pool; the scan reads/writes the doubled
+            # recurrent_state pool (base -> scratch on spec passes, in place otherwise)
+            slots_scan_out = get_for_device(params, "recurrent_slots_scan", self.device)
+            slots_scan_in = get_for_device(params, "recurrent_slots_scan_in", self.device, None) if save_history else None
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan_out, slots_scan_in, save_history)
+            if save_history:
+                rsl.spec_inputs[(bsz, seqlen)] = ("m2", *self.bc_spec_statics[(bsz, seqlen)])
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -434,7 +449,12 @@ class Mamba2(Module):
             params = params,
         )
 
-        # SSM
+        # [Path A] Stage the scan inputs of a verify pass for the rewind replay
+        if save_history and save_state:
+            rsl.spec_inputs[(bsz, seqlen)] = ("m2", mixed_xbc, dt, g)
+
+        # SSM. The scan never records per-token history: it advances the scratch row from
+        # the base row (spec passes) or runs in place on the base row
         if seqlen >= self.num_v_heads and not save_history:
             core_attn_out = self.ssd_chunked(mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen)
         else:
@@ -460,8 +480,9 @@ class Mamba2(Module):
                 self.num_v_heads,
                 self.k_head_dim,
                 self.v_head_dim,
-                recurrent_slots,
-                save_history,
+                get_for_device(params, "recurrent_slots_scan", self.device) if save_state else None,
+                False,
+                get_for_device(params, "recurrent_slots_scan_in", self.device, None) if save_history else None,
             )
 
         # Grouped, gated norm: y = groupnorm(y * silu(z)) * w
@@ -492,7 +513,7 @@ class Mamba2(Module):
         k = B.view(bsz, seqlen, self.num_k_heads, self.k_head_dim).repeat_interleave(self.num_v_groups, dim = 2)
         v = x_v * dt.unsqueeze(-1)
 
-        recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
+        recurrent_slots_cpu = get_for_device(params, "recurrent_slots_scan", "cpu", None)
         if recurrent_slots_cpu is None:
             recurrent_slots_cpu = buffered_arange(bsz, mixed_xbc.device)
         core_attn_out = []

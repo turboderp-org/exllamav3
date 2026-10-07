@@ -10,6 +10,7 @@ from . import Module, Linear
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
+    resolve_recurrent_parity,
     mp_cache_recurrent_clear,
     new_checkpoint_handle,
     host_copy,
@@ -88,11 +89,13 @@ class ShortConvState:
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot)
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                stashed[k] = l.stash(self.slot, 0, parity)
         else:
             cp_handle = new_checkpoint_handle()
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, 0, None))
             stashed["tp_handle"] = cp_handle
         return stashed
 
@@ -100,11 +103,13 @@ class ShortConvState:
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k])
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                l.unstash(self.slot, stashed[k], 0, parity)
         else:
             cp_handle = stashed["tp_handle"]
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, 0, None))
 
 
     def post_advance(self):
@@ -194,12 +199,12 @@ class ShortConvLayerState:
         c_state.copy_(temp)
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, parity: int = 0):
         cdim = self.module.conv_kernel_size
         return host_copy(self.conv_state[slot, :, :cdim])
 
 
-    def unstash(self, slot, stashed, position: int = 0):
+    def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
         cdim = self.module.conv_kernel_size
         self.conv_state[slot, :, :cdim].copy_(stashed)
 

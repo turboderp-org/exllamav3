@@ -122,8 +122,11 @@ class Cache:
             Max number of recurrent state slots (max supported batch size for recurrent models)
 
         :param max_history:
-            For recurrent models, max number of past states to reserve space for per batch item. For speculative
-            decoding on recurrent models, this should be equal to the number of draft tokens.
+            For recurrent models, verify-pass capacity per batch item: the convolution (and short-conv/SWA)
+            state rings reserve max_history extra positions so a speculative pass of max_history + 1 tokens
+            can rewind. Should be equal to the number of draft tokens. The recurrent (delta-rule/SSD) state
+            itself keeps only two rows per slot (base + scratch); rejected suffixes are undone by replaying
+            the scan over staged inputs, not by restoring snapshots.
 
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor

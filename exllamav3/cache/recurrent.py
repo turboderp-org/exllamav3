@@ -197,6 +197,22 @@ def new_checkpoint_handle() -> int:
     return h
 
 
+# [Path A] Only the GDN/Mamba2 layer states index the doubled recurrent_state pool by parity
+# (GDNLayerState.parity_indexed); every other recurrent layer ignores the argument. A state
+# class that does not track parity (SWA, ShortConv, DSA) passes None instead of a literal 0:
+# stashing a parity-indexed layer under a parity its state class never owned would silently
+# checkpoint the wrong pool row, so that combination is refused rather than guessed.
+def resolve_recurrent_parity(recurrent_layers, parity: int | None) -> int:
+    if parity is not None:
+        return parity
+    for layer in recurrent_layers:
+        if getattr(layer, "parity_indexed", False):
+            raise RuntimeError(
+                "recurrent checkpoint: this cache holds parity-indexed (GDN/Mamba2) layers, "
+                "so the stashing state class must carry the pool parity instead of None")
+    return 0
+
+
 # Per-rank functions for tensor-parallel mode
 
 def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
@@ -206,23 +222,25 @@ def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
         recurrent_layer.clear(slot)
 
 
-def mp_cache_recurrent_stash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int = 0):
+def mp_cache_recurrent_stash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int, parity: int | None):
     recurrent_modules = local_context["recurrent_modules"]
     recurrent_cache = local_context["recurrent_cache"]
+    layers = [m.tp_recurrent_lookup[cache_id] for m in recurrent_modules]
+    parity = resolve_recurrent_parity(layers, parity)
     stashed = []
-    for module in recurrent_modules:
-        l = module.tp_recurrent_lookup[cache_id]
-        stashed.append(l.stash(slot, position))
+    for l in layers:
+        stashed.append(l.stash(slot, position, parity))
     recurrent_cache[cp_handle] = stashed
 
 
-def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int = 0):
+def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int, parity: int | None):
     recurrent_modules = local_context["recurrent_modules"]
     recurrent_cache = local_context["recurrent_cache"]
+    layers = [m.tp_recurrent_lookup[cache_id] for m in recurrent_modules]
+    parity = resolve_recurrent_parity(layers, parity)
     stashed = recurrent_cache[cp_handle]
-    for module, s in zip(recurrent_modules, stashed):
-        l = module.tp_recurrent_lookup[cache_id]
-        l.unstash(slot, s, position)
+    for l, s in zip(layers, stashed):
+        l.unstash(slot, s, position, parity)
 
 
 def _stashed_bytes(obj) -> int:

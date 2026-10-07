@@ -14,6 +14,7 @@ from ..cache import Cache
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
+    resolve_recurrent_parity,
     new_checkpoint_handle,
 )
 from ..model.model_tp_alloc import TPAllocation
@@ -101,11 +102,13 @@ class SWAState:
             "window_beg": self.window_beg,
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                stashed[k] = l.stash(self.slot, self.position, parity)
         else:
             cp_handle = new_checkpoint_handle()
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position, None))
             stashed["tp_handle"] = cp_handle
         return stashed
 
@@ -114,11 +117,13 @@ class SWAState:
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k], self.position)
+            layers = self.cache.get_all_recurrent_layers()
+            parity = resolve_recurrent_parity(layers.values(), None)
+            for k, l in layers.items():
+                l.unstash(self.slot, stashed[k], self.position, parity)
         else:
             cp_handle = stashed["tp_handle"]
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position, None))
 
 
     def post_advance(self):
@@ -222,7 +227,7 @@ class SWALayerState:
         pass
 
 
-    def stash(self, slot, position):
+    def stash(self, slot, position, parity: int = 0):
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         return (
@@ -231,7 +236,7 @@ class SWALayerState:
         )
 
 
-    def unstash(self, slot, stashed, position):
+    def unstash(self, slot, stashed, position, parity: int = 0):
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         k, v = stashed

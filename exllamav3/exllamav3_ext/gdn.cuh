@@ -45,7 +45,8 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& slots_in = c10::nullopt
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -61,6 +62,7 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& slots_in,
     Graph* graph
 );
 
@@ -109,7 +111,8 @@ void cuda_recurrent_mamba2
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& slots_in = c10::nullopt
 );
 
 void cuda_recurrent_mamba2_gr
@@ -126,6 +129,7 @@ void cuda_recurrent_mamba2_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& slots_in,
     Graph* graph
 );
 
@@ -214,7 +218,8 @@ void kda_gate_op_gr
     Graph* graph
 );
 
-// Batched recurrent-state rewind (speculative decoding draft rejection/commit)
+// Batched conv rewind (speculative decoding draft rejection/commit). The recurrent-state side
+// is scan replay (Path A), not a snapshot copy.
 
 // conv_state shift: conv_state[slot, :, :cdim] <- conv_state[slot, :, p-cdim:p]. `dim` independent
 // per-channel copies of `cdim` elements, `stride` elements apart in both src and dst (same
@@ -232,19 +237,5 @@ struct ConvRewindJob
         src(_src), dst(_dst), dim(_dim), cdim(_cdim), stride(_stride) {}
 };
 
-// recurrent_state rewind: recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens].
-// Flat fp32 copy of num_elements contiguous elements; src/dst never overlap (num_tokens >= 1
-// forces the source history index to differ from destination index 0).
-struct StateRewindJob
-{
-    uintptr_t src;
-    uintptr_t dst;
-    int64_t num_elements;
-
-    StateRewindJob() = default;
-    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements) :
-        src(_src), dst(_dst), num_elements(_num_elements) {}
-};
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
-void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
