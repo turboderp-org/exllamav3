@@ -262,11 +262,13 @@ selection results, persisted across runs).
 
 Speculative (rejection) sampling for DFlash2 drafts, as in the DFlash reference and the Leviathan / Chen et al.
 algorithm: when the single active job samples at temperature > 0 through a stateless sampler (temperature, top-k,
-top-p, min-p; no penalties, DRY, XTC, logit bias, filters, forced tokens or returned probabilities), the drafter's
+top-p, min-p; no penalties, DRY, XTC, logit bias, filters, forced tokens or returned probabilities, and no logit mask
+from `min_new_tokens` or a banned-string rewind at that point; not with `dynamic_draft`), the drafter's
 candidate selector samples its path from q = softmax(score / T_draft) instead of taking the greedy path, and the
 verifier accepts draft token x with probability min(1, p(x) / q(x)), resampling the first rejected position from
-normalize(max(p - q, 0)). p is the job sampler's exact distribution. The output distribution is unchanged (tested by
-Monte Carlo); acceptance rises wherever several continuations are plausible. Greedy jobs and other samplers keep
+normalize(max(p - q, 0)). p is the job sampler's exact distribution, with the fused sampler's cutoffs (ties at a top-k
+or top-p cutoff kept or dropped together). The output distribution is unchanged (tested by Monte Carlo against
+ordinary sampling); acceptance rises wherever several continuations are plausible. Greedy jobs and other samplers keep
 match-the-sample verification. `0` disables it. Read at import.
 
 Qwen3.8-27B 4.0 bpw + DFlash2 4.0 bpw, temperature 1.0 / top-p 0.95 / top-k 20, xhigh reasoning, 16 prompts x 1024

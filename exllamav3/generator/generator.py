@@ -33,9 +33,14 @@ _dflash_spec_temp_scale = float(os.environ.get("EXL3_DFLASH_SPEC_TSCALE", "0.5")
 
 
 def _spec_sampling_ok(job) -> bool:
+    # The block is resolved from the sampler's unmasked distribution, so no per-position logit mask may apply:
+    # active filters (also checked per position in iterate_gen), the stop tokens held back until min_new_tokens
+    # (new_tokens only grows within a block, so checking its start covers it), and the explored tokens a
+    # banned-string rewind blocks at its checkpoint (any open checkpoint, conservatively)
     return (
         getattr(job.sampler, "spec_ok", False) and job.new_tokens >= 0 and job.forced_ids is None and
         not job.return_probs and not job.return_top_tokens and
+        job.new_tokens >= job.min_new_tokens and job.checkpoint is None and
         not any(f.is_active for f in job.filters)
     )
 
@@ -908,8 +913,11 @@ class Generator:
         # sampling instead of match-the-sample. Same output distribution, higher acceptance at temperature > 0
         self._spec = None
         spec_job = None
-        # DFlash2 only: the sampled walk runs on its candidate selector (DFlash v1 drafters keep match-the-sample)
-        if batch_size == 1 and _dflash_spec_enabled and getattr(self.draft_model, "selector", None) is not None:
+        # DFlash2 only: the sampled walk runs on its candidate selector (DFlash v1 drafters keep match-the-sample).
+        # Not with the confidence calibrator (dynamic_draft): it is fitted on the greedy walk's winning scores,
+        # which the sampled walk does not produce
+        if batch_size == 1 and _dflash_spec_enabled and self.draft_calibrator is None and \
+                getattr(self.draft_model, "selector", None) is not None:
             spec_job = next((j_ for j_ in self.active_jobs if j_.is_prefill_done()), None)
             if spec_job is not None and _spec_sampling_ok(spec_job):
                 params["dflash2_temperature"] = float(spec_job.sampler.spec_temperature) * _dflash_spec_temp_scale
@@ -983,16 +991,20 @@ class Generator:
         q_x = (q * (c == x[:, None])).sum(-1)
         g = _spec_generator(job, None, dev)
         u = torch.rand((L,), device = dev, generator = g)
-        a = (u * q_x < p_x).int().cumprod(0).sum()
-        q_dense = torch.zeros((L, P.shape[-1]), dtype = P.dtype, device = dev).scatter_(-1, c, q)
-        r = (P[:L] - q_dense).clamp_min_(0.0)
+        # a = accepted prefix length, kept on the device (indexing with it would sync the host)
+        a = (u * q_x < p_x).int().cumprod(0).sum().view(1)
+        # Only row a is drawn: the residual at the first rejection, or the bonus row p_L after a full accept
+        # (q padded with a zero row there, so the residual is p_L itself)
+        q_a = torch.cat([q, q.new_zeros((1, q.shape[-1]))]).index_select(0, a)
+        c_a = torch.cat([c, c.new_zeros((1, c.shape[-1]))]).index_select(0, a)
+        p_a = P.index_select(0, a)
+        r = (p_a - torch.zeros_like(p_a).scatter_(-1, c_a, q_a)).clamp_min_(0.0)
         tot = r.sum(-1, keepdim = True)
-        r = torch.where(tot > 0, r / tot.clamp_min(1e-30), P[:L])
-        d = torch.cat([r, P[L:L + 1]], dim = 0)
-        gum = -torch.log(-torch.log(torch.rand(d.shape, device = dev, generator = g).clamp_min(1e-20)))
-        fix = torch.argmax(torch.log(d) + gum, dim = -1)
+        r = torch.where(tot > 0, r / tot.clamp_min(1e-30), p_a)
+        gum = -torch.log(-torch.log(torch.rand(r.shape, device = dev, generator = g).clamp_min(1e-20)))
+        fix = torch.argmax(torch.log(r) + gum, dim = -1)
         seq = torch.cat([x, x[:1]])
-        seq[a] = fix[a]
+        seq = torch.where(torch.arange(L + 1, device = dev) == a, fix, seq)
         return seq.cpu()
 
 
