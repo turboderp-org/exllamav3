@@ -23,6 +23,23 @@ void hc_mix
     at::Tensor collapsed
 );
 
+void hc_mix_carry
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor collapsed,
+    const c10::optional<at::Tensor>& pre_in,
+    at::Tensor pre_out
+);
+
 void hc_mix_fused
 (
     at::Tensor x,
