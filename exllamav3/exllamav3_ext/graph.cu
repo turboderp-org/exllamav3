@@ -11,11 +11,30 @@
 
 //#define GRAPHDEBUG 1
 
+// EXL3_GRAPHS=0 disables graph capture everywhere: every graphed site then runs its C++ launch sequence
+// eagerly on each call (the same kernels in the same order, as on the uncaptured first run). Default off
+// on ROCm: the HIP runtime launches a graph node no faster than a plain kernel, so replay only saves the
+// per-kernel host submission, which is within noise of the per-graph submission; meanwhile every
+// instantiated exec holds a 2 MB device kernarg pool that grows with each parameter update until the
+// exec is destroyed. On CUDA the graphs are kept, where they are measurably faster
+static bool graphs_disabled()
+{
+    static const bool v = [] {
+        const char* e = getenv("EXL3_GRAPHS");
+#if defined(USE_ROCM)
+        return !(e && *e == '1');
+#else
+        return e && *e == '0';
+#endif
+    }();
+    return v;
+}
+
 Graph::Graph()
 {
     ready = false;
     ready_to_record = false;
-    disabled = false;
+    disabled = graphs_disabled();
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;

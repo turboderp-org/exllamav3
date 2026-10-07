@@ -845,8 +845,9 @@ void BC_MLAttention::run
     TORCH_CHECK(!index_kpool || bsz == 1, "BC_MLAttention: kpool indexer requires bsz 1");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, nullptr);
         s.runs = 1;

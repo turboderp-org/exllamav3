@@ -21,6 +21,18 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 
 ## Attention
 
+### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
+
+Whether the decode paths capture their kernel sequences into device graphs and replay them. With
+`0` every graphed site (attention, MLA, GDN, the MLP and block-sparse decode kernels) runs the same
+C++ launch sequence eagerly on each call, kernels and order unchanged, so the switch changes only
+host submission. On CUDA replay is a few percent faster at decode. On ROCm the HIP runtime launches a
+graph node no faster than a plain kernel, the measured difference is within noise, and every
+instantiated graph exec reserves a 2 MB device-side kernel-argument pool that grows with each
+parameter update until the exec is destroyed (an open HIP runtime issue); a speculative-decoding
+server holds hundreds of execs, so disabling graphs there also frees over a gigabyte of VRAM.
+Set `EXL3_GRAPHS=1` on ROCm to test the graph path.
+
 ### `EXL3_BC_ATTN` (default: `1`)
 
 Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
