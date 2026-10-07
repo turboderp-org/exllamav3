@@ -1270,22 +1270,32 @@ class DSV4Attention(Module):
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
 
         def slab(r0, r1):
+            sel, ninf = indices[r0:r1], -float("inf")
+            if mode == "use":
+                # A row selects inside its candidate blocks: score only the blocks any row of the slab kept
+                drop = shared["cand"][r0:r1]
+                ent = ((~drop).any(dim = 0).nonzero() * bs + torch.arange(bs, device = x.device)).flatten()
+                ent = ent[ent < ec]
+                rows = ent if block_table is None else block_table.reshape(-1)[ent // epp].long() * epp + ent % epp
+                scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows], ent.numel() * self.compress_rate,
+                                            self.compress_rate, ent.numel())
+                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
+                scores.masked_fill_(drop[:, ent // bs], ninf)
+                scores.masked_fill_(ent >= vis[:, None], ninf)
+                ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
+                sel.copy_(torch.where(sel < 0, sel, ent.int()[sel.clamp(min = 0)]))
+                return
             scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
                                         block_table = block_table, epp = epp)
-            if mode is not None:
-                nf, ninf = ec // bs, -float("inf")
+            if mode == "source":
+                nf = ec // bs
                 full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
-                if mode == "source":
-                    tail_max = F.pad(tail, (0, bs), value = ninf).amax(dim = -1, keepdim = True)
-                    blk = torch.cat((full.amax(dim = -1), tail_max), dim = 1)
-                    last = ((pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
-                    top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
-                    shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
-                else:
-                    drop = shared["cand"][r0:r1]
-                    full.masked_fill_(drop[:, :nf, None], ninf)
-                    tail.masked_fill_(drop[:, nf:], ninf)
-            ext.dsa_topk(scores, indices[r0:r1], k, None, 0)
+                tail_max = F.pad(tail, (0, bs), value = ninf).amax(dim = -1, keepdim = True)
+                blk = torch.cat((full.amax(dim = -1), tail_max), dim = 1)
+                last = ((pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
+                top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
+                shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
+            ext.dsa_topk(scores, sel, k, None, 0)
 
         # Row slabs bound the transient score matrix, as in MLAttention._indexer_topk: selection is
         # per row. No slab is left with the few rows that take the decode kernels
@@ -1316,8 +1326,9 @@ class DSV4Attention(Module):
             # Block maxima of a slab, live twice while the tail block is appended, and the candidate mask
             n += 2 * slab * (ec // bs + 1) + rows * (ec // bs + 1) // 2
         elif self.candidate_mode == "use" and ec > self.candidate_topk_blocks * bs:
-            # Candidate mask, one byte per block, when its source is on another device
-            n += rows * (ec // bs + 1) // 2
+            # Candidate mask, one byte per block, when its source is on another device; then, per slab, the
+            # keys of the candidate entries, the mask over them and their ids
+            n += rows * (ec // bs + 1) // 2 + ec * (self.index_head_dim + slab // 2 + 8)
         t = torch.empty((n,), dtype = torch.half, device = self.device)
         del t
 
