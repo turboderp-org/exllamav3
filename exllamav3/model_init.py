@@ -8,7 +8,7 @@ from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
-import re
+import os, re
 import torch
 import yaml
 from pathlib import Path
@@ -61,7 +61,7 @@ def add_args(
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
     parser.add_argument("-lpd", "--layers_per_device", type = str, help = "Number of layers to load on each device, example: 2,12,26 (must add up to the model's number of layers, 0 skips a device). Layer-split mode only; --gpu_split still limits the VRAM used per device")
-    parser.add_argument("-placement", "--placement", type = str, help = "Where the model's parts go, as text that stands for the other placement arguments: clauses 'subject: setting' separated by ';'. Example: \"layers 0..11: on gpu 0; other layers: on gpu 1; gpu 0: at most 22 GB; gpu 1: at most 22 GB\"")
+    parser.add_argument("-placement", "--placement", type = str, help = "Where the model's parts go, as text that stands for the other placement arguments: clauses 'subject: setting' separated by ';'. Example: \"layers 0..11: on gpu 0; other layers: on gpu 1; gpu 0: at most 22 GB; gpu 1: at most 22 GB\" (default: EXL3_PLACEMENT env)")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -162,7 +162,7 @@ def get_arg_sampler(args):
     )
 
 
-def placement_args(text: str, model, draft_model = None, who: str = "") -> tuple[dict, list[str]]:
+def placement_args(text: str, model, draft_model = None, strict: bool = True, who: str = "") -> tuple[dict, list[str]]:
     """
     Expand a placement description into the arguments it stands for, as they are typed. Clauses are separated by
     ';' or newlines and read 'subject: setting, setting'; their order does not matter:
@@ -177,7 +177,7 @@ def placement_args(text: str, model, draft_model = None, who: str = "") -> tuple
 
     'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
     is refused, so a word added later changes no text that loads today.
-    Returns ({argument: value}, notes).
+    Returns ({argument: value}, notes). Without a draft model its clauses raise if strict, else leave a note.
     """
     def fail(msg):
         raise ValueError(f"Placement: {who and 'draft model: '}{msg}")
@@ -310,8 +310,10 @@ def placement_args(text: str, model, draft_model = None, who: str = "") -> tuple
     ]:
         out["moe_cpu_split"] = ",".join(split)
     if draft and draft_model is None:
-        fail("the text has clauses for a draft model, and none is loaded")
-    if draft:
+        if strict:
+            fail("the text has clauses for a draft model, and none is loaded")
+        notes.append("no draft model is loaded, its clauses are ignored")
+    elif draft:
         placed, more = placement_args("; ".join(draft), draft_model, who = "draft ")
         if "moe_cpu_split" in placed:
             fail("a draft model's experts go to the cpu whole, write 'all experts on cpu'")
@@ -465,19 +467,25 @@ def init(
         draft_cache = None
 
     # Placement
-    text = getattr(args, "placement", None)
-    if text:
+    text, strict = (args.placement, True) if getattr(args, "placement", None) is not None \
+        else (os.environ.get("EXL3_PLACEMENT", ""), False)
+    if text.strip():
+        printp(not quiet and not strict, " -- Placement: text from EXL3_PLACEMENT")
         names = ", ".join(f"gpu {i} = {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count()))
         printp(not quiet and "gpu" in text.lower() and bool(names), f" -- Placement: {names}")
-        placed, notes = placement_args(text, model, draft_model)
+        placed, notes = placement_args(text, model, draft_model, strict)
         for note in notes:
             printp(not quiet, f" !! Placement: {note}")
         types = {"moe_cpu_offload": moe_cpu_layers, "draft_moe_cpu_layers": moe_cpu_layers,
                  "moe_cpu_split": moe_cpu_split_sizes}
-        for name, flag in placed.items():
+        for name, flag in list(placed.items()):
             given, value = getattr(args, name, None), types.get(name, lambda flag: flag)(flag)
-            assert not given or given == value, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
-            setattr(args, name, value)
+            if given and given != value:
+                assert not strict, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
+                printp(not quiet, f" !! EXL3_PLACEMENT: --{name} is given on the command line and is used instead")
+                del placed[name]
+            else:
+                setattr(args, name, value)
         flags = " ".join(f"--{name} {flag}".removesuffix(" True") for name, flag in placed.items())
         printp(not quiet and bool(placed), f" -- Placement: {flags}")
 
