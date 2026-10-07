@@ -397,7 +397,7 @@ throughput on a Xeon Gold 6148. The `vbmi` tier
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `bw` also disables the swizzled weight layout (see
+started. Note that capping to `scalar` also disables the swizzled weight layout (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_WIDE` (default: `1`)
@@ -422,10 +422,12 @@ roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather 
 leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
 (+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
 and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+with the tier forced on a 7960X). The `avx2` tier uses paired output tiles for exact K2/K8
+and eight-tile bands otherwise. The `scalar` tier reads native weights; K8 also stays native
+on AVX-512 tiers. Streamed prefill restores native order on the GPU copy stream for swizzled
+or mixed-layout layers; all-native layers use the DMA ring directly. The inverse ring is
+allocated during the first requiring layer's measured load and retained thereafter. Set to
+`0` to keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

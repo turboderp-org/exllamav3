@@ -931,7 +931,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
             acc[b][i] = _mm512_setzero_si512();
 
     // Layout and prefetch handling as in vnni_band (see the comments there); the host hands
-    // this tier the swizzled layout too (moe_cpu_host gates it on has_avx512_bw)
+    // this tier the swizzled layout too (see exl3_moe_cpu_swizzle_group)
     const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
     const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
     const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
@@ -1373,53 +1373,56 @@ void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 
 constexpr int avx2_regs(int bits, bool hb) { return (tile_words32(bits, hb) + 7) / 8; }
 
-template <int bits, bool hb, int row, bool second_word, int half, int Reg>
+template <int bits, bool hb, int row, bool second_word, int half, int Reg, bool permuted>
 constexpr uint8_t avx2_reg_mask()
 {
     constexpr auto idx16 = make_row_indices<bits, hb, row, second_word>();
     uint8_t mask = 0;
     for (int i = 0; i < 8; ++i)
-        if (idx16[half * 8 + i] / 8 == Reg) mask |= uint8_t(1) << i;
+        if (idx16[half * 8 + (permuted ? (3 * i) % 8 : i)] / 8 == Reg) mask |= uint8_t(1) << i;
     return mask;
 }
 
-template <int bits, bool hb, int row, bool second_word, int half>
+template <int bits, bool hb, int row, bool second_word, int half, bool permuted>
 constexpr std::array<int32_t, 8> avx2_lane_idx()
 {
     constexpr auto idx16 = make_row_indices<bits, hb, row, second_word>();
     std::array<int32_t, 8> out{};
-    for (int i = 0; i < 8; ++i) out[i] = idx16[half * 8 + i] % 8;
+    for (int i = 0; i < 8; ++i) out[i] = idx16[half * 8 + (permuted ? (3 * i) % 8 : i)] % 8;
     return out;
 }
 
 // Permutes+blends together only the registers that actually contribute a lane to this half, in
 // increasing Reg order (skipped candidates cost nothing -- if constexpr eliminates them, so low
 // bitrates collapse to a single unconditional permute, same as VNNI's cheapest case)
-template <int bits, bool hb, int row, bool second_word, int half, int Reg = 0>
+template <int bits, bool hb, int row, bool second_word, int half, bool permuted = false, int Reg = 0>
 M1_TARGET_AVX2
 inline __m256i avx2_gather_half(const __m256i (&preg)[avx2_regs(bits, hb)])
 {
     // All-compile-time-constant arguments: the compiler folds this to a single constant load,
     // same as a hand-written lookup table. No lambda (this function is target-attributed, and
     // GCC does not propagate the target to a lambda's closure -- see file header note).
-    constexpr auto li = avx2_lane_idx<bits, hb, row, second_word, half>();
+    constexpr auto li = avx2_lane_idx<bits, hb, row, second_word, half, permuted>();
+    // GCC does not fold an identity VPERMD intrinsic; bypass it explicitly for this order.
+    constexpr bool identity = permuted && li[0] == 0 && li[1] == 1 && li[2] == 2 && li[3] == 3 &&
+                              li[4] == 4 && li[5] == 5 && li[6] == 6 && li[7] == 7;
     const __m256i lane_idx_v = _mm256_setr_epi32(li[0], li[1], li[2], li[3], li[4], li[5], li[6], li[7]);
     if constexpr (Reg + 1 >= avx2_regs(bits, hb))
     {
         // last candidate: every column not already claimed must come from here
-        return _mm256_permutevar8x32_epi32(preg[Reg], lane_idx_v);
+        return identity ? preg[Reg] : _mm256_permutevar8x32_epi32(preg[Reg], lane_idx_v);
     }
     else
     {
-        constexpr uint8_t mask = avx2_reg_mask<bits, hb, row, second_word, half, Reg>();
+        constexpr uint8_t mask = avx2_reg_mask<bits, hb, row, second_word, half, Reg, permuted>();
         if constexpr (mask == 0)
         {
-            return avx2_gather_half<bits, hb, row, second_word, half, Reg + 1>(preg);
+            return avx2_gather_half<bits, hb, row, second_word, half, permuted, Reg + 1>(preg);
         }
         else
         {
-            const __m256i cur = _mm256_permutevar8x32_epi32(preg[Reg], lane_idx_v);
-            const __m256i rest = avx2_gather_half<bits, hb, row, second_word, half, Reg + 1>(preg);
+            const __m256i cur = identity ? preg[Reg] : _mm256_permutevar8x32_epi32(preg[Reg], lane_idx_v);
+            const __m256i rest = avx2_gather_half<bits, hb, row, second_word, half, permuted, Reg + 1>(preg);
             return _mm256_blend_epi32(rest, cur, mask);
         }
     }
@@ -1429,15 +1432,17 @@ inline __m256i avx2_gather_half(const __m256i (&preg)[avx2_regs(bits, hb)])
 // pre-loaded registers; no scalar decode_state_scalar calls. b0/b1 and the funnel shift follow
 // the same bit layout as decode_state_scalar; the shift is shared across each 8-column half (by
 // construction of the tile's tensor-core permutation, the same invariant the VNNI path relies on
-// for its single per-half s0/s1).
-template <int bits, bool hb, int row>
+// for its single per-half s0/s1). K3 rows2 keeps columns in order (3*i)%8 within each
+// half: three gather permutations become identity. Restore the order only after accumulation.
+template <int bits, bool hb, int row, bool permuted = false>
 M1_TARGET_AVX2
 inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& codes_lo, __m256i& codes_hi)
 {
-    const __m256i a_lo = avx2_gather_half<bits, hb, row, false, 0>(preg);
-    const __m256i b_lo = avx2_gather_half<bits, hb, row, true, 0>(preg);
-    const __m256i a_hi = avx2_gather_half<bits, hb, row, false, 1>(preg);
-    const __m256i b_hi = avx2_gather_half<bits, hb, row, true, 1>(preg);
+    static_assert(!permuted || (bits == 3 && !hb), "permuted columns require integer K3");
+    const __m256i a_lo = avx2_gather_half<bits, hb, row, false, 0, permuted>(preg);
+    const __m256i b_lo = avx2_gather_half<bits, hb, row, true, 0, permuted>(preg);
+    const __m256i a_hi = avx2_gather_half<bits, hb, row, false, 1, permuted>(preg);
+    const __m256i b_hi = avx2_gather_half<bits, hb, row, true, 1, permuted>(preg);
     const __m256i mask16 = _mm256_set1_epi32(0xffff);
     if constexpr (hb)
     {
@@ -1462,9 +1467,10 @@ inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& 
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
+template <int rows>
 M1_TARGET_AVX2
 inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
+    int m, __m256i (&acc)[rows ? rows : MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
 {
     // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
     // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
@@ -1476,7 +1482,8 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
     const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
     const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
     #define ACC_ROW(i) \
-        if ((i) < m) { \
+        if constexpr (rows == 0 || (i) < rows) \
+        if (rows != 0 || (i) < m) { \
             const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
             acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
             acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
@@ -1490,10 +1497,10 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 // registers staying live across the even row's accumulate spills -- AVX2 has 16 architectural
 // ymm registers). At every other K the same restructure measured neutral-to-negative
 // (K3 -5% 1T / -14% 24T-cold on the 7960X); do not widen the gate without re-measuring.
-template <int bits, bool hb, int row = 0>
+template <int bits, bool hb, int rows, int row = 0>
 M1_TARGET_AVX2
 inline void avx2_rows_accum(
-    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[rows ? rows : MAX_M][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8 && !hb)
@@ -1512,27 +1519,43 @@ inline void avx2_rows_accum(
                 _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
             __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+            avx2_accum_row<rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
             // Odd row: same gathered words, shifted by an extra `bits` (>= 32 shifts are
             // well-defined zero, so the slli term drops out cleanly when s - bits == 0)
             codes_lo = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
             codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
-            avx2_rows_accum<bits, hb, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
+            avx2_accum_row<rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
+            avx2_rows_accum<bits, hb, rows, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
         }
     }
     else if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes<bits, hb, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum<bits, hb, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_accum_row<rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum<bits, hb, rows, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
-template <int bits, bool hb>
+// Keep the permuted K3 rows2 chain together, without changing other rates' inlining.
+template <int row = 0>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_k3_rows2_accum(
+    const __m256i (&preg)[3], const int32_t* splat_dup, int k, __m256i (&acc)[2][2],
+    const __m256i& mult, const __m256i& ones32)
+{
+    if constexpr (row < 16)
+    {
+        __m256i codes_lo, codes_hi;
+        avx2_row_codes<3, false, row, true>(preg, codes_lo, codes_hi);
+        avx2_accum_row<2>(codes_lo, codes_hi, splat_dup, k, 2, acc, mult, ones32, row);
+        avx2_k3_rows2_accum<row + 1>(preg, splat_dup, k, acc, mult, ones32);
+    }
+}
+
+template <int bits, bool hb, int rows = 0>
 M1_TARGET_AVX2
 void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
@@ -1542,9 +1565,12 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
     const __m256i ones32 = _mm256_set1_epi32(0x01010101);
     const int32_t* splat_dup = in.splat_dup;
+    const int num_rows = rows ? rows : m;
+    const int group = mat.swz;
+    const size_t row_stride = static_cast<size_t>(group ? group : tiles_n) * packed_size;
 
-    // The k-major stream strides row_stride (>= 8 KB) per step, beyond what the HW prefetcher
-    // tracks (and the swizzled layout the VNNI path uses is not applied for AVX2). Cold-stack
+    // The native k-major stream can stride beyond what the HW prefetcher tracks;
+    // swizzled tiles instead stride one output group. Cold-stack
     // (offloaded expert) microbench: +20..70% at K>=4, largest at K8, warm-neutral, so always
     // on. Distance 4 measured best cold (>= 2 everywhere within noise, 4 adds another +10..35%
     // at K5-K8 cold); prefetching past the allocation end is architecturally safe.
@@ -1556,15 +1582,17 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
-        __m256i acc[MAX_M][2];
-        for (int i = 0; i < m; ++i)
+        __m256i acc[rows ? rows : MAX_M][2];
+        for (int i = 0; i < num_rows; ++i)
         {
             acc[i][0] = _mm256_setzero_si256();
             acc[i][1] = _mm256_setzero_si256();
         }
 
-        const uint16_t* packed = mat.trellis + static_cast<size_t>(tile_n) * packed_size;
-        const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+        const size_t tile_index = group
+            ? static_cast<size_t>(tile_n / group) * tiles_k * group + tile_n % group
+            : static_cast<size_t>(tile_n);
+        const uint16_t* packed = mat.trellis + tile_index * packed_size;
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed += row_stride)
         {
             const uint16_t* pf = packed + row_stride * pf_dist;
@@ -1586,16 +1614,86 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
             else
                 preg[nreg - 1] = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i*>(packed + (nreg - 1) * 16));
-            avx2_rows_accum<bits, hb>(preg, splat_k, mat.k, m, acc, mult, ones32);
+            if constexpr (bits == 3 && !hb && rows == 2)
+                avx2_k3_rows2_accum(preg, splat_k, mat.k, acc, mult, ones32);
+            else
+                avx2_rows_accum<bits, hb, rows>(preg, splat_k, mat.k, m, acc, mult, ones32);
         }
 
-        for (int i = 0; i < m; ++i)
+        for (int i = 0; i < num_rows; ++i)
         {
+            if constexpr (bits == 3 && !hb && rows == 2)
+            {
+                // (3*i)%8 is its own inverse; preserve the existing conversion/FMA epilogue.
+                const __m256i order = _mm256_setr_epi32(0, 3, 6, 1, 4, 7, 2, 5);
+                acc[i][0] = _mm256_permutevar8x32_epi32(acc[i][0], order);
+                acc[i][1] = _mm256_permutevar8x32_epi32(acc[i][1], order);
+            }
             const float scale = mul1_k_inv() * in.q[i];
             const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
             float* out = tout + static_cast<size_t>(i) * mat.n + tile_n * 16;
             _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));
             _mm256_storeu_ps(out + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
+template <int bits, int rows = 0>
+M1_TARGET_AVX2
+void avx2_pair_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    if (tn0 >= tn1) return;
+    if (tn0 & 1)
+    {
+        avx2_tiles<bits, false, rows>(mat, in, tout, m, tn0, tn0 + 1);
+        ++tn0;
+    }
+    if (tn0 >= tn1) return;
+    if (tn1 & 1)
+    {
+        --tn1;
+        avx2_tiles<bits, false, rows>(mat, in, tout, m, tn1, tn1 + 1);
+    }
+
+    const int tiles_k = mat.k / 16;
+    constexpr int packed_size = 16 * bits;
+    const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+    const size_t step = static_cast<size_t>(2) * packed_size;
+
+    for (int pair = tn0; pair < tn1; pair += 2)
+    {
+        __m256i accA[rows ? rows : MAX_M][2], accB[rows ? rows : MAX_M][2];
+        for (int i = 0; i < (rows ? rows : m); ++i)
+        {
+            accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
+            accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
+        }
+        const uint16_t* pA = mat.trellis
+            + static_cast<size_t>(pair >> 1) * tiles_k * 2 * packed_size;
+        const uint16_t* pB = pA + packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
+        {
+            const int32_t* dup = splat_dup + tile_k * 16;
+            __m256i preg[bits];
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
+            avx2_rows_accum<bits, false, rows>(preg, dup, mat.k, m, accA, mult, ones32);
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
+            avx2_rows_accum<bits, false, rows>(preg, dup, mat.k, m, accB, mult, ones32);
+        }
+        for (int i = 0; i < (rows ? rows : m); ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* outA = tout + static_cast<size_t>(i) * mat.n + pair * 16;
+            float* outB = outA + 16;
+            _mm256_storeu_ps(outA, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outA + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][1]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
         }
     }
 }
@@ -1892,8 +1990,32 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         }
         case Isa::Avx2:
         {
+            if (mat.swz == 2)
+            {
+                if (m == 1)
+                {
+                    if (mat.bits == 2) avx2_pair_tiles<2, 1>(mat, in, tout, m, tn0, tn1);
+                    else avx2_pair_tiles<8, 1>(mat, in, tout, m, tn0, tn1);
+                }
+                else
+                {
+                    if (mat.bits == 2) avx2_pair_tiles<2>(mat, in, tout, m, tn0, tn1);
+                    else avx2_pair_tiles<8>(mat, in, tout, m, tn0, tn1);
+                }
+                return;
+            }
             if (mat.hb)
             {
+                if (m == 1)
+                {
+                    switch (mat.bits)
+                    {
+                        case 1: avx2_tiles<1, true, 1>(mat, in, tout, m, tn0, tn1); return;
+                        case 2: avx2_tiles<2, true, 1>(mat, in, tout, m, tn0, tn1); return;
+                        case 3: avx2_tiles<3, true, 1>(mat, in, tout, m, tn0, tn1); return;
+                    }
+                    return;
+                }
                 switch (mat.bits)
                 {
                     case 1: avx2_tiles<1, true>(mat, in, tout, m, tn0, tn1); return;
@@ -1901,6 +2023,28 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                     case 3: avx2_tiles<3, true>(mat, in, tout, m, tn0, tn1); return;
                 }
                 return;
+            }
+            if (m == 1)
+            {
+                switch (mat.bits)
+                {
+                    case 1: avx2_tiles<1, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 2: avx2_tiles<2, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 3: avx2_tiles<3, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 4: avx2_tiles<4, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 5: avx2_tiles<5, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 6: avx2_tiles<6, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    case 7: avx2_tiles<7, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                    default: avx2_tiles<8, false, 1>(mat, in, tout, m, tn0, tn1); return;
+                }
+            }
+            if (m == 2)
+            {
+                switch (mat.bits)
+                {
+                    case 3: avx2_tiles<3, false, 2>(mat, in, tout, m, tn0, tn1); return;
+                    case 4: avx2_tiles<4, false, 2>(mat, in, tout, m, tn0, tn1); return;
+                }
             }
             switch (mat.bits)
             {
@@ -2622,6 +2766,14 @@ bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 
+int64_t exl3_moe_cpu_swizzle_group(double K)
+{
+    // Shared by registration, child packing/replacement, and the parent GPU inverse.
+    // Only exact K2/K8 use the paired AVX2 layout; half-bit formats retain group8.
+    if (g_isa == Isa::Avx2 && (K == 2.0 || K == 8.0)) return 2;
+    return K >= 1.0 && K < 8.0 && exl3_moe_cpu_has_avx2() ? 8 : 0;
+}
+
 static MoeCpuMatrix make_matrix
 (
     const at::Tensor& trellis,
@@ -2644,10 +2796,7 @@ static MoeCpuMatrix make_matrix
     m.bits = tile_w / 16;
     m.hb = tile_w % 16 == 8 ? 1 : 0;
     TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
-    // K8 tensors are exempt from swizzling (routed to the dword kernel, which would gain
-    // nothing) -- the child loader applies the same bits != 8 rule when repacking, so the two
-    // sides agree per tensor
-    m.swz = swizzled && m.bits != 8 ? 1 : 0;
+    m.swz = swizzled ? exl3_moe_cpu_swizzle_group(m.bits + 0.5 * m.hb) : 0;
     TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
@@ -2954,6 +3103,7 @@ bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+int64_t exl3_moe_cpu_swizzle_group(double) { return 0; }
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,

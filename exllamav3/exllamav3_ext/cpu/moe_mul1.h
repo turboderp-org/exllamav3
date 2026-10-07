@@ -25,8 +25,8 @@ struct MoeCpuMatrix
     int n;
     int bits;               // bits per weight, integer part
     int hb = 0;             // half-integer rate: bits + 0.5
-    // Band-contiguous ("swizzled") trellis layout: tile (kt, nt) stored at group nt/8, then
-    // kt, then member nt%8, so each 8-tile output band reads as one sequential k-stream
+    // Actual swizzle group: native (0), paired (2), or eight-tile bands (8).
+    // Tile (kt, nt) is stored at (nt / swz, kt, nt % swz) when swizzled.
     int swz = 0;
 };
 
@@ -61,7 +61,7 @@ int64_t exl3_moe_cpu_make_layer
     const std::vector<at::Tensor>& down_bias,
     int64_t activation,
     double act_limit,
-    int64_t swizzled        // caller repacked trellis tensors band-contiguous (K8 exempt)
+    int64_t swizzled        // caller repacked trellis tensors using the per-tensor ISA policy
 );
 
 void exl3_moe_cpu_free_layer(int64_t handle);
@@ -122,8 +122,9 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);  
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order();
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
-// has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
-// loader (the VBMI tier's wide swizzle bands need the byte-gather kernels' low temporary count).
+// Per-tensor layout after the ISA cap: native (0), paired (2), or eight-tile groups (8).
+// Pass the full rate, including any half bit. Shared by both loader processes.
+int64_t exl3_moe_cpu_swizzle_group(double K);
 bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
