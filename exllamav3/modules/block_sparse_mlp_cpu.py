@@ -118,9 +118,12 @@ class BlockSparseMLP_CPU:
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
                 "a slice of every eligible layer's experts, whole-layer offload takes entire " \
                 "layers — pick one"
+        if isinstance(budget, list):
+            claim = ip.moe_cpu_layer_idx.get(self.key) in budget
+        else:
+            claim = budget > 0 and ip.moe_cpu_offload_assigned.get(comp, 0) < budget
         if (
-            budget > 0 and
-            ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
+            claim and
             device is not None and torch.device(device).type == "cuda" and
             (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
