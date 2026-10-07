@@ -127,6 +127,7 @@ def add_args(
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = moe_cpu_layers, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head; a list counts the head's layers from 0)", default = 0)
+        parser.add_argument("-dgs", "--draft_gpu_split", type = str, help = "Maximum amount of VRAM to use per device for the draft model (or MTP head), in GB, default: as --gpu_split", default = None)
 
 
 def get_arg_sampler(args):
@@ -230,6 +231,8 @@ def init(
     if dmcl:
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if getattr(args, "draft_gpu_split", None):
+        assert draft_model_dir, "--draft_gpu_split requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
         # Shared config: the MTP head is a separate component with its own budget and worker
@@ -329,6 +332,8 @@ def init(
         split = None
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
+    dgs = getattr(args, "draft_gpu_split", None) or args.gpu_split
+    draft_split = None if dgs in (None, "auto") else [float(alloc) for alloc in dgs.split(",")]
     layers = [int(n) for n in args.layers_per_device.split(",")] if getattr(args, "layers_per_device", None) else None
 
     # Parallelism options
@@ -355,7 +360,7 @@ def init(
     if draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            use_per_device = split,
+            use_per_device = draft_split,
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
