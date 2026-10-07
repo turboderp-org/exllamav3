@@ -230,11 +230,11 @@ class RowTable:
     def _retire(self, entry: dict):
         # Drop a queued prefetch that no lookup will take. Its worker may still be writing the
         # staging set, so wait it out (a cold gather, at most) unless it hasn't started
-        self._forget(entry)
-        self.prefetch_stats["retired"] += 1
         f = entry["future"]
         if not f.cancel():
-            f.result()
+            f.exception()       # an error of its own belongs to no lookup
+        self._forget(entry)
+        self.prefetch_stats["retired"] += 1
         entry["pin"].held = False
 
     def _acquire_pin(self, n: int) -> _PinSet:
@@ -320,10 +320,10 @@ class RowTable:
         ids = ids.to("cpu", torch.int64).contiguous().clone()
         if self._match(ids) is not None:
             return
-        pin = self._acquire_pin(n)
         if self.on_disk:
             for h in self.stores:
                 h._ensure_open()    # lazy open isn't thread-safe; do it here, not on the worker
+        pin = self._acquire_pin(n)
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_prefetch")
         self._pending.append({
@@ -362,19 +362,22 @@ class RowTable:
             pin = self._acquire_pin(n)
         try:
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve)
+            out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
+            if not in_order:
+                out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
+            elif not out.is_cuda:
+                out = out.clone()       # the decoded rows may still be the staging buffer itself
+            if out.is_cuda and not synced:
+                if pin.event is None:
+                    pin.event = torch.cuda.Event()
+                pin.event.record(torch.cuda.current_stream(out.device))
         except BaseException:
-            # a failed gather must not keep its staging set
-            pin.held = False
+            # a failed gather, upload or decode must not keep its staging set; an interrupted wait
+            # leaves the set with its prefetch, whose worker may still be writing it
+            if entry is not None and not entry["future"].done():
+                self._pending.append(entry)
+            else:
+                pin.held = False
             raise
-
-        out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
-        if not in_order:
-            out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
-        elif not out.is_cuda:
-            out = out.clone()       # the decoded rows may still be the staging buffer itself
-        if out.is_cuda and not synced:
-            if pin.event is None:
-                pin.event = torch.cuda.Event()
-            pin.event.record(torch.cuda.current_stream(out.device))
         pin.held = False
         return out
