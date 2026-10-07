@@ -130,6 +130,11 @@ class RowTable:
                     stc.release_file(f)
             self._set_stores(handles)
         elif len(keys) == 1:
+            # no file entry: the tensor is already in host memory (conversion)
+            meta = stc.find_stc(keys[0]).get_tensor_meta(keys[0])
+            if what and meta is not None:
+                from ..util.memory import check_host_memory
+                check_host_memory(meta[keys[0]]["n_bytes"], what)
             self._set_stores([stc.get_tensor(keys[0], "cpu", allow_bf16 = allow_bf16, no_defer = True)])
         else:
             # Sharded table: one contiguous slab, each shard copied into its slice as it loads
