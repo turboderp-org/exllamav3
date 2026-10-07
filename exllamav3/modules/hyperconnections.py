@@ -228,13 +228,15 @@ class HyperConnection(Module):
                 fn = self.fn_h
             else:
                 fn = self.fn
+            if self.carry_pre:
+                # The kernel collapses with the previous site's pre weights; the first site has none, stream 0 goes on
+                prev, pre = params.get("hc_pre"), torch.empty((R, H), dtype = torch.float, device = dev)
+                ext.hc_mix_carry(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps, self.sinkhorn_iters, partials,
+                                 post, comb, collapsed, None if prev is None else to_device(prev, dev).view(R, H), pre)
+                params["hc_pre"] = pre.view(b, s, H)
+                return post.view(b, s, H), comb.view(b, s, H, H), streams[:, :, 0] if prev is None else collapsed.view(b, s, D)
             ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                        self.sinkhorn_iters, partials, post, comb, collapsed)
-            if self.carry_pre:
-                p = partials.sum(dim = 1)
-                rnorm = torch.rsqrt(p[:, -1:] / (H * D) + self.rms_eps)
-                pre = torch.sigmoid(p[:, :H] * rnorm * self.scale[0] + self.base[:H]) + self.hc_eps
-                return post.view(b, s, H), comb.view(b, s, H, H), self._carry(streams, pre.view(b, s, H), params)
             return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
         flat = self.norm.forward(streams.flatten(2), params)
         mix = F.linear(flat, self.fn)
