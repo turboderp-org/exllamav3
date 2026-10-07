@@ -400,10 +400,11 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
     return quantized_tiles, quantized_idx
 
 
-# ROCm 7.2 (gfx1201, hipBLASLt and rocBLAS alike) returns wrong rows past M = 2^20 for fp32 GEMMs of shape
-# (M, 128) @ (128, 128); fp16 is unaffected. The right-side rotation flattens to M = k * n / had_dim rows, which
-# only the lm_head of large-vocab models exceeds (2048 x 248320 -> ~4M rows), silently corrupting it. Keep
-# every GEMM below that bound; chunking along k is exact, so results are unchanged everywhere else
+# hipBLASLt 7.2 on gfx1201 (reached through rocBLAS for torch fp32 matmuls) silently returns wrong rows from
+# row 2^19 or 2^20 onward (algorithm-dependent) in fp32 GEMMs; https://github.com/ROCm/rocm-libraries/issues/13243.
+# The right-side rotation flattens to k * n / had_dim rows, which only the lm_head of large-vocab models exceeds
+# (2048 x 248320 -> ~4M rows), corrupting it. Keep every GEMM at or below 2^19 rows; chunking along k is exact,
+# so results are unchanged everywhere else
 _HAD_MAX_GEMM_ROWS = 1 << 19
 
 def preapply_had_l(x: torch.Tensor, had_dim):
