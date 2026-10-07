@@ -162,7 +162,7 @@ def get_arg_sampler(args):
     )
 
 
-def placement_args(text: str, model) -> tuple[dict, list[str]]:
+def placement_args(text: str, model, draft_model = None, who: str = "") -> tuple[dict, list[str]]:
     """
     Expand a placement description into the arguments it stands for, as they are typed. Clauses are separated by
     ';' or newlines and read 'subject: setting, setting'; their order does not matter:
@@ -173,13 +173,14 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
         token embedding: on disk; cpu: 16 threads           --embed_disk; --moe_cpu_threads
         layers 20..: all experts on cpu                     --moe_cpu_offload
         layers ..19: 64 experts on cpu                      --moe_cpu_split
+        all draft layers: on gpu 1; gpu 0: draft unused     the same for the draft model, in clauses of their own
 
     'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
     is refused, so a word added later changes no text that loads today.
     Returns ({argument: value}, notes).
     """
     def fail(msg):
-        raise ValueError(f"Placement: {msg}")
+        raise ValueError(f"Placement: {who and 'draft model: '}{msg}")
 
     def runs(layers):
         out = []
@@ -201,19 +202,26 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
         m.layer_idx: sm.num_experts for m in model.modules if m.layer_idx in idx
         for sm in m if hasattr(sm, "cpu_offload")
     }
-    gpu, cpu, limits, other, out, notes = {}, {}, {}, None, {}, []
+    gpu, cpu, limits, other, draft, out, notes = {}, {}, {}, None, [], {}, []
     for clause in re.split(r"[;\n]", text.lower()):
         clause = " ".join(clause.split())
         if not clause:
             continue
         if clause.count(":") != 1:
             fail(f"'{clause}' needs exactly one ':', as in 'layers 0..11: on gpu 0'")
+        if "draft" in clause:
+            m = re.fullmatch(r"((?:all |other )?)draft (layers?[ :].*)|(gpu ?[0-9]{1,9} ?: ?)draft (.+)", clause)
+            if not m or clause.count("draft") > 1:
+                fail(f"cannot read '{clause}'. Draft model clauses: 'all draft layers: on gpu 1', "
+                     "'draft layers 0..1: on gpu 0', 'gpu 1: draft at most 6 GB', 'gpu 0: draft unused'")
+            draft.append(m[1] + m[2] if m[2] else m[3] + m[4])
+            continue
         subject, settings = (part.strip() for part in clause.split(":"))
         settings = [setting.strip() for setting in settings.split(",")]
         if m := re.fullmatch(r"(?:(all|other) )?layers?(?: (.+))?", subject):
             which, spec = m[1], m[2]
             if bool(which) == bool(spec):
-                fail(f"'{subject}': write 'layers 0..11', 'all layers' or 'other layers'")
+                fail(f"'{subject}': write '{who}layers 0..11', 'all {who}layers' or 'other {who}layers'")
             layers = list(range(n))
             if spec:
                 item = r"[0-9]{1,9}|[0-9]{0,9} ?\.\. ?[0-9]{0,9}"
@@ -253,7 +261,7 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
         elif m := re.fullmatch(r"gpu ?([0-9]{1,9})", subject):
             g, m = int(m[1]), re.fullmatch(r"at most ([0-9]{1,6}(?:\.[0-9]{1,6})?) ?gb|unused", ",".join(settings))
             if not m:
-                fail(f"'{clause}': a gpu takes 'at most <n> GB' (GB as in --gpu_split) or 'unused'")
+                fail(f"'{clause}': a gpu takes '{who}at most <n> GB' (GB as in --gpu_split) or '{who}unused'")
             if g in limits:
                 fail(f"gpu {g} has two limits")
             limits[g] = m[1] or "0"
@@ -278,7 +286,7 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
         fail(f"there is no gpu {max(used)}: {num_gpus} visible, numbered from 0")
     if gpu:
         if len(gpu) < n:
-            fail(f"layer {min(set(range(n)) - set(gpu))} is not given a gpu (add 'other layers: on gpu <n>')")
+            fail(f"layer {min(set(range(n)) - set(gpu))} is not given a gpu (add 'other {who}layers: on gpu <n>')")
         order = [gpu[i] for i in range(n)]
         if order != sorted(order):
             i = next(i for i in range(1, n) if order[i] < order[i - 1])
@@ -288,7 +296,7 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
     if limits:
         if len(limits) < num_gpus:
             fail(f"gpu {min(set(range(num_gpus)) - set(limits))} has no limit: with one given, every visible gpu needs "
-                 "'at most <n> GB' or 'unused'")
+                 f"'{who}at most <n> GB' or '{who}unused'")
         if bad := [g for g in set(gpu.values()) if not float(limits[g])]:
             fail(f"gpu {bad[0]} is 'unused' but holds layers")
         if not any(float(x) for x in limits.values()):
@@ -301,6 +309,16 @@ def placement_args(text: str, model) -> tuple[dict, list[str]]:
         for r in runs(i for i in cpu if cpu[i] == k).split(",")
     ]:
         out["moe_cpu_split"] = ",".join(split)
+    if draft and draft_model is None:
+        fail("the text has clauses for a draft model, and none is loaded")
+    if draft:
+        placed, more = placement_args("; ".join(draft), draft_model, who = "draft ")
+        if "moe_cpu_split" in placed:
+            fail("a draft model's experts go to the cpu whole, write 'all experts on cpu'")
+        names = {"layers_per_device": "draft_layers_per_device", "gpu_split": "draft_gpu_split",
+                 "moe_cpu_offload": "draft_moe_cpu_layers"}
+        out.update((names[name], flag) for name, flag in placed.items())
+        notes += [f"draft model: {note}" for note in more]
     return out, notes
 
 
@@ -451,10 +469,11 @@ def init(
     if text:
         names = ", ".join(f"gpu {i} = {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count()))
         printp(not quiet and "gpu" in text.lower() and bool(names), f" -- Placement: {names}")
-        placed, notes = placement_args(text, model)
+        placed, notes = placement_args(text, model, draft_model)
         for note in notes:
             printp(not quiet, f" !! Placement: {note}")
-        types = {"moe_cpu_offload": moe_cpu_layers, "moe_cpu_split": moe_cpu_split_sizes}
+        types = {"moe_cpu_offload": moe_cpu_layers, "draft_moe_cpu_layers": moe_cpu_layers,
+                 "moe_cpu_split": moe_cpu_split_sizes}
         for name, flag in placed.items():
             given, value = getattr(args, name, None), types.get(name, lambda flag: flag)(flag)
             assert not given or given == value, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
