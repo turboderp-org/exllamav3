@@ -142,7 +142,12 @@ class BlockSparseMLP_CPU:
         # Registration shrinks the module to its GPU slice, then the normal load below loads
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
-        split_k = int(getattr(ip, "moe_cpu_split", 0))
+        split_k = getattr(ip, "moe_cpu_split", 0)
+        if isinstance(split_k, dict):
+            # Main model only: an MTP head sharing the config numbers its own layers
+            text = getattr(ip, "moe_cpu_component", "text") == "text"
+            split_k = split_k.get(ip.moe_cpu_layer_idx.get(self.key), 0) if text else 0
+        split_k = int(split_k)
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
@@ -330,8 +335,9 @@ class BlockSparseMLP_CPU:
         # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
         # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
+        split = getattr(self.config.infer_params, "moe_cpu_split", 0)
         if (
-            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
+            (isinstance(split, dict) or int(split) > 0) and
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False

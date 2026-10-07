@@ -20,6 +20,25 @@ def moe_cpu_layers(spec) -> int | list[int]:
     except ValueError:
         return parse_int_list(spec, min_value = 0) or int(spec)
 
+def moe_cpu_split_sizes(spec) -> int | dict[int, int]:
+    """
+    Parse a moe_cpu_split value: a plain integer N (every eligible layer), anything else LAYERS:N items, where
+    LAYERS is one layer number or one inclusive range
+    """
+    try:
+        return int(spec)
+    except ValueError:
+        sizes = {}
+        for item in spec.split(","):
+            layers, _, n = item.partition(":")
+            if not layers.strip() or not n.strip().isdecimal() or int(n) < 1:
+                raise ValueError(f"Invalid moe_cpu_split item: {item!r} (expected LAYERS:N, example: 8..23:64)")
+            for i in parse_int_list(layers, min_value = 0):
+                if i in sizes:
+                    raise ValueError(f"Invalid moe_cpu_split item: {item!r} (layer {i} is given twice)")
+                sizes[i] = int(n)
+        return sizes
+
 @dataclass
 class InferParams:
     """
@@ -57,9 +76,10 @@ class InferParams:
         self.moe_cpu_layer_idx = {}
         # Experimental: per-layer expert split — run the TAIL N routed experts of every
         # eligible block-sparse MoE layer on the CPU worker instead of whole layers, so the
-        # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
-        # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
-        self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # CPU GEMMs overlap each layer's own GPU expert compute. A dict instead of N gives the
+        # size per layer number. Mutually exclusive with moe_cpu_offload. Layer-split mode only;
+        # requires mul1-codebook experts
+        self.moe_cpu_split = moe_cpu_split_sizes(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)
