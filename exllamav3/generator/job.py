@@ -862,6 +862,14 @@ class Job:
                     emit_held = True
 
             if emit_held:
+                if emit_eos and "�" in self.held_text and self.held_tokens:
+                    # The job ends with pieces still held (max_new_tokens, a filter, a stop string): characters
+                    # split across those pieces are repaired by decoding them together; a character the last
+                    # token left incomplete stays as it is, nothing more is coming
+                    self.held_text = self.generator.tokenizer.decode(
+                        self.held_tokens.torch(),
+                        decode_special_tokens = self.decode_special_tokens
+                    )[0]
                 if self.held_text != "":
                     self.full_completion += self.held_text
                     r.update({ "text": self.held_text })
@@ -971,8 +979,8 @@ class Job:
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it ends in an incomplete character
-        if self.held_text.endswith("�"):
+        # Hold text while it contains an incomplete character
+        if "�" in self.held_text:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
