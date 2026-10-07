@@ -587,7 +587,19 @@ class Model(Model_TPMixin, Model_LSMixin):
         try:
             # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
             # shares the config but loads after the main model's worker has already started)
-            self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+            ip = self.config.infer_params
+            ip.moe_cpu_component = getattr(self, "component", "text")
+            # Layer number of each MoE module of this component, for the settings that name layers
+            ip.moe_cpu_layer_idx = {
+                sm.key: m.layer_idx for m in self.modules if m.layer_idx is not None
+                for sm in m if hasattr(sm, "cpu_offload")
+            }
+            name = "moe_cpu_offload" if ip.moe_cpu_component == "text" else "draft_moe_cpu_offload"
+            named, known = getattr(ip, name), set(ip.moe_cpu_layer_idx.values())
+            unknown = sorted(set(named) - known) if known and isinstance(named, list) else []
+            if unknown:
+                more = " and more" if unknown[8:] else ""
+                print(f" !! {name}: layers {unknown[:8]}{more} are not MoE layers of this model, ignored")
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
