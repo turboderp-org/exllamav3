@@ -63,13 +63,13 @@ def run_pending_swap_sweeps(infer_params):
     if not reg:
         return
     reg[0]._split_sweep_layer_reset()
-    # Quiesce every device holding a split layer, not just the current one: with a
+    # Quiesce every device holding a layer of these workers, not just the current one: with a
     # multi-GPU layer split, worker jobs are issued from each device's stream, and their
     # completion is only guaranteed by the collect memop waits on those streams. A
     # single-device synchronize leaves other devices' jobs in flight while the sweep
     # rewrites arena slots. After the sync, every issued job's collect has completed, so
     # the ring is drained and the worker idle by construction.
-    for d in sorted({m.device.index for m in reg if m.device is not None}):
+    for d in sorted({a["suh_u"][0].device.index for h in {m.cpu_host for m in reg} for a in h.aux.values()}):
         torch.cuda.synchronize(d)
     if os.environ.get("EXL3_MOE_CPU_SWAP_VERIFY"):
         for h in {m.cpu_host for m in reg}:
@@ -113,11 +113,6 @@ class BlockSparseMLP_CPU:
         comp = getattr(ip, "moe_cpu_component", "text")
         budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
             else getattr(ip, "draft_moe_cpu_offload", 0)
-        if budget:
-            assert not getattr(ip, "moe_cpu_split", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
         if isinstance(budget, list):
             claim = ip.moe_cpu_layer_idx.get(self.key) in budget
         else:
@@ -148,11 +143,6 @@ class BlockSparseMLP_CPU:
             text = getattr(ip, "moe_cpu_component", "text") == "text"
             split_k = split_k.get(ip.moe_cpu_layer_idx.get(self.key), 0) if text else 0
         split_k = int(split_k)
-        if split_k:
-            assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
