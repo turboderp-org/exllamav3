@@ -212,42 +212,11 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
-    if getattr(args, "moe_cpu_offload", 0):
-        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
-        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
-    if getattr(args, "moe_cpu_split", 0):
-        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
-        config.infer_params.moe_cpu_split = args.moe_cpu_split
-    if getattr(args, "moe_cpu_threads", None) is not None:
-        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
-    if getattr(args, "ngram_ram", False):
-        config.infer_params.ngram_stream_from_disk = False
-    if getattr(args, "ngram_lock", False):
-        config.infer_params.ngram_lock = True
-    if getattr(args, "embed_disk", False):
-        config.infer_params.embed_stream_from_disk = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
-    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
-    dmclt = getattr(args, "moe_cpu_threads", None)
-    if dmcl:
-        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
-        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
-    if getattr(args, "draft_gpu_split", None):
-        assert draft_model_dir, "--draft_gpu_split requires a draft model (or --mtp)"
-    if getattr(args, "draft_layers_per_device", None):
-        assert draft_model_dir, "--draft_layers_per_device requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
-        config.infer_params.draft_moe_cpu_offload = dmcl
-        if dmclt is not None:
-            config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
-        # Separate config: the draft model's own text component takes the budget
-        draft_config.infer_params.moe_cpu_offload = dmcl
-        if dmclt is not None:
-            draft_config.infer_params.moe_cpu_threads = dmclt
     else:
         draft_config = None
 
@@ -329,6 +298,41 @@ def init(
     else:
         cache = None
         draft_cache = None
+
+    # Offload
+    if getattr(args, "moe_cpu_offload", 0):
+        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
+        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
+    if getattr(args, "moe_cpu_split", 0):
+        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
+        config.infer_params.moe_cpu_split = args.moe_cpu_split
+    if getattr(args, "moe_cpu_threads", None) is not None:
+        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "ngram_ram", False):
+        config.infer_params.ngram_stream_from_disk = False
+    if getattr(args, "ngram_lock", False):
+        config.infer_params.ngram_lock = True
+    if getattr(args, "embed_disk", False):
+        config.infer_params.embed_stream_from_disk = True
+    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmclt = getattr(args, "moe_cpu_threads", None)
+    if dmcl:
+        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if getattr(args, "draft_gpu_split", None):
+        assert draft_model_dir, "--draft_gpu_split requires a draft model (or --mtp)"
+    if getattr(args, "draft_layers_per_device", None):
+        assert draft_model_dir, "--draft_layers_per_device requires a draft model (or --mtp)"
+    if use_mtp:
+        # Shared config: the MTP head is a separate component with its own budget and worker
+        config.infer_params.draft_moe_cpu_offload = dmcl
+        if dmclt is not None:
+            config.infer_params.draft_moe_cpu_threads = dmclt
+    elif draft_model_dir:
+        # Separate config: the draft model's own text component takes the budget
+        draft_config.infer_params.moe_cpu_offload = dmcl
+        if dmclt is not None:
+            draft_config.infer_params.moe_cpu_threads = dmclt
 
     # Split
     if args.gpu_split is None or args.gpu_split == "auto":
