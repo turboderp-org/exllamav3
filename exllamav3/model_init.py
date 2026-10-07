@@ -66,7 +66,7 @@ def add_args(
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = moe_cpu_layers, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Instead of N, a list of ints or (inclusive) ranges picks the layers by number, example: 8..23 (a single one is written 8..8). Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
-    parser.add_argument("-mcs", "--moe_cpu_split", type = moe_cpu_split_sizes, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Instead of N, LAYERS:N items set it per layer, example: 8..23:64,24..39:16. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = moe_cpu_split_sizes, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Instead of N, LAYERS:N items set it per layer, example: 8..23:64,24..39:16. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Layers taken whole by --moe_cpu_offload are not split. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
@@ -224,7 +224,6 @@ def init(
         config.infer_params.moe_cpu_offload = args.moe_cpu_offload
     if getattr(args, "moe_cpu_split", 0):
         assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
-        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
         config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads

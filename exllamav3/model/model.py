@@ -602,6 +602,12 @@ class Model(Model_TPMixin, Model_LSMixin):
                 if unknown:
                     more = " and more" if unknown[8:] else ""
                     print(f" !! {name}: layers {unknown[:8]}{more} are not MoE layers of this model, ignored")
+            both = sorted(set(ip.moe_cpu_offload) & set(ip.moe_cpu_split)) if ip.moe_cpu_component == "text" and \
+                isinstance(ip.moe_cpu_offload, list) and isinstance(ip.moe_cpu_split, dict) else []
+            if both:
+                more = " and more" if both[8:] else ""
+                print(f" !! moe_cpu_offload and moe_cpu_split both name layers {both[:8]}{more}: "
+                      "offloaded whole where eligible")
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
