@@ -162,7 +162,7 @@ def get_arg_sampler(args):
     )
 
 
-def placement_args(text: str, model) -> dict:
+def placement_args(text: str, model) -> tuple[dict, list[str]]:
     """
     Expand a placement description into the arguments it stands for, as they are typed. Clauses are separated by
     ';' or newlines and read 'subject: setting, setting'; their order does not matter:
@@ -171,13 +171,24 @@ def placement_args(text: str, model) -> dict:
         gpu 0: at most 22 GB; gpu 1: unused                 --gpu_split (every gpu or none; per load, as the argument)
         ngram tables: in ram | locked in ram                --ngram_ram | --ngram_lock
         token embedding: on disk; cpu: 16 threads           --embed_disk; --moe_cpu_threads
+        layers 20..: all experts on cpu                     --moe_cpu_offload
+        layers ..19: 64 experts on cpu                      --moe_cpu_split
 
     'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
     is refused, so a word added later changes no text that loads today.
-    Returns {argument: value}.
+    Returns ({argument: value}, notes).
     """
     def fail(msg):
         raise ValueError(f"Placement: {msg}")
+
+    def runs(layers):
+        out = []
+        for i in sorted(layers):
+            if out and out[-1][1] == i - 1:
+                out[-1][1] = i
+            else:
+                out.append([i, i])
+        return ",".join(f"{a}..{b}" for a, b in out)
 
     if len(text) > 4096:
         fail("the text is longer than 4096 characters")
@@ -186,7 +197,11 @@ def placement_args(text: str, model) -> dict:
     n = len(idx)
     if idx != list(range(n)):
         fail("the model's layers are not numbered from 0 in order, use the arguments")
-    gpu, limits, other, out = {}, {}, None, {}
+    experts = {
+        m.layer_idx: sm.num_experts for m in model.modules if m.layer_idx in idx
+        for sm in m if hasattr(sm, "cpu_offload")
+    }
+    gpu, cpu, limits, other, out, notes = {}, {}, {}, None, {}, []
     for clause in re.split(r"[;\n]", text.lower()):
         clause = " ".join(clause.split())
         if not clause:
@@ -210,8 +225,22 @@ def placement_args(text: str, model) -> dict:
                 if layers != sorted(set(layers)):
                     fail(f"'{subject}': list each layer once, in ascending order")
             for setting in settings:
+                if m := re.fullmatch(r"(all|[1-9][0-9]{0,5}) experts? on cpu", setting):
+                    if which == "other":
+                        fail(f"'{clause}': 'other layers' are the layers no clause puts on a gpu, name the layers here")
+                    named = [i for i in layers if i in experts]
+                    if (spec or not named) and len(named) < len(layers):
+                        rest = runs(set(layers) - set(named))
+                        notes.append(f"layers {rest} have no routed experts, '{setting}' does nothing there")
+                    for i in named:
+                        if i in cpu:
+                            fail(f"layer {i} has two experts settings")
+                        if m[1] != "all" and int(m[1]) >= experts[i]:
+                            fail(f"layer {i} has {experts[i]} routed experts, '{setting}' needs fewer")
+                        cpu[i] = m[1]
+                    continue
                 if not (m := re.fullmatch(r"on gpu ?([0-9]{1,9})", setting)):
-                    fail(f"'{setting}' is not valid after '{subject}', write 'on gpu <n>'")
+                    fail(f"'{setting}' is not valid after '{subject}' (on gpu <n>, all experts on cpu, <n> experts on cpu)")
                 if which == "other":
                     if other is not None:
                         fail("'other layers' is given twice")
@@ -238,7 +267,8 @@ def placement_args(text: str, model) -> dict:
         else:
             fail(f"cannot read '{clause}'. Clauses: 'layers 0..11: on gpu 0', 'all layers: on gpu 0', "
                  "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused', 'ngram tables: in ram', "
-                 "'ngram tables: locked in ram', 'token embedding: on disk', 'cpu: 16 threads'")
+                 "'ngram tables: locked in ram', 'token embedding: on disk', 'cpu: 16 threads', "
+                 "'layers 20..: all experts on cpu', 'layers ..19: 64 experts on cpu'")
     if other is not None:
         if len(gpu) == n:
             fail("'other layers' names no layer, every layer is already on a gpu")
@@ -264,7 +294,14 @@ def placement_args(text: str, model) -> dict:
         if not any(float(x) for x in limits.values()):
             fail("every gpu is 'unused'")
         out["gpu_split"] = ",".join(limits[g] for g in range(num_gpus))
-    return out
+    if whole := [i for i in cpu if cpu[i] == "all"]:
+        out["moe_cpu_offload"] = runs(whole)
+    if split := [
+        f"{r}:{k}" for k in dict.fromkeys(cpu.values()) if k != "all"
+        for r in runs(i for i in cpu if cpu[i] == k).split(",")
+    ]:
+        out["moe_cpu_split"] = ",".join(split)
+    return out, notes
 
 
 def init(
@@ -414,11 +451,14 @@ def init(
     if text:
         names = ", ".join(f"gpu {i} = {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count()))
         printp(not quiet and "gpu" in text.lower() and bool(names), f" -- Placement: {names}")
-        placed = placement_args(text, model)
+        placed, notes = placement_args(text, model)
+        for note in notes:
+            printp(not quiet, f" !! Placement: {note}")
+        types = {"moe_cpu_offload": moe_cpu_layers, "moe_cpu_split": moe_cpu_split_sizes}
         for name, flag in placed.items():
-            given = getattr(args, name, None)
-            assert not given or given == flag, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
-            setattr(args, name, flag)
+            given, value = getattr(args, name, None), types.get(name, lambda flag: flag)(flag)
+            assert not given or given == value, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
+            setattr(args, name, value)
         flags = " ".join(f"--{name} {flag}".removesuffix(" True") for name, flag in placed.items())
         printp(not quiet and bool(placed), f" -- Placement: {flags}")
 
