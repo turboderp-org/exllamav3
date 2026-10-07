@@ -367,12 +367,9 @@ class DSV4LayerState:
 
 
     def get_checkpoint_size(self):
-        # Window slice + buffers + overlaps (upper bound; the ring slice shrinks below the
-        # window at low positions). Pools are paged cache state and not part of checkpoints
-        n = self.window * self.module.head_dim * 2
-        for t in self._tensors()[1:]:
-            n += t[0].numel() * t.element_size()
-        return n
+        # Ring slice + buffers + overlaps (upper bound; stash() copies up to ring_rows rows of
+        # the ring, fewer at low positions). Pools are paged cache state and not part of checkpoints
+        return sum(t[0].numel() * t.element_size() for t in self._tensors())
 
 
     def storage_size(self):
