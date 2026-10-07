@@ -264,10 +264,10 @@ bool exl3_gemv_int8
     {
         int device_;
         cudaGetDevice(&device_);
-        if (DevCtx::instance().get_cc(device_) < CC_AMPERE) return false;
+        // Volta only (cc_raw < 75): the int8 kernels mis-execute there (PR
+        // K=5 mul1 fix); Turing runs the upstream SM75-aware int8 path.
+        if (g_get_cc_raw(device_) < 75) return false;
     }
-
-    int K = B.size(2) / 16;
 
     // 16 * K uint16 per tile, 16 * K + 8 at the half-integer rates (mul1 only, which this path is anyway)
     const int tile_u16 = B.size(2);

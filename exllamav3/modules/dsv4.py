@@ -190,7 +190,7 @@ class DSV4Compressor:
         # Batched wkv+wgate projection: one 2-expert exl3_mgemm when formats match
         # (mgemm is sm80+ only — skip the mg tables on cc < 8)
         if (
-            ext.g_get_cc_raw(self.ape.device.index or 0) >= 8 and
+            ext.g_get_cc_raw(self.ape.device.index or 0) >= 75 and
             isinstance(wkv_i, LinearEXL3) and
             isinstance(wgate_i, LinearEXL3) and
             wkv_i.K == wgate_i.K and
@@ -938,8 +938,8 @@ class DSV4Attention(Module):
         if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
             return
         # The mgemm fan kernels are sm80+ only (arch-guarded no-ops below); on
-        # cc < 8 keep the per-Linear path, which routes through the sm70 GEMV
-        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
+        # cc < 75 (Volta) keep the per-Linear path, which routes through the sm70 GEMV
+        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 75:
             return
         device = torch.device(self.device)
 
@@ -1019,7 +1019,7 @@ class DSV4Attention(Module):
         # mgemm is sm80+ only; on cc < 8 use the sm70 multi-matrix
         # GEMV (pointer tables, one launch for all G slices)
         self.woa_sm70_multi = None
-        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
+        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 75:
             try:
                 if all(l.quant_type == "exl3" for l in self.wo_a):
                     inners = [l.inner for l in self.wo_a]

@@ -694,7 +694,7 @@ class GatedDeltaNet(Module):
                 import exllamav3_ext as _ext
                 _dev = str(device)
                 _idx = int(_dev.split(':')[-1]) if ':' in _dev else 0
-                _cc_ok = not (_ext.g_get_cc_raw(_idx) < 8 and self.qkv_proj.inner.K > 4)
+                _cc_ok = not (_ext.g_get_cc_raw(_idx) < 75 and self.qkv_proj.inner.K > 4)
         except Exception:
             pass
         is_quantized_split = (

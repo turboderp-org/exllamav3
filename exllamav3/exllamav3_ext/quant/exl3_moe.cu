@@ -414,19 +414,9 @@ void exl3_moe
         TORCH_CHECK(false, "exl3_moe: fused MoE kernel is not supported on this "
                            "architecture (compute capability < 7.5)");
 
-    // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
-    // With a known number of active experts, launch only as many groups as there are experts and widen them to
-    // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
-    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
-    int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
-    int group_size = MOE_SMS_PER_EXPERT;
-    if (num_active > 0)
-    {
-        num_groups = MIN(num_groups, num_active);
-        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
-    }
-    dim3 grid_dim(group_size, 1, num_groups);
+    // sm_70 Volta gate: the upstream SM75 paths cover Turing; Volta's fused MoE
+    // compute stages (cp.async/ldmatrix/mma) are arch-guarded no-ops there, so a
+    // launch would silently produce zeros — fail loudly instead. [PR #404]
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;

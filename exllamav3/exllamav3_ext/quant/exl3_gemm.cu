@@ -332,7 +332,7 @@ int exl3_gemm_gr
                 void* tile_kernel = nullptr;
                 all_ok = exl3_gemv_try_launch
                 (
-                    tileArgs, tile_rows, size_k, size_n, K, cb, c_fp32,
+                    tileArgs, tile_rows, size_k, size_n, K, half_k, cb, c_fp32,
                     suh_ptr && A_had_ptr && svh_ptr,
                     device, stream, &tile_kernel, true
                 );

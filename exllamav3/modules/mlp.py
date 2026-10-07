@@ -782,21 +782,16 @@ class GatedMLP(Module):
         # is not graph-capturable; skip the bc path for those only. g_get_cc returns
         # the DevCtx class enum (CC_OLD=1 .. CC_BLACKWELL=5), so "pre-Ampere" == 1.
         self.bc = None
-        cc_old = False
+        cc_volta = False
         try:
             from ..ext import exllamav3_ext as _ext
             dev_str = str(self.device)
             dev_idx = int(dev_str.split(':')[-1]) if ':' in dev_str else 0
-<<<<<<< HEAD
-            cc_old = _ext.g_get_cc_raw(dev_idx) < 75  # Volta only; Turing keeps the fused path
-=======
-            if _ext.g_get_cc_raw(dev_idx) < 8:
-                cc_ok = all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0]))
->>>>>>> 5a6838c (sm70: gate fused MoE/mgemm/mgemm-fan paths on cc >= 8)
+            cc_volta = _ext.g_get_cc_raw(dev_idx) < 75  # Volta only; Turing keeps the fused path
         except Exception:
             pass
         if (self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None
-                and (not cc_old or all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0])))):
+                and (not cc_volta or all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0])))):
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (

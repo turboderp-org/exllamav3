@@ -149,15 +149,15 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            # sm_70: only the GEMV decode kernel (rows == 1) is ported; the
-            # sm80 block-pipelined kernels are arch-guarded no-ops. Route
-            # rows > 1 to reconstruct+hgemm.
+            # Volta (cc < 7.5): the sm80 block-pipelined kernels are arch-guarded
+            # no-ops there, and multi-row GEMV is not competitive — route rows > 2
+            # to reconstruct+hgemm. Turing (7.5) keeps the standard SM75 paths.
             if (rows <= AUTO_RECONSTRUCT_THRESHOLD and not disable_sm70_gemv) or self.config.infer_params.no_reconstruct:
-                cc = ext.g_get_cc(x.device.index) if x.device.index is not None else 99
-                # K > 4 on sm70: the GEMV kernel now covers K 5-8 (SMEM
+                cc = ext.g_get_cc_raw(x.device.index) if x.device.index is not None else 99
+                # K > 4 on Volta: the GEMV kernel now covers K 5-8 (SMEM
                 # decode); exl3_gemm_gr's reconstruct+hgemm fallback catches
                 # whatever the GEMV declines (large M). No special routing.
-                if rows > 2 and cc < 8:
+                if rows > 2 and cc < 75:
                     pass  # fall through to reconstruct_hgemm
                 else:
                     dtype = out_dtype or self.default_out_dtype

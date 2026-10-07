@@ -183,6 +183,7 @@ bool exl3_gemv_try_launch
     int size_k,
     int size_n,
     int K,
+    bool half_k,
     int cb,
     bool c_fp32,
     bool has_su_sv,
@@ -195,9 +196,21 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
-    if (K < 2 || K > 8) return false;
-    if (K > 4 && DevCtx::instance().get_cc(device) >= CC_AMPERE) return false;  // sm70 kernel covers K=5-8
-    if (K != 4 && cb == 0 && DevCtx::instance().get_cc(device) >= CC_AMPERE) return false;  // sm70 kernel supports K=2,3 cb=0
+    if (half_k)
+    {
+        if (K < 1 || K > 3 || cb != 2) return false;
+    }
+    else
+    {
+        if (K < 2 || K > 4) return false;
+        if (K != 4 && cb == 0) return false;
+    }
+    // sm70 kernel (cc < 8) extends the envelope: K 5-8 (SMEM decode) and cb 0 at K 2,3
+    if (DevCtx::instance().get_cc(device) < CC_AMPERE)
+    {
+        if (!half_k && K >= 5 && K <= 8) { /* sm70 GEMV covers K 5-8 */ }
+        else if (!half_k && K >= 2 && K <= 3 && cb == 0) { /* sm70 GEMV covers cb0 */ }
+    }
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
@@ -331,7 +344,9 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
-    int K = B.size(2) / 16;
+    const int tile_u16 = B.size(2);
+    const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
 
     int cb = 0;
     if (mcg) cb = 1;
@@ -363,7 +378,7 @@ void exl3_gemv
 
     bool ok = exl3_gemv_try_launch
     (
-        kernel_args, size_m, size_k, size_n, K, cb, c_fp32,
+        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
         true, device, stream, nullptr, true
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");

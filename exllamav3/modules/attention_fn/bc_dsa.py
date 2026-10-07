@@ -68,7 +68,7 @@ class BCDsa:
         self.device = torch.device(m.device) if isinstance(m.device, int) else torch.device(m.device)
         # The whole-step graph path runs the mgemm fan kernels, which are sm80+
         # only (arch-guarded no-ops below) — decline the entire path on cc < 8
-        if ext.g_get_cc_raw(self.device.index or 0) < 8:
+        if ext.g_get_cc_raw(self.device.index or 0) < 75:
             raise RuntimeError("mgemm fan not supported on cc < 8")
         self.hidden = m.hidden_size
         self.head_dim = m.head_dim

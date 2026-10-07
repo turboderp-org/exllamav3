@@ -543,9 +543,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
 self.shared_experts is None and
             not self.config.infer_params.no_reconstruct and
-            ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 8
+            ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 75
         )
-        self._cc_ok = ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 8
+        self._cc_ok = ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 75
 
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
@@ -565,7 +565,7 @@ self.shared_experts is None and
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths and
-                ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 8
+                ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 75
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -632,7 +632,7 @@ self.shared_experts is None and
 
         if (self.support_quant_paths or self.support_bc_bszn) \
                 and not self.config.infer_params.no_reconstruct \
-                and ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 8:
+                and ext.g_get_cc_raw(torch.device(self.device).index or 0) >= 75:
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
