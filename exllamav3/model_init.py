@@ -169,6 +169,8 @@ def placement_args(text: str, model) -> dict:
 
         layers 0..11: on gpu 0; other layers: on gpu 1      --layers_per_device (every layer, one run per gpu, in order)
         gpu 0: at most 22 GB; gpu 1: unused                 --gpu_split (every gpu or none; per load, as the argument)
+        ngram tables: in ram | locked in ram                --ngram_ram | --ngram_lock
+        token embedding: on disk; cpu: 16 threads           --embed_disk; --moe_cpu_threads
 
     'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
     is refused, so a word added later changes no text that loads today.
@@ -226,9 +228,17 @@ def placement_args(text: str, model) -> dict:
             if g in limits:
                 fail(f"gpu {g} has two limits")
             limits[g] = m[1] or "0"
+        elif subject == "ngram tables" and settings in (["in ram"], ["locked in ram"]):
+            out["ngram_lock" if settings[0][0] == "l" else "ngram_ram"] = True
+        elif subject == "token embedding" and settings == ["on disk"]:
+            out["embed_disk"] = True
+        elif subject == "cpu" and (m := re.fullmatch(r"([1-9][0-9]{0,5}) threads?", ",".join(settings))):
+            if out.setdefault("moe_cpu_threads", int(m[1])) != int(m[1]):
+                fail("'cpu' is given two thread counts")
         else:
             fail(f"cannot read '{clause}'. Clauses: 'layers 0..11: on gpu 0', 'all layers: on gpu 0', "
-                 "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused'")
+                 "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused', 'ngram tables: in ram', "
+                 "'ngram tables: locked in ram', 'token embedding: on disk', 'cpu: 16 threads'")
     if other is not None:
         if len(gpu) == n:
             fail("'other layers' names no layer, every layer is already on a gpu")
@@ -409,7 +419,8 @@ def init(
             given = getattr(args, name, None)
             assert not given or given == flag, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
             setattr(args, name, flag)
-        printp(not quiet and bool(placed), " -- Placement: " + " ".join(f"--{name} {flag}" for name, flag in placed.items()))
+        flags = " ".join(f"--{name} {flag}".removesuffix(" True") for name, flag in placed.items())
+        printp(not quiet and bool(placed), f" -- Placement: {flags}")
 
     # Offload
     if getattr(args, "moe_cpu_offload", 0):
