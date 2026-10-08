@@ -12,6 +12,7 @@ from .rmsnorm import RMSNorm
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle, yarn_inv_freq
 from ..util.tensor import g_tensor_cache, get_for_device
+from ..util.device_copy import to_device
 from .quant.exl3 import LinearEXL3
 from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
@@ -29,12 +30,12 @@ from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
 
-def _ext_rope(x, inv_freq, position = 0, position_ids = None):
+def _ext_rope(x, inv_freq, position = 0, position_ids = None, positions = None):
     # In-place GPT-J rotation of a (bsz, seq, heads, rope_dim) tensor via ext.rope. x may be
     # a trailing-slice VIEW of wider heads. De-rotation (paper eq. 26) uses a negated inv_freq
     # table. attn_factor is 1.0 by V4 semantics (yarn mscale never applied to cos/sin).
     ext.rope(
-        x, x, None, None, inv_freq, position, None, position_ids,
+        x, x, None, None, inv_freq, position, positions, position_ids,
         int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0,
     )
 
@@ -127,7 +128,7 @@ class DSV4Compressor:
             cfg, f"{key}.wkv", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.wgate = wgate if wgate is not None else Linear(
+        self.wgate = wgate if wgate is not None or compress_rate == 1 and not overlapping else Linear(
             cfg, f"{key}.wgate", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
@@ -157,6 +158,8 @@ class DSV4Compressor:
         self.fused_norm_w = self.norm.weight.data
         if self.fused_norm_w.dtype != torch.half:
             self.fused_norm_w = self.fused_norm_w.half().contiguous()
+        if self.wgate is None:
+            return
         wkv_i, wgate_i = self.wkv.inner, self.wgate.inner
         if (
             self.wkv.out_features != self.wkv.out_features_unpadded or
@@ -237,7 +240,7 @@ class DSV4Compressor:
                         pool_bt, pool_epp, stage_rel)
         else:
             kv = self.wkv.forward(x, params)[0]
-            gate = self.wgate.forward(x, params)[0]
+            gate = self.wgate.forward(x, params)[0] if self.wgate is not None else kv
             ext.dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
@@ -338,6 +341,9 @@ class DSV4Compressor:
 
 class DSV4Attention(Module):
 
+    # Query rows per indexer score slab
+    SCORE_SLAB = 256
+
     def __init__(
         self,
         config: Config,
@@ -374,6 +380,13 @@ class DSV4Attention(Module):
         idx_wq_b: Linear | None = None,
         idx_weights: Linear | None = None,
         tp_defer_compressors: bool = False,
+        kv_source: int | None = None,
+        kv_owner: DSV4Attention | None = None,
+        indexer_mode: str | None = None,
+        q_head_norm: bool = True,
+        candidate_mode: str | None = None,
+        candidate_topk_blocks: int = 0,
+        candidate_block_size: int = 1,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.q_priority = 2 + select_hq_bits
@@ -414,6 +427,15 @@ class DSV4Attention(Module):
         self.indexer = None
         self.idx_wq_b = None
         self.idx_weights = None
+        self.idx_wk = self.idx_k_norm = None
+        self.kv_source = None if layer_type == "sliding" else layer_idx if kv_source is None else kv_source
+        self.kv_owner = kv_owner
+        self.kv_mirror = False
+        self.indexer_mode = indexer_mode or ("full" if layer_type == "csa" else None)
+        self.q_head_norm = q_head_norm
+        self.candidate_mode = candidate_mode
+        self.candidate_topk_blocks = candidate_topk_blocks
+        self.candidate_block_size = candidate_block_size
         self.inv_freq_main = None
         self.inv_freq_compress = None
         self.wo_a_multi = None
@@ -503,7 +525,7 @@ class DSV4Attention(Module):
         )
         self.idx_wq_b = idx_wq_b
         self.idx_weights = idx_weights
-        if layer_type in ("csa", "hca") and not tp_defer_compressors:
+        if self.kv_source == layer_idx and not tp_defer_compressors:
             self.compressor = DSV4Compressor(
                 self,
                 f"{key}.compressor",
@@ -523,7 +545,7 @@ class DSV4Attention(Module):
                 qmap = qmap,
                 select_hq_bits = select_hq_bits
             )
-        if layer_type == "csa" and self.idx_wq_b is None:
+        if self.indexer_mode == "full" and self.idx_wq_b is None:
             self.idx_wq_b = Linear(
                 config,
                 f"{key}.indexer.wq_b",
@@ -546,6 +568,9 @@ class DSV4Attention(Module):
                 out_dtype = torch.half,
                 pad_to = 1,
             )
+        if self.indexer_mode == "full" and self.compressor is not None and self.indexer is None:
+            self.idx_wk = Linear(config, f"{key}.indexer.wk", head_dim, index_head_dim, out_dtype = torch.half)
+            self.idx_k_norm = RMSNorm(config, f"{key}.indexer.k_norm", rms_norm_eps)
 
         for m in [
             self.q_a,
@@ -556,6 +581,8 @@ class DSV4Attention(Module):
             *self.wo_a,
             self.wo_b,
             self.idx_wq_b,
+            self.idx_wk,
+            self.idx_k_norm,
             self.idx_weights
         ]:
             self.register_submodule(m)
@@ -598,7 +625,7 @@ class DSV4Attention(Module):
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
         self.cache_layers = []
-        if self.layer_type in ("csa", "hca"):
+        if self.kv_source == layer_idx:
             self.caps.update({"kv_cache": True})
 
 
@@ -629,7 +656,10 @@ class DSV4Attention(Module):
         self.kv_norm_w = self.kv_norm.weight.data
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
 
-        if self.compressor is not None:
+        if self.idx_wk is not None:
+            self.compressor.ape = torch.zeros((self.compress_rate, self.head_dim), dtype = torch.float, device = device)
+            self.compressor.make_bc(torch.zeros_like(self.inv_freq_compress))
+        elif self.compressor is not None:
             self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True, arena = False).float().contiguous()
             self.compressor.make_bc(self.inv_freq_compress)
         if self.indexer is not None:
@@ -639,10 +669,19 @@ class DSV4Attention(Module):
             rl.alloc(device)
         for cl in self.cache_layers:
             cl.alloc(device)
+        if self.kv_owner is not None:
+            for cl in self.kv_owner.cache_layers:
+                if cl.device not in (None, device) and device not in cl.mirrors:
+                    self.kv_mirror = True
+                    cl.alloc_mirror(device)
 
 
     @override
     def unload(self):
+        if self.kv_mirror:
+            for cl in self.kv_owner.cache_layers:
+                cl.mirrors.pop(self.device, None)
+            self.kv_mirror = False
         super().unload()
         for cl in self.cache_layers:
             cl.free()
@@ -909,7 +948,7 @@ class DSV4Attention(Module):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
 
-    def _project_qkv(self, x, params, position):
+    def _project_qkv(self, x, params, position, positions = None):
         """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
         applies both head norms (unweighted per-head q norm via a ones weight, weighted
         kv_norm) before rotating the trailing rope slice (rotate_offset)."""
@@ -918,9 +957,18 @@ class DSV4Attention(Module):
         q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
         q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
         kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
+        if not self.q_head_norm:
+            _ext_rope(q[..., -rd:], self._rope_type(), position, positions = positions)
+            ext.rope(
+                kv, kv, None, None,
+                self._rope_type(), position, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
+            )
+            return q_res, q, kv.view(bsz, seq, self.head_dim)
         ext.rope(
             q, q, kv, kv,
-            self._rope_type(), position, None, None,
+            self._rope_type(), position, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
             self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
         )
@@ -933,7 +981,7 @@ class DSV4Attention(Module):
         widest). Mirrors the BC_DSV4Attention fan. A second fan pairs q_b with idx_wq_b
         (both consume q_res) for the top-k regime."""
         self.x_fan_ready = True
-        if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
+        if not self.q_head_norm or os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
             return
         device = torch.device(self.device)
 
@@ -1107,8 +1155,8 @@ class DSV4Attention(Module):
         # Window rows come from the chunk itself (win_floor == q_pos0: no prior rows in nc)
         w = self.sliding_window
 
-        m = self.compress_rate if self.compressor is not None else 1
-        T = seq // m if self.compressor is not None else 0
+        m = self.compress_rate if self.kv_source is not None else 1
+        T = seq // m if self.kv_source is not None else 0
         hpg = self.num_q_heads // self.o_groups
         hd = self.head_dim
         D_c, D_r = hd - self.rope_head_dim, self.rope_head_dim
@@ -1133,7 +1181,14 @@ class DSV4Attention(Module):
         for b in range(bsz):
             indices = None
             k_len = 0
-            if self.compressor is not None:
+            sh = params.setdefault("dsv4_shared", {}).setdefault(b, {})
+            if self.idx_wk is not None:
+                stage = torch.empty((cap, hd), dtype = torch.half, device = device)
+                self.compressor.forward_fused(x[b:b + 1], params, ring_kv, ring_gate, None, stage, None, 0)
+                pool_idx = self._indexer_keys(stage[:T], params, 0) if T else None
+                pool_c, pool_r = stage[:, :D_c].contiguous(), stage[:, D_c:].contiguous()
+                sh["pool"] = pool_c, pool_r, pool_idx, bt
+            elif self.compressor is not None:
                 # Window positions count from 0 in the stateless path (fwp = 0), matching
                 # the HF cache = None reference; causal bounds use the absolute positions
                 self.compressor.forward_fused(
@@ -1145,9 +1200,17 @@ class DSV4Attention(Module):
                     iring_gate = g_tensor_cache.get(device, iring_kv.shape, torch.half, "dsv4_nc_iring_gate")
                     iovl = g_tensor_cache.get(device, (1, 2, m, idx_hd), torch.float, "dsv4_nc_iovl")
                     self.indexer.forward_fused(x[b:b + 1], params, iring_kv, iring_gate, iovl, pool_idx, None, 0)
-                    if T > self.index_topk:
-                        indices, k_len = self._indexer_topk(
-                            x[b:b + 1], params, q_res[b:b + 1], pool_idx[:T], T, position)
+            elif self.kv_source is not None:
+                if sh["pool"][0].device != device:
+                    sh["pool"] = tuple(None if t is None else to_device(t, device) for t in sh["pool"])
+                pool_c, pool_r, pool_idx, bt = sh["pool"]
+            if self.indexer_mode is not None and T > self.index_topk:
+                if self.indexer_mode == "full":
+                    sh["topk"] = self._indexer_topk(
+                        x[b:b + 1], params, q_res[b:b + 1], pool_idx[:T], T, position, shared = sh)
+                elif sh["topk"][0].device != device:
+                    sh["topk"] = to_device(sh["topk"][0], device), sh["topk"][1]
+                indices, k_len = sh["topk"]
 
             out = dsa_attn(
                 q[b].half().contiguous(), pool_c, pool_r, bt, sinks = self.sinks,
@@ -1162,6 +1225,15 @@ class DSV4Attention(Module):
         return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
 
 
+    def _indexer_keys(self, lat, params, e0):
+        n = lat.shape[0]
+        k = self.idx_k_norm.forward(self.idx_wk.forward(lat.unsqueeze(0), params), params, out_dtype = torch.half)
+        pos = ((torch.arange(n, dtype = torch.int, device = lat.device) + e0) * self.compress_rate).unsqueeze(0)
+        for t in (k, lat):
+            _ext_rope(t.view(1, n, 1, -1)[..., -self.rope_head_dim:], self.inv_freq_compress, position_ids = pos)
+        return k[0]
+
+
     def _indexer_topk(
         self,
         x,
@@ -1173,6 +1245,7 @@ class DSV4Attention(Module):
         q_idx_pre = None,
         block_table = None,
         epp = 0,
+        shared = None,
     ):
         """Lightning-indexer scoring + top-k selection over the indexer key pool (ec valid
         rows). The indexer query rope uses the compress table at the query positions == this
@@ -1186,13 +1259,78 @@ class DSV4Attention(Module):
             q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, self.index_n_heads, self.index_head_dim).contiguous()
         _ext_rope(q_idx[..., -self.rope_head_dim:], self.inv_freq_compress, position = pos0)
         wts = self.idx_weights.forward(x, params)
-        scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
-                                    block_table = block_table, epp = epp)
+        bs = self.candidate_block_size
+        mode = self.candidate_mode if ec > self.candidate_topk_blocks * bs else None
+        if mode == "source":
+            shared["cand"] = torch.ones((seq, ec // bs + 1), dtype = torch.bool, device = x.device)
+        elif mode == "use":
+            shared["cand"] = to_device(shared["cand"], x.device)
         k = min(self.index_topk, ec)
         K_pad = -(-k // 32) * 32
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
-        ext.dsa_topk(scores, indices, k, None, 0)
+
+        def slab(r0, r1):
+            sel, ninf = indices[r0:r1], -float("inf")
+            if mode == "use":
+                # A row selects inside its candidate blocks: score only the blocks any row of the slab kept
+                drop = shared["cand"][r0:r1]
+                ent = ((~drop).any(dim = 0).nonzero() * bs + torch.arange(bs, device = x.device)).flatten()
+                ent = ent[ent < ec]
+                rows = ent if block_table is None else block_table.reshape(-1)[ent // epp].long() * epp + ent % epp
+                scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows], ent.numel() * self.compress_rate,
+                                            self.compress_rate, ent.numel())
+                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
+                scores.masked_fill_(drop[:, ent // bs], ninf)
+                scores.masked_fill_(ent >= vis[:, None], ninf)
+                ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
+                sel.copy_(torch.where(sel < 0, sel, ent.int()[sel.clamp(min = 0)]))
+                return
+            scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
+                                        block_table = block_table, epp = epp)
+            if mode == "source":
+                nf = ec // bs
+                full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
+                tail_max = F.pad(tail, (0, bs), value = ninf).amax(dim = -1, keepdim = True)
+                blk = torch.cat((full.amax(dim = -1), tail_max), dim = 1)
+                last = ((pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
+                top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
+                shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
+            ext.dsa_topk(scores, sel, k, None, 0)
+
+        # Row slabs bound the transient score matrix, as in MLAttention._indexer_topk: selection is
+        # per row. No slab is left with the few rows that take the decode kernels
+        cuts = list(range(0, max(seq - 16, 1), self.SCORE_SLAB))
+        for r0, r1 in zip(cuts, cuts[1:] + [seq]):
+            slab(r0, r1)
         return indices, k
+
+
+    def autosplit_extra_measure(self, params):
+        """Indexer score matrix at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach: allocated (and dropped) here for the device budget"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        cache = params.get("cache")
+        if cache is None or self.device is None or self.indexer_mode != "full":
+            return
+        rows = params["batch_shape"][1]
+        ec = cache.layers[self.kv_source, params.get("layer_instance") or 0].capacity
+        if ec <= self.index_topk:
+            return   # cache too small to ever reach the top-k regime
+        slab = min(rows, self.SCORE_SLAB + 16)
+        n = slab * max(128, 1 << (ec - 1).bit_length())
+        # Attention and indexer queries, live while it is scored
+        n += rows * (self.num_q_heads * self.head_dim + self.index_n_heads * self.index_head_dim)
+        bs = self.candidate_block_size
+        if self.candidate_mode == "source" and ec > self.candidate_topk_blocks * bs:
+            # Block maxima of a slab, live twice while the tail block is appended, and the candidate mask
+            n += 2 * slab * (ec // bs + 1) + rows * (ec // bs + 1) // 2
+        elif self.candidate_mode == "use" and ec > self.candidate_topk_blocks * bs:
+            # Candidate mask, one byte per block, when its source is on another device; then, per slab, the
+            # keys of the candidate entries, the mask over them and their ids
+            n += rows * (ec // bs + 1) // 2 + ec * (self.index_head_dim + slab // 2 + 8)
+        t = torch.empty((n,), dtype = torch.half, device = self.device)
+        del t
 
 
     def _forward_cached(self, x, params, out_dtype):
@@ -1206,11 +1344,11 @@ class DSV4Attention(Module):
         assert len(rsg) >= bsz
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         kl = bt = None
-        if self.compressor is not None:
+        if self.kv_source is not None:
             # In TP workers rs.cache is an opaque id; resolve to this rank's replicated
             # pool layer before anything dereferences it
             kl = self.tp_cache_lookup[rsg[0].cache] if self.tp_mode \
-                else rsg[0].cache.layers[layer_instance]
+                else rsg[0].cache.layers[(self.kv_source, layer_instance[1])]
             if "block_table" in params:
                 bt = get_for_device(params, "block_table", self.device)
             else:
@@ -1224,11 +1362,18 @@ class DSV4Attention(Module):
                 assert 0 <= bmin and bmax < kl.num_pages, \
                     f"DSA block table content OOB: [{bmin}, {bmax}] vs {kl.num_pages} pages " \
                     f"(layer {self.layer_idx})"
+            if self.kv_owner is not None and kl.device != self.device:
+                src, kl = kl, kl.mirrors.get(self.device, kl)
+                bt = to_device(bt, self.device)
+                if self.kv_mirror:
+                    m, pages = self.compress_rate, params.get("block_table", bt)
+                    for i in range(bsz):
+                        kl.pull(src, pages[i], rsg[i].position // m, (rsg[i].position + x.shape[1]) // m)
         if bsz == 1:
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
                 kl = kl, bt_row = bt[:1] if bt is not None else None)
-        if not dsv4_batch_eager:
+        if not dsv4_batch_eager or not self.q_head_norm:
             # Per-job loop: each job dispatches into its per-slot whole-step graph (or the
             # eager core). Measured faster than the batched-eager path below at bsz 2-8 --
             # graph replays beat batched GEMVs + per-job eager cores. The batched path is
@@ -1578,7 +1723,7 @@ class DSV4Attention(Module):
 
         # Whole-step graph path (EXL3_BC_DSA=1); not used when the batched path already
         # projected this job's rows (pre)
-        if pre is None and \
+        if pre is None and self.q_head_norm and \
                 bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
             if not hasattr(self, "_bc_dsa"):
                 self._bc_dsa = {}
@@ -1602,8 +1747,8 @@ class DSV4Attention(Module):
 
         converting = any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         use_fan = self.x_fan is not None and seq <= 32 and not converting
-        ec = (pos0 + seq) // self.compress_rate if self.compressor is not None else 0
-        topk_regime = self.indexer is not None and ec > self.index_topk
+        ec = (pos0 + seq) // self.compress_rate if self.kv_source is not None else 0
+        topk_regime = self.indexer_mode is not None and ec > self.index_topk
         q_idx_pre = None
         fouts = None
         if pre is not None:
@@ -1698,7 +1843,7 @@ class DSV4Attention(Module):
             # state updated. With the fan the projections are already done: feed the
             # compress kernels directly
             pool_r_flat = kl.pool_r.view(-1, kl.D_r)
-            if kl.quant:
+            if kl.quant or self.idx_wk is not None:
                 # Packed pool: compress into transient staging rows (this step's entries),
                 # then quantize + scatter through the block table
                 stage = g_tensor_cache.get(device, (seq // m + 1, self.head_dim), torch.half, "dsv4_stage")
@@ -1729,22 +1874,38 @@ class DSV4Attention(Module):
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
                         bt_row, epp)
+            if self.idx_wk is not None and ec > pos0 // m:
+                e0 = pos0 // m
+                rows = torch.arange(e0, ec, device = device)
+                rows = bt_row[0, rows // epp].long() * epp + rows % epp
+                kl.pool_idx.view(-1, kl.D_i)[rows] = self._indexer_keys(stage[:ec - e0], params, e0)
+                if not kl.quant:
+                    kl.pool_c.view(-1, kl.D_c)[rows] = stage[:ec - e0, :kl.D_c]
+                    pool_r_flat[rows] = stage[:ec - e0, kl.D_c:]
             if kl.quant:
                 ext.dsv4_pool_quant_scatter(
                     stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), pool_r_flat,
                     bt_row, pos0, None, m, seq, epp)
             pool_len = ec
+        elif self.kv_source is not None:
+            assert kl.pool_r.device == device, "DSV4Attention: shared pool on another device"
+            dense_m, epp, pool_len = self.compress_rate, kl.epp, ec
 
+        if topk_regime:
             # Selection is only non-trivial once the pool exceeds index_topk: below that,
             # top-k keeps every entry under the causal bound, which is exactly DENSE_POOL
             # mode. Indexer scoring chain is skipped (key pool is still maintained for later)
-            if topk_regime:
-                indices, k_len = self._indexer_topk(
+            sh = params.setdefault("dsv4_shared", {}).setdefault(slot, {})
+            if self.indexer_mode == "full":
+                sh["topk"] = self._indexer_topk(
                     x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
-                    block_table = bt_row, epp = epp)
+                    block_table = bt_row, epp = epp, shared = sh)
+            elif sh["topk"][0].device != device:
+                sh["topk"] = to_device(sh["topk"][0], device), sh["topk"][1]
+            indices, k_len = sh["topk"]
 
         qc = None
-        if self.compressor is not None:
+        if self.kv_source is not None:
             pool_c, pool_r = kl.pool_c_view(), kl.pool_r
             qc = kl.qc()
             bt = bt_row

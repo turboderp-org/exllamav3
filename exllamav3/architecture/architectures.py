@@ -6,6 +6,7 @@ from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
+from .deepseek_v41 import DeepseekV41Model
 from .dflash import DFlashModel
 from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
@@ -76,6 +77,7 @@ ARCHITECTURES = {
         DeciLMModel,
         DeepseekV3Model,
         DeepseekV4Model,
+        DeepseekV41Model,
         DFlashModel,
         DFlash2Model,
         DFlashLagunaModel,

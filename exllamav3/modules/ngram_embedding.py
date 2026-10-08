@@ -52,6 +52,8 @@ class NGramEmbedding(Module):
         stream_from_disk: bool | None = None,
         out_dtype: torch.dtype | None = torch.half,
         qmap: str | None = None,
+        head_vocab_sizes: list | None = None,
+        layer_multipliers: list | None = None,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "NGramEmbedding quantizes via util/convert_ngram.py, not the qmap pipeline"
@@ -62,14 +64,15 @@ class NGramEmbedding(Module):
         self.num_heads = (ngram_size - 1) * heads_per_ngram
         self.ple_embed_dim = ple_embed_dim
         self.head_dim = ple_embed_dim // self.num_heads
-        assert self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
         self.eos_token_id = eos_token_id
         # None: defer to config.infer_params.ngram_stream_from_disk at load time (the load-time
         # option; also EXL3_NGRAM_STREAM). An explicit bool here overrides it
         self.stream_from_disk = stream_from_disk
         self.out_dtype = out_dtype
+        self.hash_params = (head_vocab_sizes, layer_multipliers)
 
         self.table = None
+        self.scale = None
         self.K = None               # None for an unquantized table
         self.num_rows = 0
         self.head_bias = None
@@ -139,11 +142,17 @@ class NGramEmbedding(Module):
             table = RowTable.find(stc, self.key, "weight")
             if table is None:
                 raise ValueError(f"No .trellis, .weight or .shard_N.weight tensors found for {self.key}")
-            self._load_aux({
-                "offsets": f"{parent}.ngram_heads_offsets",
-                "sizes": f"{parent}.ngram_heads_vocab_sizes",
-                "multipliers": f"{parent}.layer_multipliers",
-            })
+            if self.hash_params[0] is None:
+                self._load_aux({
+                    "offsets": f"{parent}.ngram_heads_offsets",
+                    "sizes": f"{parent}.ngram_heads_vocab_sizes",
+                    "multipliers": f"{parent}.layer_multipliers",
+                })
+            else:
+                self.head_vocab_sizes = torch.tensor(self.hash_params[0], dtype = torch.long)
+                self.layer_multipliers = torch.tensor(self.hash_params[1], dtype = torch.long)
+                self.head_offsets = self.head_vocab_sizes.cumsum(0) - self.head_vocab_sizes
+            self.scale = RowTable.find(stc, self.key, "scale")
 
         infer_params = getattr(self.config, "infer_params", None)
         lock = infer_params is not None and infer_params.ngram_lock
@@ -153,18 +162,24 @@ class NGramEmbedding(Module):
         table.open(stc, stream_from_disk and not lock, allow_bf16 = not quantized,
                    what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock)
         self._set_table(table, quantized)
+        if self.scale is not None:
+            self.scale.open(stc, stream_from_disk and not lock, lock = lock)
 
     def _set_table(self, table: RowTable, quantized: bool):
         self.table = table
         self.num_rows = table.num_rows
         self.K = (table.row_words - 1) * 16 // ROW_DIM if quantized else None
-        assert table.row_words == (words_per_row(self.K) if quantized else ROW_DIM)
+        assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
+        assert not quantized or self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
 
     @override
     def unload(self):
         if self.table is not None:
             self.table.close()
+        if self.scale is not None:
+            self.scale.close()
         self.table = None
+        self.scale = None
         self.device = None
         self.K = None
         self.head_bias = None
@@ -311,7 +326,12 @@ class NGramEmbedding(Module):
 
     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
         if not self.K:
-            return packed.float()
+            rows = packed.float()
+            if self.scale is not None:
+                s = self.scale.lookup(pin.uids[:U], U, lambda ids, _: (ids, True),
+                                      lambda r, *_: (r.float() - 127.0).exp2(), packed.device)
+                rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
+            return rows
         heads = pin.heads[:U].to(packed.device, non_blocking = True)
         rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = packed.device)
         ext.ngram_dequant(packed, self.K, heads, self.head_bias, rows, False)
@@ -344,4 +364,4 @@ class NGramEmbedding(Module):
         bsz = ids.shape[0]
         H = self.num_heads
         out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device)
-        return out.view(bsz, out_len, H * ROW_DIM).to(out_dtype or self.out_dtype or torch.half)
+        return out.view(bsz, out_len, H * self.head_dim).to(out_dtype or self.out_dtype or torch.half)

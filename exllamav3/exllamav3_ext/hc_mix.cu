@@ -118,7 +118,8 @@ void hc_mix_partials_kernel
 
 // NORM (decode rows): one block per row covers all D columns and runs the following RMSNorm on the collapsed
 // row (hc_fuse.cuh)
-template <int H, int M_, bool HEAD, bool HALF_OUT, bool NORM = false>
+// CARRY: the row's own pre weights go to pre_out, and the collapse uses pre_in when it is given
+template <int H, int M_, bool HEAD, bool HALF_OUT, bool NORM = false, bool CARRY = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void hc_mix_finalize_kernel
 (
@@ -135,7 +136,9 @@ void hc_mix_finalize_kernel
     const float rms_eps,
     const float hc_eps,
     const int sinkhorn_iters,
-    const HcNormArgs norm = {}
+    const HcNormArgs norm = {},
+    const float* __restrict__ pre_in = nullptr,    // (R, H) or null
+    float* __restrict__ pre_out = nullptr          // (R, H)
 )
 {
     constexpr int M = M_;
@@ -189,6 +192,8 @@ void hc_mix_finalize_kernel
         if (threadIdx.x < H)
             post[(size_t) r * H + threadIdx.x] =
                 2.0f * sigmoidf_(fmaf(mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x]));
+        if constexpr (CARRY)
+            if (threadIdx.x < H) pre_out[(size_t) r * H + threadIdx.x] = pre_s[threadIdx.x];
 
         if (threadIdx.x < H * H)
         {
@@ -222,7 +227,7 @@ void hc_mix_finalize_kernel
     // block the first warp is excluded, so the remaining threads re-cover its lanes
     float pre_r[H];
     #pragma unroll
-    for (int h = 0; h < H; ++h) pre_r[h] = pre_s[h];
+    for (int h = 0; h < H; ++h) pre_r[h] = (CARRY && pre_in) ? __ldg(pre_in + (size_t) r * H + h) : pre_s[h];
 
     const bool shrunk = !HEAD && blockIdx.x == 0;
     const int tid = shrunk ? threadIdx.x - 32 : threadIdx.x;
@@ -874,7 +879,9 @@ static void hc_mix_launch
     at::Tensor& collapsed,
     Graph* graph,
     const HcPendingApply* pend = nullptr,      // fold a preceding hc_apply on these streams into the partials
-    const HcNormArgs* nrm = nullptr            // fold the following RMSNorm into the finalize
+    const HcNormArgs* nrm = nullptr,           // fold the following RMSNorm into the finalize
+    const at::Tensor* pre_in = nullptr,        // collapse with these pre weights instead of the rows' own
+    at::Tensor* pre_out = nullptr              // receives the rows' own pre weights (selects the carried mix)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -906,6 +913,23 @@ static void hc_mix_launch
     int n_chunks_c = (D + chunk_cols_c - 1) / chunk_cols_c;
 
     bool half_out = collapsed.dtype() == at::kHalf;
+    if (pre_out)
+    {
+        TORCH_CHECK(!head && !pend && !nrm, "hc_mix: carried pre weights are for the plain mix");
+        TORCH_CHECK_DTYPE(collapsed, kHalf);
+        TORCH_CHECK(collapsed.is_contiguous() && collapsed.numel() == (int64_t) R * D && collapsed.device() == streams.device(),
+                    "hc_mix: collapsed must be (R, D) contiguous on the streams' device");
+        TORCH_CHECK_DTYPE((*pre_out), kFloat);
+        TORCH_CHECK(pre_out->is_contiguous() && pre_out->numel() == (int64_t) R * H && pre_out->device() == streams.device(),
+                    "hc_mix: pre_out must be (R, H) contiguous on the streams' device");
+        if (pre_in)
+        {
+            TORCH_CHECK_DTYPE((*pre_in), kFloat);
+            TORCH_CHECK(pre_in->is_contiguous() && pre_in->numel() == (int64_t) R * H && pre_in->device() == streams.device(),
+                        "hc_mix: pre_in must be (R, H) contiguous on the streams' device");
+            TORCH_CHECK(!pre_in->is_alias_of(*pre_out), "hc_mix: pre_in and pre_out must not alias");
+        }
+    }
 
     dim3 grid_a(n_chunks_a, R);
     dim3 grid_c(n_chunks_c, R);
@@ -983,7 +1007,11 @@ static void hc_mix_launch
         cuda_check(cudaPeekAtLastError());
         float* post_p = (float*) post->data_ptr();
         float* comb_p = (float*) comb->data_ptr();
-        if (half_out)
+        if (pre_out)
+            hc_mix_finalize_kernel<4, 24, false, true, false, true><<<grid_c, NUM_THREADS, 0, stream>>>
+                (ARGS_C(post_p, comb_p), HcNormArgs {},
+                 pre_in ? (const float*) pre_in->data_ptr() : nullptr, (float*) pre_out->data_ptr());
+        else if (half_out)
             hc_mix_finalize_kernel<4, 24, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
         else
             hc_mix_finalize_kernel<4, 24, false, false><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, comb_p));
@@ -1042,6 +1070,29 @@ void hc_mix
         collapsed,
         nullptr
     );
+}
+
+// hc_mix that collapses with pre_in when it is given, and stores the rows' own pre weights in pre_out
+void hc_mix_carry
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& fn,                // (2H + H^2, H * D) float
+    const at::Tensor& base,              // (2H + H^2) float
+    const at::Tensor& scale,             // (3) float
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    at::Tensor partials,                 // (R, chunks, M + 1) float workspace
+    at::Tensor post,                     // (R, H) float out
+    at::Tensor comb,                     // (R, H, H) float out
+    at::Tensor collapsed,                // (R, D) half out
+    const c10::optional<at::Tensor>& pre_in,    // (R, H) float, or none (collapse with the rows' own)
+    at::Tensor pre_out                   // (R, H) float out
+)
+{
+    hc_mix_launch(streams, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
+                  partials, &post, &comb, collapsed, nullptr, nullptr, nullptr,
+                  pre_in.has_value() ? &pre_in.value() : nullptr, &pre_out);
 }
 
 // hc_mix with the launch-count folds (hc_fuse.cuh): y / post_a / comb_a describe a pending hc_apply
