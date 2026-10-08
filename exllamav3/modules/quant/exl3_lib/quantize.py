@@ -18,6 +18,27 @@ codebook_scale = 1.24371088
 codebook_mcg_mult = 0xCBAC1FED
 codebook_mul1_mult = 0x83DCD12D
 
+
+def quant_codebook(quant_args: dict) -> tuple[bool, bool]:
+    """(mcg, mul1) codebook selection of quant_args: {"mcg": True} or {"mul1": True} selects that codebook, neither
+    (or False) the default 3INST. Encoder, packing and the stored marker all read the selection through here, so the
+    trellis and the marker naming its codebook cannot disagree"""
+    mcg, mul1 = bool(quant_args.get("mcg")), bool(quant_args.get("mul1"))
+    assert not (mcg and mul1), "quant_args selects both the mcg and mul1 codebooks"
+    return mcg, mul1
+
+
+def codebook_markers(quant_args: dict) -> dict[str, torch.Tensor]:
+    """The marker tensor naming the selected codebook, as stored next to the trellis ({} for 3INST). Safetensors
+    has no uint32, and since the multipliers are locked the stored values are never read: only the presence of
+    the marker tells inference which codebook a tensor uses"""
+    mcg, mul1 = quant_codebook(quant_args)
+    if mcg:
+        return {"mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)}
+    if mul1:
+        return {"mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)}
+    return {}
+
 @lru_cache
 def tensor_core_perm(device):
     """
@@ -109,7 +130,7 @@ def quantize_tiles_frac(tiles, quant_args: dict):
     """Half-integer bitrate (KA + 0.5): alternating pattern of KA / KA+1-bit steps. mul1 codebook only"""
     tiles = tiles.contiguous()
     assert tiles.shape[1] == 256 and tiles.dtype == torch.float
-    assert quant_args.get("mul1"), "fractional bitrates require the mul1 codebook"
+    assert quant_codebook(quant_args)[1], "fractional bitrates require the mul1 codebook"
     ka, mask = frac_k(quant_args["K"])
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
@@ -133,8 +154,7 @@ def quantize_tiles(tiles, quant_args: dict):
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
-    mcg = "mcg" in quant_args
-    mul1 = "mul1" in quant_args
+    mcg, mul1 = quant_codebook(quant_args)
     cb = 2 if mul1 else 1 if mcg else 0
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
@@ -324,8 +344,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
                 # Work buffers
                 K = quant_args["K"]
-                mcg = "mcg" in quant_args
-                mul1 = "mul1" in quant_args
+                mcg, mul1 = quant_codebook(quant_args)
                 temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
 
                 ext.quantize_tiles(
@@ -1841,17 +1860,7 @@ def quantize_exl3(
             "trellis": trellis,
         }
 
-        # Safetensors doesn't know what to do with a torch.uint32 tensor. Anyway, since the multipliers are now
-        # locked, the values in these tensors are never read, but they need to be present in the model files to
-        # indicate which codebook to use during inference, per individual tensor.
-        if quant_args.get("mcg"):
-            out_tensors.update({
-                "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
-            })
-        if quant_args.get("mul1"):
-            out_tensors.update({
-                "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
-            })
+        out_tensors.update(codebook_markers(quant_args))
 
         quant_args.update({
             "apply_out_scales": apply_out_scales,
@@ -2135,14 +2144,7 @@ def quantize_exl3_batch(
                 "svh": svh,
                 "trellis": trellis,
             }
-            if qa.get("mcg"):
-                out_tensors.update({
-                    "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
-                })
-            if qa.get("mul1"):
-                out_tensors.update({
-                    "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
-                })
+            out_tensors.update(codebook_markers(qa))
 
             qa.update({
                 "apply_out_scales": apply_out_scales,
