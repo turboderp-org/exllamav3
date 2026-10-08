@@ -1119,7 +1119,9 @@ class GatedDeltaNet(Module):
             z = self.g_b_proj.forward(self.g_a_proj.forward(x, params, out_dtype = torch.half), params) \
                 .view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
 
-            beta = torch.sigmoid(self.b_proj.forward(x, params, out_dtype = _gate_dtype).float() * self.beta_scale) \
+            # beta_scale multiplies after the sigmoid, as in the kernels and the reference (beta in [0, 2] for
+            # negative eigenvalues)
+            beta = (torch.sigmoid(self.b_proj.forward(x, params, out_dtype = _gate_dtype).float()) * self.beta_scale) \
                 .to(torch.bfloat16)
 
             # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
