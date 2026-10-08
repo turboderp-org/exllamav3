@@ -359,8 +359,9 @@ class Model_LSMixin(ABC):
     def prefill_ls_pipelined(self, input_ids: torch.Tensor, params: dict) -> bool:
         """
         Prefill a call longer than the max_chunk_size the split was loaded for in pieces of that size, each device
-        of the split working on a different piece. A device takes its next piece once the following device has run
-        its first module on the current one. Returns False, having done nothing, if the call is not eligible.
+        of the split working on a different piece (one piece after another where the split does not allow that).
+        A device takes its next piece once the following device has run its first module on the current one.
+        Returns False, having done nothing, if the call is not eligible.
         """
         n = self.max_chunk_size // PAGE_SIZE * PAGE_SIZE
         rows = input_ids.shape[-1]
@@ -377,13 +378,22 @@ class Model_LSMixin(ABC):
                 devs.append(module.device)
             if (idx, instance) == self.last_kv_module_idx_instance:
                 break
+        if len(devs) < 2:
+            return False
         # The CPU MoE worker takes one caller at a time, so its layers must all be on one device; with recurrent
         # states the first device needs a layer that sets their ring shift before they are advanced
-        if len(devs) < 2 or len(set(devs)) < len(devs) \
+        if len(set(devs)) < len(devs) \
                 or len({m.device for m in self if getattr(m, "cpu_offload", False)
                         or getattr(m, "cpu_split_first", None) is not None}) > 1 \
                 or (rs and devs[0] not in {m.device for m in self.get_recurrent_layers() if (m.layer_idx or 0) >= 0}):
-            return False
+            taps = []
+            for c, ids in enumerate(input_ids.split(n, dim = -1)):
+                p = dict(params, cache_seqlens = params["cache_seqlens"] + c * n)
+                self.prefill(ids, p)
+                taps.append([t.cpu() for t in p.get("export_states") or ()])
+            if taps[0]:
+                params["export_states"] = [torch.cat(t, dim = -2) for t in zip(*taps)]
+            return True
         cuts = [0] + cuts[1:] + [i + 1]
         qs = [queue.Queue() for _ in cuts[2:]]
         err, taps = [], []
