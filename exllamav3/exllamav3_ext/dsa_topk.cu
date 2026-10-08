@@ -556,7 +556,7 @@ void dsa_topk_merge_kernel
     int total = 0;
     for (int g = 0; g < G; ++g) total += cnt_sh[g];
 
-    if (total > k)
+    if (total >= k)
     {
         // Pass 1: high-byte histogram over the candidates (all finite by construction)
         for (int g = 0; g < G; ++g)
