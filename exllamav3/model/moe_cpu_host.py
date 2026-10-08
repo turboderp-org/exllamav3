@@ -44,9 +44,13 @@ Shared-memory layout constants mirror cpu/moe_handoff.h.
 MOE_JOB_RING = 256
 MOE_MAX_SLOTS = 8
 MOE_JOB_MAX_EXPERTS = 256   # structural capacity of MoeJob.experts[]; see cpu/moe_handoff.h
-# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + one uint32 pad, all 4-byte
+# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + seq_hi, all 4-byte
 # fields so no compiler padding -- recompute this if the struct's fixed fields ever change
 MOE_JOB_BYTES = (7 + MOE_JOB_MAX_EXPERTS + 1) * 4
+MOE_JOB_SEQ_HI = 7 + MOE_JOB_MAX_EXPERTS   # u32 index of MoeJob.seq_hi
+# Flag width (MOE_FLAG_BITS in cpu/moe_handoff.h): ROCm's stream wait has no cyclic compare, so its
+# flags are 64-bit and never wrap; CUDA's are 32-bit and compared cyclically
+MOE_FLAG_BITS = 64 if torch.version.hip else 32
 MOE_CTRL_JOBS_OFFSET = 384
 MOE_SLOT_FLAGS_OFFSET = MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * MOE_JOB_BYTES
 MOE_MAX_WSLOTS = 8
@@ -56,6 +60,20 @@ MOE_STAGE_TAIL_OFFSET = MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE
 MOE_STAGE_HEAD_OFFSET = MOE_STAGE_TAIL_OFFSET + 64
 MOE_STAGE_JOBS_OFFSET = MOE_STAGE_TAIL_OFFSET + 128
 MOE_CTRL_SIZE = MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * MOE_JOB_BYTES
+
+
+def _set_job_seq(job, seq: int):
+    """Sequence number into a job descriptor (u32 view) as its two 32-bit halves"""
+    job[0] = seq & 0xFFFFFFFF
+    job[MOE_JOB_SEQ_HI] = seq >> 32
+
+
+def _write_flag(u32: np.ndarray, offset: int, value: int):
+    """Host-side write of a handoff flag at a byte offset into the region"""
+    if MOE_FLAG_BITS == 64:
+        u32[offset // 4 : offset // 4 + 2].view(np.uint64)[0] = value
+    else:
+        u32[offset // 4] = value & 0xFFFFFFFF
 
 
 def _align64(x):
@@ -1134,12 +1152,12 @@ class MoeCpuHost:
                         done0 = MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS
                         cons0 = MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_SLOTS):
-                            u32[(done0 + s * 64) // 4] = seq
-                            u32[(cons0 + s * 64) // 4] = seq
+                            _write_flag(u32, done0 + s * 64, seq)
+                            _write_flag(u32, cons0 + s * 64, seq)
                         fl = MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_WSLOTS):
-                            u32[(fl + s * 64) // 4] = wseq                          # stage_done
-                            u32[(fl + 64 * MOE_MAX_WSLOTS + s * 64) // 4] = wseq    # pinned_free
+                            _write_flag(u32, fl + s * 64, wseq)                         # stage_done
+                            _write_flag(u32, fl + 64 * MOE_MAX_WSLOTS + s * 64, wseq)   # pinned_free
                         self.v_abort[0] = 1
                     except Exception:
                         pass
@@ -1256,7 +1274,7 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (ring stall)")
                     time.sleep(0.0002)
             job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
+            _set_job_seq(job, seq)
             job[1] = layer_idx
             job[2] = rows
             job[3] = spec["topk"]
@@ -1333,7 +1351,7 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (ring stall)")
                     time.sleep(0.0002)
             job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
+            _set_job_seq(job, seq)
             job[1] = layer_idx
             job[2] = n
             job[3] = spec["topk"]
@@ -1725,13 +1743,13 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (stage ring stall)")
                     time.sleep(0.0002)
                 job = self.v_stage_jobs[stail % MOE_STAGE_RING]
-                job[0] = seq
+                _set_job_seq(job, seq)
                 job[1] = layer_idx
                 job[2] = len(batch)
                 job[3] = 0
                 job[4] = ws
                 job[5] = 1    # MOE_JOB_KIND_STAGE
-                job[6] = self.wslot_prev_seq[ws]
+                job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
                 for bi, e in enumerate(batch):
                     job[7 + bi] = e
                 self.v_stage_tail[0] = stail + 1

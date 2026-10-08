@@ -285,10 +285,11 @@ def test_quit(protocol):
 
 # ---------------------------------------------------------------------------------------------------------------
 
-def gpu_child(memops: bool) -> dict:
+def gpu_child(memops: bool, seq_base: int = 0) -> dict:
     """GPU-driven run in one process: per job, H2D-staged inputs (D2H into the mapped slot), data_ready published
     and done awaited by stream flag ops, output read back on the stream, consumed published; slots reused behind
-    the consumed flag, as MoeCpuHost._issue_compute / _collect_one. Everything enqueued before one synchronize"""
+    the consumed flag, as MoeCpuHost._issue_compute / _collect_one. Everything enqueued before one synchronize.
+    Sequence numbers start at seq_base + 1, which lets a run cross 2^32 (where 32-bit flags wrap)"""
     from exllamav3.ext import exllamav3_ext as ext
     torch.set_num_threads(1)
     dev = torch.device("cuda:0")
@@ -302,12 +303,17 @@ def gpu_child(memops: bool) -> dict:
     inputs = [job_inputs(gen, layer, rows) for layer, rows in jobs]
     outs = [torch.zeros(rows, H, device = dev) for _, rows in jobs]
     last = [0] * NUM_SLOTS
+    # The flags trail the sequence, as they do in a running host (a fresh segment's zeros would be cyclically
+    # ahead of a sequence just below 2^32)
+    for s in range(NUM_SLOTS):
+        for bank in (DATA_READY, DONE, CONSUMED):
+            seg.set_flag(bank, s, seq_base)
     try:
         seg.start(threads = 2, stage_threads = 1)
         dev_in = [(x.to(dev), sel.to(dev), w.to(dev)) for x, sel, w in inputs]
         torch.cuda.synchronize()
         for i, ((layer, rows), (x, sel, w)) in enumerate(zip(jobs, dev_in)):
-            seq, slot = i + 1, i % NUM_SLOTS
+            seq, slot = seq_base + i + 1, i % NUM_SLOTS
             seg.push_job(seq, layer, rows, TOPK, slot)
             if last[slot]:
                 ext.exl3_moe_flag_wait(base + CONSUMED + 64 * slot, last[slot], base + ABORT)
@@ -331,9 +337,12 @@ def gpu_child(memops: bool) -> dict:
     return dict(bad = bad, stopped = stopped, err = err, abort = abort)
 
 
+@pytest.mark.parametrize("seq_base", [0, (1 << 32) - 20], ids = ["from_1", "across_2_32"])
 @pytest.mark.parametrize("memops", [True, False], ids = ["memops", "kernels"])
-def test_gpu_driven_jobs(device, memops):
-    r = run_isolated(gpu_child, memops, env = device_env(device), timeout = 600)
+def test_gpu_driven_jobs(device, memops, seq_base):
+    """Also across 2^32: 32-bit flags (CUDA) wrap there and are compared cyclically; ROCm's stream wait has no
+    cyclic compare, so its 64-bit flags must carry the full sequence number past it (jobs carry the high half)"""
+    r = run_isolated(gpu_child, memops, seq_base, env = device_env(device), timeout = 600)
     assert r["err"] == [] and r["abort"] == 0 and r["stopped"]
     assert not r["bad"], f"jobs with wrong output: {r['bad']}"
 
@@ -387,6 +396,7 @@ def test_host_layout_matches_header():
                  "MOE_SLOT_FLAGS_OFFSET", "MOE_FLAGS_SIZE", "MOE_STAGE_RING", "MOE_STAGE_TAIL_OFFSET",
                  "MOE_STAGE_HEAD_OFFSET", "MOE_STAGE_JOBS_OFFSET", "MOE_CTRL_SIZE"):
         assert getattr(host, name) == getattr(hdr, name), name
+    assert host.MOE_JOB_SEQ_HI == hdr.JOB_SEQ_HI and host.MOE_FLAG_BITS == hdr.FLAG_BITS
 
 
 def _empty_forward_worker():

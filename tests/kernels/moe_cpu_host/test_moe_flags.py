@@ -3,13 +3,14 @@ GPU-side flag ops of the CPU expert-offload handoff (cpu/moe_handoff.cu): exl3_m
 exl3_moe_flag_wait(addr, value, abort_addr) on mapped, registered host memory, in both implementations
 exl3_moe_cpu_set_memops selects (stream memory operations, or the fallback kernels).
 
-Contracts:
-- flag_write stores (uint32) value at addr in stream order on the current torch stream: not before the stream's
-  earlier work, and after everything the stream copied to host memory earlier (a reader that sees the flag sees
-  the data). Other streams are not ordered behind it.
-- flag_wait holds the current stream until the flag reaches value in the cyclic sense ((int32)(flag - value) >= 0,
-  so 3 satisfies a wait for 0xFFFFFFF0 and 0x80000005 does not satisfy a wait for 5); later work on the stream
-  (including copies from host memory written before the flag) runs only afterwards. Values are taken mod 2^32.
+Contracts (flag width MOE_FLAG_BITS: 32 on CUDA, 64 on ROCm, whose stream wait has no cyclic compare):
+- flag_write stores value at addr, as uint32 on CUDA and uint64 on ROCm, in stream order on the current torch
+  stream: not before the stream's earlier work, and after everything the stream copied to host memory earlier (a
+  reader that sees the flag sees the data). Other streams are not ordered behind it.
+- flag_wait holds the current stream until the flag reaches value: on CUDA in the cyclic sense
+  ((int32)(flag - value) >= 0, so 3 satisfies a wait for 0xFFFFFFF0 and 0x80000005 does not satisfy a wait for 5,
+  values taken mod 2^32), on ROCm as a plain uint64 >= (flags never wrap). Later work on the stream (including
+  copies from host memory written before the flag) runs only afterwards.
 - The two together carry the parent/worker handshake: data out + flag, flag in + data, with the counterpart a
   host thread or another process polling and writing the same words (the CPU worker process in MoeCpuHost).
 - Fallback kernel only: a wait still unsatisfied after its timeout (30 s) sets *abort_addr = 1 and lets the stream
@@ -28,6 +29,7 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
+from testlib.moe_handoff import FLAG_BITS
 from exllamav3.model.model_tp_cuda import (CUDA_HOST_REGISTER_MAPPED, CUDA_HOST_REGISTER_PORTABLE,
                                            cuda_host_get_device_pointer, cuda_host_register, cuda_host_unregister)
 
@@ -37,7 +39,8 @@ DATA_BYTES = 1 << 16
 
 
 class Region:
-    """Registered, mapped shared memory: u32 flag words at a 64-byte stride from byte 0, a data area from DATA_OFF"""
+    """Registered, mapped shared memory: flag words (FLAG_BITS wide) at a 64-byte stride from byte 0, a data area from
+    DATA_OFF"""
 
     def __init__(self, size = DATA_OFF + 2 * DATA_BYTES):
         self.shm = shared_memory.SharedMemory(create = True, size = size)
@@ -52,10 +55,15 @@ class Region:
         return self.dev + 64 * i
 
     def get(self, i):
+        if FLAG_BITS == 64:
+            return int(self.u32[16 * i : 16 * i + 2].view(np.uint64)[0])
         return int(self.u32[16 * i])
 
     def set(self, i, v):
-        self.u32[16 * i] = v & 0xFFFFFFFF
+        if FLAG_BITS == 64:
+            self.u32[16 * i : 16 * i + 2].view(np.uint64)[0] = v & 0xFFFFFFFFFFFFFFFF
+        else:
+            self.u32[16 * i] = v & 0xFFFFFFFF
 
     def data(self, which, dtype = torch.int32):
         """Torch view of data area `which` (0, 1), pinned through the registration"""
@@ -86,7 +94,7 @@ def region(device):
     yield r
     # Unblock any wait a failing test left on the stream before tearing down
     for i in range(8):
-        r.set(i, 0x7FFFFFFF)
+        r.set(i, 0x7FFFFFFF if FLAG_BITS == 32 else 1 << 62)
     r.close()
 
 
@@ -114,7 +122,10 @@ def test_write_stream_ordered(device, memops, region):
     ext.exl3_moe_flag_write(region.addr(1), (1 << 32) + 5)
     ext.exl3_moe_flag_write(region.addr(2), -1)
     torch.cuda.synchronize()
-    assert region.get(1) == 5 and region.get(2) == 0xFFFFFFFF
+    if FLAG_BITS == 64:
+        assert region.get(1) == (1 << 32) + 5 and region.get(2) == 0xFFFFFFFFFFFFFFFF
+    else:
+        assert region.get(1) == 5 and region.get(2) == 0xFFFFFFFF
     # Untouched neighbours
     assert region.get(0) == 0 and region.get(3) == 0 and region.get(5) == 0
 
@@ -130,11 +141,23 @@ def test_write_follows_current_stream(device, memops, region):
     assert seen == 3, "flag write on a side stream waited for the default stream"
 
 
-@pytest.mark.parametrize("flag, value, satisfied", [
-    (5, 5, True), (9, 5, True), (4, 5, False), (3, 0xFFFFFFF0, True), (3, -16, True), (0x80000005, 5, False),
-    (0, 0x80000001, True), (5, (1 << 32) + 5, True),
-], ids = ["equal", "above", "below", "wrapped", "wrapped_negative_arg", "half_ring_behind", "half_ring_ahead",
-          "value_mod_2_32"])
+if FLAG_BITS == 32:
+    PREDICATE_CASES = [
+        (5, 5, True), (9, 5, True), (4, 5, False), (3, 0xFFFFFFF0, True), (3, -16, True), (0x80000005, 5, False),
+        (0, 0x80000001, True), (5, (1 << 32) + 5, True),
+    ]
+    PREDICATE_IDS = ["equal", "above", "below", "wrapped", "wrapped_negative_arg", "half_ring_behind",
+                     "half_ring_ahead", "value_mod_2_32"]
+else:
+    PREDICATE_CASES = [
+        (5, 5, True), (9, 5, True), (4, 5, False), (0x80000005, 5, True), (0xFFFFFFF0, (1 << 32) + 3, False),
+        ((1 << 32) + 3, 0xFFFFFFF0, True), ((1 << 32) + 5, (1 << 32) + 5, True), (5, (1 << 32) + 5, False),
+    ]
+    PREDICATE_IDS = ["equal", "above", "below", "above_2_31", "below_across_2_32", "above_across_2_32",
+                     "equal_above_2_32", "high_half_compared"]
+
+
+@pytest.mark.parametrize("flag, value, satisfied", PREDICATE_CASES, ids = PREDICATE_IDS)
 def test_wait_predicate(device, memops, region, flag, value, satisfied):
     region.set(0, flag)
     ext.exl3_moe_flag_wait(region.addr(0), value, region.addr(7))

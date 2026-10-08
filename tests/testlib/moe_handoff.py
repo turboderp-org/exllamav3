@@ -10,8 +10,9 @@ exl3_moe_cpu_worker_run and the GPU flag ops without a model. Layout constants a
     seg.stop()                                     # quit flag, join
 
 Slot sections are torch views (x fp16 [cap_rows, max_hi], sel int32 [cap_rows, max_topk], w fp16, out fp32
-[cap_rows, max_ho]); flags are u32 words at a 64-byte stride. `register()` pins and maps the segment for GPU
-flag ops / copies and returns the device alias of its base.
+[cap_rows, max_ho]); flags are words at a 64-byte stride, u32 compared cyclically on CUDA and u64 on ROCm (whose
+stream wait has no cyclic compare; FLAG_BITS), and job descriptors carry the sequence number as two u32 halves (seq,
+seq_hi). `register()` pins and maps the segment for GPU flag ops / copies and returns the device alias of its base.
 """
 
 import threading
@@ -26,6 +27,8 @@ MOE_MAX_SLOTS = 8
 MOE_MAX_WSLOTS = 8
 MOE_JOB_MAX_EXPERTS = 256
 MOE_JOB_BYTES = 4 * (7 + MOE_JOB_MAX_EXPERTS + 1)     # sizeof(MoeJob)
+JOB_SEQ_HI = 7 + MOE_JOB_MAX_EXPERTS                   # u32 index of MoeJob.seq_hi
+FLAG_BITS = 64 if torch.version.hip else 32            # MOE_FLAG_BITS
 MOE_CTRL_JOBS_OFFSET = 384
 MOE_SLOT_FLAGS_OFFSET = MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * MOE_JOB_BYTES
 MOE_FLAGS_SIZE = 3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS
@@ -84,10 +87,17 @@ class Segment:
         self.u32[off // 4] = v & 0xFFFFFFFF
 
     def flag(self, bank: int, idx: int) -> int:
-        return self.word(bank + 64 * idx)
+        off = bank + 64 * idx
+        if FLAG_BITS == 64:
+            return int(self.u32[off // 4 : off // 4 + 2].view(np.uint64)[0])
+        return self.word(off)
 
     def set_flag(self, bank: int, idx: int, v: int):
-        self.set_word(bank + 64 * idx, v)
+        off = bank + 64 * idx
+        if FLAG_BITS == 64:
+            self.u32[off // 4 : off // 4 + 2].view(np.uint64)[0] = v
+        else:
+            self.set_word(off, v)
 
     def section(self, slot: int, name: str) -> torch.Tensor:
         off, count, dtype, cols = dict(
@@ -112,8 +122,9 @@ class Segment:
     def _write_job(self, ring_off, index, seq, layer, rows, topk, slot, kind, prev_seq = 0, experts = ()):
         j = np.ndarray((MOE_JOB_BYTES // 4,), dtype = np.uint32, buffer = self.shm.buf,
                        offset = ring_off + index * MOE_JOB_BYTES)
-        j[:7] = [seq, layer, rows, topk, slot, kind, prev_seq]
+        j[:7] = [seq & 0xFFFFFFFF, layer, rows, topk, slot, kind, prev_seq & 0xFFFFFFFF]
         j[7 : 7 + len(experts)] = experts
+        j[JOB_SEQ_HI] = seq >> 32
 
     def push_job(self, seq, layer, rows, topk, slot, kind = KIND_COMPUTE):
         """Compute job descriptor, published by advancing jobs_tail (before the slot's data_ready flag)"""
@@ -130,9 +141,10 @@ class Segment:
         self.set_word(MOE_STAGE_TAIL_OFFSET, tail + 1)
 
     def wait(self, bank, idx, seq, timeout = 30.0):
-        """Poll a flag until it reaches seq (cyclic >=), as the GPU wait does"""
+        """Poll a flag until it reaches seq (>= on 64-bit flags, cyclic >= on 32-bit ones), as the GPU wait does"""
         deadline = time.monotonic() + timeout
-        while ((self.flag(bank, idx) - seq) & 0xFFFFFFFF) >= 0x80000000:
+        reached = (lambda f: f >= seq) if FLAG_BITS == 64 else (lambda f: ((f - seq) & 0xFFFFFFFF) < 0x80000000)
+        while not reached(self.flag(bank, idx)):
             if self.error:
                 raise self.error[0]
             if time.monotonic() > deadline:
