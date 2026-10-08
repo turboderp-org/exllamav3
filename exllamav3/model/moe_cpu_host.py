@@ -1958,6 +1958,10 @@ class MoeCpuHost:
         self.aux = {}
         self.acked = 0
         self.live_layers = 0
+        self.seq = self.wseq = 0
+        self.next_slot = self.next_wslot = 0
+        self.slot_last_seq = [0] * MOE_MAX_SLOTS
+        self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:
