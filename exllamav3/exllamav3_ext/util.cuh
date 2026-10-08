@@ -143,5 +143,18 @@ __device__ inline half2 h2xor(half2 v, uint32_t mask)
     return v;
 }
 
+// sin/cos of an fp32 angle of any practical size (RoPE angles reach position * inv_freq). The build
+// uses fast math, which turns sinf/cosf/sincosf into the hardware approximations; those reduce the
+// argument with an fp32 multiply by 1/(2 pi), so their error grows with |x| (about one fp32 ulp of
+// the angle). Reduce to [-pi, pi] exactly instead (two-part 2 pi constant, FMA steps) and apply the
+// approximation only to the reduced argument, where its absolute error is ~2^-21.4
+__device__ __forceinline__ void sincos_accurate(float x, float* s, float* c)
+{
+    const float k = rintf(x * 0.15915494309189535f);
+    float r = fmaf(-k, 6.28318548202514648f, x);
+    r = fmaf(-k, -1.74845553e-7f, r);
+    __sincosf(r, s, c);
+}
+
 #define NEG_INF_F16 __ushort_as_half(0xFC00)
 #define POS_INF_F16 __ushort_as_half(0x7C00)

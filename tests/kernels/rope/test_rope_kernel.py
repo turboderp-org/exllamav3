@@ -106,10 +106,9 @@ def ref_rope(x, angles, mode, attn_factor, rotate_offset, rd):
 
 
 def sincos_err(angles, attn_factor):
-    """Absolute sin/cos error bound of __sinf/__cosf on the fp32 angle: the hardware reduces the argument with an
-    fp32 multiply by 1/(2 pi), so the reduced argument carries about one ulp of the angle (twice that as margin);
-    inside [-pi, pi] the intrinsic's own error is ~2^-21.4"""
-    return (2.0 * EPS32 * max(angles.abs().max().item(), 1.0) + 2.0 ** -21) * attn_factor
+    """Absolute sin/cos error bound of sincos_accurate (util.cuh) on the fp32 angle, independent of its size: the
+    reduction to [-pi, pi] rounds once (<= 2^-23), and the intrinsic's own error there is ~2^-21.4"""
+    return 2.0 ** -20 * attn_factor
 
 
 def assert_within(actual, expected, bound, msg = ""):
@@ -437,8 +436,6 @@ def test_rope_deterministic_and_inverse(device, mode):
     assert_within(back, q.double().cpu(), bound)
 
 
-@pytest.mark.xfail(strict = True, reason = "sin/cos via __sinf/__cosf: error grows with the angle (about one fp32 "
-                                           "ulp of it) and exceeds fp16 resolution at long context")
 @torch.inference_mode()
 def test_rope_long_positions_match_accurate_sincos(device):
     # The HF formulation computes the same fp32 angle and takes accurate sin/cos of it. Against that, the result

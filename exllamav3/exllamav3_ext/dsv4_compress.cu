@@ -194,8 +194,8 @@ void dsv4_compress_windows_kernel
     {
         int p = (c - c0) / 2;
         float theta = inv_freq[p] * (float) ((ec0 + w) * m);
-        float cs = __cosf(theta);
-        float sn = __sinf(theta);
+        float cs, sn;
+        sincos_accurate(theta, &sn, &cs);
         float v_e = sh_comp[c0 + p * 2];
         float v_o = sh_comp[c0 + p * 2 + 1];
         out = ((c - c0) & 1) ? (v_o * cs + v_e * sn) : (v_e * cs - v_o * sn);

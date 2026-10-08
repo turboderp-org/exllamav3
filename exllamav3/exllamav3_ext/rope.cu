@@ -73,14 +73,16 @@ void rope_kernel
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * attn_factor;
-            cos = __cosf(fr * pf) * attn_factor;
+            sincos_accurate(fr * pf, &sin, &cos);
+            sin *= attn_factor;
+            cos *= attn_factor;
         }
         else
         {
             float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * attn_factor;
-            cos = __cosf(fr) * attn_factor;
+            sincos_accurate(fr, &sin, &cos);
+            sin *= attn_factor;
+            cos *= attn_factor;
         }
     };
 
