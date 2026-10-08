@@ -114,6 +114,10 @@ jobs:
     name: ${{ matrix.os }} P${{ matrix.pyver }} ${{ matrix.cuda && format('CUDA {0}', matrix.cuda) || format('ROCm {0}', matrix.rocm) }} T${{ matrix.torch }}
     needs: define_matrix
     runs-on: ${{ matrix.os }}
+    # A healthy wheel build takes well under an hour on the free runners; a job past this is hung
+    # (seen: a toolkit download that never completed). Failing it lets "Re-run failed jobs" pick
+    # it up instead of blocking the run until GitHub's six-hour limit
+    timeout-minutes: 150
     defaults:
       run:
         shell: pwsh
@@ -161,8 +165,48 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
+      # Compiler cache for the Linux builds: ccache in front of nvcc / hipcc and the host compiler
+      # (torch's BuildExtension does this itself for CUDA when ccache is on PATH; the HIP compiler is
+      # named through PYTORCH_NVCC below), with the cache directory carried between runs through the
+      # Actions cache. Keys end in the commit so every run saves its own state; the restore prefixes
+      # fall back to the latest cache for the same backend/torch and, failing that, any Python version
+      # of it. The kernel translation units include no Python headers, so their compiles are identical
+      # across Python versions once the torch include path is too: the venv's site-packages (whose
+      # path carries the Python version) is reached through a fixed symlink on PYTHONPATH (next step),
+      # and that is the path ccache sees in the preprocessed source
+      - name: Set up ccache
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y ccache
+          $dir = Join-Path $env:RUNNER_TEMP 'ccache'
+          Write-Output "CCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_BASEDIR=${{ github.workspace }}" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_NOHASHDIR=1" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines,locale" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_COMPRESS=1" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_MAXSIZE=3G" >> "$env:GITHUB_ENV"
+
+      - name: Stable site-packages path for the compiler cache
+        if: runner.os == 'Linux'
+        run: |
+          $site = python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+          $link = Join-Path $env:RUNNER_TEMP 'site'
+          New-Item -ItemType SymbolicLink -Path $link -Target $site | Out-Null
+          Write-Output "PYTHONPATH=$link" >> "$env:GITHUB_ENV"
+
+      - name: Restore compiler cache
+        if: runner.os == 'Linux'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-
+
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
+        timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -243,6 +287,7 @@ jobs:
 
       - name: Install Windows CUDA 13.2
         if: runner.os == 'Windows' && contains(matrix.cuda, '13.2')
+        timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -331,6 +376,7 @@ jobs:
       - name: Install Linux CUDA ${{ matrix.cuda }}
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit-Linux
+        timeout-minutes: 30
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
@@ -446,8 +492,25 @@ jobs:
           $env:BUILD_TARGET = "rocm"
           $env:PYTORCH_ROCM_ARCH = '${{ matrix.cudaarch }}'
           $env:EXLLAMA_EXT_COMPRESS = "1"
+          # torch does not put ccache in front of hipcc on its own; PYTORCH_NVCC names the device compiler
+          # verbatim, wrapper included
+          $hipcc = Join-Path (python -m rocm_sdk path --bin) 'hipcc'
+          $env:PYTORCH_NVCC = "ccache $hipcc"
 
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
+      - name: Compiler cache statistics
+        if: runner.os == 'Linux' && always()
+        run: |
+          python -c "import sys; print('python prefix:', sys.prefix)"
+          ccache -s
+
+      - name: Save compiler cache
+        if: runner.os == 'Linux' && (matrix.cuda != '' || matrix.rocm != '')
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
 
       - name: Verify extension size
         if: matrix.cuda != '' || matrix.rocm != ''

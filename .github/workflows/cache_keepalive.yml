@@ -1,0 +1,67 @@
+name: Compiler Cache Keepalive
+run-name: Compiler Cache Keepalive
+
+# The Actions cache drops an entry that has not been restored for seven days, and releases can be
+# weeks apart. Restoring every compiler-cache entry once a week keeps the build cache alive between
+# them (a read is an access; the build workflow's own restore-key fallbacks then find a warm cache).
+# Lists the entries through the API so nothing here duplicates the build matrix.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  list_caches:
+    name: List compiler caches
+    runs-on: ubuntu-22.04
+    outputs:
+      keys: ${{ steps.list.outputs.keys }}
+    steps:
+      - name: List cache keys
+        id: list
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json, os, urllib.request
+          keys = []
+          page = 1
+          while True:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/${{ github.repository }}/actions/caches?per_page=100&page={page}",
+                  headers = {"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(req) as r:
+                  data = json.load(r)
+              batch = [c["key"] for c in data.get("actions_caches", []) if c["key"].startswith("ccache-")]
+              keys += batch
+              if len(data.get("actions_caches", [])) < 100:
+                  break
+              page += 1
+          print(f"{len(keys)} compiler cache entries")
+          for k in keys:
+              print(" ", k)
+          # A matrix needs at least one entry; an empty list is reported and the restore job skipped
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("keys=" + json.dumps(keys) + "\n")
+
+  touch_caches:
+    name: Restore ${{ matrix.key }}
+    needs: list_caches
+    if: needs.list_caches.outputs.keys != '[]'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        key: ${{ fromJSON(needs.list_caches.outputs.keys) }}
+    steps:
+      - name: Restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ matrix.key }}
+          fail-on-cache-miss: true
