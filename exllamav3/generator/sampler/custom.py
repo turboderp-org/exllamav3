@@ -941,18 +941,23 @@ class SS_DRY(SS_Base):
     match_length is the length of the longest context suffix whose earlier repetition the token
     would continue. The matching semantics and the float32 exponent clamp follow llama.cpp's
     llama_sampler_dry_apply (ported to koboldcpp-derived runtimes by pi6am; the scheme was
-    designed by p-e-w), with two divergences: sequence breakers are single tokens, where
-    llama.cpp additionally builds multi-token restart sequences from partially overlapping
-    tokens, and match lengths are capped at 2048, so where allowed_length plus llama.cpp's
-    exponent clamp exceeds 2048 (dry_base below ~1.044 at the default allowed_length) a verbatim
-    repeat longer than the cap is penalized as a 2048-token repeat. The parameter surface
-    follows exllamav2, including dry_range = 0 meaning the whole context. exllamav2's own DRY is
-    a different algorithm (an occurrence-counting trie), so outputs are not expected to match it.
+    designed by p-e-w), with two divergences:
+
+    - sequence breakers are single tokens, where llama.cpp additionally builds multi-token
+      restart sequences from partially overlapping tokens;
+    - the match scan stops where the penalty stops changing, at allowed_length plus llama.cpp's
+      exponent clamp. For dry_base so close to 1 that llama.cpp applies no clamp (at most
+      1.000001) it stops at 2048 tokens instead, so a longer verbatim repeat is penalized as a
+      2048-token one; at those bases the penalty grows by at most 0.2% per further 2048 tokens.
+
+    The parameter surface follows exllamav2, including dry_range = 0 meaning the whole context.
+    exllamav2's own DRY is a different algorithm (an occurrence-counting trie), so outputs are not
+    expected to match it.
 
     One kernel launch per sampled token (ext.dry_penalty) on the logits device; past_ids are
     uploaded first if they live on the host. The scan is O(window) comparisons per token for
-    ordinary text and at most O(window * min(allowed_length + clamp, 2048)) for a context that
-    is one long verbatim repeat.
+    ordinary text and at most O(window * min(window, scan limit)) for a context that is one long
+    verbatim repeat, where the scan limit is allowed_length plus the clamp (2048 without one).
     """
     def __init__(
         self,
