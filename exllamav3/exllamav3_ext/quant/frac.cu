@@ -9,9 +9,12 @@
 // Fractional-rate trellis tiles. The 256-weight tile is a ring of 16 * K bits: weight i's D(i) new bits,
 // D(i) = KA + bit (i mod 16) of MASK, sit at ring position S(i) - D(i) .. S(i) where S(i) is the prefix sum
 // of D; its 16-bit window is ring bits [S(i) - 16, S(i)). Bits are stored MSB-first in 32-bit words, the
-// same stream convention as the integer pack_trellis output, so a tile is 16 * K uint16 = 2 * K uint32
+// same stream convention as the integer pack_trellis output, so a tile is 16 * K uint16 = 8 * K uint32
 // words (K half-integer -> whole words). One warp per tile; lane t owns ring positions 8t .. 8t+7 (the
 // tensor-core element order the quantizer works in).
+
+// Largest tile in 32-bit words: KA = 7 with every extra bit set, 16 * 8 bits per 16 weights
+#define FRAC_MAX_WORDS 64
 
 __device__ __forceinline__ int frac_d(int i, int ka, uint32_t mask) { return ka + ((mask >> (i & 15)) & 1); }
 
@@ -50,7 +53,7 @@ void pack_trellis_frac_kernel(uint16_t* __restrict__ g_packed, const uint16_t* _
     const int tile = blockIdx.x * 128 + threadIdx.x;
     if (tile >= num_tiles) return;
     const int nw = bpb / 2;
-    uint32_t words[32];
+    uint32_t words[FRAC_MAX_WORDS];
     for (int w = 0; w < nw; ++w) words[w] = 0;
     const uint16_t* idx = g_unpacked + (size_t) tile * 256;
     int pos = 0;
@@ -69,11 +72,11 @@ __global__ __launch_bounds__(32)
 void unpack_trellis_frac_kernel(uint16_t* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
                                 int ka, uint32_t mask, int bpb)
 {
-    __shared__ uint32_t words[32];
+    __shared__ uint32_t words[FRAC_MAX_WORDS];
     const int tile = blockIdx.x;
     const int t = threadIdx.x;
     const int nw = bpb / 2;
-    if (t < nw) words[t] = ((const uint32_t*) (g_packed + (size_t) tile * bpb))[t];
+    for (int w = t; w < nw; w += 32) words[w] = ((const uint32_t*) (g_packed + (size_t) tile * bpb))[w];
     __syncwarp();
     for (int j = 0; j < 8; ++j)
     {
