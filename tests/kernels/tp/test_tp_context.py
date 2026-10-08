@@ -37,23 +37,23 @@ MAX_REDUCE_JOBS = 2048
 
 # Byte offsets in PGContext (alignas(64) struct, parallel/context.cuh)
 OFF = dict(
-    sync_timeout = 0, barrier_epoch = 4,
-    barrier_epoch_device = 16, broadcast_stage_device = 80, reduce_stage_produced = 144,
-    reduce_stage_consumed = 208, gather_stage_produced = 272, gather_stage_consumed = 336,
-    broadcast_ll_epoch = 448, broadcast_ll_sequence_device = 512,
-    reduce_jobs_head = 576, reduce_jobs_tail = 640,
-    cpusum_stage_device = 704, cpusum_stage_device_mb = 1728, cpusum_stage_recv = 5824,
-    cpusum_stage_recv_mb = 6848, cpusum_stage_cpu = 10944, reduce_jobs = 11008,
+    sync_timeout = 0,
+    barrier_arrive = 16, barrier_release = 80, broadcast_stage_device = 144, reduce_stage_produced = 208,
+    reduce_stage_consumed = 272, gather_stage_produced = 336, gather_stage_consumed = 400,
+    broadcast_ll_epoch = 512, broadcast_ll_sequence_device = 576,
+    reduce_jobs_head = 640, reduce_jobs_tail = 704,
+    cpusum_stage_device = 768, cpusum_stage_device_mb = 1792, cpusum_stage_recv = 5888,
+    cpusum_stage_recv_mb = 6912, cpusum_stage_cpu = 11008, reduce_jobs = 11072,
 )
 SIZEOF_CONTEXT = OFF["reduce_jobs"] + 16 * MAX_REDUCE_JOBS
 
 
 def initialized_words() -> dict[int, int]:
     """{byte offset: value} of every word pg_init_context must set"""
-    w = {OFF["sync_timeout"]: 0, OFF["barrier_epoch"]: 1, OFF["broadcast_ll_epoch"]: 1,
+    w = {OFF["sync_timeout"]: 0, OFF["broadcast_ll_epoch"]: 1,
          OFF["reduce_jobs_head"]: 0, OFF["reduce_jobs_tail"]: 0, OFF["cpusum_stage_cpu"]: 0}
     for i in range(MAX_DEVICES):
-        for f in ("barrier_epoch_device", "broadcast_stage_device", "reduce_stage_produced", "reduce_stage_consumed",
+        for f in ("barrier_arrive", "barrier_release", "broadcast_stage_device", "reduce_stage_produced", "reduce_stage_consumed",
                   "gather_stage_produced", "gather_stage_consumed", "broadcast_ll_sequence_device"):
             w[OFF[f] + 4 * i] = 0
         for f in ("cpusum_stage_device", "cpusum_stage_recv"):

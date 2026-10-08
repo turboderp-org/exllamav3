@@ -45,8 +45,8 @@ import torch
 _MODULE_NAME = "_exl3_tp_native_module"
 _SYNC_STRIDE = 16   # u32 words between participants' barrier slots (one cache line each)
 # Byte offsets of PGContext::reduce_jobs_head / reduce_jobs_tail (parallel/context.cuh)
-_CTX_JOBS_HEAD = 576
-_CTX_JOBS_TAIL = 640
+_CTX_JOBS_HEAD = 640
+_CTX_JOBS_TAIL = 704
 
 
 @dataclass

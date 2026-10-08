@@ -1,4 +1,10 @@
-
+// Barrier over the devices in device_mask, coordinated by coordinator_device. Each other
+// participant publishes arrive[d] = release[d] + 1 and spins until the coordinator copies that
+// value into release[d]; the coordinator spins until every participant's arrive counter is ahead
+// of its release counter, then releases each of them. The counters are per device, so devices
+// outside the mask are never touched and barriers over different subsets cannot release each
+// other's participants. A device must not take part in two barriers at once (one stream per
+// device enforces this). The coordinator itself needs no handshake.
 __device__ __forceinline__ void pg_barrier_inner
 (
     PGContext* __restrict__ ctx,
@@ -10,36 +16,33 @@ __device__ __forceinline__ void pg_barrier_inner
 {
     if (!blockIdx.x && !blockIdx.y && !blockIdx.z && !threadIdx.x && !threadIdx.y && !threadIdx.z)
     {
-        uint32_t* epoch_ptr     = &ctx->barrier_epoch;
-        uint32_t* epoch_dev_ptr = ctx->barrier_epoch_device;
-
-        // Snapshot current epoch
-        const uint32_t epoch = ldg_cv_u32(epoch_ptr);
-
-        // Publish arrival
-        stg_wt_u32(&epoch_dev_ptr[this_device], epoch);
+        uint32_t* arrive  = ctx->barrier_arrive;
+        uint32_t* release = ctx->barrier_release;
 
         if (this_device == coordinator_device)
         {
             uint64_t deadline = sync_deadline();
             uint32_t pending = device_mask & ~(1 << this_device);
+            uint32_t seq[MAX_DEVICES];
 
-            // Wait for other participants to arrive at epoch
+            // Wait for the other participants to arrive. Arrive and release counters are loaded
+            // together, so each poll costs one round trip
             uint32_t sleep = SYNC_MIN_SLEEP;
             while (pending)
             {
                 uint32_t pending_t = pending;
-                uint4* p = (uint4*) epoch_dev_ptr;
-                for (int i = 0; i < MAX_DEVICES; i += 4, p++)
+                #pragma unroll
+                for (int i = 0; i < MAX_DEVICES; i += 4)
                 {
                     uint32_t pmask = (pending >> i) & 0x0f;
                     if (!pmask) continue;
 
-                    uint4 s = ldg_cv_u128(p);
-                    if ((pmask & 1) && s.x == epoch) pending &= ~(1 << (i + 0));
-                    if ((pmask & 2) && s.y == epoch) pending &= ~(1 << (i + 1));
-                    if ((pmask & 4) && s.z == epoch) pending &= ~(1 << (i + 2));
-                    if ((pmask & 8) && s.w == epoch) pending &= ~(1 << (i + 3));
+                    uint4 a = ldg_cv_u128((const uint4*) (arrive + i));
+                    uint4 r = ldg_cv_u128((const uint4*) (release + i));
+                    if ((pmask & 1) && a.x != r.x) { pending &= ~(1 << (i + 0)); seq[i + 0] = a.x; }
+                    if ((pmask & 2) && a.y != r.y) { pending &= ~(1 << (i + 1)); seq[i + 1] = a.y; }
+                    if ((pmask & 4) && a.z != r.z) { pending &= ~(1 << (i + 2)); seq[i + 2] = a.z; }
+                    if ((pmask & 8) && a.w != r.w) { pending &= ~(1 << (i + 3)); seq[i + 3] = a.w; }
                 }
 
                 if (pending == pending_t)
@@ -52,16 +55,24 @@ __device__ __forceinline__ void pg_barrier_inner
                 else sleep = SYNC_MIN_SLEEP;
             }
 
-            // Release: bump epoch
-            stg_wt_u32(epoch_ptr, epoch + 1);
+            // Release every participant that arrived (all of them unless aborted)
+            uint32_t arrived = device_mask & ~(1 << this_device) & ~pending;
+            #pragma unroll
+            for (int i = 0; i < MAX_DEVICES; ++i)
+                if (arrived & (1 << i)) stg_wt_u32(release + i, seq[i]);
         }
         else
         {
             uint64_t deadline = sync_deadline();
 
-            // Wait for coordinator to bump epoch
+            // Between barriers arrive == release for this device, and only this device writes its
+            // arrive counter
+            const uint32_t s = ldg_cv_u32(release + this_device) + 1;
+            stg_wt_u32(arrive + this_device, s);
+
+            // Wait for the coordinator to release this device
             uint64_t sleep = SYNC_MIN_SLEEP;
-            while (ldg_cv_u32(epoch_ptr) == epoch)
+            while (ldg_cv_u32(release + this_device) != s)
             {
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;

@@ -10,12 +10,12 @@ void pg_init_context(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
 
     ctx_ptr->sync_timeout = 0;
-    ctx_ptr->barrier_epoch = 1;
     ctx_ptr->broadcast_ll_epoch = 1;
 
     for (int i = 0; i < MAX_DEVICES; ++i)
     {
-        ctx_ptr->barrier_epoch_device[i] = 0;
+        ctx_ptr->barrier_arrive[i] = 0;
+        ctx_ptr->barrier_release[i] = 0;
         ctx_ptr->broadcast_stage_device[i] = 0;
         ctx_ptr->broadcast_ll_sequence_device[i] = 0;
         ctx_ptr->reduce_stage_produced[i] = 0;
