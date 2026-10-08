@@ -1,18 +1,11 @@
 from __future__ import annotations
 from typing_extensions import override
-import math
 import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle
+from ..util.rope import RopeStyle, yarn_sm_scale_fold
 from ..modules import RMSNorm, Embedding, TransformerBlock, MLAttention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.attn import prepare_for_attn
-
-
-def _yarn_mscale(scale: float, mscale: float = 1.0) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class DeepseekV3Config(Config):
@@ -77,11 +70,7 @@ class DeepseekV3Config(Config):
 
         # Absorption does not change the scores, so the softmax scale follows the unabsorbed head
         # dim. YaRN with mscale_all_dim rescales it, squared (once for q, once for k)
-        self.sm_scale = self.qk_head_dim ** -0.5
-        rs = self.rope_settings.rope_scaling
-        if rs is not None and rs.get("mscale_all_dim", 0):
-            ms = _yarn_mscale(float(rs["factor"]), float(rs["mscale_all_dim"]))
-            self.sm_scale *= ms * ms
+        self.sm_scale = self.qk_head_dim ** -0.5 * yarn_sm_scale_fold(self.rope_settings.rope_scaling)
 
 
 class DeepseekV3Model(Model):

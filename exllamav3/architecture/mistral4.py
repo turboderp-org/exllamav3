@@ -69,7 +69,9 @@ def mistral4_init_config(config, directory: str, **kwargs):
 
     # RoPE applies to the rope half of the query and the single shared rope key only. The yarn
     # config carries inert mscale/mscale_all_dim 1.0 and llama_4_scaling_beta supersedes the
-    # static attention factor (rope.py rule 3), so sm_scale stays plain
+    # static attention factor (rope.py rule 3), so sm_scale stays plain, as Mistral's own params.json
+    # specifies (yarn apply_scale = false). transformers >= 5.17 folds DeepSeek's mscale_all_dim**2
+    # into the softmax scale for this model, which the release's perplexity does not support
     config.assert_cfg(bool, "text_config->rope_interleave", True, True)
     text_cfg = config.read_cfg(dict, "text_config", no_default)
     config.rope_settings = config.read_rope_settings_default(

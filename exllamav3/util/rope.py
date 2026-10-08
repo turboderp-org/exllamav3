@@ -45,6 +45,29 @@ class RopeSettings:
         print(f"    llama_4_scaling_beta: {self.llama_4_scaling_beta}")
 
 
+def yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
+    """YaRN magnitude scale for a context extension by `scale`"""
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_sm_scale_fold(rope_scaling: dict | None) -> float:
+    """Factor DeepSeek-family attention (DeepSeek-V3, Mistral-Small-4, ...) folds into the softmax scale under YaRN:
+    yarn_get_mscale(factor, mscale_all_dim) squared, once for q and once for k. 1.0 without a YaRN-type rope or
+    without mscale_all_dim. Paired with RopeSettings(yarn_mscale_ratio = True), which gives sin/cos the
+    mscale / mscale_all_dim ratio, as HF transformers does for these architectures"""
+    if not rope_scaling:
+        return 1.0
+    if rope_scaling.get("rope_type", rope_scaling.get("type", "default")) == "default":
+        return 1.0
+    mscale_all_dim = rope_scaling.get("mscale_all_dim", 0)
+    if not mscale_all_dim:
+        return 1.0
+    ms = yarn_get_mscale(float(rope_scaling["factor"]), float(mscale_all_dim))
+    return ms * ms
+
+
 def yarn_inv_freq(
     dim: int,
     base: float,
@@ -286,10 +309,7 @@ class RoPE:
 
         attn_factor = rs.rope_scaling.get("attention_factor")
         if attn_factor is None:
-            def get_mscale(scale, mscale = 1.0):
-                if scale <= 1:
-                    return 1.0
-                return 0.1 * mscale * math.log(scale) + 1.0
+            get_mscale = yarn_get_mscale
             mscale = rs.rope_scaling.get("mscale")
             mscale_all_dim = rs.rope_scaling.get("mscale_all_dim")
             if rs.yarn_mscale_ratio and mscale and mscale_all_dim:
