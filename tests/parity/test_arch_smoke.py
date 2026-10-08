@@ -34,7 +34,7 @@ def _check_qwen3_5(cfg, layer_type, block):
 
 
 CHECKS = {"swa": _check_gemma4, "recurrent": _check_qwen3_5}
-MULTIMODAL_GENERATION = {"swa"}
+MULTIMODAL_GENERATION = {"swa", "recurrent"}
 
 
 @pytest.fixture(scope = "module", params = [pytest.param(r, marks = pytest.mark.model(r)) for r in ARCHS])
@@ -101,7 +101,7 @@ def test_multimodal_generation(setup, role, device):
     from exllamav3 import Cache, Generator, Job
     from exllamav3.generator.sampler import GreedySampler
     if role not in MULTIMODAL_GENERATION:
-        pytest.skip("multimodal generation is checked on Gemma4 only")
+        pytest.skip(f"multimodal generation is not checked for role {role}")
     cfg, model, vision, tokenizer = setup
     vision.load(device)
     try:
@@ -120,7 +120,7 @@ def test_multimodal_generation(setup, role, device):
     try:
         generator = Generator(model, cache, tokenizer)
         job = Job(input_ids = prompt_ids.cpu(), max_new_tokens = 8, embeddings = [emb], sampler = GreedySampler(),
-                  stop_conditions = [tokenizer.eos_token_id, "<turn|>"], decode_special_tokens = True)
+                  stop_conditions = list(cfg.eos_token_id_list), decode_special_tokens = True)
         generator.enqueue(job)
         text = ""
         while generator.num_remaining_jobs():
@@ -131,4 +131,4 @@ def test_multimodal_generation(setup, role, device):
         model.unload()
         del cache
         torch.cuda.empty_cache()
-    assert "cat" in text.lower(), f"unexpected multimodal generation output: {text!r}"
+    assert any(w in text.lower() for w in ("cat", "kitten")), f"unexpected multimodal generation output: {text!r}"

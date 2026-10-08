@@ -1,7 +1,12 @@
 """
-Config.max_position_embeddings must come from the top-level key when present, from text_config when a
-multimodal config keeps the text model's limit there (PR #328 reported 8192 for Qwen3.8-27B whose real limit
-is 262144), and from the architecture default otherwise; an explicit top-level key wins over the nested one.
+Config parsing of fields every architecture shares:
+
+- max_position_embeddings comes from the top-level key when present, from text_config when a multimodal config
+  keeps the text model's limit there (PR #328 reported 8192 for Qwen3.8-27B whose real limit is 262144), and from
+  the architecture default otherwise; an explicit top-level key wins over the nested one.
+- image_token_id (the placeholder a multimodal prompt carries per image, which Tokenizer.hf_chat_template
+  substitutes) comes from the top-level image_token_id, or image_token_index in older configs, for every
+  architecture, and is None for text-only configs.
 
 Synthetic config.json files (small dimensions, no weights) written to tmp_path and read through
 Config.from_directory, so the real architecture config classes do the parsing.
@@ -96,15 +101,19 @@ QWEN3_5_VL_PREPROCESSOR = {
 }
 
 
-def max_pos(tmp_path, config, edit = None):
-    """Config.from_directory(...).max_position_embeddings for a copy of `config` after edit(copy)"""
+def load_config(tmp_path, config, edit = None) -> Config:
+    """Config.from_directory over a copy of `config` after edit(copy)"""
     config = copy.deepcopy(config)
     if edit:
         edit(config)
     (tmp_path / "config.json").write_text(json.dumps(config))
     if "vision_config" in config:
         (tmp_path / "preprocessor_config.json").write_text(json.dumps(QWEN3_5_VL_PREPROCESSOR))
-    return Config.from_directory(str(tmp_path)).max_position_embeddings
+    return Config.from_directory(str(tmp_path))
+
+
+def max_pos(tmp_path, config, edit = None):
+    return load_config(tmp_path, config, edit).max_position_embeddings
 
 
 def test_top_level_key(tmp_path):
@@ -128,3 +137,17 @@ def test_explicit_top_level_key_wins_over_nested(tmp_path):
 def test_neither_key_uses_architecture_default(tmp_path):
     def neither(c): del c["text_config"]["max_position_embeddings"]
     assert max_pos(tmp_path, QWEN3_5_VL, neither) == ARCH_DEFAULT
+
+
+def test_image_token_id(tmp_path):
+    def add(c): c["image_token_id"] = 1002
+    assert load_config(tmp_path, QWEN3_5_VL, add).image_token_id == 1002
+
+
+def test_image_token_index_alias(tmp_path):
+    def add(c): c["image_token_index"] = 1003
+    assert load_config(tmp_path, QWEN3_5_VL, add).image_token_id == 1003
+
+
+def test_image_token_id_absent(tmp_path):
+    assert load_config(tmp_path, QWEN3).image_token_id is None

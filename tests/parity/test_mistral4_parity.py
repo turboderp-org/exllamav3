@@ -7,13 +7,19 @@ expert tensors in HF DeepseekV3Experts orientation): MLA with asymmetric qk_nope
 the softmax top-k router with a shared expert, fused gate_up/down expert slicing, yarn rope with interleaved (GPT-J)
 pairs and, with original_max_position_embeddings shrunk to 64, the Llama-4 position scale on the full query at
 positions past the boundary (which a short test on the real model never reaches). Reference: HF fp32 eager;
-exllamav3 cache-less full-sequence logits, gated separately before and past the boundary. The mutation test disables
+exllamav3 cache-less full-sequence logits, gated separately before and past the boundary.
+
+One deliberate departure from HF: transformers >= 5.17 folds DeepSeek's YaRN mscale_all_dim**2 into this model's
+softmax scale (yarn_apply_mscale). Mistral's own params.json for the release sets yarn apply_scale = false, and the
+release's perplexity agrees, so exllamav3 keeps the plain scale and the HF reference is built with the fold
+disabled (hf_plain_softmax_scale). Everything else is compared against transformers as is. The mutation test disables
 the l4 scale in exllamav3 and requires the same gate to fail.
 
 Real checkpoint (slow): the first REAL_LAYERS layers of the release (registry role mistral4-hf, truncated-config
 symlink farm), HF fp32 eager with the fp8 weights dequantized, vs exllamav3 on the same weights.
 """
 
+import contextlib
 import json
 import os
 
@@ -191,12 +197,31 @@ def make_checkpoint(out_dir: str, seed: int) -> str:
     return out_dir
 
 
+# Median KL per segment: a single MoE routing flip on a near-tie dominates the mean (one position at ~1e-2), while
+# a wrong or missing l4 query scale shifts every position past original_max (median ~2e-6 vs ~1e-7 when exact)
+MAX_MEDIAN_KL = 5e-7
+
+
+@contextlib.contextmanager
+def hf_plain_softmax_scale():
+    """Context in which transformers' Mistral4 attention keeps the plain qk_head_dim**-0.5 softmax scale, as
+    Mistral's reference does. The attention modules compute their scale at construction, so the HF model must be
+    built inside"""
+    from transformers.models.mistral4 import modeling_mistral4
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(modeling_mistral4, "yarn_apply_mscale", lambda rope_parameters, scaling: scaling)
+        yield
+
+
 def boundary_gate(got: torch.Tensor, ref: torch.Tensor, tag: str) -> Gate:
-    """KL mean < 5e-4 and argmax > 0.98, separately before original_max (scale 1) and past it (l4 scale active)"""
+    """KL mean < 5e-4, median KL < MAX_MEDIAN_KL and argmax > 0.98, separately before original_max (scale 1) and past
+    it (l4 scale active)"""
     gate = Gate(tag)
     om = TINY["original_max"]
     for name, lo, hi in (("pos < original_max", 0, om), ("pos >= original_max", om, got.shape[0])):
-        logit_gate(gate, logit_stats(got[lo:hi], ref[lo:hi]), name, kl_mean = 5e-4, argmax = 0.98)
+        stats = logit_stats(got[lo:hi], ref[lo:hi])
+        logit_gate(gate, stats, name, kl_mean = 5e-4, argmax = 0.98)
+        gate.lt(f"{name} KL median", stats.kl.median().item(), MAX_MEDIAN_KL)
     return gate
 
 
@@ -205,7 +230,8 @@ def tiny(tmp_path_factory, device):
     from transformers import Mistral3ForConditionalGeneration
     model_dir = make_checkpoint(str(tmp_path_factory.mktemp("mistral4_tiny")), seed = SEED)
     ids = token_ids(SEQ_LEN, TINY["vocab_size"], seed = SEED + 1)
-    model = load_hf(Mistral3ForConditionalGeneration, model_dir, device = device, dtype = torch.float32)
+    with hf_plain_softmax_scale():
+        model = load_hf(Mistral3ForConditionalGeneration, model_dir, device = device, dtype = torch.float32)
     ref = hf_forward(model, ids, hidden_states = False)["logits"]
     del model
     free_cuda()
@@ -237,7 +263,8 @@ def test_real_checkpoint_logits(model_dir, device, tmp_path):
     from transformers import Mistral3ForConditionalGeneration
     stub = truncated_checkpoint(model_dir, str(tmp_path / "mistral4_trunc"), _truncate)
     ids = hf_tokenizer_ids(stub, RUMEN_TEXT, REAL_SEQ_LEN)
-    model = load_hf(Mistral3ForConditionalGeneration, stub, device = device, dtype = torch.float32)
+    with hf_plain_softmax_scale():
+        model = load_hf(Mistral3ForConditionalGeneration, stub, device = device, dtype = torch.float32)
     ref = hf_forward(model, ids, hidden_states = False)["logits"]
     del model
     free_cuda()

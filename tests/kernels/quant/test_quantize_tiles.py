@@ -7,6 +7,8 @@ quantize_tiles (the Viterbi trellis quantizer) and ext.decode, for every K and c
 - a tile that is itself a valid decoded codeword is recovered with zero error
 - results are independent of batch composition, launch waves, stream and scratch reuse; nonfinite inputs stay
   memory-safe and an empty scratch is rejected
+- the codebook selection is one contract (quant_codebook): {"mcg": True} / {"mul1": True} select, False or absent
+  does not, both is rejected; the encoder and the stored marker follow the same selection
 """
 
 import pytest
@@ -14,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from exllamav3.ext import exllamav3_ext as ext
-from exllamav3.modules.quant.exl3_lib.quantize import get_temp_buffers, quantize_tiles
+from exllamav3.modules.quant.exl3_lib.quantize import codebook_markers, get_temp_buffers, quant_codebook, quantize_tiles
 
 # (codebook id, mcg, mul1, typical scale of the codebook's values)
 CODEBOOKS = [(0, False, False, 1.24371088), (1, True, False, 1.24371088), (2, False, True, 1.0)]
@@ -149,3 +151,38 @@ def test_quantize_nonfinite_stays_in_bounds(device, K):
     # No quality guarantee for nonfinite weights, but traceback must remain memory-safe.
     quantize_tiles(x, args(K, 2))
     torch.cuda.synchronize(device)
+
+
+@pytest.mark.nogpu
+@pytest.mark.parametrize("quant_args, expected", [
+    ({}, (False, False)),
+    ({"mcg": False, "mul1": False}, (False, False)),
+    ({"mcg": True}, (True, False)),
+    ({"mcg": True, "mul1": False}, (True, False)),
+    ({"mul1": True}, (False, True)),
+    ({"mcg": False, "mul1": True}, (False, True)),
+])
+def test_codebook_selection(quant_args, expected):
+    assert quant_codebook(quant_args) == expected
+    markers = codebook_markers(quant_args)
+    assert set(markers) == {name for name, sel in zip(("mcg", "mul1"), expected) if sel}
+
+
+@pytest.mark.nogpu
+def test_codebook_selection_rejects_both():
+    with pytest.raises(AssertionError):
+        quant_codebook({"mcg": True, "mul1": True})
+
+
+@pytest.mark.parametrize("K", [2, 4])
+@pytest.mark.parametrize("cb", CODEBOOKS, ids = CB_IDS)
+@torch.inference_mode()
+def test_encoder_follows_selection(device, K, cb):
+    """Explicit False flags select exactly what leaving them out does (they used to switch the encoder to the
+    flagged codebook while the stored marker said otherwise)"""
+    cbi, mcg, mul1, scale = cb
+    torch.manual_seed(0)
+    tiles = torch.randn((64, 256), device = device) * scale
+    _, idx = quantize_tiles(tiles, args(K, cbi))
+    _, idx_explicit = quantize_tiles(tiles, {"K": K, "mcg": mcg, "mul1": mul1})
+    assert torch.equal(idx, idx_explicit)

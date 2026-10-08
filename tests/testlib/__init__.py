@@ -19,11 +19,16 @@ Synthetic weights and references, by subsystem
     routing       router configs and tie-aware selection comparison
     mla           random MLAttention modules, explicit per-head reference forward, paged drivers
     dsv4          tiny DeepSeek-V4 model helpers (module loop, cached forward, noise floor)
+    trellis       independent definition of the EXL3 format (codebook decoders, bitstream packing, dense dequant)
+    sampling      NumPy Philox4x32-10 (cuRAND) and exact Gumbel references for the sampling kernels
     tiny_models   tiny random checkpoints in native formats (DeepSeek-V4)
     cache         fake cache layers and pages for page-table / CPU-tier tests
     tp            fakes for tensor-parallel export/import tests
+    tp_native     multi-process harness running the native TP backend's collectives on real shared memory
+    moe_handoff   the CPU-expert handoff segment layout, for driving the worker's job rings and flags
 
 Model level
+    parity        HF/reference parity machinery (loading, streamed capture, gates, tolerance policies)
     e2e           load_model through model_init (configurations as CLI arguments), teacher-forced logits,
                   greedy runs, near-tie-tolerant comparison, per-model noise floor
     graph         lower-level loading with several caches per model, decode-vs-forward check for graph paths

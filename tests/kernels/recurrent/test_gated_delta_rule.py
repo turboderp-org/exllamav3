@@ -153,7 +153,7 @@ RECURRENT_SHAPES = [
 def _recurrent_param(shape, history):
     # A per-step state history of 1024+ steps, and the reference's copies of it, need very large device memory
     big = history and shape[1] >= 1024
-    return pytest.param(history, *shape, marks = [pytest.mark.slow, pytest.mark.vram(28)] if big else [])
+    return pytest.param(history, *shape, marks = [pytest.mark.slow, pytest.mark.vram(40)] if big else [])
 
 
 @pytest.mark.parametrize(

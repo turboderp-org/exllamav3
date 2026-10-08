@@ -2,7 +2,9 @@
 Production DSA kernels (modules/attention_fn/dsa_triton.py) against fp64 torch references: dsa_attn over the
 constexpr toggle matrix (window on/off, sinks on/off, gathered vs dense pool, D_c padding (448), fused de-rotation /
 group-major epilogue, packed-quantized pools, non-causal image chunks, packed-pool prefill staging, split-kv),
-dsa_indexer_scores with causal bounds, and ext.dsa_topk against torch.topk (tie-aware, deterministic).
+dsa_indexer_scores with causal bounds, and ext.dsa_topk against torch.topk (tie-aware, deterministic). dsa_attn keeps
+only decode-class workspaces in the global tensor cache: prefill-sized calls allocate their output and split
+workspaces per call.
 """
 import pytest
 import torch
@@ -14,16 +16,6 @@ from exllamav3.util.tensor import g_tensor_cache
 from testlib.attention import quant_roundtrip
 
 PAGE_SIZE = 256
-
-
-@pytest.fixture(autouse = True)
-def _release_workspaces():
-    # dsa_attn keeps its output and split workspaces in the global tensor cache, keyed by shape; the prefill-sized
-    # cases would otherwise hold GiBs for the rest of the session
-    before = set(g_tensor_cache.cache)
-    yield
-    for key in set(g_tensor_cache.cache) - before:
-        del g_tensor_cache.cache[key]
 
 
 def ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
@@ -349,3 +341,23 @@ def test_topk(device, i, R, T, k, mode):
             above = torch.nonzero(scores[r].float() > vstar).flatten()
             assert torch.isin(above, sel).all(), f"row {r}: missed an entry above the k-th score"
         assert (out[r][expect_n:] == -1).all(), f"row {r}: tail not -1 padded"
+
+
+@pytest.mark.parametrize("R, n_splits, kept", [(1, 16, True), (8, 16, True), (2048, 8, False), (2048, 1, False)])
+@torch.inference_mode()
+def test_workspaces_kept_only_for_decode_rows(device, monkeypatch, R, n_splits, kept):
+    """g_tensor_cache holds decode-class buffers only: a prefill-sized call (split or not) must not leave its
+    output or split workspaces there, a decode-class call keeps them"""
+    H, D_c, D_r, n_keys = 64, 448, 64, 1024
+    pages = n_keys // PAGE_SIZE
+    q = torch.randn((R, H, D_c + D_r), dtype = torch.half, device = device)
+    pool_c = torch.randn((pages, PAGE_SIZE, D_c), dtype = torch.half, device = device)
+    pool_r = torch.randn((pages, PAGE_SIZE, D_r), dtype = torch.half, device = device)
+    bt = torch.arange(pages, dtype = torch.int32, device = device).unsqueeze(0).expand(R, pages).contiguous()
+    monkeypatch.setattr(g_tensor_cache, "cache", {})
+    dsa_attn(q, pool_c, pool_r, bt, pool_len = n_keys, q_pos0 = n_keys * 4 - R, compress_rate = 4, n_splits = n_splits)
+    kept_tags = {k.rsplit("/", 1)[-1] for k in g_tensor_cache.cache}
+    if kept:
+        assert {"dsa_out", "dsa_ws_ml", "dsa_ws_acc"} <= kept_tags, f"decode-class call kept only {sorted(kept_tags)}"
+    else:
+        assert not kept_tags, f"prefill-sized call left kept workspaces: {sorted(kept_tags)}"

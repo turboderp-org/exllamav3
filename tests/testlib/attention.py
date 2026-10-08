@@ -53,9 +53,9 @@ def rand_packed_cache(num_pages: int, page_size: int, n_kv: int, head_dim: int, 
     """Random packed-quantized K/V pages (any bit pattern is a valid payload) and group scales in 0.1..1.1.
     Returns (k_words, v_words, qc) with qc = (k_scales, v_scales, bits, bits) as the paged kernels take it"""
     token_dim = n_kv * head_dim
-    shape = (num_pages, page_size, token_dim * bits // 64)
-    kc = torch.randint(-2**63, 2**63 - 1, shape, dtype = torch.int64, device = device).view(torch.int32)
-    vc = torch.randint(-2**63, 2**63 - 1, shape, dtype = torch.int64, device = device).view(torch.int32)
+    shape = (num_pages, page_size, token_dim // 32 * bits)      # bits int32 words per 32-element group
+    kc = torch.randint(-2**31, 2**31, shape, dtype = torch.int64, device = device).to(torch.int32)
+    vc = torch.randint(-2**31, 2**31, shape, dtype = torch.int64, device = device).to(torch.int32)
     ks = torch.rand((num_pages, page_size, token_dim // 32), dtype = torch.float16, device = device) + 0.1
     vs = torch.rand((num_pages, page_size, token_dim // 32), dtype = torch.float16, device = device) + 0.1
     return kc, vc, (ks, vs, bits, bits)

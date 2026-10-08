@@ -19,7 +19,7 @@ against references; higher levels compose them.
 
 | Directory     | Contents | Needs |
 |---------------|----------|-------|
-| `kernels/`    | One file per extension function or Triton kernel family, against a torch/NumPy reference or an exact contract (`norm`, `activation`, `gemm`, `quant`, `routing`, `sampling`, `attention`, `dsa`, `recurrent`, `moe`, `cache`, `hyperconnections`, `strings`, `portability`) | GPU |
+| `kernels/`    | One file per extension function or Triton kernel family, against a torch/NumPy reference or an exact contract (`norm`, `activation`, `rope`, `gemm`, `quant`, `hadamard`, `routing`, `sampling`, `attention`, `dsa`, `recurrent`, `moe`, `moe_cpu_host`, `cache`, `embedding`, `ple`, `draft`, `hyperconnections`, `strings`, `loader`, `tp`, `util`, `portability`) | GPU |
 | `modules/`    | One directory per module type, built from synthetic weights (`testlib.checkpoint`, `testlib.exl3`), against an explicit reference forward or another path of the same module | GPU |
 | `graph/`      | CUDA-graph (BC_*) paths against the eager path they replace | GPU, some need models |
 | `cache/`      | Cache layers, recurrent state, CPU page tier | |
