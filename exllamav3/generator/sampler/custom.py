@@ -175,8 +175,15 @@ class SS_Fused(SS_Base):
     keeps a top segment of the same ordering. The threshold is found from a deterministic
     fixed-point histogram of the logits (counts for top-K, exp-mass for top-P, normalized over
     the top-K-truncated set), with boundary buckets refined to 1/32768 nat -- finer than fp16
-    ULP, so the kept set matches the exact sort-based truncation for fp16 logits. Tokens tied
-    exactly at a cutoff are all kept rather than truncated in sort order.
+    ULP, so the kept set matches the exact sort-based truncation for fp16 logits, except at ties
+    and in the far tail:
+
+    - top-K: tokens tied exactly at the cutoff are all kept rather than truncated in sort order.
+      Tokens 32 nats or more below the max (at the filter temperature, relative weight below
+      e^-32) are not ordered: when the cutoff falls among them they are dropped, so fewer than
+      top_k tokens remain.
+    - top-P: the token crossing the cumulative mass is dropped together with every token tied
+      with it (sort-order truncation drops only the crossing token and keeps its earlier ties).
 
     Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
     Gumbel noise stream for a given rand_u32, up to rounding at exact ties).

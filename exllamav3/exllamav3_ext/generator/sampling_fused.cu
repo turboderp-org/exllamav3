@@ -169,8 +169,10 @@ void fs_partial_max_kernel
 // resolves the exact threshold. Top-K refines first, because top-P's target is p times the
 // mass of the top-K-truncated set; the exact target then locates the top-P crossing either
 // inside the already-refined bucket or in an earlier bucket, which gets its own refinement
-// round. The crossing sub-bucket is dropped, matching the eager rule that the token crossing
-// the cumulative sum is dropped; tokens tied at the exact cutoff are all kept.
+// round. For top-P the crossing sub-bucket is dropped, matching the eager rule that the token
+// crossing the cumulative sum is dropped (here together with its exact ties); for top-K the
+// tokens tied at the exact cutoff are all kept, except that a cutoff inside the clamped tail
+// drops the tail.
 
 #define FS_HIST_RANGE 32.0f
 #define FS_MASS_SCALE 1099511627776.0f  // 2^40
@@ -484,8 +486,9 @@ void fs_select_kernel
         fs_scan_1024(fs_hist_count(hist, row, 0), fs_hist_mass(hist, row, 0), sh_c, sh_ms, cum_c, cum_m);
         unsigned long long total = cum_m[FS_NB - 1];
 
-        // Top-K boundary bucket: binding only if the count crosses k before the last bucket
-        // (the last bucket also holds the clamped tail, so a crossing there keeps everything)
+        // Top-K boundary bucket. A crossing in the last bucket is refined like any other: the
+        // refinement separates the bucket's in-range elements, and the clamped tail lands in its
+        // last sub-bucket, which the refined select drops
         int b_k = FS_NB;
         if (filters & FUSED_SAMPLER_F_TOPK)
         {
@@ -502,7 +505,7 @@ void fs_select_kernel
             __syncthreads();
             b_k = sh_res;
         }
-        if (b_k < FS_NB - 1)
+        if (b_k < FS_NB)
         {
             // Refine the top-K bucket first; top-P needs the exact truncated mass
             if (t == 0)
@@ -565,8 +568,18 @@ void fs_select_kernel
         }
         __syncthreads();
         int s_k = sh_res;
-        unsigned long long kept_mass_rb = cum_m[s_k];
-        if (t == 0) bound_min(rb, s_k);
+
+        // A cutoff inside the clamped tail (the last sub-bucket of the last bucket: everything
+        // FS_HIST_RANGE nats or more below the max) drops the tail rather than keeping all of it.
+        // Those tokens have relative weight below e^-FS_HIST_RANGE at the filter temperature, and
+        // ordering them would take another pass, so the kept set then holds fewer than k tokens
+        bool drop_tail = rb == FS_NB - 1 && s_k == FS_NB - 1;
+        unsigned long long kept_mass_rb = drop_tail ? (s_k > 0 ? cum_m[s_k - 1] : 0) : cum_m[s_k];
+        if (t == 0)
+        {
+            if (drop_tail) bound_drop_crossing(rb, s_k);
+            else bound_min(rb, s_k);
+        }
 
         if (!(filters & FUSED_SAMPLER_F_TOPP))
         {

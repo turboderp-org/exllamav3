@@ -86,9 +86,10 @@ def masked_inputs(logits, size, mask = None, bits = None) -> np.ndarray:
 
 
 def kept_set(x: np.ndarray, mode, minp_log = 0.0, filters = 0, top_k = 0, top_p = 1.0, inv_temp_filter = 1.0):
-    """Boolean kept set of one row (float32 x) or None where the reference is ambiguous: a top-P crossing that
-    falls inside a group of tied values, a cumulative probability within 4e-6 of top_p, or a top-K cutoff 32 or
-    more filter-temperature nats below the max (covered separately by test_fused_topk_deep_cutoff)"""
+    """Boolean kept set of one row (float32 x) under SS_Fused's documented rules, or None where the reference is
+    ambiguous (a cumulative probability within 4e-6 of top_p, or a token within 1e-3 nat of the 32-nat tail
+    boundary). Top-K keeps cutoff ties, and a cutoff 32 or more filter-temperature nats below the max drops
+    every token that deep; top-P drops the crossing token together with all its ties"""
     finite = np.isfinite(x)
     if mode == 1:
         return finite
@@ -102,9 +103,13 @@ def kept_set(x: np.ndarray, mode, minp_log = 0.0, filters = 0, top_k = 0, top_p 
     if filters & F_TOPK and keep.sum() > top_k:
         vals = np.sort(x[keep])[::-1]
         kth = vals[top_k - 1]
-        if (np.float64(m) - kth) * inv_temp_filter >= 31.9:
-            return None
-        keep &= x >= kth
+        depth = (np.float64(m) - x.astype(np.float64)) * inv_temp_filter
+        if (np.float64(m) - kth) * inv_temp_filter >= 32.0 - 1e-3:
+            if np.any(keep & (np.abs(depth - 32.0) < 1e-3)):
+                return None
+            keep &= depth < 32.0
+        else:
+            keep &= x >= kth
     if filters & F_TOPP:
         idx = np.nonzero(keep)[0]
         v = x[idx].astype(np.float64)
@@ -113,15 +118,15 @@ def kept_set(x: np.ndarray, mode, minp_log = 0.0, filters = 0, top_k = 0, top_p 
         w = np.exp((v - np.float64(m)) * inv_temp_filter)
         c = np.cumsum(w) / w.sum()
         # The kernel's mass is __expf in fp32 (relative error ~2 ulp plus |arg| * 2^-24 for args down to -32),
-        # summed exactly in 2^40 fixed point: normalized cumulative sums carry up to ~3e-6 of error
-        if np.min(np.abs(c - top_p)) < 4e-6:
+        # summed exactly in 2^40 fixed point: normalized cumulative sums carry up to ~3e-6 of error. Tie groups
+        # are kept or dropped whole, so only the cumulative mass at the end of each group decides
+        group_end = np.append(v[1:] != v[:-1], True)
+        if np.min(np.abs(c[group_end] - top_p)) < 4e-6:
             return None
         cross = int(np.argmax(c > top_p)) if (c > top_p).any() else len(c)
         if cross < len(c):
-            # A crossing token tied with a kept one: sort-order truncation splits the tie group (see
-            # test_fused_topp_ties_at_cutoff); a crossing token that starts its group is unambiguous
-            if cross > 0 and v[cross] == v[cross - 1]:
-                return None
+            # The crossing token's whole tie group goes, including ties sorted before it
+            cross = int(np.argmax(v == v[cross]))
         nkeep = max(cross, 1)
         # The top token keeps its exact ties
         top_ties = int((v == v[0]).sum())
@@ -306,10 +311,7 @@ def test_fused_filters(bsz, dim, case, temp_first, kind, device):
             out = run_fused(logits, 3, inv_temp = it, seed = seed, **kw)
             ref = expected_tokens(logits, 3, seed, inv_temp = it, **kw)
             tally.check(out, ref, f"seed {seed} inv_temp {it}")
-    # On the fp16 grid a large vocabulary puts the top-P crossing inside a tie group most of the time, which the
-    # reference leaves undecided (test_fused_topp_ties_at_cutoff)
-    if kind == "float_distinct" or not (case["filters"] & F_TOPP and dim > 1000):
-        tally.require(0.5)
+    tally.require(0.5)
 
 
 @torch.inference_mode()
@@ -341,31 +343,49 @@ def test_fused_topk_ties_kept(device):
 
 @torch.inference_mode()
 def test_fused_topp_ties_at_cutoff(device):
-    """Top-P crossing inside a group of tied values. SS_Fused's docstring: 'Tokens tied exactly at a cutoff are
-    all kept rather than truncated in sort order'. Probabilities e/(e+4), 1/(e+4) x 4: cumsums 0.405, 0.554,
-    0.702, ... cross top_p = 0.6 at the second tied token; sort-order truncation keeps the top token and one tied
-    token, keeping ties keeps all five"""
+    """Top-P crossing inside a group of tied values: the crossing token is dropped together with all its exact
+    ties (SS_Fused docstring). Probabilities e/(e+4), 1/(e+4) x 4: cumsums 0.405, 0.554, 0.702, ... cross
+    top_p = 0.6 inside the tied group, so only the top token remains (sort-order truncation would keep one of the
+    tied tokens as well)"""
     logits = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]], dtype = torch.half, device = device)
     seen = set()
     for seed in range(300):
         seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPP, top_p = 0.6).item())
-    assert seen == {0, 1, 2, 3, 4}, f"kept {sorted(seen)}"
+    assert seen == {0}, f"kept {sorted(seen)}"
 
 
 @pytest.mark.parametrize("depth", [20.0, 31.0, 31.9, 33.0, 40.0])
 @torch.inference_mode()
 def test_fused_topk_deep_cutoff(depth, device):
-    """Top-K must keep exactly the k largest (distinct) values however far below the max the k-th lies; with the
-    sampling temperature after the filter, tokens deep below the max are not negligible"""
+    """Top-K keeps the k largest values among the tokens less than 32 nats below the max (at the filter
+    temperature) and drops the tokens beyond that when the cutoff falls among them (SS_Fused docstring), never
+    keeping more than k. The sampling temperature applied after the filter (near-uniform here) makes every kept
+    token show up"""
     dim = 64
     logits = (-depth - torch.arange(dim).float() * 0.25).half().view(1, dim).to(device)
     logits[0, 5] = 0.0
     k = 3
-    expect = {5, 0, 1}
+    ref = logits[0].float().cpu()
+    top = torch.topk(ref, k).indices.tolist()
+    expect = {i for i in top if ref.max().item() - ref[i].item() < 32.0}
     seen = set()
     for seed in range(300):
         seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPK, top_k = k).item())
-    assert seen == expect, f"depth {depth}: kept {len(seen)} tokens, expected {sorted(expect)}"
+    assert seen == expect, f"depth {depth}: kept {sorted(seen)}, expected {sorted(expect)}"
+
+
+@torch.inference_mode()
+def test_fused_topk_tail_then_topp(device):
+    """Top-K cutting into the tail, then top-P over what remains: the three in-range tokens (probabilities 0.506,
+    0.307, 0.186 among themselves; the deep tokens weigh nothing at the filter temperature) cross top_p = 0.9 at
+    the third, so the first two remain"""
+    deep = -40.0 - 0.01 * torch.arange(1000).float()
+    logits = torch.cat((torch.tensor([0.0, -0.5, -1.0]), deep)).half().view(1, -1).to(device)
+    seen = set()
+    for seed in range(300):
+        seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPK | F_TOPP, top_k = 5,
+                           top_p = 0.9).item())
+    assert seen == {0, 1}, f"kept {sorted(seen)}"
 
 
 @torch.inference_mode()
