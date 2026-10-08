@@ -1,0 +1,136 @@
+# Canonical test models, keyed by role. Model-level and end-to-end tests name a role (or select roles by tag)
+# instead of hard-coding a path; see tests/testlib/models.py.
+#
+# Paths are relative to the model root (--model-root or $EXL3_TEST_MODEL_ROOT) unless absolute. Per-machine
+# overrides and extra entries go in tests/models.local.yaml (untracked) or a file named by $EXL3_TEST_MODELS,
+# e.g.
+#
+#     root: /mnt/models
+#     models:
+#       moe:
+#         path: /elsewhere/qwen3-30b-a3b-exl3-4.0bpw
+#
+# "vram" (GiB) makes tests skip on devices too small for a single-device load.
+#
+# Roles are chosen to be small while covering one feature family each. Tags drive test matrices
+# (@pytest.mark.models("moe") runs a test once per available model tagged "moe"). "mul1" marks MoE quants whose
+# experts use the mul1 codebook, which CPU expert offload requires.
+
+models:
+
+  dense:
+    path: qwen3-0.6b/exl3/4.0bpw
+    tags: [dense, attention, small]
+
+  dense-llama:
+    path: llama3.2-1b-instruct/exl3/2.5bpw
+    tags: [dense, attention, small]
+
+  dense-8b:
+    path: qwen3-8b/exl3/4.0bpw
+    tags: [dense, attention]
+    draft: dflash-8b
+
+  dflash-8b:
+    path: qwen3-8b-dflash/hf
+    tags: [draft, dflash]
+
+  moe:
+    path: qwen3-30b-a3b/exl3/4.0bpw
+    tags: [moe, attention]
+    notes: pure-transformer MoE, the reference case for CPU expert offload
+
+  moe-hybrid:
+    path: lfm2.5-8b-a1b/exl3/4.10bpw_mul1
+    tags: [moe, conv, attention, recurrent, small, mul1]
+
+  moe-shared:
+    path: trinity-nano-preview/exl3/4.00bpw_mul1
+    tags: [moe, shared_experts, attention, small, mul1]
+
+  recurrent:
+    path: qwen3.5-0.8b/exl3/4.00bpw_mul1
+    tags: [recurrent, gdn, attention, vision, small]
+
+  mtp:
+    path: qwen3.5-9b/exl3/4.00bpw_mtp
+    tags: [recurrent, gdn, attention, mtp, vision]
+
+  mamba2:
+    path: nemotron-3-nano-4b/exl3/4.00bpw
+    tags: [recurrent, mamba2, attention]
+
+  swa:
+    path: gemma4-12b-it/exl3/4.00bpw_mul1
+    tags: [swa, attention, vision]
+
+  mla:
+    path: moonlight-16b-a3b-instruct/exl3/4.11bpw
+    tags: [mla, moe, shared_experts, mul1]
+
+  sinks:
+    path: gpt-oss-20b/exl3/2.00bpw_mul1
+    tags: [swa, sinks, moe, attention, mul1]
+
+  # Truncated stubs of large architectures (a few layers of the real model, converted). Not downloadable: build
+  # them by truncating num_hidden_layers of the real checkpoint and converting, then point to them from
+  # tests/models.local.yaml. Tests that need them skip otherwise.
+
+  qwen4-exp-stub:
+    tags: [stub, qwen4_exp, ple, qsa, gated_residual]
+    notes: Qwen3.8-Flash-Next, 4 layers, quantized, with the n-gram embedding table
+
+  qwen4-exp-stub-hf:
+    tags: [stub, hf_reference, qwen4_exp, ple, qsa, gated_residual, vision]
+    notes: Qwen3.8-Flash-Next, 4 layers (GDN, GDN + PLE, GDN, QSA full attention), unquantized bf16 with the n-gram
+      table sliced to ~4M rows per head (8 shards), the full vision tensors and the image processor config;
+      reference for the HF parity tests
+
+  qwen4-exp-stub-ngram-k3:
+    tags: [stub, qwen4_exp, ple]
+    notes: directory holding ngram_k3.safetensors, qwen4-exp-stub-hf's n-gram table quantized at K=3
+      (util/convert_ngram.py); not a model directory, tests check for the file themselves
+
+  dsv4-vision-stub:
+    tags: [stub, deepseek_v4, vision]
+    vram: 40
+    notes: DeepSeek-V4-Flash-Vision, 8 layers, with the checkpoint's inference/ reference code and example images
+
+  glm53-stub:
+    tags: [stub, glm5_next, mla, dsa, moe]
+    notes: GLM-5.3-Flash, 8 layers, quantized
+
+  glm52-stub-hf:
+    tags: [stub, hf_reference, glm_moe_dsa, mla, dsa, moe]
+    notes: GLM-5.2, 4 layers (dense + full indexer, sparse + shared, sparse + full, sparse + shared), unquantized;
+      reference for the HF parity tests
+
+  glm53-stub-hf:
+    tags: [stub, hf_reference, glm5_next, mla, dsa, kda, moe, vision]
+    notes: GLM-5.3-Flash, 8 layers (all four block flavors), unquantized (bf16, or the release's fp8 block scales),
+      experts truncated, with the full vision tensors and processor_config.json; reference for the HF parity tests
+
+  # Unquantized checkpoints for the HF parity tests (tests/parity/): transformers loads these directly
+
+  dsv4-flash-hf:
+    path: deepseek-v4-flash-0731/hf
+    tags: [hf_reference, deepseek_v4]
+    vram: 80
+    notes: DeepSeek-V4-Flash release (native tensor names, fp8 + fp4 experts); parity tests run its first layers
+
+  kimi-linear-hf:
+    path: kimi-linear-48b-a3b-instruct/hf
+    tags: [hf_reference, kimi_linear, kda, mla, moe]
+    vram: 24
+    notes: Kimi-Linear-48B-A3B-Instruct release (bf16, 96 GB); the HF side of the parity test spreads over two devices
+
+  moonlight-hf:
+    tags: [hf_reference, deepseek_v3, mla, moe]
+    vram: 40
+    notes: Moonlight-16B-A3B-Instruct release (bf16 safetensors + tiktoken.model)
+
+  mistral4-hf:
+    path: mistral-small-4-119b-2603/hf
+    tags: [hf_reference, mistral4, mla, moe]
+    vram: 48
+    notes: Mistral-Small-4-119B-2603 release (fp8); parity tests run its first layers

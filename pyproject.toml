@@ -141,3 +141,12 @@ explicit = true
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tools", "_retired", "testlib", "__disk_lru_cache__", ".*"]
+addopts = ["-p", "no:cacheprovider"]
+filterwarnings = [
+    # Triton's code generator on Python 3.14
+    "ignore:AnnAssign.__init__ missing:DeprecationWarning",
+]
