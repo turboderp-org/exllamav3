@@ -305,8 +305,6 @@ void exl3_moe
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Nothing for the fused kernel to do
-    if (num_active == 0) return;
     void* _output_scratch = nullptr;
     void* _fused_base = nullptr;
     if (output_scratch.has_value())
@@ -331,12 +329,13 @@ void exl3_moe
 
     TORCH_CHECK_DTYPE(expert_count, kLong);
     TORCH_CHECK_DIM(expert_count, 1);
+    TORCH_CHECK(expert_count.size(0) >= 1, "exl3_moe: expert_count must hold num_experts + 1 bins");
     size_t num_experts = expert_count.size(0) - 1;
 
     TORCH_CHECK_DTYPE(token_sorted, kLong);
     TORCH_CHECK_DIM(token_sorted, 1);
     TORCH_CHECK_SHAPES_FULL(token_sorted, weight_sorted);
-    size_t num_experts_per_tok = token_sorted.size(0) / bsz;
+    size_t num_experts_per_tok = bsz ? token_sorted.size(0) / bsz : 0;
 
     TORCH_CHECK_DTYPE(temp_state_g, kHalf);
     TORCH_CHECK_DTYPE(temp_state_u, kHalf);
@@ -395,6 +394,14 @@ void exl3_moe
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_trellis);
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_suh);
     TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_svh);
+    // An empty intermediate dim would make the down projection an empty (zero) sum, but the fused tier's
+    // output_scratch slots are only written by the expert's down projection, so this is rejected
+    TORCH_CHECK(intermediate_dim > 0, "exl3_moe: empty intermediate dimension");
+
+    // Nothing for the fused kernel to do: no tokens, experts, active experts, rows per expert in this
+    // tier or output columns
+    if (!bsz || !num_experts || !num_active || !max_tokens_per_expert || !hidden_dim) return;
+    TORCH_CHECK(concurrency > 0, "exl3_moe: temp buffers hold no expert group");
 
     // Device properties
     int device;

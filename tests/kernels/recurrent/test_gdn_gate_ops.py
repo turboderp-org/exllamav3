@@ -315,3 +315,73 @@ def test_kda_gate_op_rejects(device):
                       ("beta", args["beta"].float()), ("g", args["g"].bfloat16())]:
         with pytest.raises(RuntimeError):
             call(**{name: bad})
+
+
+# Zero-size inputs: an empty batch, sequence or head axis is an elementwise no-op (nothing written, no launch). The
+# fused op's head counts and head dims define its segment layout (Ng = Nv / Nk) and must be positive. kda_gate_op
+# with H = 0 still casts qkv (only beta and g are empty)
+
+def _assert_device_usable(device):
+    torch.cuda.synchronize(device)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+def _empty_fused_op(device, B, S, Nk = 2, Nv = 4, Hk = 32, Hv = 32):
+    Ng = Nv // Nk if Nk else 0
+    qkvz = torch.randn(B, S, Nk * (2 * Hk + 2 * Ng * Hv), device = device)
+    ba = torch.randn(B, S, Nk * 2 * Ng, device = device)
+    bufs = [guarded(s, t, device) for s, t in [((B, 2 * Nk * Hk + Nv * Hv, S), torch.bfloat16),
+                                              ((B, S, Nv, Hv), torch.bfloat16), ((B, S, Nv), torch.bfloat16),
+                                              ((B, S, Nv), torch.float)]]
+    ext.gated_delta_net_fused_op(qkvz, ba, torch.zeros(Nv, dtype = torch.bfloat16, device = device),
+                                 torch.zeros(Nv, dtype = torch.bfloat16, device = device),
+                                 *[t for _, t in bufs], Nk, Nv, Hk, Hv, 1.0)
+    for (buf, _), name in zip(bufs, ["mixed_qkv", "z", "beta", "g"]):
+        assert_guards(buf, name)
+
+
+def _empty_fused_op_2(device, B, S, H):
+    (buf_beta, beta), (buf_g, g) = guarded((B, S, H), torch.bfloat16, device), guarded((B, S, H), torch.float, device)
+    ext.gated_delta_net_fused_op_2(torch.randn(B, S, H, device = device), torch.randn(B, S, H, device = device),
+                                   torch.zeros(H, dtype = torch.bfloat16, device = device),
+                                   torch.zeros(H, device = device), beta, g, 1.0)
+    assert_guards(buf_beta, "beta")
+    assert_guards(buf_g, "g")
+
+
+def _empty_kda(device, B, S, H, Dk = 4, F = 24):
+    qkv = torch.randn(B, S, F, device = device)
+    (buf_qkv, mixed_qkv), (buf_beta, beta), (buf_g, g) = guarded((B, F, S), torch.bfloat16, device), \
+        guarded((B, S, H), torch.bfloat16, device), guarded((B, S, H, Dk), torch.float, device)
+    ext.kda_gate_op(qkv, torch.randn(B, S, H, device = device), torch.randn(B, S, H * Dk, device = device),
+                    torch.zeros(H * Dk, dtype = torch.bfloat16, device = device), torch.zeros(H, device = device),
+                    mixed_qkv, beta, g, 0.0, 1.0)
+    assert torch.equal(mixed_qkv, qkv.bfloat16().transpose(1, 2)), "mixed_qkv: not the exact bf16 cast/transpose"
+    for buf, name in [(buf_qkv, "mixed_qkv"), (buf_beta, "beta"), (buf_g, "g")]:
+        assert_guards(buf, name)
+
+
+EMPTY_CASES = {
+    "fused_op B=0": lambda d: _empty_fused_op(d, 0, 3),
+    "fused_op S=0": lambda d: _empty_fused_op(d, 2, 0),
+    "fused_op heads=0": ("head counts and head dims must be positive", lambda d: _empty_fused_op(d, 1, 1, Nk = 0, Nv = 0)),
+    "fused_op Hk=0": ("head counts and head dims must be positive", lambda d: _empty_fused_op(d, 1, 1, Hk = 0)),
+    "fused_op_2 B=0": lambda d: _empty_fused_op_2(d, 0, 3, 8),
+    "fused_op_2 S=0": lambda d: _empty_fused_op_2(d, 2, 0, 8),
+    "fused_op_2 H=0": lambda d: _empty_fused_op_2(d, 2, 3, 0),
+    "kda B=0": lambda d: _empty_kda(d, 0, 2, 4),
+    "kda S=0": lambda d: _empty_kda(d, 2, 0, 4),
+    "kda H=0": lambda d: _empty_kda(d, 2, 3, 0),
+}
+
+
+@pytest.mark.parametrize("case", list(EMPTY_CASES))
+@torch.inference_mode()
+def test_empty(device, case):
+    spec = EMPTY_CASES[case]
+    if isinstance(spec, tuple):
+        with pytest.raises(RuntimeError, match = spec[0]):
+            spec[1](device)
+    else:
+        spec(device)
+    _assert_device_usable(device)

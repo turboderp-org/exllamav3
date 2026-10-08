@@ -208,3 +208,88 @@ def test_batch_recon_layer_matches_per_expert(device, gated, folded, static, int
     # scale tables, scrambled ids) fail these by orders of magnitude
     tol = (4e-3 if folded else 5e-4) * scale + 1e-3
     assert err <= tol, f"max abs err {err} vs scale {scale} (folded {folded})"
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("fn", ["reconstruct_batch", "reconstruct_had_batch"])
+@pytest.mark.parametrize("B, k, n", [(0, 128, 256), (2, 0, 256), (2, 128, 0)])
+@torch.inference_mode()
+def test_empty_reconstruct_batched(device, fn, B, k, n):
+    """No matrices, rows or columns: a no-op; shape checks still apply"""
+    out = torch.empty((B, k, n), dtype = torch.half, device = device)
+    mats = [torch.zeros((k // 16, n // 16, 64), dtype = torch.int16, device = device) for _ in range(B)]
+    ptrs = ptr_table(mats, device) if B else torch.empty(0, dtype = torch.long, device = device)
+
+    def call(o):
+        if fn == "reconstruct_batch":
+            ext.reconstruct_batch(o, ptrs, 4, False, True)
+        else:
+            ext.reconstruct_had_batch(o, ptrs, ptrs, ptrs, 4, False, True)
+
+    call(out)
+    with pytest.raises(RuntimeError, match = "divisible by 128"):
+        call(torch.empty((B, k, 100), dtype = torch.half, device = device))
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        call(out.float())
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.float])
+@pytest.mark.parametrize("rows, cols", [(0, 256), (6, 0), (0, 0)])
+@torch.inference_mode()
+def test_empty_had_r_128(device, dtype, rows, cols):
+    """Elementwise over 128-blocks: zero rows or blocks is a no-op; dtype and divisibility still checked"""
+    x = torch.empty((rows, cols), dtype = dtype, device = device)
+    out = torch.empty_like(x)
+    sc = torch.ones(cols, dtype = torch.half, device = device)
+    ext.had_r_128(x, out, None, None, 1.0)
+    ext.had_r_128(x, out, sc, None, 1.0)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.had_r_128(x, out.bfloat16(), None, None, 1.0)
+    with pytest.raises(RuntimeError, match = "divisible by 128"):
+        ext.had_r_128(torch.empty((rows, 100), dtype = dtype, device = device),
+                      torch.empty((rows, 100), dtype = dtype, device = device), None, None, 1.0)
+    table = torch.ones((3, cols), dtype = torch.half, device = device)
+    ids = torch.zeros(4, dtype = torch.long, device = device)
+    m = 3 if rows else 1
+    xb = torch.empty((rows // m * m, cols), dtype = dtype, device = device)
+    ext.had_r_128_batch(xb, torch.empty_like(xb), table, None, ids, m, 1.0)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.had_r_128_batch(xb, torch.empty_like(xb).bfloat16(), table, None, ids, m, 1.0)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.float])
+@pytest.mark.parametrize("m, k, n", [(0, 64, 128), (5, 64, 0), (5, 0, 128), (0, 0, 0)])
+@torch.inference_mode()
+def test_empty_hgemm(device, dtype, m, k, n):
+    """hgemm / hgemm_recon / hgemm_batched: no rows or columns is a no-op, an empty reduction (k = 0) writes zeros
+    (also into a strided output, leaving its padding alone)"""
+    a = torch.randn((m, k), device = device).half()
+    b = torch.randn((k, n), device = device).half()
+    for fn in (ext.hgemm, ext.hgemm_recon):
+        store = torch.full((max(m, 1), n + 8), 3.0, dtype = dtype, device = device)
+        c = store[:m, :n]
+        fn(a, b, c)
+        torch.cuda.synchronize(device)
+        assert (c == (0.0 if k == 0 else 3.0)).all()
+        assert (store[:, n:] == 3.0).all()
+        _device_still_works(device)
+    a3 = a.unsqueeze(0).repeat(2, 1, 1)
+    b3 = b.unsqueeze(0).repeat(2, 1, 1)
+    c3 = torch.full((2, m, n), 3.0, dtype = dtype, device = device)
+    ext.hgemm_batched(a3, b3, c3)
+    torch.cuda.synchronize(device)
+    assert (c3 == (0.0 if k == 0 else 3.0)).all()
+    ext.hgemm_batched(a3[:0], b3[:0], c3[:0])
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.hgemm(a.float(), b, c3[0])
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.hgemm_batched(a3, b3[:1], c3)
+    _device_still_works(device)

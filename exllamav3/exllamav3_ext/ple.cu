@@ -81,6 +81,7 @@ void ple_gate_gr
     TORCH_CHECK(out.size(3) % 4 == 0, "out.size(3) must be a multiple of 4");
 
     size_t numel = out.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 4 * NUM_THREADS);
     ple_gate_kernel<<<blocks, NUM_THREADS, 0, stream>>>
     (
@@ -152,6 +153,18 @@ void ple_forward_streams
     float eps = (float) rms_eps;
     TORCH_CHECK(streams.is_contiguous() && emb.is_contiguous(), "ple_forward_streams: contiguous inputs");
     TORCH_CHECK(delta.is_contiguous() && conv_stream.is_contiguous(), "ple_forward_streams: contiguous outputs");
+    TORCH_CHECK(D > 0, "ple_forward_streams: norm over an empty stream dimension");
+
+    // conv column stream: [state | new columns]. With no tokens (or no streams) there is no delta
+    // and the conv stream is just the carried state
+    if (state_len > 0)
+    {
+        if (conv_state)
+            conv_stream.narrow(2, 0, state_len).copy_(conv_state.value());
+        else
+            conv_stream.narrow(2, 0, state_len).zero_();
+    }
+    if (!R || !H) return;
 
     auto opts_f = streams.options();
     auto opts_h = emb.options();
@@ -175,14 +188,7 @@ void ple_forward_streams
     at::Tensor normed = at::empty({R * H, D}, opts_h);
     rms_norm(gated.view({R * H, D}), norm_conv_w, normed, eps, 1.0f, 1.0f, false, false, (int) H);
 
-    // conv column stream: [state | new columns], then the dilated depthwise conv
-    if (state_len > 0)
-    {
-        if (conv_state)
-            conv_stream.narrow(2, 0, state_len).copy_(conv_state.value());
-        else
-            conv_stream.narrow(2, 0, state_len).zero_();
-    }
+    // new conv columns, then the dilated depthwise conv
     conv_stream.narrow(2, state_len, seq)
         .copy_(normed.view({bsz, seq, hc}).transpose(1, 2));
     at::Tensor y = at::conv1d(conv_stream, conv_w, c10::nullopt,

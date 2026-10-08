@@ -78,3 +78,28 @@ def test_deinterleave_qg_rejects(device):
         ext.deinterleave_qg(qg, q[:1], g, 64)
     with pytest.raises(RuntimeError, match = "size mismatch"):
         ext.deinterleave_qg(qg[:1], q, g, 64)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@torch.inference_mode()
+def test_deinterleave_qg_empty(device):
+    # No rows (or no heads): nothing to do, outputs untouched
+    for shape in ((0, 4 * 64), (3, 0)):
+        qbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+        gbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+        qg = torch.empty(shape[0], 2 * shape[1], dtype = torch.half, device = device)
+        ext.deinterleave_qg(qg, qbuf[8:8].view(shape), gbuf[8:8].view(shape), 64)
+        assert (qbuf == 7.0).all() and (gbuf == 7.0).all()
+    # A zero head_dim passed the multiple-of-8 check; it is not a head width (and q is not a whole number of heads)
+    qg = torch.randn(2, 4 * 2 * 64, device = device).half()
+    q = torch.empty(2, 4 * 64, device = device).half()
+    with pytest.raises(RuntimeError, match = "positive multiple of 8"):
+        ext.deinterleave_qg(qg, q, torch.empty_like(q), 0)
+    with pytest.raises(RuntimeError, match = "whole number of heads"):
+        ext.deinterleave_qg(qg, q, torch.empty_like(q), 24)
+    assert_device_ok(device)

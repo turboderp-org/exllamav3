@@ -17,6 +17,10 @@ without accumulation across tokens):
   scratch rows outside the window are untouched. The reference decodes the packed format independently (power-of-
   two bit planes, midpoint grid, fp16 group scale / sqrt(32), inverse unnormalized Sylvester Hadamard over each
   32-group) in float64, over every K/V width pair 2..8 and head layouts with a partial last 4-group chunk.
+
+Empty inputs (test_empty_*): no rows, no tokens or zero width is a no-op for all four, with outputs untouched,
+argument checks still applied, and no CUDA error left pending. Tokens to write through a block table without pages
+raise (paged_kv_cache_update, dspark_write_rows).
 """
 import math
 
@@ -382,3 +386,104 @@ def test_dequant_cache_paged_window_rejects(device):
     with pytest.raises(RuntimeError, match = "multiple of 32"):
         o = torch.zeros((4, PAGE, 2, 40), dtype = torch.half, device = device)
         ext.dequant_cache_paged_window(kc, ks, o, vc, vs, o, sl, bt, PAGE, 0, 0.0)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Empty inputs
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("B, S, H, D", [(0, 3, 2, 64), (2, 0, 2, 64), (2, 3, 0, 64), (2, 3, 2, 0), (0, 0, 0, 0)])
+@torch.inference_mode()
+def test_empty_paged_kv_cache_update(device, B, S, H, D):
+    k_cache = sentinel_like((4, PAGE, H, D), device)
+    v_cache = -sentinel_like((4, PAGE, H, D), device)
+    k_ref, v_ref = k_cache.clone(), v_cache.clone()
+    bt = torch.arange(B * 2, dtype = torch.int32, device = device).view(B, 2)
+    sl = torch.zeros((B,), dtype = torch.int32, device = device)
+    k = torch.randn((B, S, H, D), device = device).half()
+    ext.paged_kv_cache_update(k, k, k_cache, v_cache, bt, sl)
+    assert torch.equal(k_cache, k_ref) and torch.equal(v_cache, v_ref)
+    _device_still_works(device)
+    # Argument checks apply to empty inputs too
+    e = torch.empty((B, S, H, 12), dtype = torch.half, device = device)
+    c = torch.zeros((4, PAGE, H, 12), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "divisible by 8"):
+        ext.paged_kv_cache_update(e, e, c, c, bt, sl)
+
+
+@pytest.mark.parametrize("bsz, s, w", [(0, 3, 64), (2, 0, 64), (2, 3, 0), (0, 0, 0)])
+@torch.inference_mode()
+def test_empty_dspark_write_rows(device, bsz, s, w):
+    kv = sentinel_like((4, PAGE, w), device)
+    ref = kv.clone()
+    bt = torch.arange(bsz * 2, dtype = torch.int32, device = device).view(bsz, 2)
+    sl = torch.zeros((bsz,), dtype = torch.int32, device = device)
+    ext.dspark_write_rows(torch.randn((bsz, s, w), device = device).half(), kv, bt, sl)
+    assert torch.equal(kv, ref)
+    _device_still_works(device)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: expected"):
+        ext.dspark_write_rows(torch.zeros((bsz * s, w), dtype = torch.half, device = device), kv, bt, sl)
+
+
+@pytest.mark.parametrize("seq, D, jobs", [(0, 64, None), (0, 0, None), (3, 0, None), (0, 64, 0), (0, 64, 2), (2, 0, 2)])
+@torch.inference_mode()
+def test_empty_dsv4_ring_append(device, seq, D, jobs):
+    if jobs is None:
+        ring = sentinel_like((16, D), device)
+        kv = torch.randn((seq, D), device = device).half()
+        pos = torch.tensor([3], dtype = torch.int32, device = device)
+        beg = torch.zeros((1,), dtype = torch.int32, device = device)
+        slots = None
+    else:
+        ring = sentinel_like((3, 16, D), device)
+        kv = torch.randn((jobs * seq, D), device = device).half()
+        pos = torch.full((jobs,), 3, dtype = torch.int32, device = device)
+        beg = torch.zeros((jobs,), dtype = torch.int32, device = device)
+        slots = torch.arange(jobs, dtype = torch.int32, device = device)
+    ref = ring.clone()
+    ext.dsv4_ring_append(kv, ring, pos, beg, slots)
+    assert torch.equal(ring, ref)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("bsz, pps, dim", [(0, 2, 128), (2, 0, 128), (2, 2, 0), (0, 0, 0)])
+@pytest.mark.parametrize("window", [True, False])
+@torch.inference_mode()
+def test_empty_dequant_cache_paged(device, bsz, pps, dim, window):
+    num_pages = 4
+    kc = torch.zeros((num_pages, PAGE, dim // 32 * 4), dtype = torch.int32, device = device)
+    ks = torch.ones((num_pages, PAGE, dim // 32), dtype = torch.half, device = device)
+    out = sentinel_like((num_pages, PAGE, dim), device)
+    ref = out.clone()
+    bt = torch.arange(bsz * pps, dtype = torch.int32, device = device).view(bsz, pps)
+    sl = torch.full((bsz,), 5, dtype = torch.int32, device = device)
+    if window:
+        ext.dequant_cache_paged_window(kc, ks, out, kc, ks, out, sl, bt, PAGE, 1, 0.0)
+    else:
+        ext.dequant_cache_paged(kc, ks, out, kc, ks, out, sl, bt, PAGE, -1, 0.0)
+    assert torch.equal(out, ref)
+    _device_still_works(device)
+    # Argument checks apply to empty inputs too
+    fn = ext.dequant_cache_paged_window if window else ext.dequant_cache_paged
+    with pytest.raises(RuntimeError, match = "Page size"):
+        fn(kc, ks, out, kc, ks, out, sl, bt, 128, 0, 0.0)
+
+
+@torch.inference_mode()
+def test_empty_block_table_rejected(device):
+    sl = torch.zeros((2,), dtype = torch.int32, device = device)
+    bt = torch.zeros((2, 0), dtype = torch.int32, device = device)
+    k = torch.zeros((2, 1, 2, 64), dtype = torch.half, device = device)
+    cache = torch.zeros((2, PAGE, 2, 64), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: .*no pages"):
+        ext.paged_kv_cache_update(k, k, cache, cache, bt, sl)
+    kv = torch.zeros((2, PAGE, 8), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: .*no pages"):
+        ext.dspark_write_rows(torch.zeros((2, 1, 8), dtype = torch.half, device = device), kv, bt, sl)
+    _device_still_works(device)

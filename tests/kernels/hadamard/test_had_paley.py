@@ -89,3 +89,13 @@ def test_rejections():
             f(torch.zeros((12, 24), dtype = torch.half))
     with pytest.raises(RuntimeError):
         ext.had_paley(torch.zeros((24, 24), dtype = torch.half)[::2, ::2])
+
+
+def test_empty():
+    # The 0 x 0 matrix: nothing to fill, no-op. Validation still applies
+    for f in (ext.had_paley, ext.had_paley2):
+        h = torch.zeros((0, 0), dtype = torch.half)
+        f(h)
+        assert h.shape == (0, 0)
+        with pytest.raises(RuntimeError):
+            f(torch.zeros((0, 0), dtype = torch.float))

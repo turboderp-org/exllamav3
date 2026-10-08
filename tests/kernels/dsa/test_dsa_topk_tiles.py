@@ -12,6 +12,11 @@ workspace slot and touches no other slot. dsa_topk_merge_tiles over slots that h
 (or a running set from a previous merge in slot 0, written through strided slot views with out_scr / out_cnt) must
 produce exactly what dsa_topk produces on the whole row -- bitwise, order included (the qsa_indexer docstring and the
 kernel comment claim this) -- which is also checked directly against dsa_topk.
+
+Empty inputs (test_empty_*): no rows is a no-op; k == 0 is an empty selection (every output slot -1 padding, a tile
+slot count of 0, merge counts 0, scores untouched); a tile with no entries contributes no candidates; selecting
+k > 0 from an empty row (dsa_topk with T == 0, a merge over zero slots) is undefined and raises, as does a
+negative k. No CUDA error is left pending.
 """
 import numpy as np
 import pytest
@@ -302,3 +307,94 @@ def test_tile_merge_rejects(device):
         ext.dsa_topk_merge_tiles(idx, scr, cnt, out, torch.zeros((2, 16), dtype = torch.half, device = device), None, 8)
     with pytest.raises(RuntimeError, match = "bad out_cnt"):
         ext.dsa_topk_merge_tiles(idx, scr, cnt, out, None, torch.zeros((3,), dtype = torch.int32, device = device), 8)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Empty inputs
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("R, T, k, kp, error", [
+    (0, 100, 8, 32, None),          # no rows
+    (3, 100, 0, 32, None),          # empty selection: all padding
+    (3, 0, 0, 32, None),
+    (3, 0, 0, 0, None),
+    (3, 40000, 0, 32, None),        # (split-path shape)
+    (3, 0, 8, 32, "empty score row"),
+    (0, 0, 8, 32, "empty score row"),
+    (3, 100, -1, 32, "negative k"),
+])
+@torch.inference_mode()
+def test_empty_dsa_topk(device, R, T, k, kp, error):
+    scores = torch.randn((R, T), device = device).half()
+    out = torch.full((R, kp), -7, dtype = torch.int32, device = device)
+    if error:
+        with pytest.raises(RuntimeError, match = f"dsa_topk: .*{error}"):
+            ext.dsa_topk(scores, out, k, None, 0)
+        assert (out == -7).all()
+    else:
+        ext.dsa_topk(scores, out, k, None, 0)
+        assert (out == (-7 if R == 0 else -1)).all()
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("R, T, k, error", [
+    (0, 100, 8, None),
+    (3, 100, 0, None),              # no candidates
+    (3, 0, 8, None),                # empty tile: no candidates
+    (3, 0, 0, None),
+    (3, 100, -1, "negative k"),
+])
+@torch.inference_mode()
+def test_empty_dsa_topk_tile(device, R, T, k, error):
+    G, kp, slot = 3, 32, 1
+    scores = torch.randn((R, T), device = device).half()
+    ws_idx = torch.full((R, G, kp), -7, dtype = torch.int32, device = device)
+    ws_scr = torch.full((R, G, kp), 3.5, dtype = torch.half, device = device)
+    ws_cnt = torch.full((R, G), -9, dtype = torch.int32, device = device)
+    idx0, scr0, cnt0 = ws_idx.clone(), ws_scr.clone(), ws_cnt.clone()
+    if error:
+        with pytest.raises(RuntimeError, match = f"dsa_topk_tile: .*{error}"):
+            ext.dsa_topk_tile(scores, ws_idx, ws_scr, ws_cnt, slot, k, 0)
+    else:
+        ext.dsa_topk_tile(scores, ws_idx, ws_scr, ws_cnt, slot, k, 0)
+        cnt0[:, slot] = 0
+    assert torch.equal(ws_cnt, cnt0)
+    assert torch.equal(ws_idx, idx0) and torch.equal(ws_scr, scr0)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("R, G, k, error", [
+    (0, 2, 8, None),
+    (3, 2, 0, None),                # empty selection
+    (3, 0, 0, None),
+    (3, 0, 8, "empty set of tiles"),
+    (3, 2, -1, "negative k"),
+])
+@pytest.mark.parametrize("with_outputs", [False, True])
+@torch.inference_mode()
+def test_empty_dsa_topk_merge_tiles(device, R, G, k, error, with_outputs):
+    kp = 32
+    ws_idx = torch.arange(R * G * kp, dtype = torch.int32, device = device).view(R, G, kp)
+    ws_scr = torch.randn((R, G, kp), device = device).half()
+    ws_cnt = torch.full((R, G), kp, dtype = torch.int32, device = device)
+    out = torch.full((R, kp), -7, dtype = torch.int32, device = device)
+    out_scr = torch.full((R, kp), 3.5, dtype = torch.half, device = device) if with_outputs else None
+    out_cnt = torch.full((R,), -9, dtype = torch.int32, device = device) if with_outputs else None
+    args = (ws_idx, ws_scr, ws_cnt, out, out_scr, out_cnt, k)
+    if error:
+        with pytest.raises(RuntimeError, match = f"dsa_topk_merge_tiles: .*{error}"):
+            ext.dsa_topk_merge_tiles(*args)
+        assert (out == -7).all()
+    else:
+        ext.dsa_topk_merge_tiles(*args)
+        assert (out == (-7 if R == 0 else -1)).all()
+        if with_outputs:
+            assert (out_scr == 3.5).all()
+            assert (out_cnt == (-9 if R == 0 else 0)).all()
+    _device_still_works(device)

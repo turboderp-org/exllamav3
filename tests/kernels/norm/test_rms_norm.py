@@ -104,3 +104,51 @@ def test_rms_norm_rows_times_dim_beyond_int32(device):
     torch.testing.assert_close(y[tail], reference_rms_norm(x[tail], w, 1e-6, torch.half), rtol = 1e-3, atol = 1e-3)
     del x, y
     torch.cuda.empty_cache()
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["rows", "rows_span_heads", "rows_res", "dim", "dim_span_heads", "w_groups"])
+@torch.inference_mode()
+def test_rms_norm_empty(device, case):
+    # Empty row axis: nothing to do (no launch, nothing written). Empty normalized axis: the RMS of an empty vector
+    # is undefined, so it raises
+    buf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+    w = torch.randn(128, dtype = torch.half, device = device)
+    if case.startswith("rows"):
+        span = case == "rows_span_heads"
+        shape = (0, 4, 32) if span else (0, 128)
+        x = torch.randn(shape, dtype = torch.half, device = device)
+        y = buf[8:8].view(shape)
+        ext.rms_norm(x, w, y, 1e-6, 0.0, 1.0, span, case == "rows_res", 1)
+        assert (buf == 7.0).all()
+    elif case.startswith("dim"):
+        span = case == "dim_span_heads"
+        shape = (4, 0, 32) if span else (4, 0)
+        x = torch.randn(shape, dtype = torch.half, device = device)
+        with pytest.raises(RuntimeError, match = "rms_norm: norm over an empty dimension"):
+            ext.rms_norm(x, torch.empty(0, dtype = torch.half, device = device), torch.empty_like(x), 1e-6, 0.0, 1.0,
+                         span, False, 1)
+    else:
+        x = torch.randn(4, 128, dtype = torch.half, device = device)
+        with pytest.raises(RuntimeError, match = "w_groups must be positive"):
+            ext.rms_norm(x, torch.empty(0, dtype = torch.half, device = device), torch.empty_like(x), 1e-6, 0.0, 1.0,
+                         False, False, 0)
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_rms_norm_empty_weight_rejected(device):
+    # An empty weight tensor is a weight of the wrong size, not "no weight"
+    x = torch.randn(4, 128, dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.rms_norm(x, torch.empty(0, dtype = torch.half, device = device), torch.empty_like(x), 1e-6, 0.0, 1.0,
+                     False, False, 1)
+    # Dtype validation still applies to empty input
+    with pytest.raises(RuntimeError, match = "Invalid datatypes"):
+        ext.rms_norm(torch.empty(0, 128, dtype = torch.bfloat16, device = device), None,
+                     torch.empty(0, 128, dtype = torch.half, device = device), 1e-6, 0.0, 1.0, False, False, 1)

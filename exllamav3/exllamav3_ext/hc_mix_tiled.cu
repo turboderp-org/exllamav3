@@ -595,6 +595,8 @@ void gr_mix_tiled
     const int q = gr_dots_slices_per_stream(R, D, Mpad), S = HC * q;
     TORCH_CHECK(H == HC, "gr_mix_tiled: H = 4 only");
     TORCH_CHECK(D % DOTS_KCH == 0 && LR % GATE_KCH == 0, "gr_mix_tiled: D must be a multiple of 128 and LR of 64");
+    TORCH_CHECK(D > 0, "gr_mix_tiled: norm over an empty stream dimension");
+    TORCH_CHECK(LR > 0, "gr_mix_tiled: LR must be a positive multiple of 64");
     TORCH_CHECK(proj_i8.size(0) == 2 && proj_i8.size(2) == HD && up_i8.size(0) == 2 && up_i8.size(1) == HD && w.numel() == HD, "gr_mix_tiled: dims");
     TORCH_CHECK(proj_sb.numel() == Mpad && up_sb.numel() == HD, "gr_mix_tiled: scales");
     TORCH_CHECK(M == LR + (post ? H : 0) && M <= Mpad, "gr_mix_tiled: proj rows must be LR (+ H with post)");
@@ -605,6 +607,7 @@ void gr_mix_tiled
     TORCH_CHECK(t_i8.size(0) == 2 && t_i8.size(1) == R && t_i8.size(2) == LR && t_s.size(0) == R && t_s.size(1) == LR / 64, "gr_mix_tiled: latent workspace");
     TORCH_CHECK(mixed.size(0) == R && mixed.size(1) == D, "gr_mix_tiled: mixed shape");
     if (post) { TORCH_CHECK_DTYPE(post.value(), kFloat); TORCH_CHECK(post.value().is_contiguous() && post.value().size(0) == R && post.value().size(1) == H, "gr_mix_tiled: post shape"); }
+    if (!R) return;
 
     int dev = 0;
     cudaGetDevice(&dev);

@@ -788,6 +788,14 @@ __global__ void attn_reduce_kernel
     out[tid] = __float2half(l_acc > 0.f ? (o_acc / l_acc) : 0.f);
 }
 
+// Instances dispatched below; checked up front so shape errors also fire on empty inputs
+static bool bighead_attn_supported(int64_t dim, int64_t G)
+{
+    if (dim == 512) return G == 1 || G == 2 || G == 4 || G == 8 || G == 16;
+    if (dim == 64 || dim == 128 || dim == 256) return G == 1 || G == 2 || G == 4 || G == 8;
+    return false;
+}
+
 void bighead_attn_paged
 (
     const at::Tensor& q,
@@ -872,10 +880,16 @@ void bighead_attn_paged
     TORCH_CHECK(block_table.size(0) == bsz, "block_table batch mismatch");
     TORCH_CHECK(cache_seqlens.size(0) == bsz, "cache_seqlens batch mismatch");
 
+    TORCH_CHECK(n_kv_heads > 0, "bighead_attn_paged: n_kv_heads must be positive");
     TORCH_CHECK(n_q_heads % n_kv_heads == 0, "n_q_heads must be divisible by n_kv_heads");
     const int64_t G = n_q_heads / n_kv_heads;
     TORCH_CHECK(G <= G_MAX, "GQA ratio ", G, " exceeds G_MAX=", G_MAX);
     TORCH_CHECK(kv_chunk_size > 0, "kv_chunk_size must be positive");
+    TORCH_CHECK(bighead_attn_supported(dim, G), "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
+    TORCH_CHECK(num_pages_per_seq > 0, "bighead_attn_paged: attention over zero keys (empty block table)");
+
+    // No rows: nothing to do. No queries: only the cache append runs
+    if (!bsz) return;
 
     const int64_t max_total_k_len = num_pages_per_seq * PAGE_SIZE;
 
@@ -925,12 +939,14 @@ void bighead_attn_paged
                 kv_cache_update_kernel_paged<DIM><<<grid_up, DIM / 2, 0, stream>>>(PAGED_UPDATE_ARGS); \
                 cuda_check(cudaPeekAtLastError()); \
             } \
-            const size_t smem_bytes = \
-                (size_t)DIM * sizeof(half) + (size_t)(DIM / 32) * G * sizeof(float); \
-            attn_chunked_paged_kernel<DIM, GVAL><<<grid1, DIM, smem_bytes, stream>>>(PAGED_ARGS1); \
-            cuda_check(cudaPeekAtLastError()); \
-            attn_reduce_kernel<DIM, GVAL><<<grid2, DIM, 0, stream>>>(ARGS2); \
-            cuda_check(cudaPeekAtLastError()); \
+            if (q_len > 0) { \
+                const size_t smem_bytes = \
+                    (size_t)DIM * sizeof(half) + (size_t)(DIM / 32) * G * sizeof(float); \
+                attn_chunked_paged_kernel<DIM, GVAL><<<grid1, DIM, smem_bytes, stream>>>(PAGED_ARGS1); \
+                cuda_check(cudaPeekAtLastError()); \
+                attn_reduce_kernel<DIM, GVAL><<<grid2, DIM, 0, stream>>>(ARGS2); \
+                cuda_check(cudaPeekAtLastError()); \
+            } \
         }
 
     #define LAUNCH_PAGED_512(GVAL) \
@@ -939,10 +955,12 @@ void bighead_attn_paged
                 kv_cache_update_kernel_paged<512><<<grid_up, 256, 0, stream>>>(PAGED_UPDATE_ARGS); \
                 cuda_check(cudaPeekAtLastError()); \
             } \
-            attn_chunked_paged_kernel_512x256<GVAL><<<grid1, 256, 0, stream>>>(PAGED_ARGS1); \
-            cuda_check(cudaPeekAtLastError()); \
-            attn_reduce_kernel_512x256<<<grid2, 256, 0, stream>>>(ARGS2); \
-            cuda_check(cudaPeekAtLastError()); \
+            if (q_len > 0) { \
+                attn_chunked_paged_kernel_512x256<GVAL><<<grid1, 256, 0, stream>>>(PAGED_ARGS1); \
+                cuda_check(cudaPeekAtLastError()); \
+                attn_reduce_kernel_512x256<<<grid2, 256, 0, stream>>>(ARGS2); \
+                cuda_check(cudaPeekAtLastError()); \
+            } \
         }
 
     LAUNCH_PAGED_512(1)
@@ -1010,7 +1028,6 @@ void bighead_attn
     const int64_t dim        = q.size(3);
     const int64_t kv_len     = k.size(1);
     const int64_t n_kv_heads = k.size(2);
-    const int64_t G          = n_q_heads / n_kv_heads;
 
     TORCH_CHECK(k.size(0) == bsz, "k batch mismatch");
     TORCH_CHECK(v.size(0) == bsz, "v batch mismatch");
@@ -1023,9 +1040,14 @@ void bighead_attn
     TORCH_CHECK(o.size(2) == n_q_heads, "o n_q_heads mismatch");
     TORCH_CHECK(o.size(3) == dim, "o head_dim mismatch");
 
+    TORCH_CHECK(n_kv_heads > 0, "bighead_attn: n_kv_heads must be positive");
     TORCH_CHECK(n_q_heads % n_kv_heads == 0, "n_q_heads must be divisible by n_kv_heads");
+    const int64_t G = n_q_heads / n_kv_heads;
     TORCH_CHECK(G <= G_MAX, "GQA ratio ", G, " exceeds G_MAX=", G_MAX);
     TORCH_CHECK(kv_chunk_size > 0, "kv_chunk_size must be positive");
+    TORCH_CHECK(bighead_attn_supported(dim, G), "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
+    TORCH_CHECK(kv_len > 0, "bighead_attn: attention over zero keys (empty kv_len)");
+    if (!bsz || !q_len) return;
 
     const uint64_t ws_numel      = WORKSPACE_SIZE / sizeof(float);
     int64_t n_chunks;
@@ -1113,6 +1135,7 @@ size_t bighead_attn_workspace_size
     int dim
 )
 {
+    TORCH_CHECK(kv_chunk_size > 0, "bighead_attn_workspace_size: kv_chunk_size must be positive");
     const int64_t n_chunks = (max_kv_len + kv_chunk_size - 1) / kv_chunk_size;
     return
         (size_t)bsz *

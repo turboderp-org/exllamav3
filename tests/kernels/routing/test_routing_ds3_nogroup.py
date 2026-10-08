@@ -166,3 +166,79 @@ def test_rejections(device):
         ext.routing_sel_norm(hidden, cfg.gate_tensor, torch.empty((2, 64), dtype = torch.half, device = device),
                              torch.zeros((2, 33), dtype = torch.long, device = device),
                              torch.empty((2, 33), dtype = torch.half, device = device), 1.0, None, 0, None, None)
+
+
+# Zero-size inputs of the fused router entry points (routing_ds3_nogroup, routing_sel_norm, and routing_std, which
+# shares the projection paths):
+# - no tokens (bsz = 0): no-op, scores and outputs untouched
+# - no experts (E = 0): top-k over an empty set, raises; K = 0: the weights normalize over an empty selection, raises.
+#   Both are checked before the empty-batch return, so they also fire without tokens
+# - empty hidden dim: every logit is the empty sum (0) on every projection path; any K distinct experts are a valid
+#   selection, all weighted scaling / K
+
+def _fused_route(fn, hidden, gate, scores, idx, w, opt, scaling = 1.5):
+    gate_t, gi8, gsb = opt
+    if fn == "ds3":
+        ext.routing_ds3_nogroup(hidden, gate, scores, None, idx, w, scaling, gate_t, 0, gi8, gsb)
+    elif fn == "sel_norm":
+        ext.routing_sel_norm(hidden, gate, scores, idx, w, scaling, gate_t, 0, gi8, gsb)
+    else:
+        ext.routing_std(hidden, gate, scores, idx, w, None, gate_t, None, gi8, gsb)
+
+
+@pytest.mark.parametrize("fn", ["ds3", "sel_norm", "std"])
+@pytest.mark.parametrize("bsz, E, K, error", [
+    (0, 16, 4, None),
+    (2, 0, 0, "empty expert set"),
+    (0, 0, 0, "empty expert set"),
+    (2, 16, 0, "K = 0"),
+    (0, 16, 0, "K = 0"),
+])
+@pytest.mark.parametrize("path", ["gemv", "det"])
+@torch.inference_mode()
+def test_empty(device, fn, bsz, E, K, error, path):
+    hdim = 64
+    cfg = make_cfg(hdim, E, K, device)
+    gate_t = _gate_t(cfg)
+    opt = (gate_t, cfg.gate_i8, cfg.gate_sb) if path == "det" else (gate_t, None, None)
+    hidden = torch.randn((bsz, hdim), device = device).half()
+    scores = torch.full((bsz, E), 99.0, dtype = torch.half, device = device)
+    idx = torch.zeros((bsz, K), dtype = torch.long, device = device) if fn == "sel_norm" else \
+        torch.full((bsz, K), -7, dtype = torch.long, device = device)
+    w = torch.full((bsz, K), 99.0, dtype = torch.half, device = device)
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            _fused_route(fn, hidden, cfg.gate_tensor, scores, idx, w, opt)
+    else:
+        _fused_route(fn, hidden, cfg.gate_tensor, scores, idx, w, opt)
+    torch.cuda.synchronize(device)
+    assert (scores == 99.0).all() and (w == 99.0).all()
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("fn", ["ds3", "sel_norm", "std"])
+@pytest.mark.parametrize("path", PATHS)
+@torch.inference_mode()
+def test_empty_hidden(device, fn, path):
+    E, K = 16, 4
+    cfg = make_cfg(64, E, K, device)
+    cfg.gate_tensor = torch.empty((0, E), dtype = torch.half, device = device)
+    gate_t = _gate_t(cfg)
+    rows = ROWS[path]
+    opt = {
+        "gemv": (gate_t, None, None),
+        "hgemm1": (None, None, None),
+        "det": (gate_t, cfg.gate_i8, cfg.gate_sb),
+        "hgemm": (gate_t, None, None),
+    }[path]
+    hidden = torch.empty((rows, 0), dtype = torch.half, device = device)
+    scores = torch.full((rows, E), 99.0, dtype = torch.half, device = device)
+    idx = torch.stack([torch.randperm(E)[:K] for _ in range(rows)]).to(device) if fn == "sel_norm" else \
+        torch.full((rows, K), -7, dtype = torch.long, device = device)
+    w = torch.full((rows, K), 99.0, dtype = torch.half, device = device)
+    _fused_route(fn, hidden, cfg.gate_tensor, scores, idx, w, opt)
+    torch.cuda.synchronize(device)
+    assert torch.equal(scores, torch.zeros_like(scores))
+    assert ((idx >= 0) & (idx < E)).all() and (idx.sort(dim = 1).values.diff(dim = 1) != 0).all()
+    expect = torch.full_like(w, (1.0 if fn == "std" else 1.5) / K)
+    assert torch.allclose(w.float(), expect.float(), rtol = 2.0 ** -10, atol = 0)

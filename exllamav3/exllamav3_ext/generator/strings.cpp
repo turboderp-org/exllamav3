@@ -73,6 +73,7 @@ int count_match_tensor
     uint64_t* pb = (uint64_t*) b.data_ptr();
     int max_b = b.size(1);
     if (max_b < max_a) max_a = max_b;
+    if (a.numel() < max_a) max_a = (int) a.numel();
 
     int match = 0;
     while (match < max_a && *pa++ == *pb++)

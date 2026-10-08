@@ -356,3 +356,22 @@ def test_table_prefetch_worker(tmp_path):
     assert emb.table.prefetch_stats == {"hit": len(chunks), "miss": 0, "retired": 0}
     for ids, out in zip(chunks, outs):
         assert torch.equal(out.cpu(), ref[ids])
+
+
+def test_kernel_ngram_dequant_empty():
+    # No rows or zero-width rows: nothing to decode, no launch, out untouched. Rows indexing an empty aux table
+    # (no bias / sign rows) are rejected
+    words = 1 + ROW_DIM * 2 // 16
+    buf = torch.full((64,), 7.0, dtype = torch.half, device = DEV)
+    ext.ngram_dequant(torch.empty((0, words), dtype = torch.int16, device = DEV), 2, None, None,
+                      buf[8:8].view(0, ROW_DIM), False)
+    ext.ngram_dequant(torch.zeros((4, 1), dtype = torch.int16, device = DEV), 2, None, None, buf[8:8].view(4, 0), False)
+    assert (buf == 7.0).all()
+    packed = torch.zeros((4, words), dtype = torch.int16, device = DEV)
+    with pytest.raises(RuntimeError, match = "aux is empty"):
+        ext.ngram_dequant(packed, 2, None, torch.empty((0, ROW_DIM), dtype = torch.half, device = DEV),
+                          torch.empty((4, ROW_DIM), dtype = torch.half, device = DEV), False)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.ngram_dequant(packed[:0].int(), 2, None, None, buf[8:8].view(0, ROW_DIM), False)
+    torch.cuda.synchronize(DEV)
+    assert torch.ones(8, device = DEV).sum().item() == 8

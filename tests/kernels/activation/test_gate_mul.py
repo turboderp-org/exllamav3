@@ -183,3 +183,30 @@ def test_add_sigmoid_gate_rejects(device):
         ext.add_sigmoid_gate(x, y, z.half())
     with pytest.raises(RuntimeError, match = "size"):
         ext.add_sigmoid_gate(x, torch.randn(4, 2, device = device), z)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("op", ["mul_sigmoid_", "mul_sigmoid_broadcast_", "mul_softplus_broadcast_", "add_sigmoid_gate"])
+@pytest.mark.parametrize("axis", [0, -1])
+@torch.inference_mode()
+def test_gate_mul_empty(device, op, axis):
+    # Elementwise gates on an empty input (rows/tokens, or the per-gate feature dim) are no-ops: nothing written
+    if op == "add_sigmoid_gate":
+        shape = (0, 64) if axis == 0 else (4, 0)
+        buf = torch.full((64,), 7.0, device = device)
+        ext.add_sigmoid_gate(torch.empty(shape, device = device), torch.zeros(shape[0], 1, device = device),
+                             buf[8:8].view(shape))
+    else:
+        shape = ((1, 0, 4, 64) if axis == 0 else (1, 3, 4, 0)) if "broadcast" in op else ((0, 64) if axis == 0 else (4, 0))
+        buf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+        y = torch.zeros(shape[:3] if "broadcast" in op else shape, dtype = torch.half, device = device)
+        getattr(ext, op)(buf[8:8].view(shape), y)
+        with pytest.raises(RuntimeError, match = "incorrect datatype"):
+            getattr(ext, op)(buf[8:8].view(shape), y.float())
+    assert (buf == 7.0).all()
+    assert_device_ok(device)

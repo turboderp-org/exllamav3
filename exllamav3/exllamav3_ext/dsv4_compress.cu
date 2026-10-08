@@ -338,11 +338,13 @@ void dsv4_ring_append_gr
         TORCH_CHECK_DTYPE(slot_ids.value(), kInt);
         slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
         batch = (int) slot_ids.value().size(0);
+        if (!batch) return;
         seq /= batch;
         ring_rows = (int) ring.size(1);
         ring_stride = ring_rows * D;
     }
     size_t total = (size_t) seq * D;
+    if (!total) return;
     dsv4_ring_append_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv.data_ptr(), (half*) ring.data_ptr(),
@@ -410,12 +412,16 @@ void dsv4_compress_gr
     int Wa = dest_a.size(-1);
     int hd = Wa + (dest_b ? dest_b.value().size(-1) : 0);
     int rd = inv_freq.size(0) * 2;
+    TORCH_CHECK(hd > 0, "dsv4_compress: RMS norm over an empty head dim");
     bool overlap = W == 2 * hd;
     TORCH_CHECK(overlap || W == hd, "dsv4_compress: W must be hd or 2 * hd");
     TORCH_CHECK(norm_w.size(0) == hd, "dsv4_compress: norm weight size mismatch");
     TORCH_CHECK(rd % 2 == 0 && rd <= hd && hd <= 1024, "dsv4_compress: bad dims");
     TORCH_CHECK(!overlap || ovl, "dsv4_compress: overlapping mode requires snapshot ring");
+    TORCH_CHECK(m > 0, "dsv4_compress: empty compression window (m must be positive)");
+    TORCH_CHECK(buf_rows > 0, "dsv4_compress: empty ring");
     int ovl_depth = ovl ? (int) ovl.value().size(slot_ids ? 1 : 0) : 1;
+    TORCH_CHECK(ovl_depth > 0, "dsv4_compress: empty snapshot ring");
     if (ovl)
     {
         TORCH_CHECK_DTYPE(ovl.value(), kFloat);
@@ -440,11 +446,14 @@ void dsv4_compress_gr
         TORCH_CHECK(pos_ptr, "dsv4_compress: batched mode requires position_tensor");
         slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
         batch = (int) slot_ids.value().size(0);
+        if (!batch) return;
         seq /= batch;                       // kv_new is (B * seq, W)
         ring_stride = buf_rows * W;
+        TORCH_CHECK(!ovl || ovl.value().size(0) > 0, "dsv4_compress: empty snapshot ring");
         ovl_stride = ovl ? (int) (ovl.value().numel() / ovl.value().size(0)) : 0;
         if (!pool_bt)
         {
+            TORCH_CHECK(dest_a.size(0) > 0 && (!dest_b || dest_b.value().size(0) > 0), "dsv4_compress: empty destination");
             da_stride = (int) (dest_a.numel() / dest_a.size(0));
             db_stride = dest_b ? (int) (dest_b.value().numel() / dest_b.value().size(0)) : 0;
         }
@@ -464,6 +473,8 @@ void dsv4_compress_gr
             bt_stride = (int) pool_bt.value().size(1);
         }
     }
+
+    if (!seq) return;
 
     int nw = (position + seq) / m - position / m;
     int grid_w = pos_ptr ? seq / m + 1 : nw;
@@ -497,6 +508,7 @@ void dsv4_compress_gr
 
     int j0 = seq > buf_rows ? seq - buf_rows : 0;
     size_t total = (size_t) (seq - j0) * W;
+    if (!total) return;
     dsv4_compress_store_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv_new.data_ptr(),

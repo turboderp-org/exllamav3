@@ -311,3 +311,43 @@ def test_cuda_recurrent_gated_delta_rule_is_bit_reproducible(device, bsz, seqlen
                                        num_k_heads, num_v_heads, k_head_dim, v_head_dim) for _ in range(4)]
     for out, state in runs[1:]:
         assert torch.equal(out, runs[0][0]) and torch.equal(state, runs[0][1])
+
+
+# Zero-size inputs: an empty batch, sequence or v-head axis (or v_head_dim = 0) takes no step: the state (all
+# slots and history entries) and the empty output are untouched. num_k_heads sets the GQA ratio and must be
+# positive; k_head_dim = 0 would l2-normalize empty q / k vectors and is rejected with the other k_head_dim rules
+
+EMPTY_RULE_CASES = [
+    # bsz, seqlen, nk, nv, dk, dv, history, slots, channelwise, error
+    (0, 1, 2, 4, 32, 32, False, False, False, None),
+    (0, 3, 2, 4, 32, 32, True, True, False, None),
+    (2, 0, 2, 4, 32, 32, False, False, False, None),
+    (2, 0, 2, 4, 32, 32, True, True, False, None),
+    (1, 0, 2, 4, 128, 128, False, True, False, None),          # the 128x128 kernel (v_split 4 at bsz 1)
+    (1, 0, 1, 2, 128, 128, True, True, True, None),            # channelwise (KDA) decay
+    (2, 1, 2, 0, 32, 32, False, False, False, None),
+    (2, 1, 2, 4, 32, 0, False, False, False, None),
+    (2, 1, 0, 0, 32, 32, False, False, False, "num_k_heads must be positive"),
+    (2, 1, 2, 4, 0, 32, False, False, False, "k_head_dim must be a positive multiple of 32"),
+]
+
+
+@pytest.mark.parametrize("bsz, seqlen, nk, nv, dk, dv, history, use_slots, channelwise, error", EMPTY_RULE_CASES)
+@torch.inference_mode()
+def test_empty(device, bsz, seqlen, nk, nv, dk, dv, history, use_slots, channelwise, error):
+    mixed_qkv = torch.randn(bsz, seqlen, 2 * nk * dk + nv * dv, device = device).bfloat16()
+    g = -torch.rand((bsz, seqlen, nv, dk) if channelwise else (bsz, seqlen, nv), device = device)
+    beta = torch.rand(bsz, seqlen, nv, device = device).bfloat16()
+    state = torch.randn(3, max(seqlen, 1) + 1, nv, dk, dv, device = device)
+    state0 = state.clone()
+    out = torch.full((bsz, seqlen, nv, dv), 777.0, dtype = torch.bfloat16, device = device)
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) if use_slots else None
+    call = lambda: ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, state, out, nk, nv, dk, dv, slots, history)
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            call()
+    else:
+        call()
+    torch.cuda.synchronize(device)
+    assert torch.equal(state, state0), "state modified"
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

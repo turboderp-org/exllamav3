@@ -178,3 +178,32 @@ def _max_k_worker():
 @pytest.mark.parametrize("env, expected", [("3", 3), ("7", 7), ("12", 8)])
 def test_int8_max_k_env_override(device, env, expected):
     assert run_isolated(_max_k_worker, env = {"EXL3_INT8_GEMV_MAX_K": env}) == expected
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("m, k, n", [(0, 256, 256), (4, 256, 0), (4, 0, 256), (0, 0, 0)])
+@torch.inference_mode()
+def test_empty_gemv(device, fp32, m, k, n):
+    """No rows or no output columns: a no-op. An empty reduction (k = 0): the product is zero. suh / svh / A_had
+    are still required (an empty tensor counts as given)"""
+    K = 3
+    tr = torch.zeros((k // 16, n // 16, 16 * K), dtype = torch.int16, device = device)
+    A = torch.randn((m, k), device = device).half()
+    C = torch.full((m, n), 5.0, dtype = torch.float if fp32 else torch.half, device = device)
+    suh = torch.ones(k, dtype = torch.half, device = device)
+    svh = torch.ones(n, dtype = torch.half, device = device)
+    ext.exl3_gemv(A, tr, C, suh, torch.empty_like(A), svh, False, True)
+    torch.cuda.synchronize(device)
+    assert (C == (0.0 if k == 0 and m and n else 5.0)).all()
+    with pytest.raises(RuntimeError, match = "requires suh, A_had and svh"):
+        ext.exl3_gemv(A, tr, C, None, torch.empty_like(A), svh, False, True)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.exl3_gemv(A, tr, C.bfloat16(), suh, torch.empty_like(A), svh, False, True)
+    _device_still_works(device)

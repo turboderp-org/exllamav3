@@ -149,7 +149,7 @@ def ref_forward_streams(t, eps, gate_scale, dilation):
     from torch's own fp16 matmul (the op the binding calls for them, not code under test), so the reference
     starts from the same fp16 key/value rows instead of ones that differ by an fp16 ulp at rounding boundaries"""
     d = {k: (v.double().cpu() if v is not None else None) for k, v in t.items()}
-    emb2 = t["emb"].view(-1, t["emb"].shape[-1])
+    emb2 = t["emb"].flatten(0, -2)
     key16 = (emb2 @ t["key_w"]).double().cpu()
     value16 = (emb2 @ t["value_w"]).double().cpu()
     bsz, seq, H, D = d["streams"].shape
@@ -302,3 +302,62 @@ def test_ple_forward_streams_rejects_noncontiguous(device, which):
         conv_stream = torch.empty(bsz, H * D, 2 * (state_len + seq), dtype = torch.half, device = device)[..., ::2]
     with pytest.raises(RuntimeError):
         run_forward_streams(t, 1e-6, 0.1, dilation, conv_stream = conv_stream, delta = delta)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("shape", [(0, 3, 4, 64), (2, 0, 4, 64), (2, 3, 0, 64), (2, 3, 4, 0)])
+@torch.inference_mode()
+def test_ple_gate_empty(device, shape):
+    # Elementwise gate: an empty output is a no-op (nothing written); dtype validation still applies
+    B, S, H, D = shape
+    buf = torch.full((64,), 7.0, device = device)
+    gate = torch.zeros(B, S, H, device = device)
+    value = torch.zeros(B, S, D, dtype = torch.half, device = device)
+    ext.ple_gate(gate, value, buf[8:8].view(shape), 1.0)
+    assert (buf == 7.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.ple_gate(gate.half(), value, buf[8:8].view(shape), 1.0)
+    assert_device_ok(device)
+
+
+@pytest.mark.parametrize("bsz, seq, H", [(1, 0, 4), (2, 0, 4), (0, 3, 4), (2, 3, 0)])
+@pytest.mark.parametrize("with_state", [False, True], ids = ["nostate", "state"])
+@torch.inference_mode()
+def test_ple_forward_streams_empty(device, bsz, seq, H, with_state):
+    # No tokens (or no streams): delta is empty and untouched, and the conv stream is just the carried state (the
+    # caller keeps its trailing columns as the next state)
+    D, ple_dim, ksize, dilation = 64, 32, 4, 2
+    state_len = (ksize - 1) * dilation
+    t = make_ple_inputs(device, bsz, seq, H, D, ple_dim, ksize, dilation, with_state, torch.half)
+    dbuf = torch.full((64,), 7.0, device = device)
+    delta = dbuf[8:8].view(bsz, seq, H, D)
+    conv_stream = torch.full((bsz, H * D, state_len + seq), 7.0, dtype = torch.half, device = device)
+    run_forward_streams(t, 1e-6, 0.125, dilation, conv_stream = conv_stream, delta = delta)
+    assert (dbuf == 7.0).all()
+    if with_state:
+        assert torch.equal(conv_stream[..., :state_len], t["conv_state"])
+    else:
+        assert (conv_stream[..., :state_len] == 0).all()
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_ple_forward_streams_empty_dims(device):
+    # D == 0: the per-stream RMS norms are over an empty vector, undefined -> raises
+    t = make_ple_inputs(device, 1, 3, 4, 1, 32, 4, 2, True, torch.half)
+    t = {k: (v[..., :0] if k in ("streams", "value_w") else v.view(-1)[:0] if k.startswith("norm") else v)
+         for k, v in t.items()}
+    t["key_w"], t["conv_w"], t["conv_state"] = t["key_w"][:, :0], t["conv_w"][:0], t["conv_state"][:, :0]
+    with pytest.raises(RuntimeError, match = "ple_forward_streams: norm over an empty stream dimension"):
+        run_forward_streams(t, 1e-6, 0.125, 2)
+    # ple_dim == 0: key and value are K = 0 products, i.e. zeros, and the rest follows the formulas
+    t = make_ple_inputs(device, 2, 3, 4, 64, 1, 4, 2, True, torch.half)
+    t["emb"], t["key_w"], t["value_w"] = t["emb"][..., :0], t["key_w"][:0], t["value_w"][:0]
+    delta, conv_stream = run_forward_streams(t, 1e-6, 0.125, 2)
+    check_forward_streams(t, delta, conv_stream, ref_forward_streams(t, 1e-6, 0.125, 2))
+    assert_device_ok(device)

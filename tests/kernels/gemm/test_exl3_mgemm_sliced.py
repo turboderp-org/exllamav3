@@ -139,3 +139,64 @@ def test_uniform_bundle_unchanged(device, bits, m):
     )
     for o, r in zip(out, ref):
         _close(o, r)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["no_rows", "no_cols", "no_mats", "no_mats_weighted", "no_indices",
+                                  "no_indices_weighted"])
+@torch.inference_mode()
+def test_empty_mgemm(device, case):
+    """No rows, output columns or matrices (an expert batch without tokens): a no-op. An empty index selection (or
+    one that can only skip, with no matrices) with weights reduces to zero rows (the weighted sum of nothing)"""
+    torch.manual_seed(0)
+    k, n, bits, E = 256, 256, 4, 3
+    m = 0 if case == "no_rows" else 2
+    n_ = 0 if case == "no_cols" else n
+    mats = [_weights(k, n_, bits, device) for _ in range(E)]
+    if case.startswith("no_mats"):
+        mats = []
+    x = (torch.randn(1, m, k, device = device) * 0.5).half()
+    c = torch.full((max(len(mats), 1) if case != "no_mats" else 0, m, n_), 5.0, dtype = torch.half, device = device)
+    a_had = torch.empty((E, m, k), dtype = torch.half, device = device)
+    indices = weights = None
+    if case.startswith("no_indices") or case == "no_mats_weighted":
+        c = torch.full((E, m, n_), 5.0, dtype = torch.half, device = device)
+        sel = 0 if case.startswith("no_indices") else 2
+        indices = torch.full((1, sel), -1, dtype = torch.long, device = device)
+        if case.endswith("weighted"):
+            weights = torch.ones((1, sel), dtype = torch.half, device = device)
+    ptr = lambda i: _ptrs([t[i] for t in mats], device) if mats else torch.empty(0, dtype = torch.long, device = device)
+    ext.exl3_mgemm(x, ptr(0), c, ptr(1), a_had, ptr(2), indices, weights, bits, -1, False, True, -1, -1, 0)
+    torch.cuda.synchronize(device)
+    if case.endswith("weighted"):
+        assert (c[0] == 0).all() and (c[1:] == 5.0).all()
+    else:
+        assert (c == 5.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.exl3_mgemm(x.float(), ptr(0), c, ptr(1), a_had, ptr(2), indices, weights, bits, -1, False, True, -1, -1, 0)
+    _device_still_works(device)
+
+
+@torch.inference_mode()
+def test_empty_mgemm_rejections(device):
+    """An empty reduction (k = 0) is rejected: which outputs the kernel would write (indices, weights, output
+    pointer tables) is only known on the device. num_tokens must be positive"""
+    k, n, bits = 256, 256, 4
+    B, suh, svh = _weights(0, n, bits, device)
+    x = torch.empty((1, 2, 0), dtype = torch.half, device = device)
+    c = torch.full((1, 2, n), 5.0, dtype = torch.half, device = device)
+    t = lambda v: _ptrs([v], device)
+    with pytest.raises(RuntimeError, match = r"exl3_mgemm: empty reduction dimension \(k = 0\)"):
+        ext.exl3_mgemm(x, t(B), c, t(suh), x, t(svh), None, None, bits, -1, False, True, -1, -1, 0)
+    B, suh, svh = _weights(k, n, bits, device)
+    x = torch.randn((1, 2, k), device = device).half()
+    with pytest.raises(RuntimeError, match = "num_tokens must be at least 1"):
+        ext.exl3_mgemm(x, t(B), c, t(suh), torch.empty_like(x), t(svh), None, None, bits, -1, False, True, -1, -1, 0, 0)
+    assert (c == 5.0).all()
+    _device_still_works(device)

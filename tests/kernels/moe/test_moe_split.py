@@ -234,3 +234,46 @@ def _inactive_null_worker():
 def test_moe_split_collect_inactive_reads_nothing(device):
     """An empty job never touches the slot: a null output pointer is fine"""
     assert torch.equal(run_isolated(_inactive_null_worker), torch.ones((3, 64)))
+
+
+# Zero-size inputs: moe_split_map with no picks is a no-op (hist and sel_cpu untouched). moe_split_issue with no
+# picks still runs: it must record the slot as empty (dev_count[slot] = 0) so the collect skips the slot's stale
+# contents, and stages nothing. moe_split_collect_add with no rows or no columns is a no-op (the slot is not read,
+# so a null pointer is fine)
+
+@torch.inference_mode()
+def test_moe_split_map_empty(device):
+    pmap = torch.arange(16, device = device)
+    hist = torch.zeros(16, device = device)
+    sel_cpu = torch.full((4,), -9, dtype = torch.long, device = device)
+    ext.moe_split_map(torch.empty(0, dtype = torch.long, device = device), pmap, hist, sel_cpu, 8)
+    torch.cuda.synchronize(device)
+    assert not hist.any() and (sel_cpu == -9).all()
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("use_map", [False, True])
+@torch.inference_mode()
+def test_moe_split_issue_empty(device, use_map):
+    slot = _Slot(1, 4, 64, 64, False, device)
+    sel_h, x_h, w_h = slot.sel.clone(), slot.x.clone(), slot.w.clone()
+    pmap = torch.arange(16, device = device) if use_map else None
+    hist = torch.zeros(16, device = device) if use_map else None
+    dev_count = torch.ones(3, dtype = torch.int32, device = device)
+    ext.moe_split_issue(torch.empty(0, dtype = torch.long, device = device), pmap, hist,
+                        torch.empty((0, 64), dtype = torch.half, device = device),
+                        torch.empty(0, dtype = torch.half, device = device),
+                        slot.ptr(slot.sel), slot.ptr(slot.x), slot.ptr(slot.w), dev_count, 1, 64, 8)
+    torch.cuda.synchronize(device)
+    assert dev_count.tolist() == [1, 0, 1]
+    assert torch.equal(slot.sel, sel_h) and torch.equal(slot.x, x_h) and torch.equal(slot.w, w_h)
+    assert hist is None or not hist.any()
+
+
+@pytest.mark.parametrize("rows, h_", [(0, 64), (3, 0)])
+@torch.inference_mode()
+def test_moe_split_collect_add_empty(device, rows, h_):
+    final = torch.empty((rows, h_), device = device)
+    ext.moe_split_collect_add(final, 0, torch.ones(1, dtype = torch.int32, device = device), 0, 64)
+    torch.cuda.synchronize(device)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

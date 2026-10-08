@@ -173,6 +173,7 @@ int exl3_gemm_gr
     const bool half_k = (tile_u16 % 16) != 0;
     int K = tile_u16 / 16;
     TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemm: half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK(K >= 1 && K <= 8, "exl3_gemm: trellis tile width must encode 1..8 bits per weight");
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
@@ -188,6 +189,14 @@ int exl3_gemm_gr
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+
+    // No rows or no output columns: nothing to compute. Empty reduction (k = 0): the product is zero
+    if (!size_m || !size_n) return 0;
+    if (!size_k)
+    {
+        cuda_check(cudaMemsetAsync(C_ptr, 0, (size_t) size_m * size_n * C.element_size(), stream));
+        return 0;
+    }
 
 #if defined(USE_ROCM)
     // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
@@ -606,6 +615,25 @@ int exl3_mgemm_gr
     const int K = bk.bits;
     const bool half_k = bk.half;
     TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK(num_tokens >= 1, "exl3_mgemm: num_tokens must be at least 1");
+    // The outputs of an empty reduction would be zero, but with indices, weights and output pointer
+    // tables the set of outputs the kernel writes is only known on the device
+    TORCH_CHECK(size_k > 0, "exl3_mgemm: empty reduction dimension (k = 0) is not supported");
+
+    // No slots, rows or output columns: nothing to compute
+    if (!bszm || !size_m || !size_n) return 0;
+
+    // Empty selection or no matrices (which only negative, skipped indices could address): no products. The
+    // weighted sums, one output row per token, are then zero; unweighted outputs are left alone
+    if (!MAX(bszm_in, bszm_out) || !B.size(0))
+    {
+        if (weights)
+        {
+            TORCH_CHECK(C.size(0) >= num_tokens, "exl3_mgemm: C must hold one reduced row per token");
+            cuda_check(cudaMemsetAsync(C_ptr, 0, (size_t) num_tokens * size_m * size_n * C.element_size(), stream));
+        }
+        return 0;
+    }
 
 #if defined(USE_ROCM)
     // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)

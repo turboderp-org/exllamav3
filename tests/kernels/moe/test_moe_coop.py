@@ -197,3 +197,65 @@ def test_odd_shapes(device):
     # k-slices not divisible by the 16-warp split, several column groups
     run_case(device, 16, 4, 4, 4, 1, H = 640, Hi = 640, I = 896, Ho = 640, H_out = 640)
     run_case(device, 17, 6, 6, 6, 2, H = 384, Hi = 384, I = 1152, Ho = 384, H_out = 384)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+def _empty_case(device, bsz, topk, shared = None, Hi = 256, H = 256):
+    gen = torch.Generator().manual_seed(bsz * 10 + topk)
+    E, I, Ho, K, cb = 2, 256, 256, 4, 2
+    Hp = max(Hi, 128)
+    gate, up, down = (Proj(k, n, K, cb, False, gen, E, device) for k, n in ((Hp, I), (Hp, I), (I, Ho)))
+    x = (torch.randn((bsz, H), generator = gen) * 0.05).half().to(device)
+    sel = torch.zeros((bsz, topk), dtype = torch.long, device = device)
+    rw = torch.ones((bsz, topk), dtype = torch.half, device = device)
+    smax = 4
+    gu_g, gu_u, act_out = (torch.empty((smax, 1, I), dtype = torch.half, device = device) for _ in range(3))
+    d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = device)
+    had_g, had_u = (torch.empty((smax, max(Hi, 1)), dtype = torch.half, device = device) for _ in range(2))
+    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = device)
+    out = torch.full((8, Ho), float("nan"), dtype = torch.float, device = device)
+    sh_out = sh_w = None
+    ref = torch.zeros((bsz, Ho), dtype = torch.float, device = device)
+    if shared is not None:
+        sh_out = torch.randn((bsz, H), generator = gen).float().to(device)
+        if shared == "gated":
+            sh_w = (torch.randn((H,), generator = gen) * 0.05).half().to(device)
+            ref += torch.sigmoid((x.float() * sh_w.float()).sum(1, keepdim = True)) * sh_out
+        else:
+            ref += sh_out
+    ext.exl3_moe_coop(
+        x, sel, rw, -1, -1, Hi, *gate.tabs, *up.tabs, *down.tabs, None, None, None, K, K, K, False, True,
+        0, 0.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out[:bsz], sh_out, sh_w,
+    )
+    torch.cuda.synchronize()
+    return out, ref
+
+
+@pytest.mark.parametrize("bsz, topk, shared", [(0, 3, None), (0, 0, None), (3, 0, None), (3, 0, "plain"),
+                                               (3, 0, "gated")])
+def test_empty(device, bsz, topk, shared):
+    """No tokens: a no-op. No routed slots (top-k 0): each row is the empty sum, zero, plus the shared expert term
+    when there is one. Rows past the batch are never written"""
+    out, ref = _empty_case(device, bsz, topk, shared)
+    assert torch.allclose(out[:bsz], ref, rtol = 1e-3, atol = 1e-5)
+    assert out[bsz:].isnan().all()
+    _device_still_works(device)
+
+
+def test_empty_rejections(device):
+    """An expert with an empty input dimension (Hi = 0) is rejected (it would divide the scratch capacity by zero)"""
+    with pytest.raises(RuntimeError, match = "exl3_moe_coop: empty Hi/I/Ho dimension"):
+        _empty_case(device, 2, 1, Hi = 0, H = 0)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_empty_input_width(device, bias):
+    """x of width 0 (H = 0 < Hi): the zero-padded input makes gate/up empty sums, so only the biases remain"""
+    run_case(device, 31, 4, 4, 4, 2, H = 0, bias = bias)

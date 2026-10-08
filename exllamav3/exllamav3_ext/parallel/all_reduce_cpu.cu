@@ -560,6 +560,12 @@ void pg_all_reduce_cpu
     size_t device_data_size = tensor.numel() * tensor.element_size();
 
     TORCH_CHECK(cpu_data_size % 16 == 0, "data_size must be multiple of 16");
+    TORCH_CHECK(tensor.dtype() == at::kFloat || tensor.dtype() == at::kHalf || tensor.dtype() == at::kBFloat16,
+                "pg_all_reduce_cpu: Unknown dtype");
+
+    // Every rank reduces a tensor of the same shape, so an empty reduce is a no-op on all of them.
+    // It must not reach the job queue either: a zero-size job is the CPU helper's end-of-round marker
+    if (!tensor.numel()) return;
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
 

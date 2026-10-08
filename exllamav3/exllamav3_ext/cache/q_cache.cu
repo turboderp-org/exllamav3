@@ -34,11 +34,17 @@ void quant_cache_cont
     int head_dim = in.size(-1);
     int head_blocks = head_dim / 32;
     TORCH_CHECK(head_dim == 32 * head_blocks, "head_dim must be a multiple of 32");
+    if (!head_blocks)
+    {
+        TORCH_CHECK(out.numel() == 0 && out_scales.numel() == 0, "out is wrong size");
+        return;
+    }
     int bits = out.size(-1) / head_blocks;
     TORCH_CHECK(out.numel() == bsz * bits, "out is wrong size");
     TORCH_CHECK(out_scales.numel() == bsz, "out_scales is wrong size");
 
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+    if (!bsz) return;
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
     auto quant_cache_cont_fn = quant_cache_cont_kernel_instances[bits - 2];
@@ -115,11 +121,17 @@ void dequant_cache_cont
     int head_dim = out.size(-1);
     int head_blocks = head_dim / 32;
     TORCH_CHECK(head_dim == 32 * head_blocks, "head_dim must be a multiple of 32");
+    if (!head_blocks)
+    {
+        TORCH_CHECK(in.numel() == 0 && in_scales.numel() == 0, "in is wrong size");
+        return;
+    }
     int bits = in.size(-1) / head_blocks;
     TORCH_CHECK(in.numel() == bsz * bits, "in is wrong size");
     TORCH_CHECK(in_scales.numel() == bsz, "in_scales is wrong size");
 
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+    if (!bsz) return;
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
     auto dequant_cache_cont_fn = dequant_cache_cont_kernel_instances[bits - 2];
@@ -186,11 +198,18 @@ void quant_cache_paged_gr
 
     int groups_per_token = dim / 32;
     TORCH_CHECK(dim == 32 * groups_per_token, "dim must be a multiple of 32");
+    TORCH_CHECK(seq_len >= 0, "quant_cache_paged: negative seq_len");
+
+    TORCH_CHECK(k_out.dim() == 3 && v_out.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
+    if (!groups_per_token)
+    {
+        TORCH_CHECK(k_out.size(2) == 0 && v_out.size(2) == 0, "quant_cache_paged: q.cache width mismatch");
+        return;
+    }
     int chunks_per_token = CEIL_DIVIDE(groups_per_token, 4);     // 4-group warp chunks per token
     int tb_per_token = CEIL_DIVIDE(chunks_per_token, MAX_WARPS); // Threadblocks per token position
     int tb_usage = CEIL_DIVIDE(chunks_per_token, tb_per_token);  // Number of warps to use per threadblock
 
-    TORCH_CHECK(k_out.dim() == 3 && v_out.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
     int k_bits = k_out.size(2) / groups_per_token;
     int v_bits = v_out.size(2) / groups_per_token;
 
@@ -201,6 +220,8 @@ void quant_cache_paged_gr
     dim3 threads(32 * tb_usage);
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+    if (!seq_len || !bsz) return;
+    TORCH_CHECK(blocks_per_seq > 0, "quant_cache_paged: tokens to write but no pages in block table");
 
     void* kernel_ptr = (void*) quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
     const half* k_in_ptr = (const half*) k_in.data_ptr();
@@ -309,6 +330,12 @@ void dequant_cache_paged
 
     int groups_per_token = dim / 32;
     TORCH_CHECK(dim == 32 * groups_per_token, "dim must be a multiple of 32");
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
+    if (!groups_per_token)
+    {
+        TORCH_CHECK(k_in.size(2) == 0 && v_in.size(2) == 0, "dequant_cache_paged: q.cache width mismatch");
+        return;
+    }
     int chunks_per_token = CEIL_DIVIDE(groups_per_token, 4);
 
     int bsz = block_table.size(0);
@@ -322,11 +349,11 @@ void dequant_cache_paged
     dim3 blocks(num_tb, bsz);
     dim3 threads(num_threads);
 
-    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
     int k_bits = k_in.size(2) / groups_per_token;
     int v_bits = v_in.size(2) / groups_per_token;
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+    if (!bsz || !pages_per_seq) return;
 
     auto dequant_cache_paged_fn = dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
     dequant_cache_paged_fn<<<blocks, threads, 0, stream>>>
@@ -397,6 +424,12 @@ void dequant_cache_paged_window
 
     int groups_per_token = dim / 32;
     TORCH_CHECK(dim == 32 * groups_per_token, "dim must be a multiple of 32");
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
+    if (!groups_per_token)
+    {
+        TORCH_CHECK(k_in.size(2) == 0 && v_in.size(2) == 0, "dequant_cache_paged: q.cache width mismatch");
+        return;
+    }
     int chunks_per_token = CEIL_DIVIDE(groups_per_token, 4);
 
     int bsz = block_table.size(0);
@@ -411,11 +444,11 @@ void dequant_cache_paged_window
     dim3 blocks(num_tb, bsz);
     dim3 threads(num_threads);
 
-    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
     int k_bits = k_in.size(2) / groups_per_token;
     int v_bits = v_in.size(2) / groups_per_token;
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+    if (!bsz || !pages_per_seq) return;
 
     auto dequant_cache_paged_fn = dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
     dequant_cache_paged_fn<<<blocks, threads, 0, stream>>>

@@ -165,13 +165,13 @@ void reconstruct_slice
     int rows = packed.size(0);
     int packed_cols = packed.size(1);
 
-    if (unpacked.numel() == 0)
-        return;
-
     TORCH_CHECK(unpacked.size(1) % 128 == 0, "unpacked N dimension must be divisible by 128");
     TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
     TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");
     TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
+
+    if (unpacked.numel() == 0)
+        return;
 
     int cols = unpacked.size(1) / 16;
     int packed_n_offset = n_offset / 16;
@@ -457,9 +457,6 @@ void reconstruct_had_slice
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
 
-    if (unpacked.numel() == 0)
-        return;
-
     TORCH_CHECK(unpacked.size(0) % 128 == 0, "reconstruct_had: K dimension must be divisible by 128");
     TORCH_CHECK(unpacked.size(1) % 128 == 0, "reconstruct_had: N dimension must be divisible by 128");
     TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
@@ -467,6 +464,9 @@ void reconstruct_had_slice
     TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
     TORCH_CHECK(suh.numel() >= unpacked.size(0), "reconstruct_had: suh size");
     TORCH_CHECK(svh.numel() >= unpacked.size(1), "reconstruct_had: svh size");
+
+    if (unpacked.numel() == 0)
+        return;
 
     dim3 blockDim(256);
     dim3 gridDim(unpacked.size(1) / 128, unpacked.size(0) / 128);
@@ -543,10 +543,10 @@ void reconstruct_had_batch
     int n = unpacked.size(2);
     TORCH_CHECK(packed_ptrs.numel() >= batch && suh_ptrs.numel() >= batch && svh_ptrs.numel() >= batch,
                 "reconstruct_had_batch: pointer table too short");
-    if (!batch || !unpacked.numel())
-        return;
     TORCH_CHECK(k % 128 == 0, "reconstruct_had_batch: K dimension must be divisible by 128");
     TORCH_CHECK(n % 128 == 0, "reconstruct_had_batch: N dimension must be divisible by 128");
+    if (!batch || !unpacked.numel())
+        return;
 
     dim3 blockDim(RH_THREADS);
     dim3 gridDim(n / 128, k / 128, batch);
@@ -603,10 +603,10 @@ void reconstruct_batch
     int k = unpacked.size(1);
     int n = unpacked.size(2);
     TORCH_CHECK(packed_ptrs.numel() >= batch, "reconstruct_batch: pointer table too short");
-    if (!batch || !unpacked.numel())
-        return;
     TORCH_CHECK(k % 16 == 0, "reconstruct_batch: K dimension must be divisible by 16");
     TORCH_CHECK(n % 128 == 0, "reconstruct_batch: N dimension must be divisible by 128");
+    if (!batch || !unpacked.numel())
+        return;
 
     dim3 blockDim(256);
     dim3 gridDim(n / 128, k / 16, batch);

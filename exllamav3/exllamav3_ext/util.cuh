@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include <c10/util/Exception.h>
 
 typedef struct __align__(8) half4
 {
@@ -89,14 +90,17 @@ union half_uint16
     __device__ half_uint16() : as_uint16(0) {}
 };
 
+// Raise (with a Python stack trace) rather than exit: every entry point is a Python binding. A
+// non-sticky error is consumed first, so a caller that catches the exception doesn't see the same
+// error again from the next unrelated CUDA call
 #define cuda_check(ans) { gpu_assert((ans), __FILE__, __LINE__); }
-inline void gpu_assert(cudaError_t code, const char *file, int line, bool abort=true)
+inline void gpu_assert(cudaError_t code, const char *file, int line)
 {
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"GPU assert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
+    if (code != cudaSuccess)
+    {
+        cudaGetLastError();
+        TORCH_CHECK(false, "CUDA error: ", cudaGetErrorString(code), " (", file, ":", line, ")");
+    }
 }
 
 inline const char* cublasGetErrorString(cublasStatus_t status) {
@@ -119,14 +123,9 @@ inline const char* cublasGetErrorString(cublasStatus_t status) {
 }
 
 #define cublas_check(ans) { cublas_assert((ans), __FILE__, __LINE__); }
-inline void cublas_assert(cublasStatus_t code, const char *file, int line, bool abort=true)
+inline void cublas_assert(cublasStatus_t code, const char *file, int line)
 {
-    if (code != CUBLAS_STATUS_SUCCESS)
-    {
-        fprintf(stderr, "cuBLAS assert: %s %s %d\n",
-                cublasGetErrorString(code), file, line);
-        if (abort) exit(static_cast<int>(code));
-    }
+    TORCH_CHECK(code == CUBLAS_STATUS_SUCCESS, "cuBLAS error: ", cublasGetErrorString(code), " (", file, ":", line, ")");
 }
 
 __device__ inline float fxor(float v, uint32_t mask)

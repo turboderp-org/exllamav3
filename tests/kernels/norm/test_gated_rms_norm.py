@@ -198,3 +198,38 @@ def test_gated_rms_norm_rows_times_dim_beyond_int32(device):
     torch.testing.assert_close(y[tail].double(), reference(x[tail], w, g[tail], 1e-6, 0.0, 1, False, 0), **TOL[torch.half])
     del x, g, y
     torch.cuda.empty_cache()
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["rows", "rows_small", "rows_groups", "dim", "w_groups"])
+@torch.inference_mode()
+def test_gated_rms_norm_empty(device, case):
+    # No rows: nothing to do, y untouched (dtype validation still applies). Empty dim: the RMS of an empty vector is
+    # undefined, so it raises
+    bf = torch.bfloat16
+    if case.startswith("rows"):
+        dim = 128 if case == "rows_small" else 1024
+        w_groups = 2 if case == "rows_groups" else 1
+        ybuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+        x = torch.empty(0, dim, dtype = bf, device = device)
+        w = torch.ones(w_groups * dim, device = device)
+        ext.gated_rms_norm(x, w, ybuf[8:8].view(0, dim), x.clone(), 1e-6, 0.0, w_groups, False, 0)
+        assert (ybuf == 7.0).all()
+        with pytest.raises(RuntimeError, match = "Invalid datatypes"):
+            ext.gated_rms_norm(x, w.half(), ybuf[8:8].view(0, dim), x.clone(), 1e-6, 0.0, w_groups, False, 0)
+    elif case == "dim":
+        x = torch.empty(4, 0, dtype = bf, device = device)
+        with pytest.raises(RuntimeError, match = "gated_rms_norm: norm over an empty dimension"):
+            ext.gated_rms_norm(x, torch.empty(0, device = device), torch.empty(4, 0, dtype = torch.half, device = device),
+                               x.clone(), 1e-6, 0.0, 1, False, 0)
+    else:
+        x = torch.randn(4, 128, device = device).to(bf)
+        with pytest.raises(RuntimeError, match = "w_groups must be positive"):
+            ext.gated_rms_norm(x, torch.empty(0, device = device), torch.empty(4, 128, dtype = torch.half, device = device),
+                               x.clone(), 1e-6, 0.0, 0, False, 0)
+    assert_device_ok(device)

@@ -325,6 +325,15 @@ void pg_gather_small_kernel
 }
 
 
+// Rows of a gather operand: the product of its leading dimensions (not numel / size(-1), which is
+// undefined when the last dimension is empty)
+static int gather_batch(const at::Tensor& t)
+{
+    int64_t b = 1;
+    for (int i = 0; i < t.dim() - 1; ++i) b *= t.size(i);
+    return (int) b;
+}
+
 void pg_gather_small
 (
     uintptr_t ctx,
@@ -351,17 +360,17 @@ void pg_gather_small
     size_t esize = tensor.element_size();
     size_t send_size = tensor.numel() * esize;
     TORCH_CHECK(devices.size() == ldims.size(), "Must have one ldim per active device");
-    int batch = out_data_ptr ? out_tensor.value().numel() / out_tensor.value().size(-1)
-                             : (tensor.size(-1) ? tensor.numel() / tensor.size(-1) : 0);
+    int batch = gather_batch(out_tensor.has_value() ? out_tensor.value() : tensor);
 
     Offsets all_offsets = {};
     for (int i = 0; i < MAX_DEVICES + 1; ++i) all_offsets[i] = 0;
     for (int i = 0; i < devices.size(); ++i) all_offsets[devices[i]] = ldims[i] * esize;
     int p = 0;
     for (int i = 0; i < MAX_DEVICES + 1; ++i) { int q = p; p += all_offsets[i]; all_offsets[i] = q; }
-    if (out_data_ptr)
+    if (out_tensor.has_value())
         TORCH_CHECK(p == out_tensor.value().size(-1) * esize, "Gather small: Output tensor last dimension mismatch");
     TORCH_CHECK((size_t) p * (size_t) batch <= shbuf_size, "Gather small: Shared buffer too small");
+    if (!batch || !p) return;
 
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);
@@ -426,16 +435,18 @@ void pg_gather
     size_t send_ldim = tensor.size(-1) * esize;
     TORCH_CHECK(send_ldim % 128 == 0, "send_ldim must be multiple of 128");
     TORCH_CHECK(devices.size() == ldims.size(), "Must have one ldim per active device");
-    int batch = out_data_ptr ? out_tensor.value().numel() / out_tensor.value().size(-1)
-                             : tensor.numel() / tensor.size(-1);
+    int batch = gather_batch(out_tensor.has_value() ? out_tensor.value() : tensor);
 
     Offsets all_offsets = {};
     for (int i = 0; i < MAX_DEVICES + 1; ++i) all_offsets[i] = 0;
     for (int i = 0; i < devices.size(); ++i) all_offsets[devices[i]] = ldims[i] * esize;
     int p = 0;
     for (int i = 0; i < MAX_DEVICES + 1; ++i) { int q = p; p += all_offsets[i]; all_offsets[i] = q; }
-    if (out_data_ptr)
+    if (out_tensor.has_value())
         TORCH_CHECK(p == out_tensor.value().size(-1) * esize, "Gather: Output tensor last dimension mismatch");
+
+    // Every rank sees the same batch and ldims, so an empty gather is a no-op on all of them
+    if (!batch || !p) return;
 
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);

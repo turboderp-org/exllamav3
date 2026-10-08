@@ -189,7 +189,7 @@ void gated_delta_net_fused_op
     const auto Hv = v_head_dim;
     const auto Nv = num_v_heads;
 
-    TORCH_CHECK(Nk > 0 && Nv > 0 && Hk > 0 && Hv > 0, "invalid sizes");
+    TORCH_CHECK(Nk > 0 && Nv > 0 && Hk > 0 && Hv > 0, "gated_delta_net_fused_op: head counts and head dims must be positive");
     TORCH_CHECK(Nv % Nk == 0, "num_v_heads must be divisible by num_k_heads");
     const size_t Ng = Nv / Nk;
 
@@ -207,6 +207,9 @@ void gated_delta_net_fused_op
     TORCH_CHECK_DTYPE(z, kBFloat16);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
+
+    // Empty batch or sequence: nothing to split
+    if (B * S == 0) return;
 
     const int blocks = B * S * Nk;
     const int threads = MAX(Hk, Hv);
@@ -308,6 +311,7 @@ void gated_delta_net_fused_op_2
     size_t H = b.size(2);
 
     TORCH_CHECK(H <= FUSED_OP_2_THREADS, "gated_delta_net_fused_op_2: too many heads");
+    if (b.numel() == 0) return;     // empty batch, sequence or heads: elementwise no-op
     int rows_per_block = FUSED_OP_2_THREADS / H;
     int threads = rows_per_block * H;
     int blocks = CEIL_DIVIDE(B * S, rows_per_block);
@@ -396,6 +400,7 @@ void mamba2_dt_op
     size_t S = dt_raw.size(1);
     size_t H = dt_raw.size(2);
     TORCH_CHECK(H <= FUSED_OP_2_THREADS, "mamba2_dt_op: too many heads");
+    if (dt_raw.numel() == 0) return;    // empty batch, sequence or heads: elementwise no-op
 
     int rows_per_block = FUSED_OP_2_THREADS / H;
     int threads = rows_per_block * H;
@@ -872,8 +877,9 @@ void cuda_recurrent_gated_delta_rule_gr
     int seqlen = mixed_qkv.size(1);
     int qkv_dim = mixed_qkv.size(2);
 
+    TORCH_CHECK(num_k_heads > 0, "num_k_heads must be positive");
     TORCH_CHECK(num_v_heads % num_k_heads == 0, "num_v_heads must be divisible by num_k_heads");
-    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a multiple of 32");
+    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a positive multiple of 32");
     TORCH_CHECK(MAX(k_head_dim, v_head_dim) <= 256, "Max head dim exceeded");
 
     TORCH_CHECK(qkv_dim == 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
@@ -927,6 +933,9 @@ void cuda_recurrent_gated_delta_rule_gr
 
     int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
     TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
+
+    // Empty batch, sequence or v heads: no step to take, state untouched
+    if (bsz == 0 || seqlen == 0 || num_v_heads == 0 || v_head_dim == 0) return;
 
     dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads
     dim3 threads(MAX(k_head_dim, v_head_dim / v_split), SUBK);
@@ -1123,6 +1132,7 @@ void mamba2_fused_op_gr
     int B = proj.size(0);
     int S = proj.size(1);
     int N = proj.size(2);
+    if (B * S == 0) return;
     int F = xbc.numel() / (B * S);
     int H = dt.numel() / (B * S);
     TORCH_CHECK(N >= v_dim + F + dt_first + H, "mamba2_fused_op: proj too narrow");
@@ -1189,8 +1199,9 @@ void cuda_recurrent_mamba2_gr
     int seqlen = mixed_xbc.size(1);
     int xbc_dim = mixed_xbc.size(2);
 
+    TORCH_CHECK(num_k_heads > 0, "num_k_heads must be positive");
     TORCH_CHECK(num_v_heads % num_k_heads == 0, "num_v_heads must be divisible by num_k_heads");
-    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a multiple of 32");
+    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a positive multiple of 32");
     TORCH_CHECK(MAX(k_head_dim, v_head_dim) <= 256, "Max head dim exceeded");
 
     TORCH_CHECK(xbc_dim == 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
@@ -1231,6 +1242,9 @@ void cuda_recurrent_mamba2_gr
         TORCH_CHECK(slots.value().device() == mixed_xbc.device(),
                     "slots must be on the same device as mixed_xbc");
     }
+
+    // Empty batch, sequence or v heads: no step to take, state untouched
+    if (bsz == 0 || seqlen == 0 || num_v_heads == 0 || v_head_dim == 0) return;
 
     dim3 blocks(bsz, num_v_heads, 1);
     dim3 threads(MAX(k_head_dim, v_head_dim), SUBK);
@@ -1358,9 +1372,10 @@ void conv1d_update_kernel
     for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
         if (k < K - 1) win[k] = old_state[k + 1];
 
+    const int last = K > 0 ? K - 1 : 0;     // K = 0: the slot is written but never read
     for (int s = 0; s < seqlen; ++s)
     {
-        win[K - 1] = __bfloat162float(x_d[s]);
+        win[last] = __bfloat162float(x_d[s]);
 
         float acc = bias_d;
         #pragma unroll
@@ -1455,6 +1470,9 @@ void cuda_causal_conv1d_update_gr
         TORCH_CHECK(conv_state.size(0) >= bsz, "conv_state too small for batch without slots");
     }
     const bfloat16* bias_ptr = (const bfloat16*) OPTPTR(bias);
+
+    // Empty batch, channels or sequence: no step to take, state untouched
+    if (bsz == 0 || dim == 0 || seqlen == 0) return;
 
     dim3 blocks(CEIL_DIVIDE(dim, CONV1D_NUM_THREADS), bsz);
 
@@ -1599,6 +1617,7 @@ void gated_delta_net_fused_op_3_gr
 
     int BS = B * S;
     int total = BS * (F + H);
+    if (total == 0) return;
     int blocks = CEIL_DIVIDE(total, FUSED_OP_3_THREADS);
 
     #define ARGS(a_log_T)                       \
@@ -1687,11 +1706,15 @@ void gdn_ba_gemv_gr
 
     int k = x.size(-1);
     int n = w_t.size(0);
-    int rows = (int) (x.numel() / k);
+    int rows = 1;
+    for (int i = 0; i < x.dim() - 1; ++i) rows *= (int) x.size(i);
     TORCH_CHECK(w_t.dim() == 2 && w_t.size(1) == k, "w_t must be [n, k]");
     TORCH_CHECK(y.numel() == (int64_t) rows * n, "y must be [rows, n]");
     TORCH_CHECK(k % 2 == 0, "k must be even");
     TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
+
+    // No rows or outputs: nothing to do. k = 0 runs: the kernel writes the empty sum (bias or 0)
+    if (rows == 0 || n == 0) return;
 
     const half* bias_ptr = (const half*) OPTPTR(bias);
     dim3 blocks(CEIL_DIVIDE(n, BA_GEMV_WARPS), rows);
@@ -1764,10 +1787,14 @@ void gdn_lowrank_gemv_f_gr
     TORCH_CHECK_DTYPE(y, kFloat);
     int k = x.size(-1);
     int n = w_t.size(0);
-    int rows = (int) (x.numel() / k);
+    int rows = 1;
+    for (int i = 0; i < x.dim() - 1; ++i) rows *= (int) x.size(i);
     TORCH_CHECK(w_t.dim() == 2 && w_t.size(1) == k, "w_t must be [n, k]");
     TORCH_CHECK(y.numel() == (int64_t) rows * n, "y must be [rows, n]");
     TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
+
+    // No rows or outputs: nothing to do. k = 0 runs: the kernel writes the empty sum (0)
+    if (rows == 0 || n == 0) return;
 
     dim3 blocks(CEIL_DIVIDE(n, LR_GEMV_WARPS), rows);
     gdn_lowrank_gemv_f_kernel<<<blocks, LR_GEMV_WARPS * 32, 0, stream>>>
@@ -1867,11 +1894,13 @@ void kda_gate_op_gr
     int S = qkv.size(1);
     int F = qkv.size(2);
     int H = b.size(-1);
-    int Dk = (int) (f.size(-1) / H);
+    int Dk = H ? (int) (f.size(-1) / H) : 0;
     int BS = B * S;
+    TORCH_CHECK(f.size(-1) == (int64_t) H * Dk, "f must be [B,S,H*Dk]");
     TORCH_CHECK(g.numel() == (int64_t) BS * H * Dk, "g must be [B,S,H,Dk]");
 
     int total = BS * F + BS * H + BS * H * Dk;
+    if (total == 0) return;     // elementwise no-op
     int threads = 256;
     int blocks = CEIL_DIVIDE(total, threads);
 

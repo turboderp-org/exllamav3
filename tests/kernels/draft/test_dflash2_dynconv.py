@@ -205,3 +205,83 @@ def test_dynconv_rejects_invalid(device, case):
     assert set(cases) == set(INVALID)
     with pytest.raises(RuntimeError):
         ext.dflash2_dynconv(*cases[case])
+
+
+# Zero-size inputs of the DFlash2 kernels (this is the only kernel-level DFlash2 file; tests/modules/draft covers
+# dflash2_selector_walk and dflash2_topk through the module):
+# - dflash2_dynconv: empty batch, sequence or hidden is a no-op; taps = 0 is the empty sum (out = 0, or unchanged
+#   when accumulating)
+# - dflash2_selector_walk: empty batch is a no-op; rows = 0 still writes the anchor column (out[:, 0] = anchor,
+#   conf[:, 0] = 0); rank = 0 makes every pairwise term the empty dot product, so each row picks the argmax of its
+#   unary scores; an empty candidate list (k = 0) is an argmax over nothing and raises
+# - dflash2_topk: empty batch or rows is a no-op; vocab = 0 is a top-k over nothing and raises
+
+def _assert_device_usable(device):
+    torch.cuda.synchronize(device)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("bsz, seq, hidden, taps", [(0, 4, 96, 2), (2, 0, 96, 2), (2, 4, 0, 2), (2, 4, 96, 0)])
+@pytest.mark.parametrize("accumulate", [False, True])
+@torch.inference_mode()
+def test_dynconv_empty(device, bsz, seq, hidden, taps, accumulate):
+    x = torch.randn(bsz, seq, hidden, device = device)
+    dyn = torch.randn(bsz, seq, taps, hidden // 16, device = device).half()
+    base = torch.randn(taps, hidden, device = device).half()
+    out = torch.full((bsz, seq, hidden), 777.0, device = device)
+    ext.dflash2_dynconv(x, dyn, base, out, 16, accumulate)
+    expect = torch.full_like(out, 777.0) if accumulate or taps > 0 else torch.zeros_like(out)
+    assert torch.equal(out, expect)
+    _assert_device_usable(device)
+
+
+def _walk(device, bsz, rows, k, rank, vocab = 50, seed = 0):
+    g = torch.Generator().manual_seed(seed)
+    unary = torch.randn(bsz, rows, k, generator = g).to(device)
+    cands = torch.randint(0, vocab, (bsz, rows, k), generator = g).to(device)
+    gate = torch.randn(bsz, rows, rank, generator = g).half().to(device)
+    cb = torch.randn(vocab, rank, generator = g).half().to(device)
+    anchor = torch.randint(0, vocab, (bsz,), generator = g).to(device)
+    out = torch.full((bsz, rows + 1), -7, dtype = torch.long, device = device)
+    conf = torch.full((bsz, rows + 1), 777.0, device = device)
+    ext.dflash2_selector_walk(unary, cands, gate, cb, cb.clone(), anchor, out, conf)
+    return unary, cands, anchor, out, conf
+
+
+@pytest.mark.parametrize("bsz, rows, k, rank, error", [
+    (0, 3, 4, 8, None),
+    (2, 0, 4, 8, None),
+    (2, 3, 4, 0, None),
+    (2, 3, 0, 8, "argmax over an empty candidate list"),
+    (2, 0, 0, 8, "argmax over an empty candidate list"),
+    (0, 3, 0, 8, "argmax over an empty candidate list"),
+])
+@torch.inference_mode()
+def test_selector_walk_empty(device, bsz, rows, k, rank, error):
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            _walk(device, bsz, rows, k, rank)
+    else:
+        unary, cands, anchor, out, conf = _walk(device, bsz, rows, k, rank)
+        best = unary.argmax(dim = -1, keepdim = True)
+        assert torch.equal(out[:, 0], anchor)
+        assert torch.equal(out[:, 1:], cands.gather(-1, best).squeeze(-1))
+        assert torch.equal(conf[:, 0], torch.zeros_like(conf[:, 0]))
+        assert torch.equal(conf[:, 1:], unary.gather(-1, best).squeeze(-1))
+    _assert_device_usable(device)
+
+
+@pytest.mark.parametrize("bsz, rows, vocab, error", [(0, 2, 100, None), (2, 0, 100, None), (2, 2, 0, "top-k over an empty vocab")])
+@torch.inference_mode()
+def test_topk_empty(device, bsz, rows, vocab, error):
+    logits = torch.randn(bsz, rows, max(vocab, 64), device = device).half()
+    values = torch.full((bsz, rows, 8), 777.0, device = device)
+    indices = torch.full((bsz, rows, 8), -7, dtype = torch.long, device = device)
+    call = lambda: ext.dflash2_topk(logits, vocab, 1.0, 0.0, values, indices)
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            call()
+    else:
+        call()
+    assert (values == 777.0).all() and (indices == -7).all()
+    _assert_device_usable(device)

@@ -138,3 +138,29 @@ def test_rms_norm_res_in_rejects(device):
         ext.rms_norm_res_in(x, w, y.float(), r, 1e-6, 0.0, 1.0)
     with pytest.raises(RuntimeError, match = "Invalid datatypes"):
         ext.rms_norm_res_in(x, w, y, r.bfloat16(), 1e-6, 0.0, 1.0)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["rows", "dim"])
+@torch.inference_mode()
+def test_rms_norm_res_in_empty(device, case):
+    # No rows: nothing to do, y and r untouched. Empty dim: the RMS of an empty vector is undefined, so it raises
+    if case == "rows":
+        ybuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+        rbuf = torch.full((64,), 7.0, dtype = torch.float, device = device)
+        x = torch.empty(0, 128, dtype = torch.half, device = device)
+        w = torch.ones(128, dtype = torch.half, device = device)
+        ext.rms_norm_res_in(x, w, ybuf[8:8].view(0, 128), rbuf[8:8].view(0, 128), 1e-6, 0.0, 1.0)
+        assert (ybuf == 7.0).all() and (rbuf == 7.0).all()
+        with pytest.raises(RuntimeError, match = "Invalid datatypes"):
+            ext.rms_norm_res_in(x.bfloat16(), w, ybuf[8:8].view(0, 128), rbuf[8:8].view(0, 128), 1e-6, 0.0, 1.0)
+    else:
+        x = torch.empty(4, 0, dtype = torch.half, device = device)
+        with pytest.raises(RuntimeError, match = "rms_norm: norm over an empty dimension"):
+            ext.rms_norm_res_in(x, None, torch.empty_like(x), torch.empty_like(x), 1e-6, 0.0, 1.0)
+    assert_device_ok(device)

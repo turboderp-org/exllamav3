@@ -895,6 +895,13 @@ static void hc_mix_launch
     if (!fn_half) TORCH_CHECK_DTYPE(fn, kFloat);
     TORCH_CHECK_DTYPE(base, kFloat);
     TORCH_CHECK_DTYPE(scale, kFloat);
+    TORCH_CHECK(D > 0, "hc_mix: norm over an empty stream dimension");
+    TORCH_CHECK(partials.size(1) > 0, "hc_mix: partials workspace too small");
+
+    bool half_out = collapsed.dtype() == at::kHalf;
+    if (pend || nrm) TORCH_CHECK(!head && half_out, "hc_mix: folds are for the half-output mix");
+    if (nrm) TORCH_CHECK(D / 4 <= 1024, "hc_mix: folded norm needs D <= 4096");
+    if (!R) return;
 
     int n_chunks_a = partials.size(1);
     int chunk_cols = ((row_len / n_chunks_a + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
@@ -904,8 +911,6 @@ static void hc_mix_launch
     int chunks_c = std::min(32, std::max(1, 256 / R));
     int chunk_cols_c = ((D / chunks_c + 4 * NUM_THREADS - 1) / (4 * NUM_THREADS)) * (4 * NUM_THREADS);
     int n_chunks_c = (D + chunk_cols_c - 1) / chunk_cols_c;
-
-    bool half_out = collapsed.dtype() == at::kHalf;
 
     dim3 grid_a(n_chunks_a, R);
     dim3 grid_c(n_chunks_c, R);
@@ -919,8 +924,6 @@ static void hc_mix_launch
         D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
     if (pend || nrm)
     {
-        TORCH_CHECK(!head && half_out, "hc_mix: folds are for the half-output mix");
-        if (nrm) TORCH_CHECK(D / 4 <= 1024, "hc_mix: folded norm needs D <= 4096");
         // The pending apply runs inside the partials kernel when each stream is a whole number of
         // partials chunks (always at decode row counts); otherwise as its own launch first
         const bool fusable = pend && (D % chunk_cols) == 0 && n_chunks_a % H == 0;
@@ -1007,6 +1010,7 @@ static void hc_mix_launch
 
 int hc_mix_num_chunks(int R, int row_len)
 {
+    if (row_len <= 0) return 0;
     int chunks_a = std::min(128, std::max(1, 512 / std::max(R, 1)));
     int chunk_cols = ((row_len / chunks_a + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
     return (row_len + chunk_cols - 1) / chunk_cols;
@@ -1184,6 +1188,8 @@ void hc_apply
         wn_p = (const half*) wn.value().data_ptr();
         xw_p = (float*) xw.value().data_ptr();
     }
+    TORCH_CHECK(!(comb_p && xw_p), "hc_apply: xw is for the comb-less (GatedResidual) form");
+    if (!R || !D) return;
 
     int chunks_c = std::min(32, std::max(1, 256 / R));
     int chunk_cols = ((D / chunks_c + 4 * NUM_THREADS - 1)
@@ -1198,7 +1204,6 @@ void hc_apply
         if (comb_p)      hc_apply_kernel<4, Y_T, true, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
         else if (xw_p)   hc_apply_kernel<4, Y_T, false, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); \
         else           { hc_apply_kernel<4, Y_T, false, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(Y_T)); }
-    TORCH_CHECK(!(comb_p && xw_p), "hc_apply: xw is for the comb-less (GatedResidual) form");
     if (y.dtype() == at::kHalf) { LAUNCH(half) }
     else                        { LAUNCH(float) }
     #undef LAUNCH
@@ -1252,6 +1257,8 @@ void gr_mix
         TORCH_CHECK(wstreams.value().is_contiguous() && wstreams.value().sizes() == streams.sizes(), "gr_mix: wstreams shape");
         ws_p = (const float*) wstreams.value().data_ptr();
     }
+    TORCH_CHECK(D > 0, "gr_mix: norm over an empty stream dimension");
+    if (!R) return;
     const half* w_p = (const half*) w.data_ptr();
 
     const int nch = D / 256, nit = (LR + 63) / 64;

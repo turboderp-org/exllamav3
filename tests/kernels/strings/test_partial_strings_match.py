@@ -4,7 +4,8 @@ Contract used by job.py: >= 0 -> index of the EARLIEST full match (text is trunc
 partially overlaps the end of Q and starts before any full match (hold text, wait for more); -1 -> nothing.
 Regression: a partial match of an earlier-listed string used to short-circuit before a later string's full
 match at a smaller index was found, so an already-present stop string could be overrun. Checked against
-hand-computed expectations.
+hand-computed expectations. Empty inputs: an empty Q or an empty set of strings (no offsets, or a lone 0 offset)
+matches nothing (-1).
 """
 
 import numpy as np
@@ -58,3 +59,15 @@ def test_multiple_and_empty_strings():
     assert match("abcabc", ["cab", "abc"]) == 0
     assert match("abcab", ["cab", "abcabc"]) == -2          # full "cab" at 2 but partial "abcab…" at 0 starts earlier -> hold
 
+
+
+@pytest.mark.parametrize("q", ["", "abc"])
+def test_empty_strings_match(q):
+    if not q:
+        assert match(q, ["a"]) == -1
+        assert match(q, ["a", "bc"]) == -1
+    qb = np.frombuffer(q.encode("utf-32-le"), dtype = np.uint8)
+    empty = np.zeros(0, dtype = np.uint8)
+    lone = np.frombuffer(np.array([0], dtype = np.int32), dtype = np.uint8)
+    assert ext.partial_strings_match(qb, empty, empty) == -1
+    assert ext.partial_strings_match(qb, lone, empty) == -1

@@ -4,6 +4,10 @@ table and dequantizing them again reproduces the cache contents to 8-bit toleran
 dims and KV head counts, for incremental appends, a shuffled block table and full rewrites; with a sliding window
 every in-window token is dequantized. The reference is the unquantized cache itself (8-bit only: this tests the
 paging and window logic, not quantization accuracy).
+
+Empty inputs of the contiguous and paged quant/dequant (test_empty_*): no rows, no tokens or a zero head dim is a
+no-op with outputs untouched, the bitrate check still applies, and no CUDA error is left pending. Tokens to quantize
+through a block table without pages raise.
 """
 
 import random
@@ -218,3 +222,60 @@ def test_kv_quant_sliding_window(device, geometry, window, bits):
         a, b = seqlen - window, seqlen
         torch.testing.assert_close(out_k.view(max_len, -1)[a:b], ref_k[a:b], atol = 0.08, rtol = 0.05)
         torch.testing.assert_close(out_v.view(max_len, -1)[a:b], ref_v[a:b], atol = 0.08, rtol = 0.05)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("rows, dim", [(0, 128), (0, 0), (5, 0)])
+@torch.inference_mode()
+def test_empty_cache_cont(device, rows, dim):
+    bits = 4
+    x = torch.randn((rows, dim), device = device).half()
+    q = torch.full((rows, dim // 32 * bits), 7, dtype = torch.int, device = device)
+    sc = torch.full((rows, dim // 32), 7.0, dtype = torch.half, device = device)
+    ext.quant_cache_cont(x, q, sc, 0.0)
+    out = torch.full((rows, dim), 7.0, dtype = torch.half, device = device)
+    ext.dequant_cache_cont(q, sc, out, 0.0)
+    assert (out == 7.0).all()
+    _device_still_works(device)
+    if dim:
+        with pytest.raises(RuntimeError, match = "bitrate"):
+            ext.quant_cache_cont(x, q[:, :dim // 32], sc, 0.0)
+
+
+@pytest.mark.parametrize("bsz, seq_len, dim", [(0, 3, 256), (2, 0, 256), (2, 3, 0), (0, 0, 0)])
+@torch.inference_mode()
+def test_empty_quant_cache_paged(device, bsz, seq_len, dim):
+    bits = 4
+    num_pages = 4
+    x = torch.randn((num_pages, page_size, dim), device = device).half()
+    q = torch.full((num_pages, page_size, dim // 32 * bits), 7, dtype = torch.int, device = device)
+    sc = torch.full((num_pages, page_size, dim // 32), 7.0, dtype = torch.half, device = device)
+    q_ref, sc_ref = q.clone(), sc.clone()
+    bt = torch.arange(bsz * 2, dtype = torch.int, device = device).view(bsz, 2)
+    sl = torch.zeros((bsz,), dtype = torch.int, device = device)
+    ext.quant_cache_paged(x, q, sc, x, q, sc, sl, bt, page_size, seq_len, 0.0, False)
+    assert torch.equal(q, q_ref) and torch.equal(sc, sc_ref)
+    _device_still_works(device)
+    if dim:
+        with pytest.raises(RuntimeError, match = "bitrate"):
+            ext.quant_cache_paged(x, q[..., :1], sc, x, q[..., :1], sc, sl, bt, page_size, seq_len, 0.0, False)
+    with pytest.raises(RuntimeError, match = "negative seq_len"):
+        ext.quant_cache_paged(x, q, sc, x, q, sc, sl, bt, page_size, -1, 0.0, False)
+
+
+@torch.inference_mode()
+def test_empty_block_table_rejected(device):
+    x = torch.zeros((2, page_size, 64), dtype = torch.half, device = device)
+    q = torch.zeros((2, page_size, 8), dtype = torch.int, device = device)
+    sc = torch.zeros((2, page_size, 2), dtype = torch.half, device = device)
+    bt = torch.zeros((1, 0), dtype = torch.int, device = device)
+    sl = torch.zeros((1,), dtype = torch.int, device = device)
+    with pytest.raises(RuntimeError, match = "quant_cache_paged: .*no pages"):
+        ext.quant_cache_paged(x, q, sc, x, q, sc, sl, bt, page_size, 1, 0.0, False)
+    _device_still_works(device)

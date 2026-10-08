@@ -426,16 +426,25 @@ bool enabled(int device)
     return on == 1;
 }
 
-// Hard shape coverage of the kernel (independent of the device decision).
-static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+// Devices, dtypes, ranks, matching shapes and the tile multiples of K and N
+static bool covered_shapes(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
 {
     if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
     if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
     if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
     if (a.dim() != b.dim() || a.dim() != c.dim() || (a.dim() != 2 && a.dim() != 3)) return false;
+    if (a.dim() == 3 && (a.size(0) != b.size(0) || a.size(0) != c.size(0))) return false;
     int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
     if (b.size(-2) != K || c.size(-2) != M || c.size(-1) != N) return false;
-    if (K < 1 || N < 1 || M < 1 || K % BK != 0 || N % BN != 0) return false;
+    return K % BK == 0 && N % BN == 0;
+}
+
+// Hard shape coverage of the kernel (independent of the device decision).
+static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+{
+    if (!covered_shapes(a, b, c)) return false;
+    int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
+    if (K < 1 || N < 1 || M < 1) return false;
     if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
         K > std::numeric_limits<int>::max()) return false;
     // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
@@ -546,6 +555,13 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 // Force the kernel (tests / benchmarks): errors if the shape is not covered
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
 {
+    // Empty batch, rows or columns: nothing to compute. Empty reduction (K = 0): the product is zero
+    if (a.numel() == 0 || b.numel() == 0 || c.numel() == 0)
+    {
+        TORCH_CHECK(f16acc::covered_shapes(a, b, c), "hgemm_f16acc: unsupported device, dtype or shape (K % 64, N % 128)");
+        if (c.numel()) c.zero_();
+        return;
+    }
     TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: unsupported device, shape, strides or alignment (Ampere+, K % 64, N % 128; 16-byte input and vector-aligned output)");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

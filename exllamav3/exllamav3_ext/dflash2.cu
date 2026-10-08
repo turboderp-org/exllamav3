@@ -286,8 +286,9 @@ void dflash2_selector_walk
     TORCH_CHECK(out.size(0) == bsz && out.size(1) == rows + 1, "dflash2_selector_walk: out must be (bsz, rows + 1)");
     TORCH_CHECK(!conf.has_value() || (conf.value().is_contiguous() && conf.value().sizes() == out.sizes()),
                 "dflash2_selector_walk: conf must be (bsz, rows + 1), contiguous");
-    TORCH_CHECK(k >= 1 && rank >= 1, "dflash2_selector_walk: empty candidate list or rank");
-    if (!bsz || !rows) return;
+    // rank = 0 is an empty dot product (scores = unary); rows = 0 still writes the anchor column
+    TORCH_CHECK(k >= 1, "dflash2_selector_walk: argmax over an empty candidate list");
+    if (!bsz) return;
 
     size_t smem = (rank + k) * sizeof(float);
     float* conf_ptr = conf.has_value() ? (float*) conf.value().data_ptr() : nullptr;
@@ -515,14 +516,15 @@ void dflash2_topk
     int rows = logits.size(1);
     int k = values.size(2);
     TORCH_CHECK(values.size(0) == bsz && values.size(1) == rows, "dflash2_topk: output shape mismatch");
+    TORCH_CHECK(vocab > 0, "dflash2_topk: top-k over an empty vocab");
     TORCH_CHECK(vocab >= k && vocab <= logits.size(2), "dflash2_topk: vocab out of range");
     TORCH_CHECK(k == 8 || k == 16 || k == 32, "dflash2_topk: k must be 8, 16 or 32");
+    TORCH_CHECK(vocab <= 64 * TOPK_THREADS * 32, "dflash2_topk: vocab too large (max 524288)");
     if (!bsz || !rows) return;
 
     // Elements per thread: 16 covers rows up to 64 splits * 4096 = 262144 columns (the final
     // merge holds splits * K entries at K / 4 per thread), 32 up to 524288
     int E = vocab <= 64 * TOPK_THREADS * 16 ? 16 : 32;
-    TORCH_CHECK(vocab <= 64 * TOPK_THREADS * 32, "dflash2_topk: vocab too large (max 524288)");
     TORCH_CHECK(((uintptr_t) logits.data_ptr() & 15) == 0 && (logits.stride(0) * logits.element_size()) % 16 == 0 &&
                 (logits.stride(1) * logits.element_size()) % 16 == 0, "dflash2_topk: logits rows must be 16-byte aligned");
     int splits = CEIL_DIVIDE(vocab, TOPK_THREADS * E);

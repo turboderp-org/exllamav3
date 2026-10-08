@@ -55,3 +55,25 @@ def test_unswizzle_expert_major(device, K, swizzle_k8):
             a = (e * exp_b + off) // 2
             got = dst[a : a + t.numel()].cpu().view_as(t)
             assert torch.equal(got, t), f"expert {e} {name} (K {dims[name][2]}) not restored"
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("E, tiles_k, tiles_n", [(0, 4, 8), (2, 0, 8), (2, 4, 0), (0, 0, 0)])
+def test_empty_unswizzle(device, E, tiles_k, tiles_n):
+    """No experts or no tiles: nothing to copy; alignment and sign checks still apply"""
+    src = torch.zeros(4096, dtype = torch.int16, device = device)
+    dst = torch.full_like(src, -1)
+    ext.moe_unswizzle_trellis(src, dst, E, 4096, 0, tiles_k, tiles_n, 4, True)
+    torch.cuda.synchronize()
+    assert (dst == -1).all()
+    with pytest.raises(RuntimeError, match = "16-byte aligned"):
+        ext.moe_unswizzle_trellis(src, dst, E, 4096, 8, tiles_k, tiles_n, 4, True)
+    with pytest.raises(RuntimeError, match = "negative size"):
+        ext.moe_unswizzle_trellis(src, dst, -1, 4096, 0, tiles_k, tiles_n, 4, True)
+    _device_still_works(device)

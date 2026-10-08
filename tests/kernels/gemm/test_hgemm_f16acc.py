@@ -112,3 +112,33 @@ def test_f16acc_dispatch_and_graph(device, batch, M, N, K):
         run(a, b, actual)
     graph.replay()
     assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("batch, M, N, K", [(1, 0, 128, 64), (1, 16, 0, 64), (1, 16, 128, 0), (0, 16, 128, 64),
+                                            (2, 16, 128, 0)])
+@torch.inference_mode()
+def test_empty_f16acc(device, dtype, batch, M, N, K):
+    """No batches, rows or columns: a no-op. An empty reduction (K = 0): the product is zero. The dtype and tile
+    multiple checks still apply"""
+    a = torch.randn((batch, M, K), device = device).half()
+    b = torch.randn((batch, K, N), device = device).half()
+    c = torch.full((batch, M, N), 3.0, dtype = dtype, device = device)
+    ext.hgemm_f16acc(a, b, c)
+    torch.cuda.synchronize(device)
+    assert (c == (0.0 if K == 0 else 3.0)).all()
+    if batch == 1:
+        ext.hgemm_f16acc(a[0], b[0], c[0])
+    with pytest.raises(RuntimeError, match = "hgemm_f16acc: unsupported"):
+        ext.hgemm_f16acc(a.float(), b, c)
+    with pytest.raises(RuntimeError, match = "hgemm_f16acc: unsupported"):
+        ext.hgemm_f16acc(a[..., :0], torch.empty((batch, 0, 100), dtype = torch.half, device = device),
+                         torch.empty((batch, M, 100), dtype = dtype, device = device))
+    _device_still_works(device)

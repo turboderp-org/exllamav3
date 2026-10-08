@@ -6,6 +6,11 @@ entry index, optionally split into a nope / rope pair of destinations) or, with 
 staging buffer at rows [0, n_windows) that the packed-pool quantizer scatters afterwards. Covers CSA-shaped
 (overlapping, m = 4), indexer-shaped (overlapping, narrow) and HCA-shaped (non-overlapping, m = 128) compressors,
 uneven chunk schedules, and bitwise chunked-vs-whole and staged-vs-direct agreement of the fused path itself.
+
+Empty inputs (test_empty_*) of dsv4_compress and dsv4_pool_quant_scatter: no tokens or no jobs is a no-op (state
+and pools untouched); a zero window size m (softmax pooling over nothing), a zero head dim (RMS norm over
+nothing), an empty ring or snapshot ring, and batched destinations without rows raise. No CUDA error is left
+pending.
 """
 import pytest
 import torch
@@ -127,3 +132,90 @@ def test_dsv4_compress(device, i, tag, hd, W, m, ovl, total, chunks, split, stag
         direct = run_fused(*args, chunks, buf_rows = 256 + m, ovl_depth = 256 // m + 2, split = split,
                            stage_rel = False)
         assert torch.equal(got, direct), "staged entries differ from the direct pool store"
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Empty inputs
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("case, error", [
+    ("seq0", None),
+    ("seq0_pos_tensor", None),
+    ("jobs0", None),
+    ("m0", "empty compression window"),
+    ("hd0", "empty head dim"),
+    ("ring0", "empty ring"),
+    ("ovl_depth0", "empty snapshot ring"),
+    ("dest_rows0", "empty destination"),
+])
+@torch.inference_mode()
+def test_empty_dsv4_compress(device, case, error):
+    hd, m, slots, cap = 128, 4, 3, 16
+    overlap = case == "ovl_depth0"
+    W = 2 * hd if overlap else hd
+    if case == "hd0":
+        hd = W = 0
+    if case == "m0":
+        m = 0
+    batched = case in ("jobs0", "dest_rows0")
+    jobs = 0 if case == "jobs0" else 2
+    seq = 0 if case.startswith("seq0") or case == "jobs0" else 5
+    buf_rows = 0 if case == "ring0" else 256 + 4
+    rows = jobs * seq if batched else seq
+    kv = torch.randn((rows, W), device = device).half()
+    gate = torch.randn((rows, W), device = device).half()
+    ring_shape = (slots, buf_rows, W) if batched else (buf_rows, W)
+    ring_kv = torch.full(ring_shape, 7.0, dtype = torch.half, device = device)
+    ring_gate = torch.full(ring_shape, 7.0, dtype = torch.half, device = device)
+    ovl = None
+    if overlap:
+        ovl = torch.full((0, 2, m, hd), 7.0, device = device)
+    ape = torch.randn((max(m, 1), W), device = device)
+    norm_w = torch.ones((hd,), dtype = torch.half, device = device)
+    inv_freq = torch.rand((min(32, hd // 2),), device = device)
+    if batched:
+        dest_a = torch.full((0 if case == "dest_rows0" else slots, cap, hd), 7.0, dtype = torch.half, device = device)
+    else:
+        dest_a = torch.full((cap, hd), 7.0, dtype = torch.half, device = device)
+    pos_t = torch.full((max(jobs, 1),), 5, dtype = torch.int32, device = device) \
+        if batched or case == "seq0_pos_tensor" else None
+    slot_ids = torch.arange(jobs, dtype = torch.int32, device = device) if batched else None
+    refs = [t.clone() for t in (ring_kv, ring_gate, dest_a)]
+    args = (kv, gate, ring_kv, ring_gate, ovl, ape, norm_w, 1e-6, inv_freq, dest_a, None, 5, pos_t, m,
+            slot_ids, None, 0, False)
+    if error:
+        with pytest.raises(RuntimeError, match = f"dsv4_compress: .*{error}"):
+            ext.dsv4_compress(*args)
+    else:
+        ext.dsv4_compress(*args)
+    for t, r in zip((ring_kv, ring_gate, dest_a), refs):
+        assert torch.equal(t, r)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("jobs, seq, nw_max, pos_tensor", [(1, 0, 4, False), (1, 0, 0, True), (2, 0, 0, True), (0, 5, 4, True)])
+@torch.inference_mode()
+def test_empty_dsv4_pool_quant_scatter(device, jobs, seq, nw_max, pos_tensor):
+    D_c, D_r, bits, m, epp, rows = 128, 64, 4, 4, 8, 32
+    G = D_c // 32
+    stage = torch.randn((jobs, nw_max, D_c + D_r), device = device).half()
+    if jobs == 1:
+        stage = stage[0]
+    pool_q = torch.full((rows, G * bits), 7, dtype = torch.int32, device = device)
+    pool_s = torch.full((rows, G), 7.0, dtype = torch.half, device = device)
+    pool_r = torch.full((rows, D_r), 7.0, dtype = torch.half, device = device)
+    pool_bt = torch.zeros((max(jobs, 1), rows // epp), dtype = torch.int32, device = device)
+    pos_t = torch.full((max(jobs, 1),), 3, dtype = torch.int32, device = device) if pos_tensor else None
+    refs = [t.clone() for t in (pool_q, pool_s, pool_r)]
+    ext.dsv4_pool_quant_scatter(stage, pool_q, pool_s, pool_r, pool_bt, 3, pos_t, m, seq, epp)
+    for t, r in zip((pool_q, pool_s, pool_r), refs):
+        assert torch.equal(t, r)
+    _device_still_works(device)
+    with pytest.raises(RuntimeError, match = "bad epp / m"):
+        ext.dsv4_pool_quant_scatter(stage, pool_q, pool_s, pool_r, pool_bt, 3, pos_t, 0, seq, epp)

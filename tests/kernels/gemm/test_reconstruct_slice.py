@@ -87,3 +87,39 @@ def test_rejections(device):
     rejects(w128, p25, 2.5, True, False, 0, "require the mul1 codebook")
     for bad_K in (0, 9, 4.5, 2.25):
         rejects(w128, pt, bad_K, False, True, 0, "Unsupported EXL3 bitrate")
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("fn", ["reconstruct", "reconstruct_slice", "reconstruct_had_slice"])
+@pytest.mark.parametrize("k, n", [(0, 256), (128, 0), (0, 0)])
+@torch.inference_mode()
+def test_empty_reconstruct(device, fn, k, n):
+    """Zero rows or columns: a no-op; the alignment and bounds checks still apply to the empty slice"""
+    K = 3
+    pt = torch.zeros((k // 16, n // 16, 16 * K), dtype = torch.int16, device = device)
+    suh = torch.ones(k, dtype = torch.half, device = device)
+    svh = torch.ones(n, dtype = torch.half, device = device)
+
+    def call(w, off = 0):
+        if fn == "reconstruct":
+            ext.reconstruct(w, pt, K, False, True)
+        elif fn == "reconstruct_slice":
+            ext.reconstruct_slice(w, pt, K, False, True, off)
+        else:
+            ext.reconstruct_had_slice(w, pt, suh, svh, K, False, True, off)
+
+    call(torch.empty((k, n), dtype = torch.half, device = device))
+    if fn != "reconstruct":
+        with pytest.raises(RuntimeError, match = "n_offset must be divisible by 128"):
+            call(torch.empty((k, 0), dtype = torch.half, device = device), 64)
+        with pytest.raises(RuntimeError, match = "exceeds packed tensor bounds"):
+            call(torch.empty((k, 0), dtype = torch.half, device = device), n + 128)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        call(torch.empty((k, n), dtype = torch.float, device = device))
+    _device_still_works(device)

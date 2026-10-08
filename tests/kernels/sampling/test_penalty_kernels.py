@@ -18,6 +18,9 @@ dry_penalty(in (bsz, V) half/float, out float, past_ids (bsz, L) long, breakers 
     match_cap when max_exponent == 0) charges the token that followed it; a charged non-breaker token gets
     x - float(multiplier * base ** min(len - allowed_length, max_exponent or inf)) with the power in double.
     Bit-exact (one fp32 subtraction of a correctly rounded double).
+
+Empty inputs of all three: no rows or no columns is a no-op, an empty history (nothing to penalize) copies the
+logits unchanged; no CUDA error is left pending.
 """
 
 import numpy as np
@@ -369,3 +372,34 @@ def test_dry_penalty_rejects(device):
     ]:
         with pytest.raises(RuntimeError):
             call(**kw)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+def _call_penalty(fn, x, out, past):
+    if fn == "apply_rep_pens":
+        ext.apply_rep_pens(x, out, past, 1.5, 100, 10)
+    elif fn == "apply_pres_freq_pens":
+        ext.apply_pres_freq_pens(x, out, past, 0.5, 0.2, 100, 10)
+    else:
+        bsz, vocab = x.shape
+        scratch = torch.full((bsz * vocab + bsz,), -1, dtype = torch.int32, device = x.device)
+        ext.dry_penalty(x, out, past, None, scratch[:bsz * vocab], scratch[bsz * vocab:], 0.8, 1.75, 2, 0, 20, 2048)
+
+
+@pytest.mark.parametrize("fn", ["apply_rep_pens", "apply_pres_freq_pens", "dry_penalty"])
+@pytest.mark.parametrize("dtype", [torch.half, torch.float])
+@pytest.mark.parametrize("bsz, vocab, past_len", [(0, 100, 5), (0, 0, 0), (1, 0, 5), (1, 0, 0), (1, 100, 0)])
+@torch.inference_mode()
+def test_empty_penalties(device, fn, dtype, bsz, vocab, past_len):
+    x = (torch.randn(bsz, vocab, device = device) * 3).to(dtype)
+    out = torch.full((bsz, vocab), float("nan"), device = device)
+    past = torch.randint(0, max(vocab, 1), (bsz, past_len), dtype = torch.long, device = device)
+    _call_penalty(fn, x, out, past)
+    assert torch.equal(out, x.float())
+    _device_still_works(device)

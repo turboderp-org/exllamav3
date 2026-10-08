@@ -132,7 +132,7 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
 #if defined(USE_ROCM)
-    // Fail with a usable error rather than the attribute call's exit()
+    // Fail with a usable message rather than the attribute call's generic CUDA error
     TORCH_CHECK(shmem <= (int) props->sharedMemPerBlock,
                 "quantize_tiles: K = ", K, " needs ", shmem, " bytes of shared memory, the device has ",
                 (int) props->sharedMemPerBlock);
@@ -184,7 +184,6 @@ void quantize_tiles
 
     const int edges = 65536 >> K;
     const int num_tiles = input_tiles.size(0);
-    if (!num_tiles) return;
 
     for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
     {
@@ -192,13 +191,17 @@ void quantize_tiles
         TORCH_CHECK(tensor.is_contiguous(), "quantize_tiles tensors must be contiguous");
     }
     TORCH_CHECK_DTYPE(temp_costs, kHalf);
-    TORCH_CHECK(temp_costs.numel() > 0, "quantize_tiles requires nonempty cost scratch");
-    int device;
-    cuda_check(cudaGetDevice(&device));
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
     TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
+
+    // No tiles: nothing to quantize, no scratch needed
+    if (!num_tiles) return;
+
+    TORCH_CHECK(temp_costs.numel() > 0, "quantize_tiles requires nonempty cost scratch");
+    int device;
+    cuda_check(cudaGetDevice(&device));
     const auto launch = qt_launch(device, K, cb, L);
     const bool optimized = launch.optimized;
     const auto kernel = launch.kernel;
@@ -364,9 +367,12 @@ void decode
     TORCH_CHECK_DIM(input_indices, 2);
     TORCH_CHECK_SHAPES_FULL(input_indices, output_tiles);
     TORCH_CHECK_DTYPE(input_indices, kShort);
+    TORCH_CHECK(output_tiles.dtype() == at::kFloat || output_tiles.dtype() == at::kHalf,
+                "decode: output_tiles must be float or half");
 
     int rows = input_indices.size(0);
     int cols = input_indices.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(64);
     dim3 gridDim(CEIL_DIVIDE(cols, 64), rows);
@@ -489,6 +495,12 @@ void test_distribution
     TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
     if (ref_output_ptr)
         TORCH_CHECK(num_bins == ref_output.value().numel());
+    // A normalized histogram needs at least one bin and one value
+    TORCH_CHECK(num_bins > 0, "test_distribution: empty histogram (no bins)");
+    TORCH_CHECK(numel > 0, "test_distribution: empty input, the distribution is undefined");
+    // A normalized histogram needs at least one bin and one value
+    TORCH_CHECK(num_bins > 0, "test_distribution: empty histogram (no bins)");
+    TORCH_CHECK(numel > 0, "test_distribution: empty input, the distribution is undefined");
 
     test_distribution_kernel<<<1, NUM_THREADS_TD, 0, stream>>>
     (

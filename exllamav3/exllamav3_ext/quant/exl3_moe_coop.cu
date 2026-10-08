@@ -17,6 +17,14 @@
 #define EXL3_MOE_COOP_DEFINE_ROT
 #include "exl3_moe_coop_kernel.cuh"
 
+// Output rows of a launch without routed slots (top-k 0): the empty sum, plus the shared-expert term
+// when there is one. One warp per (row, 128-column chunk)
+__global__ __launch_bounds__(32)
+void exl3_moe_coop_empty_kernel(const MoeCoopParams p)
+{
+    exl3_moe_coop_ns::write_empty_row_chunk(p, blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
 static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
 {
     const BitsK bk = bits_from_K(K_);
@@ -129,6 +137,15 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;
+    if (!slots)
+    {
+        if (p.bsz && p.H_out)
+        {
+            exl3_moe_coop_empty_kernel<<<dim3(p.bsz, CEIL_DIVIDE(p.H_out, 128)), 32, 0, stream>>>(p);
+            cuda_check(cudaPeekAtLastError());
+        }
+        return;
+    }
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
 
@@ -200,6 +217,7 @@ MoeCoopParams exl3_moe_coop_prepare
     p.Ho = (int) d_out.size(-1);
     p.H_out = (int) out.size(-1);
     TORCH_CHECK(p.Hi % 128 == 0 && p.I % 128 == 0 && p.Ho % 128 == 0 && p.H_out <= p.Ho, "exl3_moe_coop: Hi/I/Ho shape");
+    TORCH_CHECK(p.Hi > 0 && p.I > 0 && p.Ho > 0, "exl3_moe_coop: empty Hi/I/Ho dimension");
 
     TORCH_CHECK_DTYPE(had_g, kHalf);
     TORCH_CHECK_DTYPE(had_u, kHalf);

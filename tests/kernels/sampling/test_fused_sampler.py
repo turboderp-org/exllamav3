@@ -23,6 +23,10 @@ max; the reference is the exact sort-based truncation, compared at a very high s
 
 apply_logit_bitmask(logits_in, logits_out, bitmask): out[r, i] = in[r, i] where bit i of the row's (or the
 single broadcast row's) packed int32 bitmask is set and i < 32 * words, else -inf; exact, out of place.
+
+Empty inputs: no rows is a no-op for both (every mode); an empty vocabulary (size bound 0) has nothing to sample
+and fused_sampler raises with out untouched; apply_logit_bitmask on zero columns is a no-op, and a zero-word
+bitmask masks every column. No CUDA error is left pending.
 """
 
 import math
@@ -540,3 +544,51 @@ def test_apply_logit_bitmask_rejects(device):
     ]:
         with pytest.raises(RuntimeError):
             ext.apply_logit_bitmask(*args)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("bsz, dim, size, raises", [
+    (0, 1000, 1000, False),     # no rows
+    (0, 1000, 10, False),
+    (2, 0, 0, True),            # no columns
+    (2, 1000, 0, True),         # size bound excludes every column
+    (0, 0, 0, True),
+])
+@torch.inference_mode()
+def test_empty_fused_sampler(device, mode, bsz, dim, size, raises):
+    logits = torch.randn(bsz, dim, device = device)
+    ws = torch.empty(max(bsz, 1) * ext.FUSED_SAMPLER_MAX_BLOCKS * 3, device = device)
+    hist = torch.empty(max(bsz, 1) * ext.FUSED_SAMPLER_HIST_STRIDE, dtype = torch.uint8, device = device)
+    out = torch.full((bsz, 1), -7, dtype = torch.long, device = device)
+
+    def call():
+        ext.fused_sampler(logits, None, None, out, ws, size, 1.0, -2.0, 0, mode, F_TOPK | F_TOPP | F_MINP, 5, 0.9,
+                          1.0, hist)
+
+    if raises:
+        with pytest.raises(RuntimeError, match = "fused_sampler: .*empty vocabulary"):
+            call()
+        assert (out == -7).all()
+    else:
+        call()
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.float])
+@pytest.mark.parametrize("bsz, dim, words", [(0, 100, 4), (0, 0, 1), (3, 0, 1), (3, 0, 0), (3, 40, 0)])
+@torch.inference_mode()
+def test_empty_apply_logit_bitmask(device, dtype, bsz, dim, words):
+    x = torch.randn(bsz, dim, device = device).to(dtype)
+    out = torch.full_like(x, 7.0)
+    bits = torch.full((1, words), -1, dtype = torch.int, device = device)
+    ext.apply_logit_bitmask(x, out, bits)
+    # Zero bitmask words leave no column unmasked
+    assert torch.equal(out, torch.full_like(x, -math.inf))
+    _device_still_works(device)

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2650,6 +2651,7 @@ static MoeCpuMatrix make_matrix
     m.swz = swizzled && m.bits != 8 ? 1 : 0;
     TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
+    TORCH_CHECK(m.k > 0 && m.n > 0, "CPU MoE: empty expert weight dimension");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
     return m;
 }
@@ -2673,10 +2675,12 @@ int64_t exl3_moe_cpu_make_layer
     int64_t swizzled
 )
 {
-    auto* layer = new MoeCpuLayer;
+    auto layer_owner = std::make_unique<MoeCpuLayer>();
+    MoeCpuLayer* layer = layer_owner.get();
     const bool swz = swizzled != 0;
     const size_t E = up_trellis.size();
     const bool gated = !gate_trellis.empty();
+    TORCH_CHECK(E > 0, "exl3_moe_cpu_make_layer: no experts");
     TORCH_CHECK(down_trellis.size() == E && (!gated || gate_trellis.size() == E), "expert count mismatch");
     TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
     TORCH_CHECK(gate_bias.empty() || gate_bias.size() == E, "gate bias count mismatch");
@@ -2708,7 +2712,7 @@ int64_t exl3_moe_cpu_make_layer
                 "expert shape mismatch");
 
     std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(layer);
+    g_layers.push_back(layer_owner.release());
     return static_cast<int64_t>(g_layers.size() - 1);
 }
 
@@ -2912,6 +2916,14 @@ void exl3_moe_cpu_forward
 {
     TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu() && out.device().is_cpu(), "CPU MoE tensors must be on CPU");
     TORCH_CHECK(x.scalar_type() == at::kHalf && out.scalar_type() == at::kFloat, "dtype mismatch");
+    TORCH_CHECK(weights.scalar_type() == at::kHalf, "weights must be float16");
+    TORCH_CHECK(x.dim() == 2 && selected.dim() == 2 && selected.size(0) == x.size(0) && weights.sizes() == selected.sizes(),
+                "exl3_moe_cpu_forward: x must be (rows, hidden), selected and weights (rows, top_k)");
+    TORCH_CHECK(x.is_contiguous() && selected.is_contiguous() && weights.is_contiguous() && out.is_contiguous(),
+                "exl3_moe_cpu_forward: tensors must be contiguous");
+    const MoeCpuLayer* layer = get_layer(handle);
+    TORCH_CHECK(x.size(1) == layer->hidden_size && out.sizes() == x.sizes(),
+                "exl3_moe_cpu_forward: x and out must be (rows, hidden_size)");
 
     const int m_total = static_cast<int>(x.size(0));
     const int top_k = static_cast<int>(selected.size(-1));

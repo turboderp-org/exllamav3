@@ -728,3 +728,38 @@ def test_cpu_reduce_round_longer_than_timeout(devices):
     for i in range(rounds):
         want = torch.full((1024,), float(2 * i + 1), dtype = HALF)
         assert torch.equal(outs[0][i], want) and torch.equal(outs[1][i], want), i
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Empty operands: every rank sees the same shape, so each collective is a no-op on all of them, and the next
+# collective still lines up
+
+def empty_program(ctx):
+    b = ctx.backend
+    out_dev = ctx.devices[0]
+    is_out = ctx.device == out_dev
+    for dtype in (HALF, torch.float):
+        b.all_reduce(torch.empty(0, dtype = dtype, device = ctx.device))
+    b.broadcast(torch.empty(0, dtype = HALF, device = ctx.device), ctx.devices[1])
+    for fn in (b.gather, b.gather_small):
+        # No rows
+        x = torch.empty(0, 64, dtype = HALF, device = ctx.device)
+        out = torch.empty(0, 64 * ctx.world, dtype = HALF, device = ctx.device) if is_out else None
+        fn(x, out, list(ctx.devices), out_dev, [64] * ctx.world)
+        # No columns on any rank (empty output tensor, null data pointer)
+        x = torch.empty(3, 0, dtype = HALF, device = ctx.device)
+        out = torch.empty(3, 0, dtype = HALF, device = ctx.device) if is_out else None
+        fn(x, out, list(ctx.devices), out_dev, [0] * ctx.world)
+    ctx.end_round()
+    x = torch.full((1024,), float(ctx.rank + 1), dtype = HALF, device = ctx.device)
+    b.all_reduce(x)
+    return x.cpu()
+
+
+def test_empty_collectives(devices):
+    """Zero-element all-reduce (fp16 and fp32), broadcast and gathers (no rows, no columns) return on every rank
+    without a hang or a launch error, and a following all-reduce is correct"""
+    ranks = [devices[0].index, devices[1].index]
+    outs = run_ranks(empty_program, ranks, timeout = 120)
+    for r in outs:
+        assert torch.equal(r, torch.full((1024,), 3.0, dtype = HALF))

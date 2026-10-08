@@ -814,7 +814,8 @@ void fused_sampler
 
     int bsz = logits.size(0);
     int dim = logits.size(1);
-    TORCH_CHECK(size > 0 && size <= dim, "fused_sampler: invalid size bound");
+    TORCH_CHECK(size > 0, "fused_sampler: sampling over an empty vocabulary (size bound 0)");
+    TORCH_CHECK(size <= dim, "fused_sampler: invalid size bound");
     TORCH_CHECK(out.numel() == bsz, "fused_sampler: out must have bsz elements");
 
     const half* mask_ptr = nullptr;
@@ -868,8 +869,10 @@ void fused_sampler
         TORCH_CHECK(hist.numel() >= bsz * FUSED_SAMPLER_HIST_STRIDE, "fused_sampler: histogram too small");
         hist_ptr = (uint8_t*) hist.data_ptr();
         TORCH_CHECK(((uintptr_t) hist_ptr) % 8 == 0, "fused_sampler: histogram must be 8-byte aligned");
-        cuda_check(cudaMemsetAsync(hist_ptr, 0, (size_t) bsz * FUSED_SAMPLER_HIST_STRIDE, stream));
     }
+
+    if (!bsz) return;
+    if (hist_ptr) cuda_check(cudaMemsetAsync(hist_ptr, 0, (size_t) bsz * FUSED_SAMPLER_HIST_STRIDE, stream));
 
     dim3 grid(num_blocks, bsz);
 
@@ -1012,6 +1015,7 @@ void apply_logit_bitmask
     bool is_half = logits_in.dtype() == at::kHalf;
     bool is_float = logits_in.dtype() == at::kFloat;
     TORCH_CHECK(is_half || is_float, "apply_logit_bitmask: logits must be half or float");
+    if (!bsz || !dim) return;
 
     dim3 grid(MIN(CEIL_DIVIDE(dim, FS_THREADS * 4), FUSED_SAMPLER_MAX_BLOCKS), bsz);
     if (is_half)

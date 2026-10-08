@@ -210,3 +210,45 @@ def test_conv1d_update_guard_regions(device, history):
     assert torch.equal(state, ref_state)
     for buf, n in ((out_buf, n_out), (st_buf, n_state)):
         assert (buf[:guard] == sentinel).all() and (buf[guard + n:] == sentinel).all()
+
+
+# Zero-size inputs: an empty batch, channel or sequence axis takes no step (conv_state untouched, also with
+# history: no tail is written for zero new tokens). K = 0 taps is the empty sum: out = act(bias); the state has no
+# window to keep (untouched without history), and with history the tail receives the last min(state_size, seqlen)
+# inputs as usual
+
+@pytest.mark.parametrize("bsz, dim, seqlen", [(0, 8, 1), (2, 0, 1), (2, 8, 0)])
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("use_slots", [False, True])
+@torch.inference_mode()
+def test_conv1d_update_empty_is_noop(device, bsz, dim, seqlen, history, use_slots):
+    K = 4
+    x = torch.randn(bsz, dim, seqlen, device = device).bfloat16()
+    state = torch.randn(3, dim, K + 3, device = device).bfloat16()
+    state0 = state.clone()
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) if use_slots else None
+    w = torch.randn(dim, K, device = device).bfloat16()
+    _run(x, state, slots, w, torch.randn(dim, device = device).bfloat16(), True, history)
+    assert torch.equal(state, state0), "conv_state modified"
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("activation", [False, True])
+@torch.inference_mode()
+def test_conv1d_update_zero_taps(device, history, activation):
+    bsz, dim, seqlen, state_size = 2, 40, 3, 5
+    x = torch.randn(bsz, dim, seqlen, device = device).bfloat16()
+    state = torch.randn(bsz, dim, state_size, device = device).bfloat16()
+    state0 = state.clone()
+    bias = torch.randn(dim, device = device).bfloat16()
+    out = _run(x, state, None, torch.empty(dim, 0, dtype = torch.bfloat16, device = device), bias, activation, history)
+    ref = bias.double()
+    if activation:
+        ref = ref * torch.sigmoid(ref)
+    assert_conv_out(out, ref.expand(bsz, seqlen, dim), torch.zeros(bsz, seqlen, dim, dtype = torch.float64, device = device))
+    expect = state0.clone()
+    if history:
+        n = min(state_size, seqlen)
+        expect[:, :, state_size - n:] = x[:, :, seqlen - n:]
+    assert torch.equal(state, expect)

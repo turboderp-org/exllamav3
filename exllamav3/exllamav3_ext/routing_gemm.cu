@@ -289,10 +289,13 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor& scores, cudaStream_t stream)
 {
     const int K = hidden.size(-1);
-    const int R = hidden.numel() / K;
+    int R = 1;
+    for (int i = 0; i < hidden.dim() - 1; ++i) R *= (int) hidden.size(i);
     const int E = gate_i8.size(1);
     const int KC = CEIL_DIVIDE(K, RG_KCH);
     TORCH_CHECK(scores.numel() == (int64_t) R * E, "routing_gemm_det: scores shape");
+    if (R == 0 || E == 0) return;
+    if (K == 0) { scores.zero_(); return; }     // empty sum
     const int S = rg_slices(R, E, KC);
     const int kslice = CEIL_DIVIDE(KC, S) * RG_KCH;
     const int S_eff = CEIL_DIVIDE(K, kslice);
@@ -403,6 +406,8 @@ void det_quant_weight
     TORCH_CHECK(w.dim() == 2 && w.is_contiguous() && w_i8.is_contiguous() && w_s.is_contiguous(), "det_quant_weight: layout");
     const int N = w.size(0), K = w.size(1);
     TORCH_CHECK(w_i8.size(0) == 2 && w_i8.size(1) == N && w_i8.size(2) == K && w_s.numel() == N, "det_quant_weight: shapes");
+    // K = 0 quantizes empty rows: the scale takes the all-zero-row convention (it multiplies nothing)
+    if (N == 0) return;
     signed char* hi = (signed char*) w_i8.data_ptr();
     quant_gate_kernel<<<N, 256, 0, stream>>>((const half*) w.data_ptr(), hi, hi + (size_t) N * K, (float*) w_s.data_ptr(), N, K);
     cuda_check(cudaPeekAtLastError());
@@ -421,6 +426,7 @@ void det_math_test(const at::Tensor& x, at::Tensor y)
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int n = x.numel();
     TORCH_CHECK(y.numel() == 3 * n, "det_math_test: y must hold 3 x n");
+    if (n == 0) return;
     det_math_kernel<<<CEIL_DIVIDE(n, 256), 256, 0, stream>>>((const float*) x.data_ptr(), (float*) y.data_ptr(), n);
     cuda_check(cudaPeekAtLastError());
 }

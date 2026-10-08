@@ -42,3 +42,24 @@ def test_add_sigmoid_gate_proj_one_hot(device):
         ext.add_sigmoid_gate_proj(x, y, z, w)
         torch.testing.assert_close(z, torch.full_like(z, 0.62245935), rtol = 1e-5, atol = 1e-5)
 
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("bsz, dim", [(0, 256), (4, 0)])
+@torch.inference_mode()
+def test_add_sigmoid_gate_proj_empty(device, bsz, dim):
+    # No rows: nothing to do. dim 0: the gate logit is an empty dot product (0), but x and z are empty too, so there
+    # is still nothing to write
+    zbuf = torch.full((64,), 7.0, device = device)
+    ext.add_sigmoid_gate_proj(torch.empty(bsz, dim, device = device), torch.empty(bsz, dim, dtype = torch.half, device = device),
+                              zbuf[8:8].view(bsz, dim), torch.empty(dim, 1, dtype = torch.half, device = device))
+    assert (zbuf == 7.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.add_sigmoid_gate_proj(torch.empty(bsz, dim, device = device).half(), torch.empty(bsz, dim, dtype = torch.half, device = device),
+                                  zbuf[8:8].view(bsz, dim), torch.empty(dim, 1, dtype = torch.half, device = device))
+    assert_device_ok(device)

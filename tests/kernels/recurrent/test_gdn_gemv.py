@@ -2,9 +2,9 @@
 Small GEMVs of the GDN/KDA graph paths (BC_GatedDeltaNetSplit), against a float64 torch matmul.
 
 ext.gdn_ba_gemv(x, w_t, bias, y): y[r, j] = sum_i x[r, i] * w_t[j, i] (+ bias[j]), x [.., k] fp16, w_t [n, k] fp16,
-    bias [n] fp16 or None, y [.., n] fp32 (rows = x.numel() / k). k must be even, all tensors contiguous; dtypes,
-    the w_t shape and y.numel() are validated. Used for the merged b/a projection and the KDA b / f_a / g_a
-    projections (x = the layer input, n = 2 * num_v_heads, num_v_heads or a head dim).
+    bias [n] fp16 or None, y [.., n] fp32 (rows = the product of x.shape[:-1]). k must be even, all tensors
+    contiguous; dtypes, the w_t shape and y.numel() are validated. Used for the merged b/a projection and the KDA
+    b / f_a / g_a projections (x = the layer input, n = 2 * num_v_heads, num_v_heads or a head dim).
 ext.gdn_lowrank_gemv_f(x, w_t, y): the same without bias for fp32 x and any k (KDA f_b / g_b second stages,
     k = head dim, n = num_v_heads * head dim).
 
@@ -165,3 +165,27 @@ def test_gdn_lowrank_gemv_f_rejects(device):
         ext.gdn_lowrank_gemv_f(x.half(), w_t, y)
     with pytest.raises(RuntimeError):
         ext.gdn_lowrank_gemv_f(x, w_t.float(), y)
+
+
+# Zero-size inputs: no rows or no outputs (n = 0) is a no-op; k = 0 is the empty dot product, so every output is
+# written as 0 (+ bias). Nothing outside y is written either way
+
+@pytest.mark.parametrize("op", ["ba", "ba_bias", "lowrank"])
+@pytest.mark.parametrize("lead, n, k", [((0,), 8, 16), ((2, 0), 8, 16), ((3,), 0, 16), ((3,), 8, 0), ((2, 3), 40, 0)])
+@torch.inference_mode()
+def test_empty(device, op, lead, n, k):
+    x = torch.randn(*lead, k, device = device)
+    w_t = torch.randn(n, k, device = device).half()
+    bias = torch.randn(n, device = device).half() if op == "ba_bias" else None
+    buf, y = guarded_out((*lead, n), device)
+    if op == "lowrank":
+        ext.gdn_lowrank_gemv_f(x, w_t, y)
+    else:
+        ext.gdn_ba_gemv(x.half(), w_t, bias, y)
+    torch.cuda.synchronize(device)
+    expect = torch.zeros_like(y) if k == 0 else torch.full_like(y, SENTINEL)
+    if k == 0 and bias is not None:
+        expect += bias.float()
+    assert torch.equal(y, expect)
+    assert_guards(buf)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

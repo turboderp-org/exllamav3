@@ -200,3 +200,49 @@ def test_pack_signs_rejects_dtypes(device):
     with pytest.raises(RuntimeError):
         ext.pack_signs(torch.zeros(2, dtype = torch.int32, device = device),
                        torch.zeros(32, dtype = torch.half, device = device))
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("K", [1, 4, 8])
+@pytest.mark.parametrize("rows, cols", [(0, 4), (3, 0), (0, 0)])
+@torch.inference_mode()
+def test_empty_pack_unpack_trellis(device, K, rows, cols):
+    """Zero tiles: no-op; shapes and K are still validated"""
+    words = torch.zeros((rows, cols, 256), dtype = torch.int16, device = device)
+    packed = torch.zeros((rows, cols, 16 * K), dtype = torch.int16, device = device)
+    ext.pack_trellis(packed, words, K)
+    ext.unpack_trellis(words, packed, K)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.pack_trellis(packed, torch.zeros((rows, cols + 1, 256), dtype = torch.int16, device = device), K)
+    with pytest.raises(RuntimeError, match = "incorrect size"):
+        ext.unpack_trellis(words, torch.zeros((rows, cols, 16 * K + 16), dtype = torch.int16, device = device), K)
+    with pytest.raises(RuntimeError, match = "K must be 1..8"):
+        ext.pack_trellis(packed[..., :0], words, 0)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("K", [1.5, 2.5])
+@pytest.mark.parametrize("rows, cols", [(0, 4), (3, 0)])
+@torch.inference_mode()
+def test_empty_frac(device, K, rows, cols):
+    ka, mask = tref.frac(K)
+    words = torch.zeros((rows, cols, 256), dtype = torch.int16, device = device)
+    packed = torch.zeros((rows, cols, int(16 * K)), dtype = torch.int16, device = device)
+    ext.pack_trellis_frac(packed, words, ka, mask)
+    ext.unpack_trellis_frac(words, packed, ka, mask)
+    _device_still_works(device)
+
+
+@torch.inference_mode()
+def test_empty_pack_signs(device):
+    packed = torch.empty(0, dtype = torch.int16, device = device)
+    ext.pack_signs(packed, torch.empty(0, dtype = torch.half, device = device))
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.pack_signs(packed, torch.empty(0, dtype = torch.float, device = device))
+    _device_still_works(device)

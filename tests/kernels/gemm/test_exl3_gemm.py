@@ -89,3 +89,30 @@ def test_smem_budget_respected(device):
         C = _gemm(A, w)
         torch.cuda.synchronize(device)
         assert torch.isfinite(C.float()).all(), f"K={K}: non-finite output (limit {limit})"
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("c_dtype", [torch.half, torch.float])
+@pytest.mark.parametrize("m, k, n", [(0, 256, 256), (4, 256, 0), (4, 0, 256), (0, 0, 0)])
+@torch.inference_mode()
+def test_empty_gemm(device, c_dtype, m, k, n):
+    """No rows (e.g. a TP shard or expert with no tokens) or no output columns: a no-op. An empty reduction
+    (k = 0): the product is zero"""
+    w = rand_linear(k, n, 4, generator(0), device)
+    A = torch.randn((m, k), device = device).half()
+    C = torch.full((m, n), 5.0, dtype = c_dtype, device = device)
+    ext.exl3_gemm(A, w["trellis"], C, w["suh"], torch.empty_like(A), w["svh"], 0, False, True, 0)
+    torch.cuda.synchronize(device)
+    assert (C == (0.0 if k == 0 and m and n else 5.0)).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.exl3_gemm(A.float(), w["trellis"], C, w["suh"], torch.empty_like(A), w["svh"], 0, False, True, 0)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.exl3_gemm(A, w["trellis"], torch.empty((m, n + 16), dtype = c_dtype, device = device), w["suh"],
+                      torch.empty_like(A), w["svh"], 0, False, True, 0)
+    _device_still_works(device)

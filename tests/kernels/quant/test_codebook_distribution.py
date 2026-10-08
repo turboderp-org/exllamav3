@@ -76,3 +76,40 @@ def test_rejections(device):
         ext.test_distribution(x, torch.empty(64, device = device), torch.empty(63, device = device), -1.0, 1.0, False, False)
     with pytest.raises(RuntimeError):
         ext.test_distribution(x.half(), torch.empty(64, device = device), None, -1.0, 1.0, False, False)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("numel, bins, match", [
+    (0, 64, "empty input"),         # normalized histogram of nothing: 0 / 0
+    (100, 0, "no bins"),
+    (0, 0, "no bins"),
+])
+@torch.inference_mode()
+def test_empty_distribution(device, numel, bins, match):
+    x = torch.randn(numel, device = device)
+    dist = torch.full((bins,), -1.0, device = device)
+    ref = torch.full((bins,), -1.0, device = device)
+    with pytest.raises(RuntimeError, match = f"test_distribution: .*{match}"):
+        ext.test_distribution(x, dist, ref, -1.0, 1.0, False, True)
+    assert (dist == -1.0).all() and (ref == -1.0).all()
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("dtype", [torch.float, torch.half])
+@torch.inference_mode()
+def test_empty_histogram(device, dtype):
+    """ext.histogram of an empty tensor counts nothing (all bins zero); a histogram without bins is rejected"""
+    out = torch.full((16,), 7, dtype = torch.long, device = device)
+    ext.histogram(torch.empty((0, 5), dtype = dtype, device = device), out, -1.0, 1.0, False)
+    assert (out == 0).all()
+    for numel in (0, 10):
+        with pytest.raises(RuntimeError, match = "histogram: empty output"):
+            ext.histogram(torch.zeros(numel, dtype = dtype, device = device),
+                          torch.empty(0, dtype = torch.long, device = device), -1.0, 1.0, True)
+    _device_still_works(device)

@@ -73,6 +73,7 @@ void pack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "pack_trellis: K must be 1..8");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -80,6 +81,7 @@ void pack_trellis
 
     int rows = packed.size(0);
     int cols = packed.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(128);
     dim3 gridDim(rows, cols);
@@ -155,6 +157,7 @@ void unpack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "unpack_trellis: K must be 1..8");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -162,6 +165,7 @@ void unpack_trellis
 
     int rows = packed.size(0);
     int cols = packed.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(128);
     dim3 gridDim(cols, rows);
@@ -215,6 +219,7 @@ void pack_signs
     TORCH_CHECK_DTYPE(packed, kShort);
 
     int cols = packed.size(0);
+    if (!cols) return;
     dim3 blockDim(32);
     dim3 gridDim(CEIL_DIVIDE(cols, 32));
 

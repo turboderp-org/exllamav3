@@ -109,3 +109,35 @@ def test_routing_ds3_radix_no_bias(device, act):
         ext.routing_ds3_nogroup_logits(scores, None, idx, w, 1.0, False, act)
         ri, rw, _ = ref_ds3(scores, K, None, 1.0, act)
         check(idx, w, ri, rw, f"ds3-radix E={E} K={K} act={act}")
+
+
+# Zero-size inputs: no rows is a no-op (outputs untouched); no experts (top-k over an empty set) and K = 0 (the
+# weights normalize over an empty selection) raise, checked before the empty-batch return
+
+@pytest.mark.parametrize("fn", ["std", "ds3"])
+@pytest.mark.parametrize("use_topk", [True, False])
+@pytest.mark.parametrize("rows, E, K, error", [
+    (0, 32, 4, None),
+    (4, 0, 0, "empty expert set"),
+    (0, 0, 0, "empty expert set"),
+    (4, 32, 0, "K = 0"),
+    (0, 32, 0, "K = 0"),
+])
+@torch.inference_mode()
+def test_empty(device, fn, use_topk, rows, E, K, error):
+    scores = torch.randn((rows, E), device = device).half()
+    scores0 = scores.clone()
+    idx = torch.full((rows, K), -7, dtype = torch.long, device = device)
+    w = torch.full((rows, K), 99.0, dtype = torch.half, device = device)
+    if fn == "std":
+        call = lambda: ext.routing_std_logits(scores, idx, w, None, use_topk)
+    else:
+        call = lambda: ext.routing_ds3_nogroup_logits(scores, None, idx, w, 1.0, use_topk, 0)
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            call()
+    else:
+        call()
+    torch.cuda.synchronize(device)
+    assert torch.equal(scores, scores0)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

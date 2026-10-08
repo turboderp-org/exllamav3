@@ -105,12 +105,13 @@ void apply_rep_pens
 
     TORCH_CHECK_DTYPE(out_logits, kFloat);
     TORCH_CHECK_DTYPE(past_ids, kLong);
-    TORCH_CHECK(in_logits.size(0) == 1, "rep. penalties only implemented for bsz 1");  // TODO
+    TORCH_CHECK(in_logits.size(0) <= 1, "rep. penalties only implemented for bsz 1");  // TODO
     TORCH_CHECK_SHAPES(past_ids, 0, in_logits, 0, 1);
     TORCH_CHECK_SHAPES_FULL(in_logits, out_logits);
 
     int past_len = past_ids.size(1);
     int vocab_size = in_logits.size(1);
+    if (!in_logits.size(0) || !vocab_size) return;
     int num_blocks = CEIL_DIVIDE(vocab_size, BLOCK_VOCAB_SPAN);
 
     #define kernel_args \
@@ -216,12 +217,13 @@ void apply_pres_freq_pens
 
     TORCH_CHECK_DTYPE(out_logits, kFloat);
     TORCH_CHECK_DTYPE(past_ids, kLong);
-    TORCH_CHECK(in_logits.size(0) == 1, "rep. penalties only implemented for bsz 1");  // TODO
+    TORCH_CHECK(in_logits.size(0) <= 1, "rep. penalties only implemented for bsz 1");  // TODO
     TORCH_CHECK_SHAPES(past_ids, 0, in_logits, 0, 1);
     TORCH_CHECK_SHAPES_FULL(in_logits, out_logits);
 
     int past_len = past_ids.size(1);
     int vocab_size = in_logits.size(1);
+    if (!in_logits.size(0) || !vocab_size) return;
     int num_blocks = CEIL_DIVIDE(vocab_size, BLOCK_VOCAB_SPAN);
 
     #define kernel_args \

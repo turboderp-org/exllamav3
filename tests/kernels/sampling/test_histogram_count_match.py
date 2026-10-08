@@ -9,7 +9,8 @@ Exact contracts of two small counting helpers:
   across one. Used by eval/prequant_test.py only.
 - count_match_tensor(a, b, max_a) (host, int64): the length of the common prefix of a.flatten() and b's row,
   stopping at min(max_a, b.size(1)). Reference: a Python loop. Used by the generator's partial-page reuse
-  (job.py) with a page's token row and a narrowed view of the sequence ids.
+  (job.py) with a page's token row and a narrowed view of the sequence ids. The count is also bounded by a's
+  length, so an empty a or b (or max_a <= 0) counts zero matches without reading past either buffer.
 """
 
 import numpy as np
@@ -120,3 +121,11 @@ def test_count_match_tensor_edges():
     a2 = torch.tensor([[1 << 40, 2]], dtype = torch.long)
     b2 = torch.tensor([[(1 << 40) + (1 << 33), 2]], dtype = torch.long)
     assert ext.count_match_tensor(a2, b2, 2) == 0
+
+
+@pytest.mark.nogpu
+@pytest.mark.parametrize("a_len, b_len, max_a", [(0, 10, 10), (0, 0, 10), (10, 0, 10), (3, 10, 10), (10, 10, 0), (0, 0, -1)])
+def test_empty_count_match_tensor(a_len, b_len, max_a):
+    a = torch.arange(a_len, dtype = torch.long).view(1, a_len)
+    b = torch.arange(b_len, dtype = torch.long).view(1, b_len)
+    assert ext.count_match_tensor(a, b, max_a) == max(0, min(a_len, b_len, max_a))

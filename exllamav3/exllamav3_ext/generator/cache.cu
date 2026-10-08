@@ -78,11 +78,12 @@ void cache_rotate
     TORCH_CHECK_DTYPE(order, kInt);
 
     size_t num_pages = cache.size(0);
-    size_t page_size = cache.nbytes() / num_pages;
+    size_t page_size = cache.element_size();
+    for (int i = 1; i < cache.dim(); ++i) page_size *= cache.size(i);
     size_t rotate_len = order.size(0) / 2;
 
     TORCH_CHECK(temp.nbytes() == page_size, "temp tensor incorrect size");
-    if (!page_size || !rotate_len) return;
+    if (!num_pages || !page_size || !rotate_len) return;
 
     uint8_t* c = (uint8_t*) cache.data_ptr();
     const int32_t* o = (const int32_t*) order.data_ptr();
@@ -135,10 +136,14 @@ void dspark_write_rows
     TORCH_CHECK_DTYPE(kv, kHalf);
     TORCH_CHECK_DTYPE(block_table, kInt);
     TORCH_CHECK_DTYPE(cache_seqlens, kInt);
+    TORCH_CHECK(rows.dim() == 3 && kv.dim() == 3 && block_table.dim() == 2 && cache_seqlens.dim() == 1,
+                "dspark_write_rows: expected (bsz, s, w) rows, (pages, page_size, w) kv, (bsz, npr) block table, (bsz,) seqlens");
     int bsz = (int) rows.size(0);
     int s = (int) rows.size(1);
     int w = (int) rows.size(2);
     int64_t total = (int64_t) s * w;
+    if (!bsz || !total) return;
+    TORCH_CHECK(block_table.size(1) > 0, "dspark_write_rows: rows to write but no pages in block table");
     dspark_write_rows_kernel<<<dim3(CEIL_DIVIDE(total, kThreads), bsz), kThreads, 0, stream>>>
     (
         (const half*) rows.data_ptr(),
@@ -230,10 +235,12 @@ void paged_kv_cache_update
     TORCH_CHECK(k_cache.size(1) == 256, "this kernel needs page_size == 256");
     TORCH_CHECK(v_cache.size(1) == 256, "this kernel needs page_size == 256");
 
+    TORCH_CHECK((D & 7) == 0, "dim must be divisible by 8");
+
     if (B == 0 || S == 0 || H == 0 || D == 0) return;
+    TORCH_CHECK(max_blocks_per_seq > 0, "paged_kv_cache_update: tokens to write but no pages in block table");
 
     const int max_grid = 65535;
-    TORCH_CHECK((D & 7) == 0, "dim must be divisible by 8");
 
     const int64_t total_vecs = (int64_t) B * (int64_t) S * (int64_t) H * (int64_t) (D >> 3);
     const int grid = std::min((int) CEIL_DIVIDE(total_vecs, (int64_t) kThreads), max_grid);

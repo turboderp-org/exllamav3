@@ -149,7 +149,8 @@ void common
     at::Tensor& ids,
     int& bsz,
     int& num_logits,
-    int& max_logit
+    int& max_logit,
+    const char* fn
 )
 {
     TORCH_CHECK_DIM(logits, 2);
@@ -161,6 +162,7 @@ void common
     bsz = logits.size(0);
     num_logits = logits.size(1);
     if (max_logit > num_logits) max_logit = num_logits;
+    TORCH_CHECK(max_logit > 0, fn, ": sampling over an empty vocabulary");
 }
 
 void argmax_sample
@@ -176,7 +178,8 @@ void argmax_sample
     if (!max_logit) max_logit = logits.size(-1);
 
     int bsz, num_logits;
-    common(logits, ids, bsz, num_logits, max_logit);
+    common(logits, ids, bsz, num_logits, max_logit, "argmax_sample");
+    if (!bsz) return;
     argmax_sample_kernel<<<bsz, NUM_THREADS, 0, stream>>>
     (
         (const half*) logits.data_ptr(),
@@ -200,7 +203,8 @@ void gumbel_sample
     if (!max_logit) max_logit = logits.size(-1);
 
     int bsz, num_logits;
-    common(logits, ids, bsz, num_logits, max_logit);
+    common(logits, ids, bsz, num_logits, max_logit, "gumbel_sample");
+    if (!bsz) return;
     gumbel_sample_kernel<<<bsz, NUM_THREADS, 0, stream>>>
     (
         (const half*) logits.data_ptr(),

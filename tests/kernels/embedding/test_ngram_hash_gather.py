@@ -288,3 +288,35 @@ def test_ngram_gather_rejects(table_file):
         ext.ngram_gather_cpu(fd, base, row_bytes, u, 0, torch.zeros((1, row_bytes // 2), dtype = torch.int16))
     with pytest.raises(RuntimeError, match = "contiguous int64"):
         ext.ngram_gather_cpu(fd, base, row_bytes, u.int(), 0, torch.zeros((2, row_bytes // 2), dtype = torch.int16))
+
+
+def test_ngram_hash_empty_axes():
+    # No positions (bsz 0) or no heads (ngram_size 1, or no multipliers at all): no ids, U = 0, nothing written
+    mult, offsets, sizes = hash_params(3, 8, 7)
+    e64 = torch.full((4,), -3, dtype = torch.int64)
+    e32 = torch.full((4,), -3, dtype = torch.int32)
+    assert ext.ngram_hash_cpu(torch.empty(0, 5, dtype = torch.int64), 3, mult, offsets, sizes, 8, EOS,
+                              e64, e64.clone(), e32) == 0
+    ids = make_ids(1, 4, 8)
+    none = torch.empty(0, dtype = torch.int64)
+    for m in (mult[:1], none):
+        assert ext.ngram_hash_cpu(ids, 4, m, none, none, 0 if m.numel() == 0 else 8, EOS, e64, e64.clone(), e32) == 0
+    assert (e64 == -3).all() and (e32 == -3).all()
+    # A head with an empty hash table has no row to map to (and would be a host division by zero)
+    sizes0 = sizes.clone()
+    sizes0[3] = 0
+    n = 4 * 16
+    b64, b32 = torch.zeros((n,), dtype = torch.int64), torch.zeros((n,), dtype = torch.int32)
+    with pytest.raises(RuntimeError, match = "empty hash table for head 3"):
+        ext.ngram_hash_cpu(ids, 4, mult, offsets, sizes0, 8, EOS, b64, b64.clone(), b32)
+    with pytest.raises(RuntimeError, match = "one entry per head"):
+        ext.ngram_hash_cpu(ids, 4, mult, offsets, sizes[:-1], 8, EOS, b64, b64.clone(), b32)
+    with pytest.raises(RuntimeError, match = "dims"):
+        ext.ngram_hash_cpu(ids, -1, mult, offsets, sizes, 8, EOS, b64, b64.clone(), b32)
+
+
+@pytest.mark.platform("linux")
+def test_ngram_gather_empty_rows(table_file):
+    # Zero-byte rows: nothing to read, no-op
+    _, fd, base, _, _ = table_file
+    ext.ngram_gather_cpu(fd, base, 0, torch.tensor([1, 2], dtype = torch.int64), 0, torch.empty((2, 0), dtype = torch.int16))

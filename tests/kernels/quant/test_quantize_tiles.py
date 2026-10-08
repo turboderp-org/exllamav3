@@ -186,3 +186,42 @@ def test_encoder_follows_selection(device, K, cb):
     _, idx = quantize_tiles(tiles, args(K, cbi))
     _, idx_explicit = quantize_tiles(tiles, {"K": K, "mcg": mcg, "mul1": mul1})
     assert torch.equal(idx, idx_explicit)
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("K", [1, 4, 8])
+@torch.inference_mode()
+def test_empty_quantize_tiles(device, K):
+    """Zero tiles: a no-op that needs no scratch; the dtype/shape checks still apply"""
+    x = torch.empty((0, 256), device = device)
+    y = torch.empty_like(x)
+    idx = torch.empty_like(x, dtype = torch.short)
+    costs, edges = get_temp_buffers(device, K, cb = 2)
+    ext.quantize_tiles(x, y, idx, costs, edges, K, False, True)
+    ext.quantize_tiles(x, y, idx, costs[:0], edges[:0], K, False, True)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.quantize_tiles(x, y, idx.int(), costs, edges, K, False, True)
+    with pytest.raises(RuntimeError, match = "length 160 requires the mul1 codebook"):
+        x160 = torch.empty((0, 160), device = device)
+        ext.quantize_tiles(x160, torch.empty_like(x160), torch.empty_like(x160, dtype = torch.short),
+                           costs, edges, K, True, False)
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("shape", [(0, 256), (3, 0), (0, 0)])
+@pytest.mark.parametrize("dtype", [torch.float, torch.half])
+@torch.inference_mode()
+def test_empty_decode(device, shape, dtype):
+    """Elementwise: an empty index tensor decodes to nothing"""
+    idx = torch.empty(shape, dtype = torch.short, device = device)
+    out = torch.empty(shape, dtype = dtype, device = device)
+    ext.decode(idx, out, False, True)
+    with pytest.raises(RuntimeError, match = "decode: output_tiles must be float or half"):
+        ext.decode(idx, out.bfloat16(), False, True)
+    _device_still_works(device)

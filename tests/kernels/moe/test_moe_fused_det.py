@@ -156,3 +156,76 @@ def test_fused_det_foreign_sentinel(device):
     scale = ref.abs().max().item()
     assert (out - ref).abs().max().item() <= 3e-3 * scale
     assert out[0].abs().max().item() == 0.0     # token with no local expert contributes nothing
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["no_tokens", "no_active", "no_cap", "no_experts", "no_hidden"])
+def test_empty_fused(device, case):
+    """No tokens, no active experts, no rows per expert in this tier, no experts or no output columns: a no-op
+    (output untouched, shape checks still applied)"""
+    gen = torch.Generator().manual_seed(0)
+    E_ = 0 if case == "no_experts" else E
+    ex = experts_to(rand_experts(E_, H, I, K, gen), device)
+    tabs = expert_ptr_tables(ex, device) if E_ else {p: [torch.empty(0, dtype = torch.long, device = device)] * 3
+                                                    for p in "gud"}
+    T_ = 0 if case == "no_tokens" else 4
+    H_ = 0 if case == "no_hidden" else H
+    y = torch.randn((T_, H_), device = device).half()
+    sel = torch.randint(0, max(E_, 1), (T_, TOPK), device = device)
+    if E_ == 0:
+        sel.fill_(-1)
+    lay = routing_layout(sel, torch.ones((T_, TOPK), dtype = torch.half, device = device), E_)
+    bufs = moe_buffers(H_, I, 0 if case == "no_cap" else CAP, device)
+    out = torch.full((T_, H_), 5.0, dtype = torch.float, device = device)
+    args = (lay.expert_count, lay.token_sorted, lay.weight_sorted)
+    launch(y, out, args, bufs, tabs, num_active = 0 if case == "no_active" else -1)
+    torch.cuda.synchronize()
+    assert (out == 5.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        launch(y, out.half(), args, bufs, tabs, num_active = 0 if case == "no_active" else -1)
+    _device_still_works(device)
+
+
+def test_empty_fused_rejections(device):
+    """An empty intermediate dim is rejected (the fused tier's output slots would stay unwritten); temp buffers
+    without a group, or an expert_count without the sentinel bin, are rejected"""
+    gen = torch.Generator().manual_seed(0)
+    ex = experts_to(rand_experts(E, H, I, K, gen), device)
+    tabs = expert_ptr_tables(ex, device)
+    y = torch.randn((4, H), device = device).half()
+    sel = torch.randint(0, E, (4, TOPK), device = device)
+    lay = routing_layout(sel, torch.ones((4, TOPK), dtype = torch.half, device = device), E)
+    args = (lay.expert_count, lay.token_sorted, lay.weight_sorted)
+    out = torch.full((4, H), 5.0, dtype = torch.float, device = device)
+    with pytest.raises(RuntimeError, match = "exl3_moe: empty intermediate dimension"):
+        launch(y, out, args, moe_buffers(H, 0, CAP, device), tabs)
+    with pytest.raises(RuntimeError, match = "exl3_moe: temp buffers hold no expert group"):
+        launch(y, out, args, [b[:0] for b in moe_buffers(H, I, CAP, device)], tabs)
+    with pytest.raises(RuntimeError, match = "exl3_moe: expert_count must hold"):
+        launch(y, out, (lay.expert_count[:0], lay.token_sorted, lay.weight_sorted), moe_buffers(H, I, CAP, device),
+               tabs)
+    assert (out == 5.0).all()
+    _device_still_works(device)
+
+
+@pytest.mark.parametrize("tokens, topk", [(0, 2), (3, 0), (0, 0)])
+def test_empty_gather(device, tokens, topk):
+    """No tokens: no-op. No assignments per token: each row gains the empty sum (unchanged)"""
+    out = torch.full((tokens, H), 5.0, dtype = torch.float, device = device)
+    scratch = torch.empty((0, H), dtype = torch.float, device = device)
+    flat = torch.empty(tokens * topk, dtype = torch.long, device = device)
+    tables = torch.zeros(E + 1, dtype = torch.long, device = device)
+    ext.exl3_moe_gather(out, scratch, flat, flat, tables, tables, tables, torch.empty(tokens * topk, dtype = torch.half,
+                                                                                      device = device))
+    torch.cuda.synchronize()
+    assert (out == 5.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        ext.exl3_moe_gather(out.half(), scratch, flat, flat, tables, tables, tables,
+                            torch.empty(tokens * topk, dtype = torch.half, device = device))
+    _device_still_works(device)

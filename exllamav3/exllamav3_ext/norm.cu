@@ -342,13 +342,14 @@ void rms_norm_impl
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES_FULL(x, y);
     TORCH_CHECK(w_groups == 1 || !span_heads, "rms_norm: w_groups and span_heads are exclusive");
+    TORCH_CHECK(w_groups >= 1, "rms_norm: w_groups must be positive");
 
     auto tx = x.scalar_type();
     auto tw = at::kHalf;  // intentional, type is irrelevant if w is None
     auto ty = y.scalar_type();
 
     const half* w_ptr = (const half*) OPTPTR(w);
-    if (w_ptr)
+    if (w.has_value())
     {
         if (w_groups == 1)
         {
@@ -365,13 +366,14 @@ void rms_norm_impl
     void* r_ptr = OPTPTR(r);
     if (res_mode == RES_IN)
     {
-        TORCH_CHECK(r_ptr, "rms_norm: res_mode RES_IN requires residual tensor");
+        TORCH_CHECK(r.has_value(), "rms_norm: res_mode RES_IN requires residual tensor");
         TORCH_CHECK_SHAPES_FULL(x, r.value());
     }
 
     int rows = 1;
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
     int dim = x.size(-1);
+    TORCH_CHECK(dim > 0, "rms_norm: norm over an empty dimension");
 
     // Size the block to the row so short rows don't idle warps through the reduction
     int threads = MIN(NUM_THREADS, CEIL_DIVIDE(dim / 4, 32) * 32);
@@ -384,7 +386,8 @@ void rms_norm_impl
     // Launch macro
     #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res, _tr, __tr)                                   \
     if (tx == at::_tx && tw == at::_tw && ty == at::_ty && res_mode == _res && tr == at::_tr)      \
-        rms_norm_kernel<_res, __tx, __ty, __tw, __tr><<<gridDim, blockDim, 0, stream>>>            \
+    {                                                                                              \
+        if (rows) rms_norm_kernel<_res, __tx, __ty, __tw, __tr><<<gridDim, blockDim, 0, stream>>>  \
         (                                                                                          \
             (const __tx*) x.data_ptr(),                                                            \
             (const __tw*) w_ptr,                                                                   \
@@ -396,7 +399,8 @@ void rms_norm_impl
             constant_bias,                                                          \
             constant_scale,                                                         \
             w_groups                                                                \
-        );
+        );                                                                          \
+    }
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
          __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_NONE, kHalf,  half)
@@ -623,6 +627,7 @@ void gated_rms_norm_gr
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIV(x, -1, 4);
+    TORCH_CHECK(w_groups >= 1, "gated_rms_norm: w_groups must be positive");
     if (w_groups == 1)
     {
         TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
@@ -637,6 +642,7 @@ void gated_rms_norm_gr
     int rows = 1;
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
     int dim = x.size(-1);
+    TORCH_CHECK(dim > 0, "gated_rms_norm: norm over an empty dimension");
 
     bool small = (dim <= 256);
 
@@ -651,7 +657,8 @@ void gated_rms_norm_gr
     // Launch macro
     #define __(_tx, __tx, _tw, __tw, _ty, __ty, _tg, __tg, _small, __num_threads)               \
     if (small == _small && tx == at::_tx && tw == at::_tw && ty == at::_ty && tg == at::_tg)    \
-        gated_rms_norm_kernel<__num_threads><<<gridDim, blockDim, 0, stream>>>                  \
+    {                                                                                           \
+        if (rows) gated_rms_norm_kernel<__num_threads><<<gridDim, blockDim, 0, stream>>>        \
         (                                                                                       \
             (const __tx*) x.data_ptr(),                                                         \
             (const __tw*) w.data_ptr(),                                                         \
@@ -664,7 +671,8 @@ void gated_rms_norm_gr
             w_groups,                                                                           \
             gate_first,                                                                         \
             gate_act                                                                            \
-        );
+        );                                                                                      \
+    }
 
     //      x_type_____________  w_type_____________  y_type_______  g_type_____________  small  num_threads
          __(kBFloat16, bfloat16, kFloat,    float,    kHalf,  half,  kBFloat16, bfloat16, true,  32         )

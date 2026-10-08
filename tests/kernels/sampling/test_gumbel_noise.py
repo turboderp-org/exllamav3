@@ -14,6 +14,9 @@ stream (testlib.sampling) and the exact float64 Gumbel transform:
   element pair and 2048-element round). No Python caller (see the report); its batch rows share one noise
   stream and its paired half2 reads assume an even row length.
 
+Empty inputs are no-ops for all of them (elementwise), with no CUDA error left pending; gumbel_sample's empty
+cases are in test_sampling_edges.py.
+
 The kernels use __logf, so the per-element comparison carries a tolerance derived from __logf's error
 (testlib.sampling.gumbel_noise_tolerance); elements with u within 1e-6 of 1, where -ln(u) is too small for
 __logf's absolute error, are only checked to be finite and bounded. The distribution is additionally checked by
@@ -291,3 +294,22 @@ def test_gumbel_sample_odd_vocab_batched(v, device):
         assert 0 <= ids[r, 0].item() < v
         if ref[r] is not None:
             assert ids[r, 0].item() == ref[r]
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("fn", ["gumbel_noise_f16", "gumbel_noise_f32", "gumbel_noise_log", "adaptivep_gumbel_noise_f32"])
+@pytest.mark.parametrize("shape", [(0,), (0, 128), (3, 0)])
+@torch.inference_mode()
+def test_empty_noise(device, fn, shape):
+    dtype = torch.half if fn == "gumbel_noise_f16" else torch.float
+    x = torch.empty(shape, dtype = dtype, device = device)
+    out = torch.empty(shape, dtype = dtype, device = device)
+    extra = (0.5, 2.0, 5.0, 1.0) if fn == "adaptivep_gumbel_noise_f32" else ()
+    getattr(ext, fn)(x, out, 7, *extra)
+    _device_still_works(device)

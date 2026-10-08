@@ -74,6 +74,8 @@ void softcap
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     uint64_t numel = x.numel();
+    TORCH_CHECK(x.dtype() == at::kFloat || x.dtype() == at::kHalf, "softcap wrong dtype");
+    if (!numel) return;
 
     if (x.dtype() == at::kFloat)
     {

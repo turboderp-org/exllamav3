@@ -523,3 +523,86 @@ def test_rope_rejects_invalid(device, case):
     # A rank-3 q fails on q.size(3) (IndexError) before the explicit rank check is reached
     with pytest.raises((RuntimeError, IndexError)):
         _call(a)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@pytest.mark.parametrize("case", ["bsz", "seq", "heads", "head_dim", "bsz_position_ids"])
+@torch.inference_mode()
+def test_rope_empty(device, case):
+    # No tokens, no heads or zero-width heads: nothing to rotate, no launch, outputs untouched. Argument validation
+    # (here an invalid rope mode) still applies
+    q_shape, k_shape, hd = {
+        "bsz": ((0, 4, 8, 64), (0, 4, 2, 64), 64),
+        "seq": ((1, 0, 8, 64), (1, 0, 2, 64), 64),
+        "heads": ((1, 4, 0, 64), None, 64),
+        "head_dim": ((1, 4, 8, 0), (1, 4, 2, 0), 0),
+        "bsz_position_ids": ((0, 4, 8, 64), None, 64),
+    }[case]
+    qbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+    kbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+    q = torch.empty(q_shape, dtype = torch.half, device = device)
+    out_q = qbuf[8:8].view(q_shape)
+    k = torch.empty(k_shape, dtype = torch.half, device = device) if k_shape else None
+    out_k = kbuf[8:8].view(k_shape) if k_shape else None
+    pid = torch.zeros(0, 4, dtype = torch.int, device = device) if case == "bsz_position_ids" else None
+    call_rope(q, out_q, default_inv_freq(hd, device), k, out_k, position = 5, position_ids = pid)
+    assert (qbuf == 7.0).all() and (kbuf == 7.0).all()
+    with pytest.raises(RuntimeError, match = "incorrect norm dtype"):
+        call_rope(q, out_q, default_inv_freq(hd, device), k, out_k, mode = 0)
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_rope_empty_head_dim_with_norm_rejected(device):
+    # The per-head RMS norm of a zero-width head is undefined
+    q = torch.empty(1, 4, 8, 0, dtype = torch.half, device = device)
+    w = torch.empty(0, dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "q/k norm over an empty head_dim"):
+        call_rope(q, q, default_inv_freq(0, device), q_norm = w, k_norm = w)
+    # An odd head_dim has an unpaired element (the kernel moves heads in half2 pairs)
+    q = torch.randn(1, 2, 2, 66, dtype = torch.half, device = device)[..., :65]
+    with pytest.raises(RuntimeError, match = "head_dim must be even"):
+        call_rope(q, q, default_inv_freq(64, device))
+    assert_device_ok(device)
+
+
+@pytest.mark.nogpu
+def test_gen_mrope_pos_ids_empty():
+    # No positions to fill: no-op, next position 0. An empty span next to an empty grid is fine (nothing reads it)
+    pid = torch.full((3, 0), -1, dtype = torch.long)
+    assert ext.gen_mrope_pos_ids(pid, torch.zeros(0, dtype = torch.long), 2, [], []) == 0
+    pid = torch.full((3, 4), -1, dtype = torch.long)
+    ids = torch.tensor([5, 6, 7, 8], dtype = torch.long)
+    assert ext.gen_mrope_pos_ids(pid, ids, 2, [(100, 100)], [(0, 0, 0)]) == 4
+    assert torch.equal(pid, torch.arange(4).expand(3, 4))
+    # A non-empty span positioned by an empty grid (or merge_size 0) has no positions to take: rejected, not a
+    # host division by zero
+    ids = torch.tensor([5, 100, 101, 8], dtype = torch.long)
+    for grid, merge in (((1, 0, 4), 2), ((1, 2, 2), 4), ((0, 2, 2), 2)):
+        with pytest.raises(RuntimeError, match = "empty grid"):
+            ext.gen_mrope_pos_ids(pid, ids, merge, [(100, 102)], [grid])
+    with pytest.raises(RuntimeError, match = "merge_size must be positive"):
+        ext.gen_mrope_pos_ids(pid, ids, 0, [(100, 102)], [(1, 2, 2)])
+    with pytest.raises(RuntimeError, match = "pair up"):
+        ext.gen_mrope_pos_ids(pid, ids, 2, [(100, 102)], [])
+
+
+@torch.inference_mode()
+def test_rope_empty_k_still_validated(device):
+    # An empty k is still checked against q (an empty tensor is not "no k")
+    q = torch.randn(1, 4, 8, 64, dtype = torch.half, device = device)
+    k = torch.empty(0, 4, 2, 64, dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "k is incorrect shape"):
+        call_rope(q, q, default_inv_freq(64, device), k, k)
+    # Zero k heads next to real q heads: k contributes nothing, q is rotated as without k
+    k = torch.empty(1, 4, 0, 64, dtype = torch.half, device = device)
+    a, b = torch.empty_like(q), torch.empty_like(q)
+    call_rope(q, a, default_inv_freq(64, device), k, k, position = 3)
+    call_rope(q, b, default_inv_freq(64, device), position = 3)
+    assert torch.equal(a, b)
+    assert_device_ok(device)

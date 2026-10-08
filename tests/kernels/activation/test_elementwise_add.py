@@ -8,7 +8,10 @@ divisor of it, e.g. a (dim,) bias over (rows, dim)). x, y, z each float16 or flo
 y are both fp16 the sum is an fp16 add (__hadd) converted to z's dtype, otherwise an fp32 add rounded once to z's
 dtype: either way bit-identical to the unfused torch expression. Works in place (z is x, or z is y when the sizes
 are equal), writes exactly z.numel() == x.numel() elements, 64-bit indexing. Rejects (TORCH_CHECK) y.numel() >
-x.numel() and y.numel() not dividing x.numel().
+x.numel() and y.numel() not dividing x.numel(). An empty x is a no-op (any y repeats over it zero times); an empty y
+with a non-empty x is rejected.
+
+Also here: the empty-input contract of the other flat elementwise ops (softcap, xielu, the act_mul family): no-ops.
 
 Reference: torch elementwise ops (exact).
 """
@@ -118,3 +121,63 @@ def test_add_numel_beyond_int32(device):
     assert bits_equal(x[:4], b.expand(4, dim).contiguous())
     del x
     torch.cuda.empty_cache()
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+def empty_in_sentinel(shape, dtype, device):
+    """(buffer, empty view of shape inside it): a write through the view would land in the sentinel buffer"""
+    buf = torch.full((64,), 7.0, dtype = dtype, device = device)
+    return buf, buf[8:8].view(shape)
+
+
+ACT_MUL = ["silu_mul", "silu_oai_mul", "gelu_mul", "relu2_mul", "relu_mul"]
+
+
+@pytest.mark.parametrize("op", ["add", "add_bias", "softcap_h", "softcap_f", "xielu"] + ACT_MUL)
+@pytest.mark.parametrize("shape", [(0, 128), (4, 0)])
+@torch.inference_mode()
+def test_elementwise_empty(device, op, shape):
+    # Elementwise ops on empty input are no-ops: no launch, nothing written. Dtype validation still applies
+    h, f = torch.half, torch.float
+    if op in ("add", "add_bias"):
+        buf, z = empty_in_sentinel(shape, h, device)
+        y = torch.empty(shape if op == "add" else shape[-1:], dtype = h, device = device)
+        if op == "add_bias" and shape[-1] > 0:
+            y = torch.randn(shape[-1], dtype = h, device = device)
+        ext.add(torch.empty(shape, dtype = h, device = device), y, z)
+    elif op.startswith("softcap"):
+        dt = h if op == "softcap_h" else f
+        buf, y = empty_in_sentinel(shape, dt, device)
+        ext.softcap(torch.empty(shape, dtype = dt, device = device), y, 30.0)
+        with pytest.raises(RuntimeError, match = "softcap wrong dtype"):
+            ext.softcap(torch.empty(shape, dtype = torch.bfloat16, device = device), y, 30.0)
+    elif op == "xielu":
+        buf, y = empty_in_sentinel(shape, h, device)
+        alpha = torch.tensor([0.8])
+        ext.xielu(torch.empty(shape, dtype = f, device = device), y, alpha, alpha)
+        with pytest.raises(RuntimeError, match = "xielu not implemented for float16"):
+            ext.xielu(torch.empty(shape, dtype = h, device = device), y, alpha, alpha)
+    else:
+        fn = getattr(ext, op)
+        buf, z = empty_in_sentinel(shape, h, device)
+        for dt in (h, f):
+            x = torch.empty(shape, dtype = dt, device = device)
+            fn(x, torch.empty_like(x), z, 7.0)
+        with pytest.raises(RuntimeError, match = "incorrect datatype"):
+            fn(torch.empty(shape, dtype = h, device = device), torch.empty(shape, dtype = f, device = device), z, 7.0)
+    assert (buf == 7.0).all()
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_add_empty_y_rejected(device):
+    # An empty y cannot be repeated over a non-empty x
+    x = torch.randn(4, 64, device = device).half()
+    with pytest.raises(RuntimeError, match = "empty y cannot broadcast"):
+        ext.add(x, torch.empty(0, device = device).half(), torch.empty_like(x))
+    assert_device_ok(device)

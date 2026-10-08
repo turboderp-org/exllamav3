@@ -99,3 +99,46 @@ def test_slices_size_the_workspace(device, D, rank, use_combine, R):
 
     with pytest.raises(RuntimeError, match = "dm_part workspace"):
         _run(m, x, S - 1)
+
+
+def assert_device_ok(device):
+    # A failed launch would leave an error for the next op on the device
+    torch.cuda.synchronize(device)
+    assert torch.ones(8, device = device).sum().item() == 8
+
+
+@torch.inference_mode()
+def test_tiled_empty_rows(device):
+    # No rows: nothing to do, outputs untouched
+    D, rank = 256, 64
+    m = make_site(device, D, rank, True)
+    s3 = torch.empty((0, 4, D), device = device)
+    S = ext.gr_mix_tiled_slices(0, D, m.proj_h.shape[0])
+    ws = lambda shape, dtype: torch.empty(shape, dtype = dtype, device = device)
+    proj_i8, proj_sb, up_i8, up_sb = m._tiled_tables(ws)
+    Mpad = m.proj_h.shape[0]
+    pbuf = torch.full((64,), 7.0, device = device)
+    mbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
+    ext.gr_mix_tiled(s3, m.w_h, proj_i8, proj_sb, up_i8, up_sb, m.rms_eps, m.proj_m, ws((S, 0, Mpad), torch.float),
+                     ws((S, 0), torch.float), ws((0, 4), torch.float), ws((2, 0, rank), torch.int8),
+                     ws((0, rank // 64), torch.float), pbuf[8:8].view(0, 4), mbuf[8:8].view(0, D))
+    assert (pbuf == 7.0).all() and (mbuf == 7.0).all()
+    assert_device_ok(device)
+
+
+@pytest.mark.parametrize("case", ["D", "LR"])
+@torch.inference_mode()
+def test_tiled_empty_dims_rejected(device, case):
+    # D == 0: the per-stream RMS norm is over an empty vector. LR == 0 passes LR % 64 but the tiled kernels need a
+    # positive rank (the generic gr_mix takes LR == 0)
+    R, H = 4, 4
+    D, LR = (0, 64) if case == "D" else (256, 0)
+    HD, M_, Mpad = H * D, LR + H, 128 if LR else 64
+    ws = lambda *shape, dtype = torch.float: torch.zeros(shape, dtype = dtype, device = device)
+    S = ext.gr_mix_tiled_slices(R, max(D, 128), Mpad)
+    match = "norm over an empty stream dimension" if case == "D" else "LR must be a positive multiple of 64"
+    with pytest.raises(RuntimeError, match = match):
+        ext.gr_mix_tiled(ws(R, H, D), ws(HD, dtype = torch.half), ws(2, Mpad, HD, dtype = torch.int8), ws(Mpad),
+                         ws(2, HD, LR, dtype = torch.int8), ws(HD), 1e-6, M_, ws(S, 64, Mpad), ws(S, 64), ws(R, H),
+                         ws(2, R, LR, dtype = torch.int8), ws(R, LR // 64), ws(R, H), ws(R, D, dtype = torch.half))
+    assert_device_ok(device)

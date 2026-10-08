@@ -387,3 +387,48 @@ def test_host_layout_matches_header():
                  "MOE_SLOT_FLAGS_OFFSET", "MOE_FLAGS_SIZE", "MOE_STAGE_RING", "MOE_STAGE_TAIL_OFFSET",
                  "MOE_STAGE_HEAD_OFFSET", "MOE_STAGE_JOBS_OFFSET", "MOE_CTRL_SIZE"):
         assert getattr(host, name) == getattr(hdr, name), name
+
+
+def _empty_forward_worker():
+    from exllamav3.ext import exllamav3_ext as ext
+    (h, _, _), _ = make_layers()
+    gen = torch.Generator().manual_seed(5)
+    res = {}
+    # No rows: nothing to do
+    out = sentinel_rows(0)
+    ext.exl3_moe_cpu_forward(h, torch.empty(0, H, dtype = torch.half), torch.empty(0, TOPK, dtype = torch.int),
+                             torch.empty(0, TOPK, dtype = torch.half), out, 2)
+    res["rows0"] = out.shape == (0, H)
+    # No experts per token: every row is the empty sum
+    x, _, _ = job_inputs(gen, 0, 3)
+    out = sentinel_rows(3)
+    ext.exl3_moe_cpu_forward(h, x, torch.empty(3, 0, dtype = torch.int), torch.empty(3, 0, dtype = torch.half), out, 2)
+    res["topk0_zero"] = bool((out == 0).all())
+
+    def raises(fn, match):
+        try:
+            fn()
+        except RuntimeError as e:
+            return match in str(e)
+        return False
+
+    x, sel, w = job_inputs(gen, 0, 2)
+    res["bad_shape"] = raises(lambda: ext.exl3_moe_cpu_forward(h, x, sel[:1], w[:1], sentinel_rows(2), 2),
+                              "selected and weights (rows, top_k)")
+    res["bad_out"] = raises(lambda: ext.exl3_moe_cpu_forward(h, x, sel, w, sentinel_rows(1), 2),
+                            "x and out must be (rows, hidden_size)")
+    res["no_experts"] = raises(lambda: ext.exl3_moe_cpu_make_layer(*([[]] * 12), 0, 0.0, 0),
+                               "exl3_moe_cpu_make_layer: no experts")
+    z = torch.zeros(0, H // 16, 64, dtype = torch.int16)
+    s0, sh = torch.zeros(0, dtype = torch.half), torch.ones(H, dtype = torch.half)
+    res["empty_dim"] = raises(lambda: ext.exl3_moe_cpu_make_layer([], [], [], [z], [s0], [sh], [z], [s0], [sh],
+                                                                  [], [], [], 2, 0.0, 0),
+                              "CPU MoE: empty expert weight dimension")
+    return res
+
+
+def test_empty_forward():
+    """exl3_moe_cpu_forward: no rows is a no-op, no experts per token writes the empty sum (zeros); mismatched shapes
+    and layers with no experts or an empty weight dimension are rejected"""
+    res = run_isolated(_empty_forward_worker)
+    assert all(res.values()), res

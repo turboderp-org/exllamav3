@@ -134,7 +134,7 @@ def ladder_outputs(dirs: dict) -> dict:
         for m in range(1, 5):
             x = torch.randn(m, H).half()
             sel = torch.stack([torch.randperm(LADDER_E)[:LADDER_TOPK] for _ in range(m)]).int()
-            w = torch.rand(m, LADDER_TOPK).float()
+            w = torch.rand(m, LADDER_TOPK).half()
             out = torch.zeros(m, H, dtype = torch.float)
             ext.exl3_moe_cpu_forward(h, x, sel, w, out, 1)
             results[(bits, m)] = out.clone()

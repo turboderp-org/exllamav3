@@ -326,3 +326,47 @@ def test_mamba2_dt_op_guard_regions(device, H):
     assert_dt_close(dt, g, ref_dt, ref_g, a_log)
     for buf in (dt_buf, g_buf):
         assert (buf[:guard] == 777.0).all() and (buf[guard + n:] == 777.0).all()
+
+
+# Zero-size inputs. mamba2_dt_op: an empty batch, sequence or head axis is an elementwise no-op. cuda_recurrent_mamba2:
+# an empty batch, sequence or v-head axis (or Dv = 0) takes no step and leaves the state untouched; Nk sets the
+# group ratio and must be positive, and Dk = 0 (an empty SSM state) is rejected with the other Dk rules
+
+@pytest.mark.parametrize("B, S, H", [(0, 3, 8), (2, 0, 8), (2, 3, 0)])
+@torch.inference_mode()
+def test_mamba2_dt_op_empty(device, B, S, H):
+    dt = torch.full((B, S, H), 777.0, dtype = torch.bfloat16, device = device)
+    g = torch.full((B, S, H), 777.0, device = device)
+    ext.mamba2_dt_op(torch.randn(B, S, H, device = device), torch.zeros(H, device = device),
+                     torch.zeros(H, device = device), dt, g, 0.0, math.inf)
+    torch.cuda.synchronize(device)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+EMPTY_MAMBA2_CASES = [
+    # bsz, seqlen, nk, nv, dk, dv, history, slots, error
+    (0, 1, 1, 4, 32, 32, False, False, None),
+    (0, 3, 1, 4, 32, 32, True, True, None),
+    (2, 0, 1, 4, 32, 32, False, False, None),
+    (2, 0, 1, 4, 32, 32, True, True, None),
+    (2, 1, 1, 0, 32, 32, False, False, None),
+    (2, 1, 1, 4, 32, 0, False, False, None),
+    (2, 1, 0, 0, 32, 32, False, False, "num_k_heads must be positive"),
+    (2, 1, 1, 4, 0, 32, False, False, "k_head_dim must be a positive multiple of 32"),
+]
+
+
+@pytest.mark.parametrize("bsz, seqlen, nk, nv, dk, dv, history, use_slots, error", EMPTY_MAMBA2_CASES)
+@torch.inference_mode()
+def test_recurrent_mamba2_empty(device, bsz, seqlen, nk, nv, dk, dv, history, use_slots, error):
+    xbc, g, dt, D, state = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, 3, max(seqlen, 1))
+    state0 = state.clone()
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) if use_slots else None
+    if error:
+        with pytest.raises(RuntimeError, match = error):
+            _mamba2_run(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv)
+    else:
+        _mamba2_run(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv)
+    torch.cuda.synchronize(device)
+    assert torch.equal(state, state0), "state modified"
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

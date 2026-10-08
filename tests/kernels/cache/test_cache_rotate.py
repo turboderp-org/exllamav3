@@ -1,8 +1,11 @@
 """
 ext.cache_rotate (in-place page permutation used by PageTable.defrag): applies a list of (dst, src) page copies,
 -1 naming a temp page, to a paged cache tensor of any page size (including pages that are not a multiple of 16
-bytes) and dtype. Checked bit-exactly against the same copies done one by one in torch.
+bytes) and dtype. Checked bit-exactly against the same copies done one by one in torch. An empty order, zero-byte
+pages or a cache without pages is a no-op (temp must still match the page size).
 """
+
+import math
 
 import pytest
 import torch
@@ -106,3 +109,31 @@ def test_rotate_dsv4_hca_pool_layer(device, k_bits):
         ext.cache_rotate(t, order, torch.empty_like(t[0]))
         torch.testing.assert_close(t, ref, rtol = 0, atol = 0)
     layer.free()
+
+
+def _device_still_works(device):
+    # A launch error left pending by the call would surface in the next unrelated launch
+    y = torch.ones(4, device = device) * 2
+    torch.cuda.synchronize(device)
+    assert y.sum().item() == 8
+
+
+@pytest.mark.parametrize("shape, order", [
+    ((8, 4, 16), []),           # nothing to rotate
+    ((8, 4, 16), [3]),          # odd length: no complete pair
+    ((0, 4, 16), [-1, -1]),     # no pages
+    ((0, 0, 16), []),
+    ((8, 0, 16), [1, 2]),       # zero-byte pages
+    ((8, 4, 0), [1, 2, 2, 1]),
+])
+@torch.inference_mode()
+def test_empty_cache_rotate(device, shape, order):
+    cache = (torch.arange(math.prod(shape), device = device) % 1000).half().view(shape)
+    ref = cache.clone()
+    temp = torch.full(shape[1:], 7.0, dtype = torch.half, device = device)
+    ext.cache_rotate(cache, torch.tensor(order, dtype = torch.int, device = device), temp)
+    assert torch.equal(cache, ref)
+    assert (temp == 7.0).all()
+    _device_still_works(device)
+    with pytest.raises(RuntimeError, match = "temp tensor incorrect size"):
+        ext.cache_rotate(cache, torch.tensor(order, dtype = torch.int, device = device), torch.empty(1, device = device))

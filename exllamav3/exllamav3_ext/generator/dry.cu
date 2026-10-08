@@ -169,6 +169,8 @@ void dry_penalty
         TORCH_CHECK(breakers.value().numel() == dim, "dry_penalty: breakers mask must cover the vocabulary");
         breakers_ptr = (const bool*) breakers.value().data_ptr();
     }
+    if (in_logits.dtype() != at::kHalf) TORCH_CHECK_DTYPE(in_logits, kFloat);
+    if (!bsz || !dim) return;
     int m = range > 0 ? MIN(past_len, range) : past_len;
     int scan_blocks = MIN(MAX_SCAN_BLOCKS, MAX(1, CEIL_DIVIDE(m, NUM_THREADS)));
     dim3 grid(scan_blocks, bsz);
@@ -184,10 +186,7 @@ void dry_penalty
     if (in_logits.dtype() == at::kHalf)
         dry_penalty_kernel<true><<<grid, NUM_THREADS, 0, stream>>>(kernel_args);
     else
-    {
-        TORCH_CHECK_DTYPE(in_logits, kFloat);
         dry_penalty_kernel<false><<<grid, NUM_THREADS, 0, stream>>>(kernel_args);
-    }
     #undef kernel_args
     cuda_check(cudaPeekAtLastError());
 }

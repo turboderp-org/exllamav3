@@ -59,13 +59,19 @@ void moe_unswizzle_trellis
     TORCH_CHECK(src.is_cuda() && dst.is_cuda() && src.device() == dst.device(), "moe_unswizzle: tensors must share a CUDA device");
     TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "moe_unswizzle: tensors must be contiguous");
     TORCH_CHECK(tiles_n % 8 == 0, "moe_unswizzle: tiles_n must be a multiple of 8");
+    TORCH_CHECK(num_experts >= 0 && tiles_k >= 0 && tiles_n >= 0 && expert_stride_b >= 0 && proj_off_b >= 0,
+                "moe_unswizzle: negative size or offset");
     const BitsK bk = bits_from_K((float) K);
     const int tile_b = bk.bits * 32 + (bk.half ? 16 : 0);
+    TORCH_CHECK((expert_stride_b | proj_off_b) % 16 == 0, "moe_unswizzle: offsets must be 16-byte aligned");
+
+    // No experts or no tiles: nothing to copy
+    if (!num_experts || !tiles_k || !tiles_n) return;
+
     const int64_t proj_b = tiles_k * tiles_n * tile_b;
     const int64_t need = (num_experts - 1) * expert_stride_b + proj_off_b + proj_b;
-    TORCH_CHECK(num_experts >= 1 && need <= (int64_t) src.numel() * src.element_size()
+    TORCH_CHECK(need <= (int64_t) src.numel() * src.element_size()
                 && need <= (int64_t) dst.numel() * dst.element_size(), "moe_unswizzle: batch exceeds the buffers");
-    TORCH_CHECK((expert_stride_b | proj_off_b) % 16 == 0, "moe_unswizzle: offsets must be 16-byte aligned");
     dim3 grid((unsigned) (tiles_k * (tiles_n / 8)), (unsigned) num_experts);
     moe_unswizzle_kernel<<<grid, NUM_THREADS, 0, stream>>>(
         (const uint8_t*) src.data_ptr(), (uint8_t*) dst.data_ptr(),

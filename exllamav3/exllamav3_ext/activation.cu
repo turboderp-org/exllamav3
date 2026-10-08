@@ -32,7 +32,6 @@ static void act_mul_check
 {
     TORCH_CHECK_NUMEL(y, x);
     TORCH_CHECK_NUMEL(z, x);
-    TORCH_CHECK(x.numel() > 0, "x must not be empty");
     TORCH_CHECK(x.numel() % 2 == 0, "x.numel() must be even");
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && z.is_contiguous(), "x, y and z must be contiguous");
     TORCH_CHECK(((uintptr_t) x.data_ptr()) % (2 * x.element_size()) == 0 &&
@@ -71,6 +70,7 @@ void silu_mul_gr
     TORCH_CHECK_DTYPE(z, kHalf);
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -152,6 +152,7 @@ void silu_oai_mul_gr
     TORCH_CHECK_DTYPE(z, kHalf);
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -232,6 +233,7 @@ void gelu_mul_gr
     TORCH_CHECK_DTYPE(z, kHalf);
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -312,6 +314,7 @@ void relu2_mul_gr
     TORCH_CHECK_DTYPE(z, kHalf);
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -393,6 +396,7 @@ void relu_mul_gr
     TORCH_CHECK_DTYPE(z, kHalf);
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -477,6 +481,7 @@ void xielu_gr
     float n = get_alpha(alpha_n) + 0.5f;
 
     size_t numel = x.numel();
+    if (!numel && float_input) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
@@ -531,6 +536,7 @@ void add_sigmoid_gate_gr
     TORCH_CHECK(gdim == 1, "gate must have size(-1) == 1")
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, NUM_THREADS);
     add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, stream>>>
     (
@@ -579,6 +585,7 @@ void mul_sigmoid__gr
     TORCH_CHECK(x.numel() % 2 == 0, "x.numel() must be even");
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     mul_sigmoid_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
     (
@@ -623,6 +630,7 @@ void mul_sigmoid_broadcast__gr
     TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t dim = x.size(3);
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     mul_sigmoid_broadcast_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
@@ -669,6 +677,7 @@ void mul_softplus_broadcast__gr
     TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
 
     size_t numel = x.numel();
+    if (!numel) return;
     size_t dim = x.size(3);
     size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     mul_softplus_broadcast_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
@@ -716,6 +725,7 @@ void add_sigmoid_gate_proj_gr
     TORCH_CHECK_SHAPES(x, -1, w, -2, 1);
     TORCH_CHECK_SHAPES(x, -1, y, -1, 1);
 
+    if (!x.numel()) return;
     size_t bsz = x.numel() / dim;
     add_sigmoid_proj_kernel_f<<<bsz, NUM_THREADS_P, 0, stream>>>
     (
@@ -784,9 +794,11 @@ void deinterleave_qg_gr
     TORCH_CHECK_DTYPE(qg, kHalf);
     TORCH_CHECK_DTYPE(q, kHalf);
     TORCH_CHECK_DTYPE(g, kHalf);
-    TORCH_CHECK(head_dim % 8 == 0, "head_dim must be a multiple of 8");
+    TORCH_CHECK(head_dim > 0 && head_dim % 8 == 0, "head_dim must be a positive multiple of 8");
     TORCH_CHECK(qg.is_contiguous() && q.is_contiguous() && g.is_contiguous(), "tensors must be contiguous");
     TORCH_CHECK(q.numel() == g.numel() && q.numel() * 2 == qg.numel(), "size mismatch");
+    TORCH_CHECK(q.numel() % head_dim == 0, "size mismatch (not a whole number of heads)");
+    if (!q.numel()) return;
 
     int hd8 = head_dim / 8;
     size_t n8 = q.numel() / 8;

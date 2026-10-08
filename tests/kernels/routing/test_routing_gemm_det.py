@@ -96,3 +96,37 @@ def test_det_transcendentals(device):
     assert rel(e.double(), torch.exp(x.double())) < 4e-7
     assert rel(l.double(), torch.log(x.double().abs() + 1e-30)) < 4e-7
     assert rel(sp.double(), torch.nn.functional.softplus(x.double())) < 4e-7
+
+
+# Zero-size inputs: routing_gemm_det with no rows or no experts is a no-op, with K = 0 the empty sum (scores = 0);
+# det_quant_weight with no rows is a no-op, and with K = 0 quantizes empty rows (the scale takes the all-zero-row
+# value, 1 / 16319: it multiplies nothing); det_math_test (elementwise) on an empty tensor is a no-op
+
+@pytest.mark.parametrize("lead, E, K", [((0,), 64, 128), ((2, 0), 64, 128), ((5,), 0, 128), ((5,), 64, 0), ((2, 3), 40, 0)])
+@torch.inference_mode()
+def test_empty(device, lead, E, K):
+    _, g8, sb = quant_gate(torch.randn(K, E, device = device).half())
+    scores = torch.full((*lead, E), 99.0, dtype = torch.half, device = device)
+    ext.routing_gemm_det(torch.randn(*lead, K, device = device).half(), g8, sb, scores)
+    torch.cuda.synchronize(device)
+    assert torch.equal(scores, torch.zeros_like(scores) if K == 0 else torch.full_like(scores, 99.0))
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("N, K", [(0, 64), (0, 0), (5, 0)])
+@torch.inference_mode()
+def test_det_quant_weight_empty(device, N, K):
+    g8 = torch.full((2, N, K), 7, dtype = torch.int8, device = device)
+    sb = torch.full((N,), 99.0, device = device)
+    ext.det_quant_weight(torch.randn(N, K, device = device).half(), g8, sb)
+    torch.cuda.synchronize(device)
+    assert torch.equal(sb, torch.full_like(sb, 1.0 / 16319.0))
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@torch.inference_mode()
+def test_det_math_empty(device):
+    y = torch.empty(0, device = device)
+    ext.det_math_test(torch.empty(0, device = device), y)
+    torch.cuda.synchronize(device)
+    assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"

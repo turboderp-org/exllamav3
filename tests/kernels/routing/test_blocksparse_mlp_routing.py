@@ -66,3 +66,25 @@ def test_activate_all(device, bsz):
     sel, w = ext.blocksparse_mlp_routing(bsz, cfg, y, {"activate_all_experts": True})
     _check(y, cfg.gate_tensor, sel, w, E)
     assert sel.data_ptr() != cfg.selected_experts_bsz1.data_ptr()
+
+
+@pytest.mark.parametrize("bsz", [0, 1, 3])
+@torch.inference_mode()
+def test_empty(device, bsz):
+    """No tokens: empty (0, K) results. An empty hidden dim makes every logit the empty sum (zero), so any K
+    distinct experts are a valid selection, all weighted 1 / K. Selecting from no experts raises (torch's top-k)"""
+    E, K = 16, 4
+    cfg = make_cfg(64, E, K, device)
+    cfg.gate_tensor = torch.empty((0, E), dtype = torch.half, device = device)
+    sel, w = ext.blocksparse_mlp_routing(bsz, cfg, torch.empty((bsz, 0), dtype = torch.half, device = device), {})
+    assert sel.shape == (bsz, K) and w.shape == (bsz, K)
+    assert (sel.sort(dim = 1).values.diff(dim = 1) != 0).all()
+    assert torch.allclose(w.float(), torch.full_like(w.float(), 1 / K))
+    if bsz == 0:
+        cfg = make_cfg(64, E, K, device)
+        sel, w = ext.blocksparse_mlp_routing(0, cfg, torch.empty((0, 64), dtype = torch.half, device = device), {})
+        assert sel.shape == (0, K) and w.shape == (0, K)
+    cfg = make_cfg(64, 0, K, device)
+    with pytest.raises(RuntimeError):
+        ext.blocksparse_mlp_routing(max(bsz, 2), cfg, torch.zeros((max(bsz, 2), 64), dtype = torch.half,
+                                                                  device = device), {})
