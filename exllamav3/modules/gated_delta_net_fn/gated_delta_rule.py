@@ -206,13 +206,13 @@ def gated_delta_rule_fn(
             recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
-            state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+            state = recurrent_state[s, 0].float().unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                 state, save_state,
             )
             if save_state and state is not None:
-                state.copy_(new_state)
+                recurrent_state[s, 0].copy_(new_state[0])
             core_attn_out.append(core_attn)
 
         core_attn_out = torch.cat(core_attn_out, dim = 0)

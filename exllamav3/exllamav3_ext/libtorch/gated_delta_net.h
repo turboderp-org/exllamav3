@@ -187,6 +187,7 @@ struct BC_GatedDeltaNetSplit
         // be patched): set on the slot's first eager run, checked before every replay
         int graph_state_size = -1;
         int graph_hist_stride = -1;
+        bool graph_state_half = false;
 
         std::unique_ptr<Graph> graph;
     };

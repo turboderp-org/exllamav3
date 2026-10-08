@@ -248,7 +248,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
     py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+        .def(py::init<uintptr_t, uintptr_t, int64_t, int>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 

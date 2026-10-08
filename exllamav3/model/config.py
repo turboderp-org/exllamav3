@@ -24,6 +24,10 @@ class InferParams:
     # Width threshold for enabling MGEMM regardless of bitrate
     mgemm_n_threshold: int = 0
 
+    # GDN recurrent-state storage dtype: None/"fp32" (default) or "fp16", for non-KDA
+    # GatedDeltaNet modules. Mamba2 and KDA keep fp32.
+    gdn_state: str | None = None
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the

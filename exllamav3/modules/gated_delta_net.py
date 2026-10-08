@@ -191,6 +191,7 @@ class GDNLayerState:
         max_batch_size: int,
         max_history: int,
         cache_id: int,
+        state_dtype: torch.dtype | None = None,
     ):
         self.module = module
         self.conv_state = torch.empty(
@@ -198,9 +199,11 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        if state_dtype is None:
+            state_dtype = module.gdn_state_dtype
         self.recurrent_state = torch.empty(
             (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = torch.float,
+            dtype = state_dtype,
             device = "meta"
         )
         self.device = None
@@ -212,7 +215,7 @@ class GDNLayerState:
     def get_checkpoint_size(self):
         return (
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
-            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * 4
+            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * self.recurrent_state.element_size()
         )
 
 
@@ -296,6 +299,7 @@ class GDNLayerState:
             base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
             base,
             rs.stride(1),
+            es,
         )
 
 
@@ -321,6 +325,7 @@ class GDNLayerState:
                 "cache_id": self.cache_id,
                 "max_history": self.max_history,
                 "max_batch_size": self.max_batch_size,
+                "state_dtype": self.recurrent_state.dtype,
             }
         }
 
@@ -606,6 +611,13 @@ class GatedDeltaNet(Module):
         self.tp_recurrent_lookup = {}
         self.tp_reduce = False
         self.has_split_cache = False
+
+
+    @property
+    def gdn_state_dtype(self):
+        if self.config.infer_params.gdn_state == "fp16" and not self.kda:
+            return torch.half
+        return torch.float
 
 
     @override

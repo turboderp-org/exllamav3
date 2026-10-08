@@ -233,17 +233,18 @@ struct ConvRewindJob
 };
 
 // recurrent_state rewind: recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens].
-// Flat fp32 copy of num_elements contiguous elements; src/dst never overlap (num_tokens >= 1
+// Flat copy of num_elements contiguous elements of elem_size bytes each; src/dst never overlap (num_tokens >= 1
 // forces the source history index to differ from destination index 0).
 struct StateRewindJob
 {
     uintptr_t src;
     uintptr_t dst;
     int64_t num_elements;
+    int elem_size;   // bytes per element (2 = fp16 state, 4 = fp32)
 
     StateRewindJob() = default;
-    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements) :
-        src(_src), dst(_dst), num_elements(_num_elements) {}
+    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements, int _elem_size) :
+        src(_src), dst(_dst), num_elements(_num_elements), elem_size(_elem_size) {}
 };
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
