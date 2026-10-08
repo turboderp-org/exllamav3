@@ -167,11 +167,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
     m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
-    m.def("reconstruct", &reconstruct, "reconstruct");
-    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
-    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
-    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
-    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("reconstruct", &reconstruct, "reconstruct",
+              py::arg("unpacked"), py::arg("packed"), py::arg("K"), py::arg("mcg"), py::arg("mul1"),
+              py::arg("group") = 0);
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice",
+              py::arg("unpacked"), py::arg("packed"), py::arg("suh"), py::arg("svh"),
+              py::arg("K"), py::arg("mcg"), py::arg("mul1"), py::arg("n_offset"), py::arg("group") = 0);
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch",
+              py::arg("unpacked"), py::arg("packed_ptrs"), py::arg("suh_ptrs"), py::arg("svh_ptrs"),
+              py::arg("K"), py::arg("mcg"), py::arg("mul1"), py::arg("group") = 0);
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch",
+              py::arg("unpacked"), py::arg("packed_ptrs"), py::arg("K"), py::arg("mcg"), py::arg("mul1"),
+              py::arg("group") = 0);
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice",
+              py::arg("unpacked"), py::arg("packed"), py::arg("K"), py::arg("mcg"), py::arg("mul1"),
+              py::arg("n_offset"), py::arg("group") = 0);
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
@@ -192,6 +202,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
     m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
+    m.def("moe_unswizzle_trellis_batch", &moe_unswizzle_trellis_batch, "moe_unswizzle_trellis_batch");
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
@@ -288,7 +299,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
-    m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe", &exl3_moe, "exl3_moe",
+              py::arg("hidden_state"), py::arg("output_state"), py::arg("expert_count"),
+              py::arg("token_sorted"), py::arg("weight_sorted"), py::arg("temp_state_g"), py::arg("temp_state_u"),
+              py::arg("temp_intermediate_g"), py::arg("temp_intermediate_u"), py::arg("act_function"),
+              py::arg("K_gate"), py::arg("K_up"), py::arg("K_down"),
+              py::arg("gate_ptrs_trellis"), py::arg("gate_ptrs_suh"), py::arg("gate_ptrs_svh"),
+              py::arg("up_ptrs_trellis"), py::arg("up_ptrs_suh"), py::arg("up_ptrs_svh"),
+              py::arg("down_ptrs_trellis"), py::arg("down_ptrs_suh"), py::arg("down_ptrs_svh"),
+              py::arg("gate_mcg"), py::arg("gate_mul1"), py::arg("up_mcg"), py::arg("up_mul1"),
+              py::arg("down_mcg"), py::arg("down_mul1"), py::arg("act_limit"), py::arg("num_active"),
+              py::arg("output_scratch"), py::arg("fused_base"), py::arg("count_lo"), py::arg("count_hi"),
+              py::arg("m_tile"), py::arg("group_g") = 0, py::arg("group_u") = 0, py::arg("group_d") = 0);
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 

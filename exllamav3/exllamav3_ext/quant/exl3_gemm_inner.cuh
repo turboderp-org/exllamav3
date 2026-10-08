@@ -34,7 +34,8 @@ void exl3_gemm_kernel_inner
     const int size_n,
     int* __restrict__ locks,
     const half* post_scale,
-    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+    int size_n_stride = 0,    // full width of B and C when computing a column slice (0: = size_n)
+    const int group = 0
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -272,11 +273,33 @@ void exl3_gemm_kernel_inner
             {
                 const int4* gl = (const int4*) gl_b_ptr;
                 int4* sh = (int4*) sh0_b_ptr;
-                #pragma unroll
-                for (int i = 0; i < load_b_iters; ++i)
+                if (group)
                 {
-                    // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i], pred_b_gl[i]);
-                    if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
+                    const int shift = group == 2 ? 1 : 3;
+                    #pragma unroll
+                    for (int i = 0; i < load_b_iters; ++i)
+                    {
+                        if (pred_b_gl[i])
+                        {
+                            const int v = i * EXL3_GEMM_BASE_THREADS + t;
+                            const int n = v % (TILEBLOCKS_N * TILE_U16 / 8);
+                            const int kt = slice0_k * TILEBLOCKS_K + v / (TILEBLOCKS_N * TILE_U16 / 8);
+                            const int nt = slice0_n * TILEBLOCKS_N + n / (TILE_U16 / 8);
+                            // Gather native logical tiles into the unchanged shared B pipeline.
+                            const size_t tile = ((size_t) (nt >> shift) * (size_k / 16) + kt) * group
+                                              + (nt & (group - 1));
+                            const int4* src = (const int4*) (B + tile * TILE_U16) + n % (TILE_U16 / 8);
+                            cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, src);
+                        }
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int i = 0; i < load_b_iters; ++i)
+                    {
+                        if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
+                    }
                 }
             }
             advance0();

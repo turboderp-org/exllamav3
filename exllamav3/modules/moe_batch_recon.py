@@ -204,15 +204,15 @@ class BatchReconLayer:
             ext.had_r_128_batch(y2, y2, None, svh, ids, cmax, 1.0)
         return y
 
-    def _recon(self, W, ptrs, p, ids_d, K, cb):
+    def _recon(self, W, ptrs, p, ids_d, K, cb, group):
         ptrs = ptrs.contiguous()
         if self.folded:
             # Per-matrix suh/svh addresses, gathered by expert id
             suh_p, svh_p = self.scale_ptrs[p]
             ext.reconstruct_had_batch(
-                W, ptrs, suh_p.index_select(0, ids_d), svh_p.index_select(0, ids_d), K, *cb)
+                W, ptrs, suh_p.index_select(0, ids_d), svh_p.index_select(0, ids_d), K, *cb, group)
         else:
-            ext.reconstruct_batch(W, ptrs, K, *cb)
+            ext.reconstruct_batch(W, ptrs, K, *cb, group)
 
     def set_static_pointers(self, ptrs_g, ptrs_u, ptrs_d):
         """Resident experts: [E] int64 device tensors of trellis addresses per projection"""
@@ -232,6 +232,7 @@ class BatchReconLayer:
         out_slab: torch.Tensor | None = None,  # (B * cmax, ho) fp32 view of the layer's slot
                                    # scratch: the down projection is written there unweighted and
                                    # nothing is accumulated here (exl3_moe_gather sums the slots)
+        groups: tuple = (0, 0, 0),  # per-projection (g, u, d) packed tile groups; 0 = native
     ):
         B = len(counts)
         assert B <= self.cap
@@ -277,13 +278,13 @@ class BatchReconLayer:
         scratch1 = torch.empty(B * max(kg * ng, kd * nd), dtype = torch.half, device = dev)
         idt = torch.float if self.interm_fp32 else torch.half
         Wu = torch.empty((B, ku, nu), dtype = torch.half, device = dev)
-        self._recon(Wu, ptr_u, "u", ids_d, Ku, self.cb_u)
+        self._recon(Wu, ptr_u, "u", ids_d, Ku, self.cb_u, groups[1])
         u = self._linear(x, Wu, "u", ids_d, nu, out_dtype = idt)
         del Wu
         if self.gated:
             Kg = self.dims_g[2]
             Wg = scratch1[:B * kg * ng].view(B, kg, ng)
-            self._recon(Wg, ptr_g, "g", ids_d, Kg, self.cb_g)
+            self._recon(Wg, ptr_g, "g", ids_d, Kg, self.cb_g, groups[0])
             g = self._linear(x, Wg, "g", ids_d, ng, out_dtype = idt)
             g2, u2 = g.view(B * cmax, ng), u.view(B * cmax, nu)
         else:
@@ -299,7 +300,7 @@ class BatchReconLayer:
 
         # Down: fp32 output, as the per-expert DQ path (hgemm into fp32, fp32 output Hadamard)
         Wd = scratch1[:B * kd * nd].view(B, kd, nd)
-        self._recon(Wd, ptr_d, "d", ids_d, Kd, self.cb_d)
+        self._recon(Wd, ptr_d, "d", ids_d, Kd, self.cb_d, groups[2])
         # Slot mode: the down projection lands straight in the layer scratch, unweighted; the
         # caller's exl3_moe_gather sums each token's slots in k order (deterministic, one launch
         # per layer, no copy). Otherwise accumulate here

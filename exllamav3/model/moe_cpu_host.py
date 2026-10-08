@@ -633,7 +633,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             return out
 
         # The same full-rate CPU policy governs initial packing, dynamic installs and the
-        # parent's native-order GPU ring, including half-bit formats.
+        # parent's streamed GPU layout metadata, including half-bit formats.
         swz = TUNING.swizzle
 
         def rehome_trellis(t):
@@ -970,6 +970,13 @@ class MoeCpuHost:
             gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
             ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
             spec["proj_bytes"] = (gb, ub, db)
+            spec["unswizzle_records"] = tuple(
+                (off, proj_dims[name][0] // 16, proj_dims[name][1] // 16,
+                 int(32 * proj_dims[name][2]), spec["swizzle_groups"][name])
+                if proj_dims.get(name) else (0, 0, 0, 0, 0)
+                for name, off in (("g", 0), ("u", gb), ("d", gb + ub))
+            )
+            spec["stream_groups"] = tuple(spec["swizzle_groups"].get(p, 0) for p in ("g", "u", "d"))
             spec["expert_bytes"] = gb + ub + db
         self.specs.append(spec)
         self.live_layers += 1
@@ -977,7 +984,8 @@ class MoeCpuHost:
         self.by_key[key] = idx
         if aux is not None:
             self.aux[idx] = aux
-        self.conn.send(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
+        self.conn.send(("layer", {k: v for k, v in spec.items()
+                                  if k not in ("proj_dims", "unswizzle_records", "stream_groups")}))
         return idx
 
     def commit_module(self, module_key):
@@ -1480,7 +1488,7 @@ class MoeCpuHost:
         self.sstate[key] = st
         return st
 
-    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
+    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half, group = 0):
         """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). out_dtype
         follows the resident experts (fp32 for the down projection, the model's interm_dtype
         for gate/up): on models with massive activations the output-side Hadamard concentrates
@@ -1489,7 +1497,7 @@ class MoeCpuHost:
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh, None, 1.0)
         w = w_scratch[:k * n].view(k, n)
-        ext.reconstruct(w, trellis_view, K, False, True)
+        ext.reconstruct(w, trellis_view, K, False, True, group)
         y = torch.empty((x.shape[0], n), dtype = out_dtype, device = x.device)
         ext.hgemm(xh, w, y)
         ext.had_r_128(y, y, None, svh, 1.0)
@@ -1686,7 +1694,8 @@ class MoeCpuHost:
         pd = spec["proj_dims"]
         gb, ub, db = spec["proj_bytes"]
         swizzle_groups = spec["swizzle_groups"]
-        needs_native = any(swizzle_groups.values())
+        needs_native = any(swizzle_groups.values()) and torch.version.hip is not None
+        groups = (0, 0, 0) if needs_native else spec["stream_groups"]
         exp_b = spec["expert_bytes"]
         per_slot = min(self.wslot_size // exp_b, self.batch_experts)
         gated = pd.get("g") is not None
@@ -1758,15 +1767,11 @@ class MoeCpuHost:
 
             with torch.cuda.stream(copy_stream):
                 if needs_native:
-                    # Restore the native tile order on the copy stream, one launch per projection
-                    # over the whole batch; native projections in a mixed batch are copied.
-                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
-                        if not pd.get(name):
-                            continue
-                        k, n, K = pd[name]
-                        ext.moe_unswizzle_trellis(
-                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, swizzle_groups[name])
+                    # Restore all projections in one launch; native projections in a mixed
+                    # batch are copied into the same native-order slot.
+                    ext.moe_unswizzle_trellis_batch(
+                        st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b,
+                        spec["unswizzle_records"])
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
@@ -1826,7 +1831,7 @@ class MoeCpuHost:
                         tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt, *groups
                     )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
@@ -1865,7 +1870,8 @@ class MoeCpuHost:
                     recon.run_group(
                         y_ext, out_ext, tok_ext, w_ext,
                         grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
+                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]),
+                        groups = groups)
                 heavy = []
             single_ids = {e for _, e in single} if recon is not None else None
             for bi, e, idx, wseg in per_e:
@@ -1893,16 +1899,16 @@ class MoeCpuHost:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
-                                         st["w_scratch"], out_dtype = idt)
+                                         st["w_scratch"], out_dtype = idt, group = groups[0])
                 uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
-                                     st["w_scratch"], out_dtype = idt)
+                                     st["w_scratch"], out_dtype = idt, group = groups[1])
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
                 dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
-                                     st["w_scratch"], out_dtype = torch.float)
+                                     st["w_scratch"], out_dtype = torch.float, group = groups[2])
                 out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 

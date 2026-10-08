@@ -47,7 +47,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const int group_g = 0,
+    const int group_u = 0,
+    const int group_d = 0
 );
 
 void exl3_moe_gather

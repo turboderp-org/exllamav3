@@ -39,12 +39,17 @@ void moe_gemm_tile
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const int K
+    const int K,
+    const int group
 )
 {
     // Fragment pipeline depth: the 64-row tile keeps two B stages so its A fragments fit
     constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
+#if defined(USE_ROCM)
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
+#else
+    #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr, 0, group
+#endif
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
     // Compile-time rate: t_bits, or t_bits + 0.5 with t_half (mul1 codebook only). Otherwise the runtime K
     // arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
@@ -245,7 +250,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         // expert's remainder with the largest smaller tile that covers it (64 -> 32 -> 16) so a
         // 96-row expert runs 64 + 32 instead of two 64-row tiles with half of one idle
         auto gemm = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K,
-                        const int size_k, const int size_n)
+                        const int size_k, const int size_n, const int group = 0)
         {
             int size_m = token_count;
             while (size_m > 0)
@@ -253,18 +258,18 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 int tm;
                 if constexpr (M_TILE >= 64)
                 {
-                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
-                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 16; }
                 }
                 else if constexpr (M_TILE == 32)
                 {
-                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 16; }
                 }
                 else
                 {
-                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K, group); tm = 16;
                 }
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;
@@ -321,21 +326,21 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 gemm(in_addr, out_addr, trellis, K, size_k, size_n);
         }
 #else
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K, const int group)
         {
-            gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim);
+            gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim, group);
         };
-        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K, const int group)
         {
-            gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
+            gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim, group);
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate, group_g);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up, group_u);
         group_barrier(group_idx, group_size, barrier_counters_sense);
         had_guad();
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down, group_d);
 #endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
 

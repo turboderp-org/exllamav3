@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <array>
 
 void moe_unswizzle_trellis
 (
@@ -13,4 +14,14 @@ void moe_unswizzle_trellis
     int64_t tiles_n,
     double K,
     int64_t group              // source layout: native (0), paired (2), or eight-tile groups (8)
+);
+
+void moe_unswizzle_trellis_batch
+(
+    const at::Tensor& src,
+    const at::Tensor& dst,
+    int64_t num_experts,
+    int64_t expert_stride_b,
+    // Three records: offset_bytes, tiles_k, tiles_n, tile_bytes, group; tiles_k == 0 is inactive.
+    const std::array<std::array<int64_t, 5>, 3>& projections
 );

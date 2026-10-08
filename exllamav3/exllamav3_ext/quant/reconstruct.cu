@@ -9,6 +9,13 @@
 #include "bits_k.cuh"
 #include "hadamard_inner.cuh"
 
+__device__ __forceinline__ size_t reconstruct_packed_tile(int kt, int nt, int tiles_k, int group)
+{
+    return group == 2
+        ? ((size_t) (nt >> 1) * tiles_k + kt) * 2 + (nt & 1)
+        : ((size_t) (nt >> 3) * tiles_k + kt) * 8 + (nt & 7);
+}
+
 template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_tile
@@ -16,7 +23,9 @@ void reconstruct_tile
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);  // in uint16s
@@ -31,9 +40,20 @@ void reconstruct_tile
 
     // Load packed 16*128 tile
     __shared__ uint32_t s_packed[8][packed_size / 2];
-    g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
+    if (!group)
+        g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
     if (t < packed_size)
-        ((int4*) s_packed)[t] = ((int4*) g_packed)[t];
+    {
+        if (!group)
+            ((int4*) s_packed)[t] = ((const int4*) g_packed)[t];
+        else
+        {
+            constexpr int j_int4 = packed_size / 8;
+            int nt = packed_n_offset + n + t / j_int4;
+            size_t tile = reconstruct_packed_tile(k, nt, packed_blocks_k, group);
+            ((int4*) s_packed)[t] = ((const int4*) g_packed)[tile * j_int4 + t % j_int4];
+        }
+    }
     __syncthreads();
 
     // Dequant
@@ -91,10 +111,12 @@ void reconstruct_kernel
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group
 )
 {
-    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
+    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset, packed_blocks_k, group);
 }
 
 // Batched variant: blockIdx.z selects the matrix from a pointer table, outputs are consecutive
@@ -106,11 +128,13 @@ void reconstruct_batch_kernel
     half* __restrict__ g_unpacked,
     const uint16_t* const* __restrict__ packed_ptrs,
     int packed_blocks_n,
-    size_t out_stride
+    size_t out_stride,
+    int packed_blocks_k,
+    int group
 )
 {
     int b = blockIdx.z;
-    reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0);
+    reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0, packed_blocks_k, group);
 }
 
 // Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
@@ -145,7 +169,8 @@ void reconstruct_slice
     float K_,
     bool mcg,
     bool mul1,
-    int64_t n_offset
+    int64_t n_offset,
+    int64_t group
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -161,6 +186,7 @@ void reconstruct_slice
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
     TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
     TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, "reconstruct: group must be 0, 2 or 8");
 
     int rows = packed.size(0);
     int packed_cols = packed.size(1);
@@ -192,7 +218,9 @@ void reconstruct_slice
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
         packed_cols,
-        packed_n_offset
+        packed_n_offset,
+        rows,
+        (int) group
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -217,7 +245,9 @@ void reconstruct_had_tile
     const half* __restrict__ suh,
     const half* __restrict__ svh,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
@@ -244,9 +274,17 @@ void reconstruct_had_tile
     {
         int j = u / (8 * j_int4);
         int r = u % (8 * j_int4);
-        const uint16_t* gp = g_packed +
-            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
-        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+        const uint16_t* gp = g_packed;
+        if (!group)
+            gp += ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+        if (!group)
+            ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+        else
+        {
+            int nt = packed_n_offset + n + r / j_int4;
+            size_t tile = reconstruct_packed_tile(kb * 8 + j, nt, packed_blocks_k, group);
+            ((int4*) s_packed[j])[r] = ((const int4*) g_packed)[tile * j_int4 + r % j_int4];
+        }
     }
     __syncthreads();
 
@@ -371,10 +409,12 @@ void reconstruct_had_kernel
     const half* __restrict__ suh,
     const half* __restrict__ svh,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group
 )
 {
-    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
+    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset, packed_blocks_k, group);
 }
 
 // Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
@@ -388,7 +428,9 @@ void reconstruct_had_batch_kernel
     const half* const* __restrict__ suh_ptrs,
     const half* const* __restrict__ svh_ptrs,
     int packed_blocks_n,
-    size_t out_stride
+    size_t out_stride,
+    int packed_blocks_k,
+    int group
 )
 {
     int b = blockIdx.z;
@@ -399,7 +441,9 @@ void reconstruct_had_batch_kernel
         suh_ptrs[b],
         svh_ptrs[b],
         packed_blocks_n,
-        0
+        0,
+        packed_blocks_k,
+        group
     );
 }
 
@@ -438,7 +482,8 @@ void reconstruct_had_slice
     float K_,
     bool mcg,
     bool mul1,
-    int64_t n_offset
+    int64_t n_offset,
+    int64_t group
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -456,6 +501,7 @@ void reconstruct_had_slice
     TORCH_CHECK_DTYPE(unpacked, kHalf);
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, "reconstruct: group must be 0, 2 or 8");
 
     if (unpacked.numel() == 0)
         return;
@@ -486,7 +532,9 @@ void reconstruct_had_slice
         (const half*) suh.data_ptr(),
         (const half*) svh.data_ptr(),
         packed.size(1),
-        (int) (n_offset / 16)
+        (int) (n_offset / 16),
+        packed.size(0),
+        (int) group
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -497,11 +545,12 @@ void reconstruct
     at::Tensor packed,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group
 )
 {
     TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
-    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0);
+    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0, group);
 }
 
 
@@ -519,7 +568,8 @@ void reconstruct_had_batch
     at::Tensor svh_ptrs,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -529,6 +579,7 @@ void reconstruct_had_batch
     const int K = bk.bits;
     TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
     TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, "reconstruct: group must be 0, 2 or 8");
     TORCH_CHECK_DIM(unpacked, 3);
     TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_had_batch: unpacked must be contiguous");
     TORCH_CHECK_DTYPE(packed_ptrs, kLong);
@@ -566,7 +617,9 @@ void reconstruct_had_batch
         (const half* const*) suh_ptrs.data_ptr(),
         (const half* const*) svh_ptrs.data_ptr(),
         n / 16,
-        (size_t) k * n
+        (size_t) k * n,
+        k / 16,
+        (int) group
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -583,7 +636,8 @@ void reconstruct_batch
     at::Tensor packed_ptrs,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -593,6 +647,7 @@ void reconstruct_batch
     const int K = bk.bits;
     TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
     TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, "reconstruct: group must be 0, 2 or 8");
     TORCH_CHECK_DIM(unpacked, 3);
     TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_batch: unpacked must be contiguous");
     TORCH_CHECK_DTYPE(packed_ptrs, kLong);
@@ -624,7 +679,9 @@ void reconstruct_batch
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
         n / 16,
-        (size_t) k * n
+        (size_t) k * n,
+        k / 16,
+        (int) group
     );
     cuda_check(cudaPeekAtLastError());
 }

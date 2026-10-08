@@ -2699,10 +2699,10 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
     return static_cast<size_t>(m.k / 16) * (m.n / 16) * tile_u16(m.bits, m.hb != 0) * 2;
 }
 
-// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
-// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
-// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
-// whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
+// Staged bytes are copied verbatim, swizzled or not. CUDA reads the packed layout directly;
+// HIP restores native tile order after DMA. Both avoid scattered tile copies on the stager.
+// Un-swizzling on the stager thread measured as the whole VBMI-vs-VNNI prefill gap
+// on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
 {
     std::memcpy(dst, m.trellis, trellis_bytes(m));

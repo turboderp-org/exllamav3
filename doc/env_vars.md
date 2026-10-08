@@ -424,10 +424,11 @@ leaves the register headroom for the wide bands the swizzled layout wants at m >
 and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
 with the tier forced on a 7960X). The `avx2` tier uses paired output tiles for exact K2/K8
 and eight-tile bands otherwise. The `scalar` tier reads native weights; K8 also stays native
-on AVX-512 tiers. Streamed prefill restores native order on the GPU copy stream for swizzled
-or mixed-layout layers; all-native layers use the DMA ring directly. The inverse ring is
-allocated during the first requiring layer's measured load and retained thereafter. Set to
-`0` to keep the native layout.
+on AVX-512 tiers. CUDA streamed prefill reads packed layouts directly from the DMA ring.
+HIP restores native order on the GPU copy stream for swizzled or mixed-layout layers;
+all-native layers use the DMA ring directly. The native-order ring is allocated during
+measured load for swizzled layers and retained thereafter, including on CUDA. Set to `0`
+to keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
