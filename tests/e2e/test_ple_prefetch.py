@@ -77,11 +77,15 @@ def runs(request, model_registry):
 
 def test_embeddings_identical_with_and_without_prefetch(runs):
     # The sampled tokens need not be identical past the first: the stub's MoE kernels are not deterministic
-    # run to run
+    # run to run. So the embeddings are compared over the forwards whose inputs both runs share: every prefill
+    # chunk, and the decode steps up to the first token sampled differently (decode step j embeds token j)
     a, b = runs
     assert a["sizes"] == b["sizes"]
-    assert a["sums"] == b["sums"], [(x, y) for x, y in zip(a["sums"], b["sums"]) if x != y]
     assert len(a["tokens"]) == NEW_TOKENS and a["tokens"][0] == b["tokens"][0], (a["tokens"], b["tokens"])
+    n_prefill = sum(1 for s in a["sizes"] if s > 1)
+    same = next((j for j, (x, y) in enumerate(zip(a["tokens"], b["tokens"])) if x != y), NEW_TOKENS)
+    n = n_prefill + same
+    assert a["sums"][:n] == b["sums"][:n], [(i, x, y) for i, (x, y) in enumerate(zip(a["sums"][:n], b["sums"][:n])) if x != y]
 
 
 def test_every_prefill_chunk_is_prefetched(runs):

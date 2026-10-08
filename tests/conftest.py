@@ -204,6 +204,12 @@ def pytest_runtest_setup(item):
             e = reg.get(mid)
             if not e.available:
                 _skip(f"test model '{mid}' not available ({e.path or 'no path / model root'})")
+            # The registry's VRAM requirement applies to every test naming the model, not only to those that
+            # resolve it through the model_dir fixture
+            if e.vram and has_cuda:
+                total = torch.cuda.get_device_properties(torch.device(dev)).total_memory / 2**30
+                if total < e.vram:
+                    _skip(f"test model '{mid}' needs {e.vram:g} GiB of VRAM, {dev} has {total:.0f}")
 
 
 def pytest_generate_tests(metafunc):
@@ -293,6 +299,12 @@ def _release_gpu_memory_between_modules():
     tensor = sys.modules.get("exllamav3.util.tensor")
     if tensor is not None:
         tensor.g_tensor_cache.drop_all()
+    # The quantizer's memoized scratch (GBs at low K), which conversion clears per layer itself but direct
+    # quantize calls in tests leave behind
+    quantize = sys.modules.get("exllamav3.modules.quant.exl3_lib.quantize")
+    if quantize is not None:
+        quantize.get_temp_buffers.cache_clear()
+        quantize.get_temp_buffers_frac.cache_clear()
     import gc
     gc.collect()
     if env.cuda_available() and torch.cuda.is_initialized():
