@@ -1722,6 +1722,18 @@ inline __m256i avx2_gather_half_planar(const __m256i (&preg)[bits])
     constexpr auto idx = make_row_indices<bits, false, row, second_word>();
     // planar position of dword w is 8*(w%bits) + w/bits: register w%bits (constexpr above),
     // lane w/bits
+    // Most slots are already in register order under the planar dword layout (57/64 of the
+    // K2..K8 row/half slots), and GCC does not fold an identity VPERMD (gcc 14 emits the
+    // instruction plus its constant), so those slots pay a cross-lane permute for nothing.
+    // Returning the register directly: warm 1T m=1 -4% K3, -6% K4/K6, -8% K8; cold m=1
+    // -4..-6%; bit-exact (bench/bench_planar).
+    constexpr bool identity =
+        idx[half * 8 + 0] / bits == 0 && idx[half * 8 + 1] / bits == 1 &&
+        idx[half * 8 + 2] / bits == 2 && idx[half * 8 + 3] / bits == 3 &&
+        idx[half * 8 + 4] / bits == 4 && idx[half * 8 + 5] / bits == 5 &&
+        idx[half * 8 + 6] / bits == 6 && idx[half * 8 + 7] / bits == 7;
+    if constexpr (identity)
+        return preg[planar_reg<bits, row, second_word, half>()];
     const __m256i lane = _mm256_setr_epi32(
         idx[half * 8 + 0] / bits, idx[half * 8 + 1] / bits, idx[half * 8 + 2] / bits,
         idx[half * 8 + 3] / bits, idx[half * 8 + 4] / bits, idx[half * 8 + 5] / bits,
