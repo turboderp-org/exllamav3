@@ -407,6 +407,17 @@ void exl3_moe
     // Turing's 64 KB cap from rejecting the fixed 90 KB ask.
     int smem_max = DevCtx::instance().get_smem_request(device);
 
+    // sm_70: the fused MoE kernel's compute stages are arch-guarded no-ops below
+    // sm_75 (cp.async/ldmatrix/mma.m16n8k16) — a launch here silently produces
+    // zeros. Fail loudly instead.
+    if (g_get_cc_raw(device) < 75)
+        TORCH_CHECK(false, "exl3_moe: fused MoE kernel is not supported on this "
+                           "architecture (compute capability < 7.5)");
+
+    // sm_70 Volta gate: the upstream SM75 paths cover Turing; Volta's fused MoE
+    // compute stages (cp.async/ldmatrix/mma) are arch-guarded no-ops there, so a
+    // launch would silently produce zeros — fail loudly instead. [PR #404]
+
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_kernel kernel;

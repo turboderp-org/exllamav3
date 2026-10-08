@@ -79,7 +79,7 @@ __device__ inline void ptx_mma_m16n8k16
 {
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f32(frag_a, frag_b, frag_c);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -131,7 +131,7 @@ __device__ inline void ptx_mma_m16n8k16
 {
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f16(frag_a, frag_b, frag_c);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -335,7 +335,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
 #if defined(USE_ROCM)
     exl3_ldsm4(frag_a, smem_ptr);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile

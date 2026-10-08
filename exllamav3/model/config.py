@@ -70,6 +70,21 @@ class InferParams:
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # Volta (cc < 7.5): the fused MGEMM kernels' compute stages are
+        # arch-guarded no-ops there (cp.async / ldmatrix / mma paths the SM75
+        # fallbacks do not cover), so a launch would silently produce zeros.
+        # Refuse bundles below Turing only; Turing keeps the SM75 fused paths
+        # and the separate Linears route to the sm70 GEMV/reconstruct paths.
+        if device is not None:
+            import torch
+            device_t = torch.device(device)
+            if device_t.type == "cuda":
+                try:
+                    from ..ext import exllamav3_ext as ext
+                    if ext.g_get_cc_raw(device_t.index) < 75:
+                        return False
+                except Exception:
+                    pass
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

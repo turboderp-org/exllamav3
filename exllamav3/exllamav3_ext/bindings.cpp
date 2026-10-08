@@ -176,10 +176,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
+    m.def("exl3_gemv2", &exl3_gemv2, "exl3_gemv2");
+    m.def("exl3_gemv_multi", &exl3_gemv_multi, "exl3_gemv_multi");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
           py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
+    m.def("g_get_cc_raw", &g_get_cc_raw, "g_get_cc_raw");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
