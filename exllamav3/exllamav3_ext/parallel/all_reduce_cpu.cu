@@ -94,9 +94,12 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
     while (true)
     {
+        // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
+        // forward pass that feeds it
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
         // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
         // readback for the full sleep quantum (a 1 ms nap at this spot showed up as a slow first
