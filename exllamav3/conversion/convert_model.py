@@ -6,7 +6,7 @@ from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
-from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, tile_orders
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -93,6 +93,7 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
+parser.add_argument("-to", "--tile_order", type = str, default = None, help = "Tile order of the encoded weights: sm80 (default) or colmajor. colmajor is for other inference engines that decode with Volta's mma.m8n8k4; ExLlamaV3 loads such a model by decoding it to FP16. Fixed for the whole job")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
 parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
@@ -185,6 +186,8 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "Must specify --out_dir or --resume"
     if args.codebook not in ["mcg", "mul1", "3inst"]:
         return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
+    if args.tile_order is not None and args.tile_order not in tile_orders:
+        return None, None, False, f"--tile_order must be one of {', '.join(tile_orders)}"
     if args.bits is not None and (args.bits > 8 or args.bits < 1):
         return None, None, False, "--bits must be between 1 and 8"
     if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
@@ -279,6 +282,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
+        ("tile_order", False, "sm80"),
         ("hessians", False, ""),
         ("hessians_reg", False, 0.025),
         ("hessians_one_sided", False, False),
@@ -341,6 +345,7 @@ def prepare(args) -> (dict, dict, bool, str):
         {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]]
     ))
     print(f"    Codebook: {in_args['codebook']}")
+    print(f"    Tile order: {in_args['tile_order']}")
 
     if warn_experimental:
         print(
@@ -521,6 +526,8 @@ def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity
         quant_args.update({"mcg": True})
     elif args["codebook"] == "mul1":
         quant_args.update({"mul1": True})
+    if args.get("tile_order", "sm80") != "sm80":
+        quant_args["tile_order"] = args["tile_order"]
     return quant_args
 
 

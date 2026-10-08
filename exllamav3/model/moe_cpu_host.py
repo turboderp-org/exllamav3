@@ -643,6 +643,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         def fetch(keys):
             out = []
             for k in keys:
+                if stc.has_tensor(k + ".tile_order"):
+                    raise ValueError(f"{k}: colmajor tile order is not supported by the CPU MoE path")
                 trellis = stc.get_tensor(k + ".trellis", cpu)
                 suh = stc.get_tensor(k + ".suh", cpu, float2half = True)
                 svh = stc.get_tensor(k + ".svh", cpu, float2half = True)
@@ -746,6 +748,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             projs = views if len(keys) == 3 else views[1:]
             for key, plist in zip(keys, projs):
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
+                if stc.has_tensor(key + ".tile_order"):
+                    raise ValueError(f"{key}: colmajor tile order is not supported by the CPU MoE path")
                 new = stc.get_tensor(key + ".trellis", cpu)
                 assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
                 if swz and v_tr.shape[2] // 16 != 8:

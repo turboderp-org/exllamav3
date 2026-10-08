@@ -7,7 +7,7 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
-from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult, tile_order_colmajor_marker
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util.pinned_arena import PinnedArena
@@ -435,6 +435,7 @@ class Linear(Module):
         trellis = stc.get_tensor(key + ".trellis", self.device)
         mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
         mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
+        tile_order = stc.get_codebook_marker(key + ".tile_order", tile_order_colmajor_marker)
         bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
@@ -450,9 +451,27 @@ class Linear(Module):
             mul1,
             bias,
             self.out_dtype,
-            key = self.key
+            key = self.key,
+            tile_order = tile_order,
         )
         self.quant_type = "exl3"
+        if self.inner.colmajor:
+            # colmajor tensors are written for other engines; the EXL3 kernels can't decode them in place,
+            # so decode once and run the layer as FP16 (this is also how the converter advances its state)
+            weight = self.inner.get_weight_tensor().half()
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight,
+                bias,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
+                self.out_dtype,
+                key = self.key
+            )
+            self.quant_type = "fp16"
         return True
 
 
@@ -573,7 +592,8 @@ class Linear(Module):
             out_tensors.get("mul1"),
             orig_bias,
             self.out_dtype,
-            key = self.key
+            key = self.key,
+            tile_order = out_tensors.get("tile_order"),
         )
 
         if return_weight_q:
@@ -899,7 +919,8 @@ def convert_exl3_group(
             out_tensors.get("mul1"),
             bias,
             linear.out_dtype,
-            key = linear.key
+            key = linear.key,
+            tile_order = out_tensors.get("tile_order"),
         )
         proxy_errs.append(proxy_err)
     return proxy_errs

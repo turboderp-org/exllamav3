@@ -39,13 +39,36 @@ def codebook_markers(quant_args: dict) -> dict[str, torch.Tensor]:
         return {"mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)}
     return {}
 
+
+# Tile orders: the order in which a 16x16 tile's 256 elements are laid along its trellis. "sm80" is the
+# order the ExLlamaV3 kernels decode. "colmajor" is for engines that decode with Volta's mma.m8n8k4, where
+# a lane reads consecutive k-rows of one column: position p holds tile element (k = p % 16, n = p // 16).
+# The order is fixed at encoding time (each position's code overlaps its neighbours'), so tensors cannot be
+# reordered afterwards. Non-default tensors carry a .tile_order marker; ExLlamaV3 loads them by decoding to FP16.
+tile_orders = ("sm80", "colmajor")
+tile_order_colmajor_marker = 0x70C0
+
+
+def tile_order_markers(quant_args: dict) -> dict[str, torch.Tensor]:
+    """The .tile_order marker stored next to the trellis of a non-default tile order ({} for sm80)"""
+    tile_order = quant_args.get("tile_order", "sm80")
+    assert tile_order in tile_orders, f"Unknown tile order: {tile_order}"
+    if tile_order == "sm80":
+        return {}
+    return {"tile_order": torch.tensor(tile_order_colmajor_marker, dtype = torch.int)}
+
+
 @lru_cache
-def tensor_core_perm(device):
+def tensor_core_perm(device, tile_order: str = "sm80"):
     """
-    Return the 16x16 tile permutation expected by the EXL3 tensor-core quantization kernels.
+    Return the 16x16 tile permutation for the given tile order (default: the order expected by the EXL3
+    tensor-core kernels).
 
     The cached index maps row-major tile elements into the lane/interleave order used by the CUDA encoder.
     """
+    if tile_order == "colmajor":
+        return torch.tensor([(p % 16) * 16 + p // 16 for p in range(256)], dtype = torch.int, device = device)
+    assert tile_order == "sm80", f"Unknown tile order: {tile_order}"
     perm_a = [0] * 256
     for t in range(32):
         r0 = (t % 4) * 2
@@ -66,8 +89,8 @@ def tensor_core_perm(device):
 
 
 @lru_cache
-def tensor_core_perm_i(device):
-    return torch.argsort(tensor_core_perm(device))
+def tensor_core_perm_i(device, tile_order: str = "sm80"):
+    return torch.argsort(tensor_core_perm(device, tile_order))
 
 
 @lru_cache
@@ -667,13 +690,13 @@ def ldlq(
                 tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
 
                 # Pre-permute to tensor core layout
-                tiles = tiles[:, tensor_core_perm(device)]
+                tiles = tiles[:, tensor_core_perm(device, quant_args.get("tile_order", "sm80"))]
 
                 # Quantize
                 quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
 
                 # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
-                quant_w = quant_w[:, tensor_core_perm_i(device)]
+                quant_w = quant_w[:, tensor_core_perm_i(device, quant_args.get("tile_order", "sm80"))]
 
                 # Store result
                 quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
@@ -740,7 +763,8 @@ def ldlq_2hess(
         W4 = weight.view(tiles_k, 16, tiles_n, 16)
         Q4 = weight_q.view(tiles_k, 16, tiles_n, 16)
         F4 = F.view(tiles_k, 16, tiles_n, 16)
-        perm, perm_i = tensor_core_perm(device), tensor_core_perm_i(device)
+        tile_order = quant_args.get("tile_order", "sm80")
+        perm, perm_i = tensor_core_perm(device, tile_order), tensor_core_perm_i(device, tile_order)
         ar16 = torch.arange(16, device = device)
 
         steps = tiles_k + tiles_n - 1
@@ -868,13 +892,13 @@ def fallback_quant(
                 tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
 
                 # Pre-permute to tensor core layout
-                tiles = tiles[:, tensor_core_perm(device)]
+                tiles = tiles[:, tensor_core_perm(device, quant_args.get("tile_order", "sm80"))]
 
                 # Quantize
                 quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
 
                 # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
-                quant_w = quant_w[:, tensor_core_perm_i(device)]
+                quant_w = quant_w[:, tensor_core_perm_i(device, quant_args.get("tile_order", "sm80"))]
 
                 # Restore row-major block layout
                 quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
@@ -963,8 +987,8 @@ def ldlq_batched(
         assert size_k % buf_size_k == 0
 
         p_row = 0
-        perm = tensor_core_perm(device)
-        perm_i = tensor_core_perm_i(device)
+        perm = tensor_core_perm(device, quant_args.get("tile_order", "sm80"))
+        perm_i = tensor_core_perm_i(device, quant_args.get("tile_order", "sm80"))
 
         prod_cache = torch.zeros((B, size_k, size_n), dtype = torch.float, device = device)
         weight_q = torch.zeros_like(weights)
@@ -1148,7 +1172,7 @@ def ldlq_drift(K) -> float:
     return LDLQ_DRIFT.get(float(K), 1.0)
 
 
-def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
+def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3, tile_order: str = "sm80") -> torch.Tensor:
     """
     Sample tiles for the global scale search: a wrapped diagonal, guaranteeing every tile row and column is
     sampled at least once (outliers are typically whole input or output channels), plus the tiles with the
@@ -1175,7 +1199,7 @@ def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
     xn = torch.cat((hi, lo)) % tiles_n
 
     tiles = w4[torch.cat((kk, xk)), :, torch.cat((nn, xn)), :].reshape(-1, 256)
-    return tiles[:, tensor_core_perm(device)].contiguous()
+    return tiles[:, tensor_core_perm(device, tile_order)].contiguous()
 
 
 def g_scale_search_batch(
@@ -1258,7 +1282,7 @@ def g_scale_gss(
     main_stream = get_quant_stream(devices[0])
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
-        tiles = sample_scale_tiles(weight_r, width)
+        tiles = sample_scale_tiles(weight_r, width, quant_args.get("tile_order", "sm80"))
         tiles *= ldlq_drift(quant_args["K"])
         if pb:
             pb.update(50)
@@ -1861,6 +1885,7 @@ def quantize_exl3(
         }
 
         out_tensors.update(codebook_markers(quant_args))
+        out_tensors.update(tile_order_markers(quant_args))
 
         quant_args.update({
             "apply_out_scales": apply_out_scales,
@@ -2026,7 +2051,7 @@ def quantize_exl3_batch(
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
-        samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
+        samples = [sample_scale_tiles(regs[t][0], tile_order = qa0.get("tile_order", "sm80")) * ldlq_drift(qa0["K"]) for t in batch_idx]
         scales = g_scale_search_batch(samples, qa0)
         del samples
         g_scales = {}
@@ -2145,6 +2170,7 @@ def quantize_exl3_batch(
                 "trellis": trellis,
             }
             out_tensors.update(codebook_markers(qa))
+            out_tensors.update(tile_order_markers(qa))
 
             qa.update({
                 "apply_out_scales": apply_out_scales,
