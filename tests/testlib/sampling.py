@@ -6,10 +6,12 @@ reproduce the noise the kernels add element by element instead of only checking 
 cuRAND's state after curand_init(seed, subsequence, offset = 0): key = (seed & 0xffffffff, seed >> 32), counter =
 (0, 0, subsequence & 0xffffffff, subsequence >> 32); draw n of the stream is word n % 4 of
 Philox4x32_10(counter + n // 4, key). curand_uniform maps a word x to float(x) * 2^-32 + 2^-33 in float32 (the
-product is an exact power-of-two scale, so the single rounding happens in float(x) and in the addition).
+product is an exact power-of-two scale, so the single rounding happens in float(x) and in the addition). hipRAND
+(rocRAND) generates the same words but offsets by a full step: 2^-32 + float(x) * 2^-32.
 """
 
 import numpy as np
+import torch
 
 _M0 = np.uint64(0xD2511F53)
 _M1 = np.uint64(0xCD9E8D57)
@@ -61,8 +63,9 @@ def curand_words(seed: int, subsequences: np.ndarray, num_draws: int = 1) -> np.
 
 
 def curand_uniform(words: np.ndarray) -> np.ndarray:
-    """curand_uniform's float32 mapping of 32-bit words: (0, 1]"""
-    return (words.astype(np.float32) * np.float32(2.0 ** -32)) + np.float32(2.0 ** -33)
+    """curand_uniform's float32 mapping of 32-bit words into (0, 1], as the build's backend implements it"""
+    offset = 2.0 ** -32 if torch.version.hip else 2.0 ** -33
+    return (words.astype(np.float32) * np.float32(2.0 ** -32)) + np.float32(offset)
 
 
 def gumbel_exact(u: np.ndarray) -> np.ndarray:

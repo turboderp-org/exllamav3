@@ -17,6 +17,12 @@ fp32, so its error is a few fp16 unit roundoffs (u = 2^-11 ~ 4.9e-4) relative to
 exl3_gemv_int8_max_k contract: 6 on Hopper and Blackwell (compute capability >= 9), 5 elsewhere; EXL3_INT8_GEMV_MAX_K
 overrides it (capped at 8). It is the gate of the int8 GEMV: an m = 1 mul1 exl3_gemm at K = max_k takes the int8
 path (recognizable by its int8-activation error level), at K = max_k + 1 it does not.
+
+ROCm: ext.exl3_gemv is the RDNA GEMV (rocm/quant/exl3_gemv_rdna.cu) behind the same interface, with a narrower
+eligibility: m = 1 only, integer K = 1..8 with any codebook, k and n multiples of 128 (half-integer bitrates go to
+the GEMM). exl3_gemm takes the RDNA GEMVs for m <= 8 ahead of every other path, so the int8 GEMV is never reached
+there and its gate test is CUDA-only; max_k itself follows the same rule (5, no RDNA part counts as Hopper or
+Blackwell).
 """
 
 import numpy as np
@@ -25,7 +31,7 @@ import torch
 
 from exllamav3.ext import exllamav3_ext as ext
 from testlib import trellis as tref
-from testlib.env import compute_capability
+from testlib.env import compute_capability, is_rocm
 from testlib.exl3 import generator, rand_linear, rand_scale
 from testlib.isolated import run_isolated
 
@@ -50,6 +56,10 @@ def _weights(k, n, K, seed):
     return p, rand_scale(k, g), rand_scale(n, g), g
 
 
+def _rdna_eligible(m, K):
+    return m == 1 and float(K).is_integer()
+
+
 def _gemv(A, tr, suh, svh, n, cb, fp32, device):
     lead = A.shape[:-1]
     m = int(np.prod(lead))
@@ -72,6 +82,8 @@ def _assert_close(C, ref):
 @pytest.mark.parametrize("K, cb, m, k, n, fp32", CASES)
 @torch.inference_mode()
 def test_gemv_matches_reference(device, K, cb, m, k, n, fp32):
+    if is_rocm() and not _rdna_eligible(m, K):
+        pytest.skip("RDNA GEMV: m = 1 and integer K only")
     p, suh, svh, g = _weights(k, n, K, m * 1000 + k + n)
     A = (torch.randn(m, k, generator = g) * 0.5).half()
     ref = tref.linear(A, p, suh, svh, K, cb)
@@ -88,11 +100,13 @@ def test_gemv_matches_reference(device, K, cb, m, k, n, fp32):
 @torch.inference_mode()
 def test_gemv_flattens_leading_dims(device):
     K, cb, k, n = 3, "mul1", 512, 384
+    lead = (1, 1, 1) if is_rocm() else (2, 3)       # RDNA: m = 1
+    m = int(np.prod(lead))
     p, suh, svh, g = _weights(k, n, K, 3)
-    A = (torch.randn(2, 3, k, generator = g) * 0.5).half()
-    ref = tref.linear(A.view(6, k), p, suh, svh, K, cb).view(2, 3, n)
+    A = (torch.randn(*lead, k, generator = g) * 0.5).half()
+    ref = tref.linear(A.view(m, k), p, suh, svh, K, cb).view(*lead, n)
     C = _gemv(A.to(device), torch.from_numpy(p.copy()).to(device), suh.to(device), svh.to(device), n, cb, False, device)
-    assert C.shape == (2, 3, n)
+    assert C.shape == (*lead, n)
     _assert_close(C, ref)
 
 
@@ -109,16 +123,26 @@ def test_gemv_rejects_ineligible(device):
 
     call(1, 256, 256, 3, False, True)   # eligible baseline
     torch.cuda.synchronize(device)
-    for args, match in [
-        ((9, 256, 256, 3, False, True), "not eligible"),            # m > 8
-        ((1, 256, 256, 5, False, True), "not eligible"),            # K = 5
-        ((1, 256, 256, 1, False, True), "not eligible"),            # K = 1
-        ((1, 256, 256, 3, False, False), "not eligible"),           # 3INST below K = 4
-        ((1, 272, 256, 3, False, True), "not eligible"),            # k % 128
-        ((1, 256, 272, 3, False, True), "not eligible"),            # n % 128
-        ((1, 256, 256, 2.5, True, False), "require the mul1 codebook"),
-        ((1, 256, 256, 3, True, True), "both mcg and mul1"),
-    ]:
+    if is_rocm():
+        cases = [
+            ((2, 256, 256, 3, False, True), "not eligible"),        # m > 1
+            ((1, 272, 256, 3, False, True), "not eligible"),        # k % 128
+            ((1, 256, 272, 3, False, True), "not eligible"),        # n % 128
+            ((1, 256, 256, 2.5, False, True), "half-integer bitrates are not supported"),
+            ((1, 256, 256, 3, True, True), "both mcg and mul1"),
+        ]
+    else:
+        cases = [
+            ((9, 256, 256, 3, False, True), "not eligible"),        # m > 8
+            ((1, 256, 256, 5, False, True), "not eligible"),        # K = 5
+            ((1, 256, 256, 1, False, True), "not eligible"),        # K = 1
+            ((1, 256, 256, 3, False, False), "not eligible"),       # 3INST below K = 4
+            ((1, 272, 256, 3, False, True), "not eligible"),        # k % 128
+            ((1, 256, 272, 3, False, True), "not eligible"),        # n % 128
+            ((1, 256, 256, 2.5, True, False), "require the mul1 codebook"),
+            ((1, 256, 256, 3, True, True), "both mcg and mul1"),
+        ]
+    for args, match in cases:
         with pytest.raises(RuntimeError, match = match):
             call(*args)
     with pytest.raises(RuntimeError, match = "requires suh, A_had and svh"):
@@ -132,7 +156,7 @@ def test_gemv_rejects_ineligible(device):
 @torch.inference_mode()
 def test_int8_max_k_default(device):
     idx = torch.device(device).index
-    expected = 6 if compute_capability(device)[0] >= 9 else 5
+    expected = 6 if not is_rocm() and compute_capability(device)[0] >= 9 else 5
     assert ext.exl3_gemv_int8_max_k(idx) == expected
 
 
@@ -154,6 +178,8 @@ def _int8_gate_worker(A, w, K):
 def test_int8_max_k_gates_int8_path(device):
     """The int8 path has a distinctive error signature: it quantizes the activations to int8, ~1e-2 relative RMS
     against the exact product, while every fp16 path stays at a few fp16 roundoffs (< 2.5e-3, see above)"""
+    if is_rocm():
+        pytest.skip("exl3_gemm takes the RDNA GEMVs for m <= 8, so the int8 GEMV is never reached on ROCm")
     max_k = ext.exl3_gemv_int8_max_k(torch.device(device).index)
     k, n = 1024, 1024
     for K, expect_int8 in ((max_k, True), (max_k + 1, False)):
