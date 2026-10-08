@@ -48,7 +48,7 @@ void apply_rep_pens_kernel
     // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i <= past_len - sustain_range - decay_range)
+        if (i < past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
@@ -165,7 +165,7 @@ void apply_pres_freq_pens_kernel
     // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i <= past_len - sustain_range - decay_range)
+        if (i < past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
