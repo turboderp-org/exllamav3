@@ -154,6 +154,11 @@ void ple_forward_streams
     TORCH_CHECK(streams.is_contiguous() && emb.is_contiguous(), "ple_forward_streams: contiguous inputs");
     TORCH_CHECK(delta.is_contiguous() && conv_stream.is_contiguous(), "ple_forward_streams: contiguous outputs");
     TORCH_CHECK(D > 0, "ple_forward_streams: norm over an empty stream dimension");
+    // The causal conv over [state | new columns] must yield exactly seq outputs
+    TORCH_CHECK(conv_w.dim() == 3 && state_len == (conv_w.size(2) - 1) * conv_dilation,
+                "ple_forward_streams: conv_stream must hold (ksize - 1) * dilation state columns before seq");
+    TORCH_CHECK(!conv_state || conv_state->sizes() == at::IntArrayRef({bsz, hc, state_len}),
+                "ple_forward_streams: conv_state must be (bsz, H * D, state_len)");
 
     // conv column stream: [state | new columns]. With no tokens (or no streams) there is no delta
     // and the conv stream is just the carried state

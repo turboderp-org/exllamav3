@@ -638,6 +638,10 @@ void gated_rms_norm_gr
                     "gated_rms_norm: w must have w_groups * dim elements");
     }
     TORCH_CHECK_SHAPES_FULL(x, g);
+    // y may be a flat view of x's shape (BC paths write (.., heads * dim) statics)
+    TORCH_CHECK_NUMEL(y, x);
+    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && y.is_contiguous() && g.is_contiguous(),
+                "gated_rms_norm: x, w, y and g must be contiguous");
 
     int rows = 1;
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);

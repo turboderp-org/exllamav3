@@ -7,7 +7,7 @@ output gate of attn.py: each head stores head_dim q values followed by head_dim 
 where n = q.numel() / head_dim, regardless of how the leading dims are shaped (callers pass q as (B, S, H, D) and
 g as (B, S, H * D)). A pure copy: bit-exact, NaN/inf payloads preserved, qg untouched, nothing written outside q
 and g. Rejects (TORCH_CHECK): non-fp16 dtypes, head_dim % 8 != 0, non-contiguous tensors, q.numel() != g.numel()
-or qg.numel() != 2 * q.numel().
+or qg.numel() != 2 * q.numel(), and tensors not 16-byte aligned (the copy moves 8-half vectors).
 
 Reference: torch view / indexing.
 """
@@ -78,6 +78,11 @@ def test_deinterleave_qg_rejects(device):
         ext.deinterleave_qg(qg, q[:1], g, 64)
     with pytest.raises(RuntimeError, match = "size mismatch"):
         ext.deinterleave_qg(qg[:1], q, g, 64)
+    off = lambda t: torch.empty(t.numel() + 4, dtype = torch.half, device = device)[4:].view(t.shape)
+    for args in ((off(qg), q, g), (qg, off(q), g), (qg, q, off(g))):
+        with pytest.raises(RuntimeError, match = "16-byte aligned"):
+            ext.deinterleave_qg(*args, 64)
+    assert_device_ok(device)
 
 
 def assert_device_ok(device):

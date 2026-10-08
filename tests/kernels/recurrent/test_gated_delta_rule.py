@@ -351,3 +351,24 @@ def test_empty(device, bsz, seqlen, nk, nv, dk, dv, history, use_slots, channelw
     torch.cuda.synchronize(device)
     assert torch.equal(state, state0), "state modified"
     assert (torch.ones(4, device = device) + 1).sum().item() == 8.0, "a later torch op failed after the empty call"
+
+
+@pytest.mark.parametrize("which", ["mixed_qkv", "g", "beta", "state", "out"])
+@torch.inference_mode()
+def test_rejects_non_contiguous(device, which):
+    """The kernel indexes every tensor densely: a strided view (here the token-major view of a channel-major
+    buffer, as the conv emits it) would be misread rather than rejected"""
+    bsz, seqlen, nk, nv, dk, dv = 1, 3, 2, 4, 32, 32
+    t = dict(
+        mixed_qkv = torch.randn(bsz, seqlen, 2 * nk * dk + nv * dv, device = device).bfloat16(),
+        g = -torch.rand(bsz, seqlen, nv, device = device),
+        beta = torch.rand(bsz, seqlen, nv, device = device).bfloat16(),
+        state = torch.zeros(bsz, 1, nv, dk, dv, device = device),
+        out = torch.empty(bsz, seqlen, nv, dv, dtype = torch.bfloat16, device = device),
+    )
+    x = t[which]
+    t[which] = x.transpose(-1, -2).contiguous().transpose(-1, -2)
+    assert not t[which].is_contiguous()
+    with pytest.raises(RuntimeError, match = "must be contiguous"):
+        ext.cuda_recurrent_gated_delta_rule(t["mixed_qkv"], t["g"], t["beta"], t["state"], t["out"], nk, nv, dk, dv,
+                                            None, False)

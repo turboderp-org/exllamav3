@@ -465,6 +465,12 @@ void xielu_gr
     bool float_input = x.dtype() == at::kFloat;
     if (!float_input) TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
+    // Flat buffers in aligned pairs (float2 in, half2 out), no tail
+    TORCH_CHECK_NUMEL(y, x);
+    TORCH_CHECK(x.numel() % 2 == 0, "xielu: x.numel() must be even");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "xielu: x and y must be contiguous");
+    TORCH_CHECK(((uintptr_t) x.data_ptr()) % (2 * x.element_size()) == 0 &&
+                ((uintptr_t) y.data_ptr()) % (2 * y.element_size()) == 0, "xielu: x and y must be aligned to element pairs");
 
     auto get_alpha = [&] (const at::Tensor& t)
     {
@@ -534,6 +540,9 @@ void add_sigmoid_gate_gr
     int dim = x.size(-1);
     int gdim = y.size(-1);
     TORCH_CHECK(gdim == 1, "gate must have size(-1) == 1")
+    TORCH_CHECK_NUMEL(z, x);
+    TORCH_CHECK(y.numel() * dim == x.numel(), "add_sigmoid_gate: gate must have one element per row of x");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && z.is_contiguous(), "add_sigmoid_gate: x, y and z must be contiguous");
 
     size_t numel = x.numel();
     if (!numel) return;
@@ -583,6 +592,8 @@ void mul_sigmoid__gr
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
     TORCH_CHECK(x.numel() % 2 == 0, "x.numel() must be even");
+    TORCH_CHECK(((uintptr_t) x.data_ptr()) % 4 == 0 && ((uintptr_t) y.data_ptr()) % 4 == 0,
+                "mul_sigmoid_: x and y must be aligned to element pairs");
 
     size_t numel = x.numel();
     if (!numel) return;
@@ -628,6 +639,7 @@ void mul_sigmoid_broadcast__gr
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
     TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
+    TORCH_CHECK(((uintptr_t) x.data_ptr()) % 4 == 0, "mul_sigmoid_broadcast_: x must be aligned to element pairs");
 
     size_t numel = x.numel();
     if (!numel) return;
@@ -675,6 +687,7 @@ void mul_softplus_broadcast__gr
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
     TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
+    TORCH_CHECK(((uintptr_t) x.data_ptr()) % 4 == 0, "mul_softplus_broadcast_: x must be aligned to element pairs");
 
     size_t numel = x.numel();
     if (!numel) return;
@@ -724,6 +737,10 @@ void add_sigmoid_gate_proj_gr
     TORCH_CHECK(gdim == 1, "gate must have size(-1) == 1")
     TORCH_CHECK_SHAPES(x, -1, w, -2, 1);
     TORCH_CHECK_SHAPES(x, -1, y, -1, 1);
+    TORCH_CHECK_NUMEL(y, x);
+    TORCH_CHECK_NUMEL(z, x);
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && z.is_contiguous() && w.is_contiguous(),
+                "add_sigmoid_gate_proj: x, y, z and w must be contiguous");
 
     if (!x.numel()) return;
     size_t bsz = x.numel() / dim;
@@ -798,6 +815,8 @@ void deinterleave_qg_gr
     TORCH_CHECK(qg.is_contiguous() && q.is_contiguous() && g.is_contiguous(), "tensors must be contiguous");
     TORCH_CHECK(q.numel() == g.numel() && q.numel() * 2 == qg.numel(), "size mismatch");
     TORCH_CHECK(q.numel() % head_dim == 0, "size mismatch (not a whole number of heads)");
+    TORCH_CHECK(((uintptr_t) qg.data_ptr()) % 16 == 0 && ((uintptr_t) q.data_ptr()) % 16 == 0 &&
+                ((uintptr_t) g.data_ptr()) % 16 == 0, "deinterleave_qg: tensors must be 16-byte aligned");
     if (!q.numel()) return;
 
     int hd8 = head_dim / 8;

@@ -105,6 +105,7 @@ void gumbel_noise_f16
 
     TORCH_CHECK_DTYPE(logits_in, kHalf);
     TORCH_CHECK_DTYPE(logits, kHalf);
+    TORCH_CHECK_SHAPES_FULL(logits_in, logits);
 
     int size = logits.numel();
     if (!size) return;
@@ -117,6 +118,7 @@ void gumbel_noise_f16
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_noise_f32
@@ -131,6 +133,7 @@ void gumbel_noise_f32
 
     TORCH_CHECK_DTYPE(logits_in, kFloat);
     TORCH_CHECK_DTYPE(logits, kFloat);
+    TORCH_CHECK_SHAPES_FULL(logits_in, logits);
 
     int size = logits.numel();
     if (!size) return;
@@ -143,6 +146,7 @@ void gumbel_noise_f32
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_noise_log
@@ -170,4 +174,5 @@ void gumbel_noise_log
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }

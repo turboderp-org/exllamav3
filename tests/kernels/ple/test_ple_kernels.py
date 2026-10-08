@@ -16,7 +16,8 @@ ext.ple_forward_streams(streams, emb, key_w, value_w, norm_key_w, norm_query_w, 
         normed = fp16(rms(gated) * (1 + norm_conv_w[h]))
         conv_stream = [conv_state (or zeros) | normed^T]     (bsz, H * D, state_len + seq) fp16, written in full
         delta  = gated + silu(depthwise conv1d(conv_stream, conv_w, dilation))^T   (bsz, seq, H, D) fp32
-    state_len = conv_stream.size(2) - seq = (ksize - 1) * dilation. Inputs and outputs must be contiguous.
+    state_len = conv_stream.size(2) - seq must equal (ksize - 1) * dilation (the conv then yields exactly seq
+    columns) and conv_state, when given, must be (bsz, H * D, state_len). Inputs and outputs must be contiguous.
 
 References: float64 torch transcriptions of the formulas above (not the module's ext-based reference path),
 rounding to fp16 where the contract stores fp16 (key, value, normed, conv output).
@@ -284,15 +285,26 @@ def test_ple_forward_streams_outputs_only(device):
     check_forward_streams(t, delta, conv_stream, ref_forward_streams(t, 1e-6, 0.125, dilation))
 
 
-@pytest.mark.parametrize("which", ["streams", "emb", "delta", "conv_stream"])
+@pytest.mark.parametrize("which", ["streams", "emb", "delta", "conv_stream", "state_len_short", "state_len_long",
+                                   "conv_state_bsz"])
 @torch.inference_mode()
-def test_ple_forward_streams_rejects_noncontiguous(device, which):
-    bsz, seq, H, D, ple_dim, ksize, dilation = 1, 4, 2, 64, 32, 4, 2
+def test_ple_forward_streams_rejects(device, which):
+    bsz, seq, H, D, ple_dim, ksize, dilation = 2, 4, 2, 64, 32, 4, 2
     state_len = (ksize - 1) * dilation
-    t = make_ple_inputs(device, bsz, seq, H, D, ple_dim, ksize, dilation, False, torch.half)
+    t = make_ple_inputs(device, bsz, seq, H, D, ple_dim, ksize, dilation, which == "conv_state_bsz", torch.half)
     delta = torch.empty(bsz, seq, H, D, device = device)
     conv_stream = torch.empty(bsz, H * D, state_len + seq, dtype = torch.half, device = device)
-    if which == "streams":
+    match = None
+    if which in ("state_len_short", "state_len_long"):
+        # The conv would yield more or fewer than seq columns (or, at one column, broadcast silently)
+        extra = -1 if which == "state_len_short" else 1
+        conv_stream = torch.empty(bsz, H * D, state_len + extra + seq, dtype = torch.half, device = device)
+        match = "state columns"
+    elif which == "conv_state_bsz":
+        # A one-row state would broadcast over the batch in the state copy
+        t["conv_state"] = t["conv_state"][:1].contiguous()
+        match = "conv_state must be"
+    elif which == "streams":
         t["streams"] = torch.empty(bsz, seq, H, 2 * D, device = device)[..., :D]
     elif which == "emb":
         t["emb"] = torch.empty(bsz, seq, 2 * ple_dim, dtype = torch.half, device = device)[..., :ple_dim]
@@ -300,8 +312,9 @@ def test_ple_forward_streams_rejects_noncontiguous(device, which):
         delta = torch.empty(bsz, seq, H, 2 * D, device = device)[..., :D]
     else:
         conv_stream = torch.empty(bsz, H * D, 2 * (state_len + seq), dtype = torch.half, device = device)[..., ::2]
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match = match):
         run_forward_streams(t, 1e-6, 0.1, dilation, conv_stream = conv_stream, delta = delta)
+    assert_device_ok(device)
 
 
 def assert_device_ok(device):

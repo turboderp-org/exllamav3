@@ -98,10 +98,10 @@ def test_gemv_flattens_leading_dims(device):
 
 @torch.inference_mode()
 def test_gemv_rejects_ineligible(device):
-    def call(m, k, n, K, mcg, mul1, with_scales = True, c_dtype = torch.half):
+    def call(m, k, n, K, mcg, mul1, with_scales = True, c_dtype = torch.half, c_rows = None):
         tr = torch.zeros((k // 16, n // 16, int(16 * K)), dtype = torch.int16, device = device)
         A = torch.zeros((m, k), dtype = torch.half, device = device)
-        C = torch.empty((m, n), dtype = c_dtype, device = device)
+        C = torch.empty((m if c_rows is None else c_rows, n), dtype = c_dtype, device = device)
         suh = torch.ones(k, dtype = torch.half, device = device) if with_scales else None
         svh = torch.ones(n, dtype = torch.half, device = device) if with_scales else None
         A_had = torch.empty_like(A) if with_scales else None
@@ -125,6 +125,8 @@ def test_gemv_rejects_ineligible(device):
         call(1, 256, 256, 3, False, True, with_scales = False)
     with pytest.raises(RuntimeError):
         call(1, 256, 256, 3, False, True, c_dtype = torch.bfloat16)
+    with pytest.raises(RuntimeError, match = "exl3_gemv: C must hold one output row per row of A"):
+        call(2, 256, 256, 3, False, True, c_rows = 1)
 
 
 @torch.inference_mode()

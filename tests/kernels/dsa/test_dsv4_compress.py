@@ -153,6 +153,7 @@ def _device_still_works(device):
     ("ring0", "empty ring"),
     ("ovl_depth0", "empty snapshot ring"),
     ("dest_rows0", "empty destination"),
+    ("pool_bt0", "no pages in block table"),
 ])
 @torch.inference_mode()
 def test_empty_dsv4_compress(device, case, error):
@@ -163,7 +164,7 @@ def test_empty_dsv4_compress(device, case, error):
         hd = W = 0
     if case == "m0":
         m = 0
-    batched = case in ("jobs0", "dest_rows0")
+    batched = case in ("jobs0", "dest_rows0", "pool_bt0")
     jobs = 0 if case == "jobs0" else 2
     seq = 0 if case.startswith("seq0") or case == "jobs0" else 5
     buf_rows = 0 if case == "ring0" else 256 + 4
@@ -187,8 +188,9 @@ def test_empty_dsv4_compress(device, case, error):
         if batched or case == "seq0_pos_tensor" else None
     slot_ids = torch.arange(jobs, dtype = torch.int32, device = device) if batched else None
     refs = [t.clone() for t in (ring_kv, ring_gate, dest_a)]
+    pool_bt = torch.zeros((jobs, 0), dtype = torch.int32, device = device) if case == "pool_bt0" else None
     args = (kv, gate, ring_kv, ring_gate, ovl, ape, norm_w, 1e-6, inv_freq, dest_a, None, 5, pos_t, m,
-            slot_ids, None, 0, False)
+            slot_ids, pool_bt, 8 if pool_bt is not None else 0, False)
     if error:
         with pytest.raises(RuntimeError, match = f"dsv4_compress: .*{error}"):
             ext.dsv4_compress(*args)
@@ -219,3 +221,24 @@ def test_empty_dsv4_pool_quant_scatter(device, jobs, seq, nw_max, pos_tensor):
     _device_still_works(device)
     with pytest.raises(RuntimeError, match = "bad epp / m"):
         ext.dsv4_pool_quant_scatter(stage, pool_q, pool_s, pool_r, pool_bt, 3, pos_t, 0, seq, epp)
+
+
+@pytest.mark.parametrize("jobs, pos_tensor", [(1, False), (1, True), (2, True)])
+@torch.inference_mode()
+def test_dsv4_pool_quant_scatter_rejects_empty_block_table(device, jobs, pos_tensor):
+    D_c, D_r, bits, m, epp, rows, seq = 128, 64, 4, 4, 8, 32, 5
+    G = D_c // 32
+    stage = torch.randn((jobs, seq // m + 1, D_c + D_r), device = device).half()
+    if jobs == 1:
+        stage = stage[0]
+    pool_q = torch.full((rows, G * bits), 7, dtype = torch.int32, device = device)
+    pool_s = torch.full((rows, G), 7.0, dtype = torch.half, device = device)
+    pool_r = torch.full((rows, D_r), 7.0, dtype = torch.half, device = device)
+    pool_bt = torch.zeros((jobs, 0), dtype = torch.int32, device = device)
+    pos_t = torch.full((jobs,), 3, dtype = torch.int32, device = device) if pos_tensor else None
+    refs = [t.clone() for t in (pool_q, pool_s, pool_r)]
+    with pytest.raises(RuntimeError, match = "dsv4_pool_quant_scatter: .*no pages in block table"):
+        ext.dsv4_pool_quant_scatter(stage, pool_q, pool_s, pool_r, pool_bt, 3, pos_t, m, seq, epp)
+    for t, r in zip((pool_q, pool_s, pool_r), refs):
+        assert torch.equal(t, r)
+    _device_still_works(device)

@@ -104,6 +104,10 @@ def test_mamba2_dt_op_rejects(device):
         ext.mamba2_dt_op(raw, bias[:-1], a_log, dt, g, 0.0, 1.0)
     with pytest.raises(RuntimeError, match = "incompatible shapes"):
         ext.mamba2_dt_op(raw, bias, a_log, dt, g[:, :1], 0.0, 1.0)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.mamba2_dt_op(torch.randn((B, H, S), device = device).transpose(1, 2), bias, a_log, dt, g, 0.0, 1.0)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.mamba2_dt_op(raw, bias, a_log, dt, torch.empty((B, H, S), device = device).transpose(1, 2), 0.0, 1.0)
     big = torch.randn((1, 1, 513), device = device)
     with pytest.raises(RuntimeError, match = "too many heads"):
         ext.mamba2_dt_op(big, big[0, 0], big[0, 0], big.bfloat16(), big.clone(), 0.0, 1.0)
@@ -274,6 +278,12 @@ def test_recurrent_mamba2_rejects(device):
         call(history = True)  # history over 2 tokens needs at least 2 entries, state has 1
     with pytest.raises(RuntimeError, match = "core_attn_out must be"):
         call(out = out[:, :1].contiguous())
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        call(xbc = xbc.transpose(1, 2).contiguous().transpose(1, 2))
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        call(state = state.transpose(3, 4).contiguous().transpose(3, 4))
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        call(out = torch.empty((bsz, seqlen, dv, nv), dtype = torch.bfloat16, device = device).transpose(2, 3))
     with pytest.raises(RuntimeError, match = "datatype"):
         call(dt = dt.float())
     with pytest.raises(RuntimeError, match = "datatype"):

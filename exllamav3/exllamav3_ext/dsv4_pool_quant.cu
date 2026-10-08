@@ -125,6 +125,7 @@ void dsv4_pool_quant_scatter_gr
         pos_ptr = (const int*) position_tensor.value().data_ptr();
     }
     if (!batch || !seq) return;
+    TORCH_CHECK(pool_bt.size(1) > 0, "dsv4_pool_quant_scatter: rows to scatter but no pages in block table");
     int nw = (position + seq) / m - position / m;
     int grid_w = pos_ptr ? seq / m + 1 : nw;
     TORCH_CHECK(grid_w <= nw_max, "dsv4_pool_quant_scatter: staging too small for this step");

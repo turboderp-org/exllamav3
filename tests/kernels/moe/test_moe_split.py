@@ -181,6 +181,20 @@ def test_moe_split_issue_rejections(device):
         call(args(y = torch.zeros((1, 128), dtype = torch.half, device = device)[:, ::2]))
     with pytest.raises(RuntimeError, match = "map requires hist"):
         call(args(map = torch.arange(8, device = device)))
+    with pytest.raises(RuntimeError, match = "rows \\* topk"):
+        call(args(sel = torch.zeros(9, dtype = torch.long, device = device)))
+    with pytest.raises(RuntimeError, match = "rows \\* topk"):
+        call(args(w = torch.zeros((1, 7), dtype = torch.half, device = device)))
+    with pytest.raises(RuntimeError, match = "rows \\* topk"):
+        call(args(sel = torch.zeros(9, dtype = torch.long, device = device),
+                  w = torch.zeros((1, 9), dtype = torch.half, device = device),
+                  y = torch.zeros((2, 64), dtype = torch.half, device = device)))
+    with pytest.raises(RuntimeError, match = "y must have 2 dimensions"):
+        call(args(y = y.view(1, 1, 64)))
+    with pytest.raises(RuntimeError, match = "map is incorrect datatype"):
+        call(args(map = torch.arange(8, dtype = torch.int32, device = device), hist = torch.zeros(8, device = device)))
+    with pytest.raises(RuntimeError, match = "hist is incorrect datatype"):
+        call(args(map = torch.arange(8, device = device), hist = torch.zeros(8, dtype = torch.half, device = device)))
     with pytest.raises(RuntimeError):
         call(args(y = y.float()))
     with pytest.raises(RuntimeError):

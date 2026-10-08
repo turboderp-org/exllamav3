@@ -115,4 +115,8 @@ def test_empty_gemm(device, c_dtype, m, k, n):
     with pytest.raises(RuntimeError, match = "incompatible shapes"):
         ext.exl3_gemm(A, w["trellis"], torch.empty((m, n + 16), dtype = c_dtype, device = device), w["suh"],
                       torch.empty_like(A), w["svh"], 0, False, True, 0)
+    if m and n:
+        with pytest.raises(RuntimeError, match = "exl3_gemm: C must hold one output row per row of A"):
+            ext.exl3_gemm(A, w["trellis"], torch.empty((m - 1, n), dtype = c_dtype, device = device), w["suh"],
+                          torch.empty_like(A), w["svh"], 0, False, True, 0)
     _device_still_works(device)

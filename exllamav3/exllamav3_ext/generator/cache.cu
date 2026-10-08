@@ -142,6 +142,11 @@ void dspark_write_rows
     int s = (int) rows.size(1);
     int w = (int) rows.size(2);
     int64_t total = (int64_t) s * w;
+    TORCH_CHECK(kv.size(2) == w, "dspark_write_rows: kv width does not match rows");
+    TORCH_CHECK(block_table.size(0) >= bsz && cache_seqlens.size(0) >= bsz,
+                "dspark_write_rows: block table and seqlens must cover the batch");
+    TORCH_CHECK(rows.is_contiguous() && kv.is_contiguous() && block_table.is_contiguous() && cache_seqlens.is_contiguous(),
+                "dspark_write_rows: all tensors must be contiguous");
     if (!bsz || !total) return;
     TORCH_CHECK(block_table.size(1) > 0, "dspark_write_rows: rows to write but no pages in block table");
     dspark_write_rows_kernel<<<dim3(CEIL_DIVIDE(total, kThreads), bsz), kThreads, 0, stream>>>
@@ -236,6 +241,13 @@ void paged_kv_cache_update
     TORCH_CHECK(v_cache.size(1) == 256, "this kernel needs page_size == 256");
 
     TORCH_CHECK((D & 7) == 0, "dim must be divisible by 8");
+    TORCH_CHECK(k_cache.size(2) == H && k_cache.size(3) == D, "paged_kv_cache_update: k_cache heads/dim do not match k");
+    TORCH_CHECK_SHAPES_FULL(v_cache, k_cache);
+    TORCH_CHECK(block_table.size(0) >= B && cache_seqlens.size(0) >= B,
+                "paged_kv_cache_update: block table and seqlens must cover the batch");
+    TORCH_CHECK(k.is_contiguous() && v.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                block_table.is_contiguous() && cache_seqlens.is_contiguous(),
+                "paged_kv_cache_update: all tensors must be contiguous");
 
     if (B == 0 || S == 0 || H == 0 || D == 0) return;
     TORCH_CHECK(max_blocks_per_seq > 0, "paged_kv_cache_update: tokens to write but no pages in block table");

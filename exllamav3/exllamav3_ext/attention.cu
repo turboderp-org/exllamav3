@@ -888,12 +888,16 @@ void bighead_attn_paged
     TORCH_CHECK(bighead_attn_supported(dim, G), "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
     TORCH_CHECK(num_pages_per_seq > 0, "bighead_attn_paged: attention over zero keys (empty block table)");
 
+    // Partial results take (dim + 2) floats per query row, head and KV chunk; a single chunk must fit
+    const uint64_t ws_numel      = WORKSPACE_SIZE / sizeof(float);
+    TORCH_CHECK((uint64_t)bsz * (uint64_t)q_len * (uint64_t)n_q_heads * (uint64_t)(dim + 2) <= ws_numel,
+                "bighead_attn_paged: bsz * q_len * n_q_heads too large for the attention workspace");
+
     // No rows: nothing to do. No queries: only the cache append runs
     if (!bsz) return;
 
     const int64_t max_total_k_len = num_pages_per_seq * PAGE_SIZE;
 
-    const uint64_t ws_numel      = WORKSPACE_SIZE / sizeof(float);
     int64_t n_chunks;
     while (true)
     {
@@ -1047,9 +1051,13 @@ void bighead_attn
     TORCH_CHECK(kv_chunk_size > 0, "kv_chunk_size must be positive");
     TORCH_CHECK(bighead_attn_supported(dim, G), "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
     TORCH_CHECK(kv_len > 0, "bighead_attn: attention over zero keys (empty kv_len)");
+
+    // Partial results take (dim + 2) floats per query row, head and KV chunk; a single chunk must fit
+    const uint64_t ws_numel      = WORKSPACE_SIZE / sizeof(float);
+    TORCH_CHECK((uint64_t)bsz * (uint64_t)q_len * (uint64_t)n_q_heads * (uint64_t)(dim + 2) <= ws_numel,
+                "bighead_attn: bsz * q_len * n_q_heads too large for the attention workspace");
     if (!bsz || !q_len) return;
 
-    const uint64_t ws_numel      = WORKSPACE_SIZE / sizeof(float);
     int64_t n_chunks;
     while (true)
     {

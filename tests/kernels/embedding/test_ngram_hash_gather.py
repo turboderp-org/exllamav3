@@ -172,6 +172,19 @@ def test_ngram_hash_rejects():
         ext.ngram_hash_cpu(ids, 8, mult, offsets, sizes, 8, EOS, b64[:-1], b64.clone(), b32)
     with pytest.raises(RuntimeError, match = "too small"):
         ext.ngram_hash_cpu(ids, 8, mult, offsets, sizes, 8, EOS, b64, b64.clone(), b32[:-1])
+    with pytest.raises(RuntimeError, match = r"ids must be \(bsz, ctx \+ seq\)"):
+        ext.ngram_hash_cpu(ids.view(-1), 8, mult, offsets, sizes, 8, EOS, b64, b64.clone(), b32)
+    # The hash parameters and outputs are read / written through raw host pointers
+    msg = "multipliers, offsets, sizes, uids and inverse must be contiguous int64 CPU"
+    for i, bad in enumerate((mult.int(), offsets.int(), sizes.int(), b64.int(), b64.int())):
+        args = [mult, offsets, sizes, b64, b64.clone()]
+        args[i] = bad
+        with pytest.raises(RuntimeError, match = msg):
+            ext.ngram_hash_cpu(ids, 8, *args[:3], 8, EOS, *args[3:], b32)
+    with pytest.raises(RuntimeError, match = msg):
+        ext.ngram_hash_cpu(ids, 8, torch.stack((mult, mult), 1)[:, 0], offsets, sizes, 8, EOS, b64, b64.clone(), b32)
+    with pytest.raises(RuntimeError, match = "heads must be contiguous int32 CPU"):
+        ext.ngram_hash_cpu(ids, 8, mult, offsets, sizes, 8, EOS, b64, b64.clone(), b64.clone())
 
 
 # --------------------------------------------------------------------------------------------------------------

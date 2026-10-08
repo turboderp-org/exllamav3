@@ -9,7 +9,7 @@ testlib.trellis (NumPy bitstream reference, no extension code):
 - the half-integer layout with MASK = 0 is the integer layout ("same stream convention", frac.cu)
 - outputs are written exactly in place: memory around the output tensor is untouched
 - pack_trellis_frac / unpack_trellis_frac reject KA outside 1..7, MASK beyond 16 bits, an odd bit count per 16
-  positions and mismatched shapes; the integer forms reject mismatched shapes
+  positions; all forms reject mismatched shapes, non-int16 tensors and non-contiguous tensors
 - pack_signs: bit b of packed[j] is the fp16 sign bit of x[16 j + b] (so -0.0 and negative NaN count as negative),
   for any column count (the kernel's 32-column blocks have a partial tail); dtypes are validated
 """
@@ -138,30 +138,36 @@ def test_rejects_shape_mismatch(device):
     words = torch.zeros((2, 3, 256), dtype = torch.int16, device = device)
     for K in (3, 2.5):
         w16 = int(16 * K)
-        bad = [torch.zeros((2, 3, w16 + 2), dtype = torch.int16, device = device),
-               torch.zeros((2, 4, w16), dtype = torch.int16, device = device),
-               torch.zeros((1, 3, w16), dtype = torch.int16, device = device)]
-        for packed in bad:
-            with pytest.raises(RuntimeError):
+        good = torch.zeros((2, 3, w16), dtype = torch.int16, device = device)
+        bad = [(torch.zeros((2, 3, w16 + 2), dtype = torch.int16, device = device), words, None),
+               (torch.zeros((2, 4, w16), dtype = torch.int16, device = device), words, None),
+               (torch.zeros((1, 3, w16), dtype = torch.int16, device = device), words, None),
+               (good.int(), words, "packed is incorrect datatype"),
+               (good, words.int(), "unpacked is incorrect datatype")]
+        for packed, w, msg in bad:
+            with pytest.raises(RuntimeError, match = msg):
                 if float(K).is_integer():
-                    ext.pack_trellis(packed, words, int(K))
+                    ext.pack_trellis(packed, w, int(K))
                 else:
-                    ext.pack_trellis_frac(packed, words, *tref.frac(K))
-            with pytest.raises(RuntimeError):
+                    ext.pack_trellis_frac(packed, w, *tref.frac(K))
+            with pytest.raises(RuntimeError, match = msg):
                 if float(K).is_integer():
-                    ext.unpack_trellis(words, packed, int(K))
+                    ext.unpack_trellis(w, packed, int(K))
                 else:
-                    ext.unpack_trellis_frac(words, packed, *tref.frac(K))
+                    ext.unpack_trellis_frac(w, packed, *tref.frac(K))
 
 
-@pytest.mark.parametrize("K", HALF_K)
+@pytest.mark.parametrize("K", [3] + HALF_K)
 @torch.inference_mode()
-def test_frac_rejects_noncontiguous(device, K):
+def test_rejects_noncontiguous(device, K):
     w16 = int(16 * K)
     words = torch.zeros((3, 2, 256), dtype = torch.int16, device = device).transpose(0, 1)
     packed = torch.zeros((2, 3, w16), dtype = torch.int16, device = device)
     with pytest.raises(RuntimeError, match = "contiguous"):
-        ext.pack_trellis_frac(packed, words, *tref.frac(K))
+        if float(K).is_integer():
+            ext.pack_trellis(packed, words, int(K))
+        else:
+            ext.pack_trellis_frac(packed, words, *tref.frac(K))
 
 
 @torch.inference_mode()

@@ -332,13 +332,20 @@ void rope_gr
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE_OPT(k, kHalf);
+    TORCH_CHECK_DIM(q, 4);
+    TORCH_CHECK_DIM_OPT(k, 4);
+    TORCH_CHECK(k.has_value() == out_k.has_value(), "rope: k and out_k must be given together");
+
     int bsz = q.size(0);
     int seq_len = q.size(1);
     int num_heads_q = q.size(2);
     int q_head_stride = q.stride(2);
     int k_head_stride = k.has_value() ? (int) k.value().stride(2) : 0;
     TORCH_CHECK(q.stride(3) == 1, "rope: q innermost dim must be dense");
-    TORCH_CHECK(out_q.strides() == q.strides(), "rope: out_q must share q's layout");
+    TORCH_CHECK(out_q.dtype() == q.dtype() && out_q.sizes() == q.sizes() && out_q.strides() == q.strides(),
+                "rope: out_q must share q's dtype, shape and layout");
     int num_heads_k = 0;
     int head_dim = q.size(3);
     int partial_head_dim = inv_freq.size(-1) * 2;
@@ -348,15 +355,14 @@ void rope_gr
     TORCH_CHECK(rotate_offset >= 0 && rotate_offset + partial_head_dim * rotate_dims <= head_dim,
                 "rotate_offset out of range");
     TORCH_CHECK(head_dim % 2 == 0, "rope: head_dim must be even");
+    // One thread per pair, one head per thread row, block capped at MAX_NUM_THREADS threads
+    TORCH_CHECK(head_dim <= 2 * MAX_NUM_THREADS, "rope: head_dim must be at most 2048");
+    TORCH_CHECK(rope_mode == ROPESTYLE_GPTJ || rope_mode == ROPESTYLE_NEOX, "rope: invalid rope_mode");
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
     const half* k_ptr = (const half*) OPTPTR(k);
     half* out_k_ptr = (half*) OPTPTR(out_k);
-    TORCH_CHECK_DTYPE(q, kHalf);
-    TORCH_CHECK_DTYPE_OPT(k, kHalf);
-    TORCH_CHECK_DIM(q, 4);
-    TORCH_CHECK_DIM_OPT(k, 4);
 
     if (k.has_value())
     {
@@ -364,15 +370,21 @@ void rope_gr
         TORCH_CHECK(k.value().size(0) == bsz, "k is incorrect shape");
         TORCH_CHECK(k.value().size(1) == seq_len, "k is incorrect shape");
         TORCH_CHECK(k.value().size(3) == head_dim, "k is incorrect shape");
+        TORCH_CHECK(k.value().stride(3) == 1, "rope: k innermost dim must be dense");
+        TORCH_CHECK(out_k.value().dtype() == k.value().dtype() && out_k.value().sizes() == k.value().sizes() &&
+                    out_k.value().strides() == k.value().strides(), "rope: out_k must share k's dtype, shape and layout");
     }
 
     const float* inv_freq_ptr = (const float*) inv_freq.data_ptr();
     TORCH_CHECK_DTYPE(inv_freq, kFloat);
+    TORCH_CHECK(inv_freq.is_contiguous(), "rope: inv_freq must be contiguous");
     bool inv_freq_table = false;
     if (inv_freq.dim() > 1)
     {
         TORCH_CHECK(inv_freq.dim() >= 2 && inv_freq.dim() <= 3, "inv_freq table must be 2-D or 3-D");
         // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
+        // Batch row b reads table b: a 2-D table is a single batch row
+        TORCH_CHECK(bsz <= (inv_freq.dim() == 3 ? inv_freq.size(0) : 1), "rope: inv_freq table has fewer batch rows than q");
         inv_freq_table = true;
         inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
     }
@@ -404,6 +416,9 @@ void rope_gr
     void* k_norm_ptr = (void*) OPTPTR(k_norm);
     bool norm_fp16 = true;
     bool norm_bf16 = false;
+    // The kernel normalizes k heads only when q heads are, and then reads k_norm unguarded
+    TORCH_CHECK(q_norm.has_value() || !k_norm.has_value(), "rope: k_norm requires q_norm");
+    TORCH_CHECK(!q_norm.has_value() || !k.has_value() || k_norm.has_value(), "rope: q_norm with k requires k_norm");
     if (q_norm.has_value())
     {
         TORCH_CHECK(head_dim > 0, "rope: q/k norm over an empty head_dim");
@@ -412,7 +427,10 @@ void rope_gr
         norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
         norm_fp16 = q_norm.value().dtype() == at::kHalf;
         if (k_norm.has_value())
+        {
             TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
+            TORCH_CHECK(k_norm.value().dim() == 1 && k_norm.value().size(0) == head_dim, "k_norm is incorrect size");
+        }
     }
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \

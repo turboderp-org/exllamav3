@@ -5,7 +5,7 @@ optionally of the selected codebook's 65536 decoded values, for comparing a weig
 Contract: with B = dist_output.numel() bins, value v falls in bin clamp(trunc((v - min) / (max - min) * B), 0, B - 1)
 (so values below min, above max, exactly max and +-inf land in the edge bins), and dist_output[b] = count[b] / numel;
 ref_output (when given) is the same histogram of decode(i) for i in 0..65535 under the mcg / mul1 / 3INST codebook,
-divided by 65536. B <= 1024; ref_output must have B elements; input must be fp32.
+divided by 65536. B <= 1024; ref_output must have B elements; input and both outputs must be fp32.
 
 Reference: the binning in float64 on the CPU over testlib.trellis.decode for the codebook values. The extension
 builds with --use_fast_math, so its fp32 divisions are approximate (a few ulp): values within 1e-4 of a bin edge may
@@ -76,6 +76,11 @@ def test_rejections(device):
         ext.test_distribution(x, torch.empty(64, device = device), torch.empty(63, device = device), -1.0, 1.0, False, False)
     with pytest.raises(RuntimeError):
         ext.test_distribution(x.half(), torch.empty(64, device = device), None, -1.0, 1.0, False, False)
+    with pytest.raises(RuntimeError, match = "dist_output is incorrect datatype"):
+        ext.test_distribution(x, torch.empty(64, dtype = torch.half, device = device), None, -1.0, 1.0, False, False)
+    with pytest.raises(RuntimeError, match = "ref_output is incorrect datatype"):
+        ext.test_distribution(x, torch.empty(64, device = device), torch.empty(64, dtype = torch.half, device = device),
+                              -1.0, 1.0, False, False)
 
 
 def _device_still_works(device):

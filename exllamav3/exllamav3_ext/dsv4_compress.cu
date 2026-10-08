@@ -475,6 +475,7 @@ void dsv4_compress_gr
     }
 
     if (!seq) return;
+    TORCH_CHECK(!pool_bt || pool_bt.value().numel() > 0, "dsv4_compress: rows to compress but no pages in block table");
 
     int nw = (position + seq) / m - position / m;
     int grid_w = pos_ptr ? seq / m + 1 : nw;

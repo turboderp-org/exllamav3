@@ -8,10 +8,11 @@ divisor of it, e.g. a (dim,) bias over (rows, dim)). x, y, z each float16 or flo
 y are both fp16 the sum is an fp16 add (__hadd) converted to z's dtype, otherwise an fp32 add rounded once to z's
 dtype: either way bit-identical to the unfused torch expression. Works in place (z is x, or z is y when the sizes
 are equal), writes exactly z.numel() == x.numel() elements, 64-bit indexing. Rejects (TORCH_CHECK) y.numel() >
-x.numel() and y.numel() not dividing x.numel(). An empty x is a no-op (any y repeats over it zero times); an empty y
-with a non-empty x is rejected.
+x.numel(), y.numel() not dividing x.numel(), z.numel() != x.numel() and any dtype other than fp16/fp32. An empty x
+is a no-op (any y repeats over it zero times); an empty y with a non-empty x is rejected.
 
-Also here: the empty-input contract of the other flat elementwise ops (softcap, xielu, the act_mul family): no-ops.
+Also here: the empty-input contract of the other flat elementwise ops (softcap, xielu, the act_mul family): no-ops;
+and the argument checks of softcap and xielu (output dtype/size, flat contiguous buffers, xielu's aligned pairs).
 
 Reference: torch elementwise ops (exact).
 """
@@ -102,6 +103,37 @@ def test_add_rejects(device):
         ext.add(x, torch.randn(5, 64, device = device).half(), torch.empty_like(x))
     with pytest.raises(RuntimeError, match = "y must divide x"):
         ext.add(x, torch.randn(3, 64, device = device).half(), torch.empty_like(x))
+    with pytest.raises(RuntimeError, match = "z must match x"):
+        ext.add(x, x, torch.empty(3, 64, dtype = torch.half, device = device))
+    # Unsupported dtypes raise instead of silently launching nothing
+    for args in ((x.bfloat16(), x, torch.empty_like(x)), (x, x.bfloat16(), torch.empty_like(x)),
+                 (x, x, torch.empty_like(x, dtype = torch.bfloat16))):
+        with pytest.raises(RuntimeError, match = "must be kHalf or kFloat"):
+            ext.add(*args)
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_softcap_xielu_rejects(device):
+    x = torch.randn(4, 64, device = device).half()
+    with pytest.raises(RuntimeError, match = "y must match x's dtype and size"):
+        ext.softcap(x, torch.empty(3, 64, dtype = torch.half, device = device), 30.0)
+    with pytest.raises(RuntimeError, match = "y must match x's dtype and size"):
+        ext.softcap(x, torch.empty_like(x, dtype = torch.float), 30.0)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.softcap(x.t(), x.t(), 30.0)
+    xf = torch.randn(4, 64, device = device)
+    alpha = torch.tensor([0.8])
+    yh = lambda *s: torch.empty(*s, dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.xielu(xf, yh(3, 64), alpha, alpha)
+    with pytest.raises(RuntimeError, match = "must be even"):
+        ext.xielu(xf.view(-1)[:255], yh(255), alpha, alpha)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.xielu(xf.t(), yh(64, 4), alpha, alpha)
+    with pytest.raises(RuntimeError, match = "aligned to element pairs"):
+        ext.xielu(xf.view(-1)[1:129], yh(128), alpha, alpha)
+    assert_device_ok(device)
 
 
 @pytest.mark.slow

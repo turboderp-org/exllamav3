@@ -1,7 +1,7 @@
 """
 ext.count_inf_nan (quant/util.cu), the Hessian-capture activation check (LinearEXL3.capture_H): adds the number of
 +-inf values of x to y[0] and the number of NaNs to y[1] (y int64 (2,), accumulated across calls), for fp16 and fp32
-x of any size; other dtypes are rejected. Exact, against torch.isinf / torch.isnan.
+x of any size; other dtypes and a y with fewer than two elements are rejected. Exact, against torch.isinf / torch.isnan.
 
 Edge cases: sizes around the 32768-element block, an element count past 2^31 (64-bit indexing), and an empty x,
 which must be a no-op that leaves no pending CUDA error behind for later, unrelated launches to report.
@@ -70,6 +70,8 @@ def test_rejects_dtypes(device):
         ext.count_inf_nan(torch.zeros(4, dtype = torch.bfloat16, device = device), y)
     with pytest.raises(RuntimeError):
         ext.count_inf_nan(torch.zeros(4, dtype = torch.half, device = device), y.int())
+    with pytest.raises(RuntimeError, match = "count_inf_nan: y must hold two counters"):
+        ext.count_inf_nan(torch.zeros(4, dtype = torch.half, device = device), y[:1])
 
 
 def _empty_worker():

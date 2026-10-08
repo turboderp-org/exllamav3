@@ -176,6 +176,10 @@ def test_conv1d_update_rejects(device):
         call(x = x.half())
     with pytest.raises(RuntimeError, match = "datatype"):
         call(bias = torch.zeros(dim, dtype = torch.half, device = device))
+    with pytest.raises(RuntimeError, match = "bias must be"):
+        call(bias = torch.zeros(dim - 1, dtype = bf, device = device))
+    with pytest.raises(RuntimeError, match = "bias must be"):
+        call(bias = torch.zeros(2 * dim, dtype = bf, device = device)[::2])
     with pytest.raises(RuntimeError, match = "datatype"):
         call(slots = torch.zeros(bsz, dtype = torch.long, device = device))
     with pytest.raises(RuntimeError, match = "slots must be"):

@@ -179,6 +179,26 @@ def test_gated_delta_net_fused_op_rejects(device):
         ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log.float(), mq, z, beta, g, Nk, Nv, Hk, Hv, 1.0)
     with pytest.raises(RuntimeError):
         ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mq, z, beta, g.bfloat16(), Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "mixed_ba"):
+        ext.gated_delta_net_fused_op(qkvz, ba[:, :1].contiguous(), dt_bias, a_log, mq, z, beta, g, Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "mixed_qkv"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mk((B + 1, F, S), torch.bfloat16), z, beta, g, Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "z must be"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mq, z[..., :-1], beta, g, Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "beta and g must be"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mq, z, beta[..., :-1], g, Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "beta and g must be"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mq, z, beta, g[:, :1], Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "dt_bias and a_log must be"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias[:-1], a_log, mq, z, beta, g, Nk, Nv, Hk, Hv, 1.0)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.gated_delta_net_fused_op(qkvz, ba, dt_bias, a_log, mq, z, beta,
+                                     mk((B, Nv, S), torch.float).transpose(1, 2), Nk, Nv, Hk, Hv, 1.0)
+    # More v heads per k head than threads per block: the tail heads' beta and g would go unwritten
+    wide = fused_op_inputs(B, S, 1, 64, 32, 32, device)
+    with pytest.raises(RuntimeError, match = "exceeds max"):
+        ext.gated_delta_net_fused_op(*wide, mk((B, 2 * 32 + 64 * 32, S), torch.bfloat16), mk((B, S, 64, 32), torch.bfloat16),
+                                     mk((B, S, 64), torch.bfloat16), mk((B, S, 64), torch.float), 1, 64, 32, 32, 1.0)
     big_qkvz = torch.randn(B, S, 1 * (2 * 64 + 2 * 1 * 320), device = device)
     with pytest.raises(RuntimeError, match = "Max head dim"):
         ext.gated_delta_net_fused_op(big_qkvz, torch.randn(B, S, 2, device = device), dt_bias[:1], a_log[:1],
@@ -310,6 +330,20 @@ def test_kda_gate_op_rejects(device):
     call = lambda **kw: ext.kda_gate_op(*{**args, **kw}.values(), 0.0, 1.0)
     with pytest.raises(RuntimeError, match = "g must be"):
         call(g = torch.empty(B, S, H, Dk - 1, device = device))
+    # fp16 a_log would be read as bf16
+    with pytest.raises(RuntimeError, match = "unsupported a_log dtype"):
+        call(a_log = args["a_log"].half())
+    with pytest.raises(RuntimeError, match = "qkv must have 3 dimensions"):
+        call(qkv = args["qkv"].unsqueeze(0))
+    for name, bad, msg in [("f", args["f"][:, :1].contiguous(), "f must be"),
+                           ("b", args["b"][:, :1].contiguous(), "b must be"),
+                           ("beta", args["beta"][..., :-1].contiguous(), "beta must be"),
+                           ("mixed_qkv", args["mixed_qkv"][:, :-1].contiguous(), "mixed_qkv must be"),
+                           ("dt_bias", args["dt_bias"][:-1], "dt_bias must be"),
+                           ("a_log", args["a_log"][:-1], "dt_bias must be"),
+                           ("g", torch.empty(B, S, Dk, H, device = device).transpose(2, 3), "contiguous")]:
+        with pytest.raises(RuntimeError, match = msg):
+            call(**{name: bad})
     for name, bad in [("qkv", args["qkv"].half()), ("b", args["b"].bfloat16()), ("f", args["f"].half()),
                       ("dt_bias", args["dt_bias"].float()), ("mixed_qkv", args["mixed_qkv"].float()),
                       ("beta", args["beta"].float()), ("g", args["g"].bfloat16())]:

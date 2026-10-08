@@ -149,6 +149,25 @@ def test_paged_kv_cache_update_rejects(device):
     with pytest.raises(RuntimeError, match = "incompatible shapes"):
         ext.paged_kv_cache_update(k, torch.zeros((1, 2, 2, 64), dtype = torch.half, device = device),
                                   cache, cache, bt, sl)
+    for bad in (torch.zeros((2, PAGE, 4, 64), dtype = torch.half, device = device),
+                torch.zeros((2, PAGE, 2, 128), dtype = torch.half, device = device)):
+        with pytest.raises(RuntimeError, match = "paged_kv_cache_update: k_cache heads/dim do not match k"):
+            ext.paged_kv_cache_update(k, k, bad, bad, bt, sl)
+    with pytest.raises(RuntimeError, match = "v_cache and k_cache have incompatible shapes"):
+        ext.paged_kv_cache_update(k, k, cache, torch.zeros((1, PAGE, 2, 64), dtype = torch.half, device = device), bt, sl)
+    k2 = torch.zeros((2, 1, 2, 64), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: block table and seqlens must cover the batch"):
+        ext.paged_kv_cache_update(k2, k2, cache, cache, bt, sl)
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: block table and seqlens must cover the batch"):
+        ext.paged_kv_cache_update(k2, k2, cache, cache, torch.zeros((2, 2), dtype = torch.int32, device = device), sl)
+    k_nc = torch.zeros((1, 1, 2, 128), dtype = torch.half, device = device)[..., :64]
+    cache_nc = torch.zeros((2, PAGE, 2, 128), dtype = torch.half, device = device)[..., :64]
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: all tensors must be contiguous"):
+        ext.paged_kv_cache_update(k_nc, k_nc, cache, cache, bt, sl)
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: all tensors must be contiguous"):
+        ext.paged_kv_cache_update(k, k, cache_nc, cache_nc, bt, sl)
+    with pytest.raises(RuntimeError, match = "paged_kv_cache_update: all tensors must be contiguous"):
+        ext.paged_kv_cache_update(k, k, cache, cache, torch.zeros((1, 4), dtype = torch.int32, device = device)[:, ::2], sl)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -183,6 +202,15 @@ def test_dspark_write_rows_rejects(device):
         ext.dspark_write_rows(torch.zeros((1, 1, 8), device = device), kv, bt, sl)
     with pytest.raises(RuntimeError):
         ext.dspark_write_rows(torch.zeros((1, 1, 8), dtype = torch.half, device = device), kv, bt.long(), sl)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: kv width does not match rows"):
+        ext.dspark_write_rows(torch.zeros((1, 1, 16), dtype = torch.half, device = device), kv, bt, sl)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: block table and seqlens must cover the batch"):
+        ext.dspark_write_rows(torch.zeros((2, 1, 8), dtype = torch.half, device = device), kv, bt, sl)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: all tensors must be contiguous"):
+        ext.dspark_write_rows(torch.zeros((1, 8, 2), dtype = torch.half, device = device).transpose(1, 2), kv, bt, sl)
+    with pytest.raises(RuntimeError, match = "dspark_write_rows: all tensors must be contiguous"):
+        ext.dspark_write_rows(torch.zeros((1, 1, 8), dtype = torch.half, device = device),
+                              torch.zeros((1, PAGE, 16), dtype = torch.half, device = device)[..., ::2], bt, sl)
 
 
 # ---------------------------------------------------------------------------------------------------------------

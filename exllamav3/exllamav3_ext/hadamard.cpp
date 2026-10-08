@@ -41,8 +41,10 @@ void had_paley
 )
 {
     TORCH_CHECK_DTYPE(h, kHalf);
+    TORCH_CHECK_DIM(h, 2);
     TORCH_CHECK_SHAPES(h, 0, h, 1, 1);
     TORCH_CHECK(h.is_contiguous());
+    TORCH_CHECK(h.device().is_cpu(), "had_paley: h must be a CPU tensor");
     int n = h.size(0);
     int p = n - 1;
     uint16_t* ptr = (uint16_t*) h.data_ptr();
@@ -76,8 +78,13 @@ void had_paley2
 )
 {
     TORCH_CHECK_DTYPE(h, kHalf);
+    TORCH_CHECK_DIM(h, 2);
     TORCH_CHECK_SHAPES(h, 0, h, 1, 1);
+    TORCH_CHECK(h.is_contiguous(), "had_paley2: h must be contiguous");
+    TORCH_CHECK(h.device().is_cpu(), "had_paley2: h must be a CPU tensor");
     int n = h.size(0);
+    // Written in 2x2 blocks (n = 2 (p + 1), p prime = 1 mod 4); n = 2 would take residues mod 0
+    TORCH_CHECK(n % 4 == 0, "had_paley2: n must be a multiple of 4");
     int p = n / 2 - 1;
     uint32_t* ptr0 = (uint32_t*) h.data_ptr();
     uint32_t* ptr1 = ptr0 + n / 2;

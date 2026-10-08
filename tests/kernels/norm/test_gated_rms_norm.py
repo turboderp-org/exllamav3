@@ -11,8 +11,9 @@ and KDA (modules/gated_rmsnorm.py). Contract, per row r of the flattened (rows, 
   in fp32, one rounding to y's dtype. dim % 4 == 0; dim <= 256 runs a one-warp block, larger dims a 1024-thread
   block with a strided column loop (dim > 4096 gives several float4 columns per thread)
 - writes exactly y (memory around y untouched), x / w / g are read only
-- rejects (TORCH_CHECK): dim % 4 != 0, w size != dim (w_groups 1) or != w_groups * dim, g shape != x shape, and
-  dtype combinations outside the list above
+- rejects (TORCH_CHECK): dim % 4 != 0, w size != dim (w_groups 1) or != w_groups * dim, g shape != x shape,
+  y.numel() != x.numel() (y may be a flat view of x's shape), non-contiguous x / w / y / g, and dtype combinations
+  outside the list above
 
 Reference: float64 torch on the same bf16/fp32 inputs.
 """
@@ -178,6 +179,13 @@ def test_gated_rms_norm_rejects(device):
         ext.gated_rms_norm(x, w, y.bfloat16(), g, 1e-6, 0.0, 1, False, 0)
     with pytest.raises(RuntimeError, match = "Invalid datatypes"):
         ext.gated_rms_norm(x, w, y, g.half(), 1e-6, 0.0, 1, False, 0)
+    with pytest.raises(RuntimeError, match = "y and x have incompatible shapes"):
+        ext.gated_rms_norm(x, w, y[:2], g, 1e-6, 0.0, 1, False, 0)
+    t = lambda a: a.reshape(128, 4).t()   # (4, 128), non-contiguous
+    for args in ((t(x), w, y, t(g)), (x, w, t(y), g), (x, w, y, t(g))):
+        with pytest.raises(RuntimeError, match = "must be contiguous"):
+            ext.gated_rms_norm(*args, 1e-6, 0.0, 1, False, 0)
+    assert_device_ok(device)
 
 
 @pytest.mark.slow

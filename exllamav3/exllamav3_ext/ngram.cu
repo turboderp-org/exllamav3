@@ -58,6 +58,13 @@ int64_t ngram_hash_cpu
 {
     TORCH_CHECK(ids.device().is_cpu() && ids.dtype() == at::kLong && ids.is_contiguous(),
                 "ngram_hash_cpu: ids must be contiguous int64 CPU");
+    TORCH_CHECK(ids.dim() == 2, "ngram_hash_cpu: ids must be (bsz, ctx + seq)");
+    // Host code reads and writes these through raw pointers
+    for (const at::Tensor* t : std::initializer_list<const at::Tensor*> { &multipliers, &offsets, &sizes, &uids, &inverse })
+        TORCH_CHECK(t->device().is_cpu() && t->dtype() == at::kLong && t->is_contiguous(),
+                    "ngram_hash_cpu: multipliers, offsets, sizes, uids and inverse must be contiguous int64 CPU");
+    TORCH_CHECK(heads.device().is_cpu() && heads.dtype() == at::kInt && heads.is_contiguous(),
+                "ngram_hash_cpu: heads must be contiguous int32 CPU");
     int64_t bsz = ids.size(0);
     int64_t T = ids.size(1);
     int64_t ctx = T - seq_len;

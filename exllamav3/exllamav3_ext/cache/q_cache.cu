@@ -16,6 +16,37 @@ out: int32, shape (..., dim / 32 * bitrate)
 out_scales: float16, shape (..., dim / 32)
 */
 
+// Validates the operands of both variants below; false when there is nothing to quantize
+static bool quant_cache_cont_args
+(
+    const at::Tensor& in,
+    const at::Tensor& out,
+    const at::Tensor& out_scales,
+    int& bsz,
+    int& bits
+)
+{
+    TORCH_CHECK_DTYPE(in, kHalf);
+    TORCH_CHECK_DTYPE(out, kInt);
+    TORCH_CHECK_DTYPE(out_scales, kHalf);
+
+    bsz = in.numel() / 32;
+    int head_dim = in.size(-1);
+    int head_blocks = head_dim / 32;
+    TORCH_CHECK(head_dim == 32 * head_blocks, "head_dim must be a multiple of 32");
+    if (!head_blocks)
+    {
+        TORCH_CHECK(out.numel() == 0 && out_scales.numel() == 0, "out is wrong size");
+        return false;
+    }
+    bits = out.size(-1) / head_blocks;
+    TORCH_CHECK(out.numel() == bsz * bits, "out is wrong size");
+    TORCH_CHECK(out_scales.numel() == bsz, "out_scales is wrong size");
+
+    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+    return bsz > 0;
+}
+
 void quant_cache_cont
 (
     const at::Tensor& in,
@@ -26,25 +57,9 @@ void quant_cache_cont
 {
     const at::cuda::OptionalCUDAGuard device_guard(in.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK_DTYPE(in, kHalf);
-    TORCH_CHECK_DTYPE(out, kInt);
-    TORCH_CHECK_DTYPE(out_scales, kHalf);
 
-    int bsz = in.numel() / 32;
-    int head_dim = in.size(-1);
-    int head_blocks = head_dim / 32;
-    TORCH_CHECK(head_dim == 32 * head_blocks, "head_dim must be a multiple of 32");
-    if (!head_blocks)
-    {
-        TORCH_CHECK(out.numel() == 0 && out_scales.numel() == 0, "out is wrong size");
-        return;
-    }
-    int bits = out.size(-1) / head_blocks;
-    TORCH_CHECK(out.numel() == bsz * bits, "out is wrong size");
-    TORCH_CHECK(out_scales.numel() == bsz, "out_scales is wrong size");
-
-    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
-    if (!bsz) return;
+    int bsz, bits;
+    if (!quant_cache_cont_args(in, out, out_scales, bsz, bits)) return;
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
     auto quant_cache_cont_fn = quant_cache_cont_kernel_instances[bits - 2];
@@ -76,11 +91,8 @@ void quant_cache_cont_gr
     const at::cuda::OptionalCUDAGuard device_guard(in.device());
     cudaStream_t stream = graph->capture_stream;
 
-    int bsz = in.numel() / 32;
-    int head_dim = in.size(-1);
-    int head_blocks = head_dim / 32;
-    int bits = out.size(-1) / head_blocks;
-    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+    int bsz, bits;
+    if (!quant_cache_cont_args(in, out, out_scales, bsz, bits)) return;
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
     auto quant_cache_cont_fn = quant_cache_cont_kernel_instances[bits - 2];

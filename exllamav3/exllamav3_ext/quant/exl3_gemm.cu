@@ -183,6 +183,7 @@ int exl3_gemm_gr
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    TORCH_CHECK(C.numel() >= (int64_t) size_m * size_n, "exl3_gemm: C must hold one output row per row of A");
 
     // Select kernel
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
@@ -580,9 +581,22 @@ int exl3_mgemm_gr
         if (bszm_out > num_indices) bszm_out = num_indices;
     }
 
+    // Slot j reads A[j] unless A is broadcast, and (without output pointers) writes C[j]. With no matrices
+    // no slot runs. The weighted reduction then sums each token's slots into C[t]
+    if (B.size(0))
+    {
+        TORCH_CHECK(bszm_in == 1 || bszm_in >= bszm_out, "exl3_mgemm: A must hold one input, or one per slot");
+        TORCH_CHECK(c_list_ptr || bszm_out >= bszm_in, "exl3_mgemm: C must hold one output per slot");
+    }
+
     if (weights)
     {
         TORCH_CHECK_DIM(weights.value(), 2);
+        TORCH_CHECK(C.size(0) >= num_tokens, "exl3_mgemm: C must hold one reduced row per token");
+        // One weight per slot, and the reduction sums each token's run of slots / num_tokens slots
+        int slots = MAX(bszm_in, bszm_out);
+        TORCH_CHECK(weights.value().numel() >= slots, "exl3_mgemm: weights must hold one weight per slot");
+        TORCH_CHECK(num_tokens < 1 || slots % num_tokens == 0, "exl3_mgemm: slots must divide evenly among num_tokens");
     }
 
     int size_m = A.size(1);
@@ -629,7 +643,6 @@ int exl3_mgemm_gr
     {
         if (weights)
         {
-            TORCH_CHECK(C.size(0) >= num_tokens, "exl3_mgemm: C must hold one reduced row per token");
             cuda_check(cudaMemsetAsync(C_ptr, 0, (size_t) num_tokens * size_m * size_n * C.element_size(), stream));
         }
         return 0;

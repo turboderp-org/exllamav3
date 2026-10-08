@@ -127,6 +127,7 @@ void dflash2_dynconv
     TORCH_CHECK(base.size(1) == hidden, "dflash2_dynconv: base width mismatch");
     TORCH_CHECK(dyn.size(0) == bsz && dyn.size(1) == seqlen && dyn.size(2) == taps && dyn.size(3) == hidden / group_size,
                 "dflash2_dynconv: dyn must be (bsz, seqlen, taps, hidden / group_size)");
+    TORCH_CHECK(seqlen <= 65535 && bsz <= 65535, "dflash2_dynconv: seqlen and bsz must be at most 65535 (grid y/z limit)");
     if (!bsz || !seqlen || !hidden) return;
 
     #define DISPATCH(TX, TB, TO) \

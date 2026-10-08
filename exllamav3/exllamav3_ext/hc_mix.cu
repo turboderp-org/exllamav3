@@ -1087,7 +1087,9 @@ void hc_mix_fused
         TORCH_CHECK_DTYPE(post_a.value(), kFloat);
         TORCH_CHECK_DTYPE(comb_a.value(), kFloat);
         TORCH_CHECK(y->is_contiguous() && post_a->is_contiguous() && comb_a->is_contiguous(), "hc_mix_fused: contiguous inputs required");
-        TORCH_CHECK(y->size(0) == R && y->size(-1) == D && post_a->size(0) == R && comb_a->size(0) == R, "hc_mix_fused: shapes");
+        TORCH_CHECK(y->size(0) == R && y->size(-1) == D && y->numel() == (int64_t) R * D &&
+                    post_a->size(0) == R && post_a->numel() == (int64_t) R * 4 &&
+                    comb_a->size(0) == R && comb_a->numel() == (int64_t) R * 16, "hc_mix_fused: shapes");
         const bool y_half = y->dtype() == at::kHalf;
         if (!y_half) TORCH_CHECK_DTYPE(y.value(), kFloat);
         pend = { y->data_ptr(), y_half, (const float*) post_a->data_ptr(), (const float*) comb_a->data_ptr() };
@@ -1161,19 +1163,22 @@ void hc_apply
 
     TORCH_CHECK_DTYPE(x, kFloat);
     TORCH_CHECK_DTYPE(post, kFloat);
+    TORCH_CHECK_FLOAT_HALF(y);
+    TORCH_CHECK_DIM(x, 3);
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && post.is_contiguous(), "hc_apply: contiguous inputs required");
     int R = x.size(0);
     int H = x.size(1);
     int D = x.size(2);
     TORCH_CHECK(H == 4, "hc_apply: H = 4 only");
     TORCH_CHECK(D % 4 == 0, "hc_apply: dims");
-    TORCH_CHECK(y.size(0) == R && y.size(-1) == D, "hc_apply: y shape");
-    TORCH_CHECK(post.size(0) == R, "hc_apply: gate shapes");
+    TORCH_CHECK(y.size(0) == R && y.size(-1) == D && y.numel() == (int64_t) R * D, "hc_apply: y shape");
+    TORCH_CHECK(post.size(0) == R && post.numel() == (int64_t) R * H, "hc_apply: gate shapes");
     const float* comb_p = nullptr;
     if (comb)
     {
         TORCH_CHECK_DTYPE(comb.value(), kFloat);
-        TORCH_CHECK(comb.value().is_contiguous() && comb.value().size(0) == R, "hc_apply: comb shape");
+        TORCH_CHECK(comb.value().is_contiguous() && comb.value().size(0) == R && comb.value().numel() == (int64_t) R * H * H,
+                    "hc_apply: comb shape");
         comb_p = (const float*) comb.value().data_ptr();
     }
     const half* wn_p = nullptr;

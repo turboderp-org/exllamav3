@@ -105,6 +105,7 @@ void pack_trellis_frac(at::Tensor packed, at::Tensor unpacked, int KA, int64_t M
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1); TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256); TORCH_CHECK_SIZE(packed, 2, bpb);
     TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "frac: contiguous");
+    TORCH_CHECK_DTYPE(packed, kShort); TORCH_CHECK_DTYPE(unpacked, kShort);
     const int num_tiles = packed.size(0) * packed.size(1);
     if (!num_tiles) return;
     pack_trellis_frac_kernel<<<(num_tiles + 127) / 128, 128, 0, stream>>>
@@ -121,6 +122,7 @@ void unpack_trellis_frac(at::Tensor unpacked, at::Tensor packed, int KA, int64_t
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1); TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256); TORCH_CHECK_SIZE(packed, 2, bpb);
     TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "frac: contiguous");
+    TORCH_CHECK_DTYPE(packed, kShort); TORCH_CHECK_DTYPE(unpacked, kShort);
     const int num_tiles = packed.size(0) * packed.size(1);
     if (!num_tiles) return;
     unpack_trellis_frac_kernel<<<num_tiles, 32, 0, stream>>>

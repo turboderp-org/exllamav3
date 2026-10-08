@@ -502,6 +502,21 @@ def _invalid_cases(device):
                                     k_norm = z(64, dt = torch.bfloat16)),
         "norm_fp32": dict(q_norm = z(64, dt = torch.float)),
         "mode_none": dict(mode = 0),
+        "k_without_out_k": dict(k = z(1, 2, 1, 64)),
+        "out_k_without_k": dict(out_k = z(1, 2, 1, 64)),
+        "out_q_fp32": dict(out_q = z(1, 2, 2, 64, dt = torch.float)),
+        "out_q_smaller": dict(out_q = z(1, 2, 1, 64)),
+        "k_inner_strided": dict(k = z(1, 2, 1, 128)[..., ::2], out_k = z(1, 2, 1, 128)[..., ::2]),
+        "out_k_layout": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 80)[..., :64]),
+        "q_norm_without_k_norm": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), q_norm = z(64)),
+        "k_norm_without_q_norm": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), k_norm = z(64)),
+        "k_norm_size": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), q_norm = z(64), k_norm = z(32)),
+        "head_dim_over_2048": dict(q = z(1, 1, 1, 2050), out_q = z(1, 1, 1, 2050)),
+        "inv_freq_table_2d_bsz2": dict(q = z(2, 2, 2, 64), out_q = z(2, 2, 2, 64),
+                                       inv_freq = torch.zeros(4, 32, device = device)),
+        "inv_freq_table_3d_bsz2": dict(q = z(2, 2, 2, 64), out_q = z(2, 2, 2, 64),
+                                       inv_freq = torch.zeros(1, 4, 32, device = device)),
+        "inv_freq_noncontig": dict(inv_freq = default_inv_freq(128, device)[::2]),
     }
 
 
@@ -510,7 +525,9 @@ INVALID_CASES = [
     "inv_freq_rank4", "rotate_dims_0", "rotate_dims_5", "rotate_dims_inconsistent", "rotate_offset_negative",
     "rotate_offset_overflow", "positions_and_ids", "positions_int64", "positions_shape", "positions_rank2",
     "position_ids_shape", "position_ids_rank3_mismatch", "position_ids_noncontig", "q_norm_size",
-    "norm_dtype_mismatch", "norm_fp32", "mode_none",
+    "norm_dtype_mismatch", "norm_fp32", "mode_none", "k_without_out_k", "out_k_without_k", "out_q_fp32",
+    "out_q_smaller", "k_inner_strided", "out_k_layout", "q_norm_without_k_norm", "k_norm_without_q_norm",
+    "k_norm_size", "head_dim_over_2048", "inv_freq_table_2d_bsz2", "inv_freq_table_3d_bsz2", "inv_freq_noncontig",
 ]
 
 
@@ -520,9 +537,9 @@ def test_rope_rejects_invalid(device, case):
     cases = _invalid_cases(device)
     assert set(cases) == set(INVALID_CASES)
     a = _args(device, **cases[case])
-    # A rank-3 q fails on q.size(3) (IndexError) before the explicit rank check is reached
-    with pytest.raises((RuntimeError, IndexError)):
+    with pytest.raises(RuntimeError):
         _call(a)
+    assert_device_ok(device)
 
 
 def assert_device_ok(device):
@@ -552,7 +569,7 @@ def test_rope_empty(device, case):
     pid = torch.zeros(0, 4, dtype = torch.int, device = device) if case == "bsz_position_ids" else None
     call_rope(q, out_q, default_inv_freq(hd, device), k, out_k, position = 5, position_ids = pid)
     assert (qbuf == 7.0).all() and (kbuf == 7.0).all()
-    with pytest.raises(RuntimeError, match = "incorrect norm dtype"):
+    with pytest.raises(RuntimeError, match = "invalid rope_mode"):
         call_rope(q, out_q, default_inv_freq(hd, device), k, out_k, mode = 0)
     assert_device_ok(device)
 

@@ -12,8 +12,9 @@ In-place gating kernels of the attention output gates and the shared-expert gate
   all float32, fp32 arithmetic
 
 All modify only their output tensor (x, or z) and leave the gate input untouched. Rejections (TORCH_CHECK): wrong
-dtypes, mismatched / non-broadcastable shapes, non-contiguous inputs, odd numel / D, and gate size(-1) != 1 for
-add_sigmoid_gate.
+dtypes, mismatched / non-broadcastable shapes, non-contiguous inputs, odd numel / D, half2 operands not aligned to
+element pairs, and for add_sigmoid_gate gate size(-1) != 1, a gate count other than one per row of x and z.numel() !=
+x.numel().
 
 Reference: float64 torch on the same inputs.
 """
@@ -132,6 +133,9 @@ def test_mul_gate_broadcast_rejects(device, fn):
         fn(x, torch.randn(1, 4, 2, device = device).half().transpose(1, 2))
     with pytest.raises(RuntimeError, match = "even"):
         fn(torch.randn(1, 2, 4, 7, device = device).half(), y)
+    with pytest.raises(RuntimeError, match = "aligned to element pairs"):
+        fn(torch.randn(x.numel() + 1, device = device).half()[1:].view(x.shape), y)
+    assert_device_ok(device)
 
 
 @torch.inference_mode()
@@ -150,6 +154,12 @@ def test_mul_sigmoid_rejects(device):
         ext.mul_sigmoid_(x, torch.randn(64, 4, device = device).half().t())
     with pytest.raises(RuntimeError, match = "even"):
         ext.mul_sigmoid_(torch.randn(3, 3, device = device).half(), torch.randn(3, 3, device = device).half())
+    misaligned = torch.randn(x.numel() + 1, device = device).half()[1:].view(x.shape)
+    with pytest.raises(RuntimeError, match = "aligned to element pairs"):
+        ext.mul_sigmoid_(misaligned, y)
+    with pytest.raises(RuntimeError, match = "aligned to element pairs"):
+        ext.mul_sigmoid_(x, misaligned)
+    assert_device_ok(device)
 
 
 @pytest.mark.parametrize("shape", [(1, 1), (1, 7), (33, 2048), (64, 4096), (2, 17, 2049), (100, 1)])
@@ -183,6 +193,13 @@ def test_add_sigmoid_gate_rejects(device):
         ext.add_sigmoid_gate(x, y, z.half())
     with pytest.raises(RuntimeError, match = "size"):
         ext.add_sigmoid_gate(x, torch.randn(4, 2, device = device), z)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.add_sigmoid_gate(x, y, torch.randn(3, 64, device = device))
+    with pytest.raises(RuntimeError, match = "one element per row"):
+        ext.add_sigmoid_gate(x, torch.randn(2, 1, device = device), z)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.add_sigmoid_gate(torch.randn(64, 4, device = device).t(), y, z)
+    assert_device_ok(device)
 
 
 def assert_device_ok(device):

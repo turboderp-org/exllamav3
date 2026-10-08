@@ -187,6 +187,7 @@ void argmax_sample
         num_logits,
         max_logit
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_sample
@@ -213,4 +214,5 @@ void gumbel_sample
         max_logit,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }

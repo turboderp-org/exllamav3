@@ -110,6 +110,13 @@ def test_gdn_ba_gemv_rejects(device):
         ext.gdn_ba_gemv(x, w_t, None, y[:, :7].contiguous())
     with pytest.raises(RuntimeError, match = "contiguous"):
         ext.gdn_ba_gemv(torch.randn(64, 2, dtype = torch.half, device = device).T, w_t, None, y)
+    # half2 loads: a contiguous view at an odd half offset is misaligned
+    with pytest.raises(RuntimeError, match = "aligned"):
+        ext.gdn_ba_gemv(torch.randn(2 * 64 + 1, dtype = torch.half, device = device)[1:].view(2, 64), w_t, None, y)
+    with pytest.raises(RuntimeError, match = "aligned"):
+        ext.gdn_ba_gemv(x, torch.randn(8 * 64 + 1, dtype = torch.half, device = device)[1:].view(8, 64), None, y)
+    with pytest.raises(RuntimeError, match = "bias must be"):
+        ext.gdn_ba_gemv(x, w_t, torch.zeros(7, dtype = torch.half, device = device), y)
     with pytest.raises(RuntimeError):
         ext.gdn_ba_gemv(x.float(), w_t, None, y)
     with pytest.raises(RuntimeError):

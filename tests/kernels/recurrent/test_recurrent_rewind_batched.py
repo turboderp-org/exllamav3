@@ -119,6 +119,11 @@ def test_batched_state_rewind_rejects_unaligned_count(device):
     dst = torch.zeros(16, device = device)
     with pytest.raises(RuntimeError, match = "multiple of 4"):
         ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr(), dst.data_ptr(), 6)], device.index)
+    # float4 copy: pointers off a 16-byte boundary
+    with pytest.raises(RuntimeError, match = "16-byte aligned"):
+        ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr() + 4, dst.data_ptr(), 8)], device.index)
+    with pytest.raises(RuntimeError, match = "16-byte aligned"):
+        ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr(), dst.data_ptr() + 4, 8)], device.index)
     torch.cuda.synchronize(device)
     assert (dst == 0).all()
 

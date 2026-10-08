@@ -8,17 +8,21 @@ non-positive kv_chunk_size has no chunk count and raises.
 Consistency with the kernels: bighead_attn / bighead_attn_paged no longer take a workspace; they use the fixed 16 MiB
 device workspace (exl3_devctx.cuh WORKSPACE_SIZE) and double kv_chunk_size until this same element count fits. A
 configuration whose requested chunk size needs more than that must still attend correctly (fp32 reference
-testlib.attention.ref_attn, same tolerance as test_bighead_attn.py).
+testlib.attention.ref_attn, same tolerance as test_bighead_attn.py). One whose query extent alone (a single chunk)
+does not fit raises.
 
 Empty inputs of the kernels (test_empty_*): no rows or no queries is a no-op (the paged variant still appends the
 new k / v); attention over zero keys (kv_len 0, or a block table without pages) is undefined and raises, as do
 zero kv heads and unsupported head dims / GQA ratios, also on empty inputs. Outputs are untouched and no CUDA
 error is left pending.
 """
+import re
+
 import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
+from testlib import isolated
 from testlib.attention import ref_attn
 
 DEV_WORKSPACE_FLOATS = 16 * 1024 * 1024 // 4
@@ -64,6 +68,39 @@ def test_chunk_growth_past_device_workspace(device, paged):
     else:
         ext.bighead_attn(q, k, v, o, chunk, True, 0.0)
     torch.testing.assert_close(o, ref, atol = 1e-2, rtol = 1e-2)
+
+
+def _workspace_overflow_worker(device: str, paged: bool):
+    # bsz * q_len * n_q_heads * (dim + 2) floats exceed the device workspace even with a single KV chunk
+    torch.cuda.set_device(torch.device(device))
+    bsz, q_len, hq, hkv, kv_len, dim = 1, 512, 16, 2, 256, 512
+    q = torch.zeros(bsz, q_len, hq, dim, dtype = torch.half, device = device)
+    k = torch.zeros(bsz, kv_len, hkv, dim, dtype = torch.half, device = device)
+    o = torch.full_like(q, 7.0)
+    try:
+        if paged:
+            kc = torch.zeros(1, 256, hkv, dim, dtype = torch.half, device = device)
+            bt = torch.zeros((1, 1), dtype = torch.int32, device = device)
+            sl = torch.zeros((1,), dtype = torch.int32, device = device)
+            ext.bighead_attn_paged(q, k[:, :0], k[:, :0], kc, kc.clone(), bt, sl, o, 64, True, 0.0)
+        else:
+            ext.bighead_attn(q, k, k, o, 64, True, 0.0)
+        msg = None
+    except RuntimeError as e:
+        msg = str(e)
+    torch.cuda.synchronize()
+    return msg, bool((o == 7.0).all())
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_workspace_overflow_rejected(device, paged):
+    """A query extent too large for the workspace at any chunk size raises (the chunk-doubling loop would
+    otherwise never terminate, so the call runs in a child process under a timeout)"""
+    assert ext.bighead_attn_workspace_size(1, 512, 16, 1, 1, 512) > DEV_WORKSPACE_FLOATS
+    msg, untouched = isolated.run_isolated(_workspace_overflow_worker, str(device), paged, timeout = 300)
+    fn = "bighead_attn_paged" if paged else "bighead_attn"
+    assert msg is not None and re.search(f"{fn}: .*too large for the attention workspace", msg), msg
+    assert untouched
 
 
 @pytest.mark.parametrize("bsz,q_len,heads,kv,dim", [(0, 1, 8, 512, 64), (1, 0, 8, 512, 64), (1, 1, 0, 512, 64), (1, 1, 8, 0, 64)])

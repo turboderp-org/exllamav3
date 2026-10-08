@@ -173,13 +173,18 @@ def test_gumbel_noise_log_in_place(device):
     assert torch.equal(a, p)
 
 
+@pytest.mark.parametrize("fn", ["gumbel_noise_f16", "gumbel_noise_f32", "gumbel_noise_log", "adaptivep_gumbel_noise_f32"])
 @torch.inference_mode()
-def test_gumbel_noise_log_rejects(device):
-    p = torch.rand(1, 64, device = device)
-    with pytest.raises(RuntimeError):
-        ext.gumbel_noise_log(p, torch.empty(1, 63, device = device), 0)
-    with pytest.raises(RuntimeError):
-        ext.gumbel_noise_log(p.half(), torch.empty(1, 64, device = device), 0)
+def test_gumbel_noise_rejects(device, fn):
+    # Input and output must match in shape (a smaller input would be read out of bounds) and dtype
+    dtype, other = (torch.half, torch.float) if fn == "gumbel_noise_f16" else (torch.float, torch.half)
+    extra = (0.5, 2.0, 5.0, 1.0) if fn == "adaptivep_gumbel_noise_f32" else ()
+    p = torch.rand(1, 64, device = device).to(dtype)
+    for x in (torch.rand(1, 63, device = device).to(dtype), torch.rand(2, 32, device = device).to(dtype)):
+        with pytest.raises(RuntimeError, match = "incompatible shapes"):
+            getattr(ext, fn)(x, torch.empty(1, 64, dtype = dtype, device = device), 0, *extra)
+    with pytest.raises(RuntimeError, match = "incorrect datatype"):
+        getattr(ext, fn)(p.to(other), torch.empty(1, 64, dtype = dtype, device = device), 0, *extra)
 
 
 # adaptivep_gumbel_noise_f32

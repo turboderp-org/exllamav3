@@ -2,7 +2,8 @@
 Reference test for add_sigmoid_gate_proj (z += x * sigmoid(y @ w)), the fused shared-expert gate used for
 batches of up to 32 rows. The gate logit is a block-wide sum broadcast to all 1024 threads, so a wrong
 broadcast shows up as a wrong gate. The one-hot case puts the whole dot product in thread 0. Checked against
-an fp32 torch reference.
+an fp32 torch reference. Rejects (TORCH_CHECK): wrong dtypes, w not (dim, 1), y or z not the size of x, and
+non-contiguous operands (rows are read at a flat dim stride).
 """
 
 import pytest
@@ -62,4 +63,21 @@ def test_add_sigmoid_gate_proj_empty(device, bsz, dim):
     with pytest.raises(RuntimeError, match = "incorrect datatype"):
         ext.add_sigmoid_gate_proj(torch.empty(bsz, dim, device = device).half(), torch.empty(bsz, dim, dtype = torch.half, device = device),
                                   zbuf[8:8].view(bsz, dim), torch.empty(dim, 1, dtype = torch.half, device = device))
+    assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_add_sigmoid_gate_proj_rejects(device):
+    x = torch.randn(4, 256, device = device)
+    y = torch.randn(4, 256, device = device).half()
+    z = torch.randn(4, 256, device = device)
+    w = torch.randn(256, 1, device = device).half()
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.add_sigmoid_gate_proj(x, y[:2], z, w)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.add_sigmoid_gate_proj(x, y, z[:2], w)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.add_sigmoid_gate_proj(x, y, torch.randn(256 * 2, 4, device = device).t()[:, ::2], w)
+    with pytest.raises(RuntimeError, match = "contiguous"):
+        ext.add_sigmoid_gate_proj(x, torch.randn(256, 4, device = device).half().t(), z, w)
     assert_device_ok(device)

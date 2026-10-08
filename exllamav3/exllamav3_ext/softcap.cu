@@ -75,6 +75,8 @@ void softcap
 
     uint64_t numel = x.numel();
     TORCH_CHECK(x.dtype() == at::kFloat || x.dtype() == at::kHalf, "softcap wrong dtype");
+    TORCH_CHECK(y.dtype() == x.dtype() && (uint64_t) y.numel() == numel, "softcap: y must match x's dtype and size");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "softcap: x and y must be contiguous");
     if (!numel) return;
 
     if (x.dtype() == at::kFloat)

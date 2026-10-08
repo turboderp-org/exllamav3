@@ -281,7 +281,7 @@ void routing_gemv
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
     else
-    if (bsz1 && gate_t.has_value() && !(k & 1))
+    if (bsz1 && gate_t.has_value() && !(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (
@@ -707,6 +707,7 @@ void routing_ds3_nogroup
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
     TORCH_CHECK(num_experts > 0, "routing_ds3_nogroup: top-k over an empty expert set");
     TORCH_CHECK(K > 0, "routing_ds3_nogroup: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_ds3_nogroup: hidden and scores row counts differ");
     if (bsz == 0) return;
 
 #if defined(USE_ROCM)
@@ -1006,9 +1007,13 @@ void moe_split_issue
     TORCH_CHECK(y.is_contiguous() && w.is_contiguous() && sel.is_contiguous(),
                 "moe_split_issue: inputs must be contiguous");
     TORCH_CHECK(map.has_value() == hist.has_value(), "moe_split_issue: map requires hist");
+    TORCH_CHECK_DTYPE_OPT(map, kLong);
+    TORCH_CHECK_DTYPE_OPT(hist, kFloat);
+    TORCH_CHECK_DIM(y, 2);
     int n = (int) sel.numel();
     int rows = (int) y.size(0);
     int h_ = (int) y.size(1);
+    TORCH_CHECK(w.numel() == n && (rows ? n % rows == 0 : n == 0), "moe_split_issue: sel and w must hold rows * topk entries");
     // n = 0 still launches: the slot's dev_count must read 0 so collect skips the stale slot
     moe_split_issue_kernel<<<1, 1024, 0, stream>>>
     (
@@ -1143,6 +1148,7 @@ void routing_sel_norm
     TORCH_CHECK(K <= 32, "routing_sel_norm: K > 32");
     TORCH_CHECK(num_experts > 0, "routing_sel_norm: empty expert set");
     TORCH_CHECK(K > 0, "routing_sel_norm: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_sel_norm: hidden and scores row counts differ");
     if (bsz == 0) return;
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
@@ -1208,8 +1214,10 @@ void routing_std
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
     TORCH_CHECK_DTYPE_OPT(bias, kHalf);
+    TORCH_CHECK_SHAPES_OPT(bias, 0, scores, 1, 1);
     TORCH_CHECK(num_experts > 0, "routing_std: top-k over an empty expert set");
     TORCH_CHECK(K > 0, "routing_std: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_std: hidden and scores row counts differ");
     if (bsz == 0) return;
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);

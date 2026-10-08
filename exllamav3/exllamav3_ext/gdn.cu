@@ -192,12 +192,21 @@ void gated_delta_net_fused_op
     TORCH_CHECK(Nk > 0 && Nv > 0 && Hk > 0 && Hv > 0, "gated_delta_net_fused_op: head counts and head dims must be positive");
     TORCH_CHECK(Nv % Nk == 0, "num_v_heads must be divisible by num_k_heads");
     const size_t Ng = Nv / Nk;
+    // One thread per v head of a group writes beta and g: the block (max(Hk, Hv) threads) must cover the group
+    TORCH_CHECK(Ng <= MAX(Hk, Hv), "gated_delta_net_fused_op: num_v_heads / num_k_heads exceeds max(k_head_dim, v_head_dim)");
 
     const size_t Fseg = 2*Hk + 2*Ng*Hv;
     TORCH_CHECK(mixed_qkvz.size(2) == Nk * Fseg, "mixed_qkvz last dim should be Nk*(2*Hk + 2*Ng*Hv)");
-    TORCH_CHECK(mixed_ba.size(2) == Nk * (2*Ng), "mixed_ba last dim should be Nk*(2*Ng)");
-    TORCH_CHECK(mixed_qkv.size(1) == 2*Nk*Hk + Nv*Hv, "mixed_qkv must be [B, 2*Nk*Hk + Nv*Hv, S]");
+    TORCH_CHECK(mixed_ba.dim() == 3 && mixed_ba.size(0) == B && mixed_ba.size(1) == S && mixed_ba.size(2) == Nk * (2*Ng),
+                "mixed_ba must be [B, S, Nk*(2*Ng)]");
+    TORCH_CHECK(mixed_qkv.size(0) == B && mixed_qkv.size(1) == 2*Nk*Hk + Nv*Hv, "mixed_qkv must be [B, 2*Nk*Hk + Nv*Hv, S]");
     TORCH_CHECK(mixed_qkv.size(2) == S, "mixed_qkv must be [B, 2*Nk*Hk + Nv*Hv, S]");
+    TORCH_CHECK(z.numel() == B * S * Nv * Hv, "gated_delta_net_fused_op: z must be [B, S, Nv, Hv]");
+    TORCH_CHECK(beta.numel() == B * S * Nv && g.numel() == B * S * Nv, "gated_delta_net_fused_op: beta and g must be [B, S, Nv]");
+    TORCH_CHECK(dt_bias.numel() == Nv && a_log.numel() == Nv, "gated_delta_net_fused_op: dt_bias and a_log must be [Nv]");
+    TORCH_CHECK(mixed_qkvz.is_contiguous() && mixed_ba.is_contiguous() && dt_bias.is_contiguous() && a_log.is_contiguous() &&
+                mixed_qkv.is_contiguous() && z.is_contiguous() && beta.is_contiguous() && g.is_contiguous(),
+                "gated_delta_net_fused_op: tensors must be contiguous");
 
     TORCH_CHECK_DTYPE(mixed_qkvz, kFloat);
     TORCH_CHECK_DTYPE(mixed_ba, kFloat);
@@ -395,6 +404,8 @@ void mamba2_dt_op
     TORCH_CHECK_SHAPES(dt_raw, 2, a_log, 0, 1);
     TORCH_CHECK_SHAPES_FULL(dt_raw, dt);
     TORCH_CHECK_SHAPES_FULL(dt_raw, g);
+    TORCH_CHECK(dt_raw.is_contiguous() && dt_bias.is_contiguous() && a_log.is_contiguous() && dt.is_contiguous() && g.is_contiguous(),
+                "mamba2_dt_op: tensors must be contiguous");
 
     size_t B = dt_raw.size(0);
     size_t S = dt_raw.size(1);
@@ -920,6 +931,10 @@ void cuda_recurrent_gated_delta_rule_gr
     TORCH_CHECK_DTYPE(recurrent_state, kFloat);
     TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
     TORCH_CHECK_DTYPE_OPT(slots, kInt);
+    // The kernel indexes every tensor densely
+    TORCH_CHECK(mixed_qkv.is_contiguous() && g.is_contiguous() && beta.is_contiguous() &&
+                recurrent_state.is_contiguous() && core_attn_out.is_contiguous(),
+                "cuda_recurrent_gated_delta_rule: tensors must be contiguous");
 
     const int* slots_ptr = (const int*) OPTPTR(slots);
     if (slots_ptr)
@@ -1232,6 +1247,9 @@ void cuda_recurrent_mamba2_gr
     TORCH_CHECK_DTYPE(recurrent_state, kFloat);
     TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
     TORCH_CHECK_DTYPE_OPT(slots, kInt);
+    TORCH_CHECK(mixed_xbc.is_contiguous() && g.is_contiguous() && dt.is_contiguous() && D.is_contiguous() &&
+                recurrent_state.is_contiguous() && core_attn_out.is_contiguous(),
+                "cuda_recurrent_mamba2: tensors must be contiguous");
 
     const int* slots_ptr = (const int*) OPTPTR(slots);
     if (slots_ptr)
@@ -1453,6 +1471,8 @@ void cuda_causal_conv1d_update_gr
                 "weight must be (dim, K)");
     TORCH_CHECK(out.dim() == 3 && out.size(0) == bsz && out.size(1) == seqlen && out.size(2) == dim,
                 "out must be (bsz, seqlen, dim)");
+    TORCH_CHECK(!bias.has_value() || (bias.value().dim() == 1 && bias.value().size(0) == dim && bias.value().is_contiguous()),
+                "bias must be a contiguous (dim) tensor");
     TORCH_CHECK_DTYPE(x, kBFloat16);
     TORCH_CHECK_DTYPE(conv_state, kBFloat16);
     TORCH_CHECK_DTYPE(weight, kBFloat16);
@@ -1712,6 +1732,8 @@ void gdn_ba_gemv_gr
     TORCH_CHECK(y.numel() == (int64_t) rows * n, "y must be [rows, n]");
     TORCH_CHECK(k % 2 == 0, "k must be even");
     TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
+    TORCH_CHECK((((uintptr_t) x.data_ptr() | (uintptr_t) w_t.data_ptr()) & 3) == 0, "gdn_ba_gemv: x and w_t must be 4-byte aligned (half2 loads)");
+    TORCH_CHECK(!bias.has_value() || bias.value().numel() == n, "gdn_ba_gemv: bias must be [n]");
 
     // No rows or outputs: nothing to do. k = 0 runs: the kernel writes the empty sum (bias or 0)
     if (rows == 0 || n == 0) return;
@@ -1889,6 +1911,8 @@ void kda_gate_op_gr
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK(a_log.dtype() == at::kFloat || a_log.dtype() == at::kBFloat16, "kda_gate_op: unsupported a_log dtype");
+    TORCH_CHECK_DIM(qkv, 3);
 
     int B = qkv.size(0);
     int S = qkv.size(1);
@@ -1896,8 +1920,15 @@ void kda_gate_op_gr
     int H = b.size(-1);
     int Dk = H ? (int) (f.size(-1) / H) : 0;
     int BS = B * S;
-    TORCH_CHECK(f.size(-1) == (int64_t) H * Dk, "f must be [B,S,H*Dk]");
+    TORCH_CHECK(f.size(-1) == (int64_t) H * Dk && f.numel() == (int64_t) BS * H * Dk, "f must be [B,S,H*Dk]");
     TORCH_CHECK(g.numel() == (int64_t) BS * H * Dk, "g must be [B,S,H,Dk]");
+    TORCH_CHECK(b.numel() == (int64_t) BS * H, "kda_gate_op: b must be [B,S,H]");
+    TORCH_CHECK(beta.numel() == (int64_t) BS * H, "kda_gate_op: beta must be [B,S,H]");
+    TORCH_CHECK(mixed_qkv.numel() == (int64_t) BS * F, "kda_gate_op: mixed_qkv must be [B,F,S]");
+    TORCH_CHECK(dt_bias.numel() == (int64_t) H * Dk && a_log.numel() == H, "kda_gate_op: dt_bias must be [H*Dk] and a_log [H]");
+    TORCH_CHECK(qkv.is_contiguous() && b.is_contiguous() && f.is_contiguous() && dt_bias.is_contiguous() && a_log.is_contiguous() &&
+                mixed_qkv.is_contiguous() && beta.is_contiguous() && g.is_contiguous(),
+                "kda_gate_op: tensors must be contiguous");
 
     int total = BS * F + BS * H + BS * H * Dk;
     if (total == 0) return;     // elementwise no-op
@@ -2029,6 +2060,7 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
         {
             batch.jobs[i] = jobs[base + i];
             TORCH_CHECK(batch.jobs[i].num_elements % 4 == 0, "batched_state_rewind: num_elements must be a multiple of 4");
+            TORCH_CHECK(((batch.jobs[i].src | batch.jobs[i].dst) & 15) == 0, "batched_state_rewind: src and dst must be 16-byte aligned (float4 copy)");
             max_elems = MAX(max_elems, batch.jobs[i].num_elements);
         }
 

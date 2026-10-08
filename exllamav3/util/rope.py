@@ -402,7 +402,7 @@ class RoPE:
             k_ = k
 
         q = q.float()
-        k = k.float()
+        k = k.float() if k is not None else k
 
         if len(q.shape) == 3:
             q = q.unsqueeze(0)
@@ -446,11 +446,11 @@ class RoPE:
             k = k.squeeze(0) if k is not None else k
 
         q = q.half()
-        k = k.half()
+        k = k.half() if k is not None else k
 
         if in_place:
             q_.copy_(q)
-            k_.copy_(k)
+            if k is not None: k_.copy_(k)
             return q_, k_
         else:
             return q, k
@@ -522,7 +522,7 @@ class RoPE:
 
         if len(q.shape) == 3:
             q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
+            k = k.unsqueeze(0) if k is not None else k
             squeeze = True
         else:
             squeeze = False

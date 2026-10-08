@@ -167,6 +167,23 @@ def test_rejections(device):
                              torch.zeros((2, 33), dtype = torch.long, device = device),
                              torch.empty((2, 33), dtype = torch.half, device = device), 1.0, None, 0, None, None)
 
+    # hidden rows must match the score rows on every projection path (the single-row GEMV and hgemm write
+    # hidden's rows, the top-k reads the scores' rows)
+    gate_t = _gate_t(cfg)
+    for rows_h, rows_s in [(1, 3), (3, 2)]:
+        for opt in [(gate_t, None, None), (None, None, None), (gate_t, cfg.gate_i8, cfg.gate_sb)]:
+            for fn in ["ds3", "sel_norm", "std"]:
+                with pytest.raises(RuntimeError, match = "row counts differ"):
+                    _fused_route(fn, torch.randn((rows_h, hdim), device = device).half(), cfg.gate_tensor,
+                                 torch.empty((rows_s, 64), dtype = torch.half, device = device),
+                                 torch.zeros((rows_s, 8), dtype = torch.long, device = device),
+                                 torch.empty((rows_s, 8), dtype = torch.half, device = device), opt)
+    with pytest.raises(RuntimeError, match = "incompatible shapes"):
+        ext.routing_std(hidden, cfg.gate_tensor, torch.empty((2, 64), dtype = torch.half, device = device),
+                        torch.empty((2, 8), dtype = torch.long, device = device),
+                        torch.empty((2, 8), dtype = torch.half, device = device), None, None,
+                        torch.zeros(63, dtype = torch.half, device = device), None, None)
+
 
 # Zero-size inputs of the fused router entry points (routing_ds3_nogroup, routing_sel_norm, and routing_std, which
 # shares the projection paths):

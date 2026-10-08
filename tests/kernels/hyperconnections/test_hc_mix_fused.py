@@ -217,6 +217,33 @@ def test_apply_empty(device, R, D, form):
     assert_device_ok(device)
 
 
+@torch.inference_mode()
+def test_apply_rejects(device):
+    # The apply kernel reads y / post / comb as dense (R, D) / (R, H) / (R, H, H) rows; anything else is refused
+    R, D = 3, 256
+    e = lambda *s, dt = torch.float: torch.zeros(s, dtype = dt, device = device)
+    x, y, post, comb = e(R, H, D), e(R, D), e(R, H), e(R, H, H)
+    cases = [
+        ((e(R, H * D), y, post, comb), "must have 3 dimensions"),
+        ((x, e(R, D, dt = torch.bfloat16), post, comb), "must be kHalf or kFloat"),
+        ((x, e(R, 2, D), post, comb), "hc_apply: y shape"),
+        ((x, y, e(R, 2), comb), "hc_apply: gate shapes"),
+        ((x, y, post, e(R, H)), "hc_apply: comb shape"),
+    ]
+    for args, msg in cases:
+        with pytest.raises(RuntimeError, match = msg):
+            ext.hc_apply(*args, None, None)
+    # The same pending apply folded into hc_mix_fused
+    gen = torch.Generator().manual_seed(0)
+    streams, fn, base, scale = _mix_inputs(R, D, True, gen, device)
+    chunks = ext.hc_mix_num_chunks(R, H * D)
+    for pend in ((e(R, 2, D), post, comb), (y, e(R, 2), comb), (y, post, e(R, H))):
+        with pytest.raises(RuntimeError, match = "hc_mix_fused: shapes"):
+            ext.hc_mix_fused(streams, *pend, fn, base, scale, 1e-6, 1e-6, 20, e(R, chunks, M + 1), e(R, H),
+                             e(R, H, H), e(R, D, dt = torch.half), None, None, 0.0, 0.0, 1.0)
+    assert_device_ok(device)
+
+
 def _gr_inputs(R, D, LR, post, device, seed = 0):
     g = torch.Generator().manual_seed(seed)
     M_ = LR + (H if post else 0)

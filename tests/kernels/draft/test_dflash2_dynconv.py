@@ -190,12 +190,16 @@ def _invalid(device):
         "dyn_taps": (x, h(1, 4, 3, 6), base, out, 16, False),
         "dyn_groups": (x, h(1, 4, 2, 5), base, out, 16, False),
         "dyn_seq": (x, h(1, 3, 2, 6), base, out, 16, False),
+        # seq and batch index grid.y / grid.z, capped at 65535
+        "seq_grid": (h(1, 65536, 16), h(1, 65536, 1, 1), h(1, 16), h(1, 65536, 16), 16, False),
+        "bsz_grid": (h(65536, 1, 16), h(65536, 1, 1, 1), h(1, 16), h(65536, 1, 16), 16, False),
     }
 
 
 INVALID = ["x_rank2", "dyn_rank3", "base_rank1", "x_noncontig", "out_noncontig", "base_noncontig", "out_shape",
            "dyn_fp32", "x_bf16", "out_bf16", "base_fp32", "accumulate_fp16_out", "group_not_dividing",
-           "group_zero", "base_width", "dyn_taps", "dyn_groups", "dyn_seq"]
+           "group_zero", "base_width", "dyn_taps", "dyn_groups", "dyn_seq", "seq_grid", "bsz_grid"]
+INVALID_MATCH = {"seq_grid": "at most 65535", "bsz_grid": "at most 65535"}
 
 
 @pytest.mark.parametrize("case", INVALID)
@@ -203,7 +207,7 @@ INVALID = ["x_rank2", "dyn_rank3", "base_rank1", "x_noncontig", "out_noncontig",
 def test_dynconv_rejects_invalid(device, case):
     cases = _invalid(device)
     assert set(cases) == set(INVALID)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match = INVALID_MATCH.get(case)):
         ext.dflash2_dynconv(*cases[case])
 
 

@@ -488,6 +488,8 @@ void test_distribution
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(input, kFloat);
+    TORCH_CHECK_DTYPE(dist_output, kFloat);
+    TORCH_CHECK_DTYPE_OPT(ref_output, kFloat);
 
     uint64_t numel = input.numel();
     float* ref_output_ptr = (float*) OPTPTR(ref_output);
@@ -495,9 +497,6 @@ void test_distribution
     TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
     if (ref_output_ptr)
         TORCH_CHECK(num_bins == ref_output.value().numel());
-    // A normalized histogram needs at least one bin and one value
-    TORCH_CHECK(num_bins > 0, "test_distribution: empty histogram (no bins)");
-    TORCH_CHECK(numel > 0, "test_distribution: empty input, the distribution is undefined");
     // A normalized histogram needs at least one bin and one value
     TORCH_CHECK(num_bins > 0, "test_distribution: empty histogram (no bins)");
     TORCH_CHECK(numel > 0, "test_distribution: empty input, the distribution is undefined");

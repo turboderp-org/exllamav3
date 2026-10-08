@@ -7,7 +7,8 @@ used by util.hadamard.get_hadamard for sizes the Sylvester doubling and the stor
 - had_paley2, n = 2 (p + 1) with p prime, p = 1 (mod 4) (Paley II): the conference matrix C = [[0, 1^T], [1, Q]]
   with each 0 replaced by [[1, -1], [-1, -1]] and each +-1 by +-[[1, 1], [1, -1]]
 - both are Hadamard: entries +-1 and H H^T = n I (exact in float64)
-- had_paley rejects non-fp16, non-square and non-contiguous tensors; had_paley2 non-fp16 and non-square
+- both reject non-fp16, non-2-D, non-square, non-contiguous and non-CPU tensors (they fill h from host code);
+  had_paley2 also rejects n % 4 != 0 (it writes 2x2 blocks, and n = 2 would take residues mod 0)
 
 Reference: an independent construction from the set of quadratic residues {x^2 mod p} (no modular exponentiation),
 and the orthogonality identity itself.
@@ -81,14 +82,24 @@ def test_paley2(p):
     _check_hadamard(h)
 
 
-def test_rejections():
+def test_rejections(device):
     for f in (ext.had_paley, ext.had_paley2):
         with pytest.raises(RuntimeError):
             f(torch.zeros((12, 12), dtype = torch.float))
         with pytest.raises(RuntimeError):
             f(torch.zeros((12, 24), dtype = torch.half))
-    with pytest.raises(RuntimeError):
-        ext.had_paley(torch.zeros((24, 24), dtype = torch.half)[::2, ::2])
+        with pytest.raises(RuntimeError, match = "must have 2 dimensions"):
+            f(torch.zeros((12,), dtype = torch.half))
+        with pytest.raises(RuntimeError, match = "must have 2 dimensions"):
+            f(torch.zeros((12, 12, 2), dtype = torch.half))
+        with pytest.raises(RuntimeError):
+            f(torch.zeros((24, 24), dtype = torch.half)[::2, ::2])
+        if device.type == "cuda" and torch.cuda.is_available():
+            with pytest.raises(RuntimeError, match = "must be a CPU tensor"):
+                f(torch.zeros((12, 12), dtype = torch.half, device = device))
+    for n in (2, 6):
+        with pytest.raises(RuntimeError, match = "multiple of 4"):
+            ext.had_paley2(torch.zeros((n, n), dtype = torch.half))
 
 
 def test_empty():

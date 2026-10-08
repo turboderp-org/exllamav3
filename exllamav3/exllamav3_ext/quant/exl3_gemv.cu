@@ -217,6 +217,7 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    TORCH_CHECK(C.numel() >= (int64_t) size_m * size_n, "exl3_gemv: C must hold one output row per row of A");
     const int tile_u16 = B.size(2);
     const bool half_k = (tile_u16 % 16) != 0;
     int K = tile_u16 / 16;

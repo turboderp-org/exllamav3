@@ -276,6 +276,8 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 {
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
+    // int4 activation loads and 16-byte cp.async weight copies
+    if (((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_i8.data_ptr()) & 15) return false;
     const int K = hidden.size(-1);
     // The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 (both sm_80+) and
     // 97 KB of dynamic smem, over the pre-Ampere ceiling; cuBLAS serves the other arches
@@ -362,7 +364,7 @@ void routing_gemm_det
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(routing_gemm_det_fits(hidden, gate_i8, gate_sb, scores), "routing_gemm_det: half activations, (2, E, K) int8 gate, fp32 scales, contiguous, K % 16 == 0");
+    TORCH_CHECK(routing_gemm_det_fits(hidden, gate_i8, gate_sb, scores), "routing_gemm_det: half activations, (2, E, K) int8 gate, fp32 scales, contiguous and 16-byte aligned, K % 16 == 0");
     routing_gemm_det_(hidden, gate_i8, gate_sb, scores, stream);
 }
 

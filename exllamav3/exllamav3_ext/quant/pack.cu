@@ -74,6 +74,9 @@ void pack_trellis
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK(K >= 1 && K <= 8, "pack_trellis: K must be 1..8");
+    TORCH_CHECK_DTYPE(packed, kShort);
+    TORCH_CHECK_DTYPE(unpacked, kShort);
+    TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "pack_trellis: packed and unpacked must be contiguous");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -158,6 +161,9 @@ void unpack_trellis
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK(K >= 1 && K <= 8, "unpack_trellis: K must be 1..8");
+    TORCH_CHECK_DTYPE(packed, kShort);
+    TORCH_CHECK_DTYPE(unpacked, kShort);
+    TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "unpack_trellis: packed and unpacked must be contiguous");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);

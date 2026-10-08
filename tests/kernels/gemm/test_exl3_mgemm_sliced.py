@@ -186,7 +186,8 @@ def test_empty_mgemm(device, case):
 @torch.inference_mode()
 def test_empty_mgemm_rejections(device):
     """An empty reduction (k = 0) is rejected: which outputs the kernel would write (indices, weights, output
-    pointer tables) is only known on the device. num_tokens must be positive"""
+    pointer tables) is only known on the device. num_tokens must be positive. A per-slot A or C must cover every
+    slot, and a weighted C one reduced row per token"""
     k, n, bits = 256, 256, 4
     B, suh, svh = _weights(0, n, bits, device)
     x = torch.empty((1, 2, 0), dtype = torch.half, device = device)
@@ -198,5 +199,26 @@ def test_empty_mgemm_rejections(device):
     x = torch.randn((1, 2, k), device = device).half()
     with pytest.raises(RuntimeError, match = "num_tokens must be at least 1"):
         ext.exl3_mgemm(x, t(B), c, t(suh), torch.empty_like(x), t(svh), None, None, bits, -1, False, True, -1, -1, 0, 0)
-    assert (c == 5.0).all()
+    tB, tsuh, tsvh = (_ptrs([v] * 3, device) for v in (B, suh, svh))
+    a_had = torch.empty((3, 2, k), dtype = torch.half, device = device)
+    x2 = torch.randn((2, 2, k), device = device).half()
+    c3 = torch.full((3, 2, n), 5.0, dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "exl3_mgemm: A must hold one input, or one per slot"):
+        ext.exl3_mgemm(x2, tB, c3, tsuh, a_had, tsvh, None, None, bits, -1, False, True, -1, -1, 0)
+    x3 = torch.randn((3, 2, k), device = device).half()
+    with pytest.raises(RuntimeError, match = "exl3_mgemm: C must hold one output per slot"):
+        ext.exl3_mgemm(x3, tB, c3[:2], tsuh, a_had, tsvh, None, None, bits, -1, False, True, -1, -1, 0)
+    idx = torch.zeros((1, 1), dtype = torch.long, device = device)
+    w = torch.ones((1, 1), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "exl3_mgemm: C must hold one reduced row per token"):
+        ext.exl3_mgemm(x, t(B), c, t(suh), torch.empty_like(x), t(svh), idx, w, bits, -1, False, True, -1, -1, 0, 2)
+    # Weighted, three slots: one weight per slot, and the slots split evenly among the tokens
+    idx3 = torch.zeros((1, 3), dtype = torch.long, device = device)
+    with pytest.raises(RuntimeError, match = "exl3_mgemm: weights must hold one weight per slot"):
+        ext.exl3_mgemm(x, tB, c3, tsuh, a_had, tsvh, idx3, torch.ones((1, 2), dtype = torch.half, device = device),
+                       bits, -1, False, True, -1, -1, 0)
+    with pytest.raises(RuntimeError, match = "exl3_mgemm: slots must divide evenly among num_tokens"):
+        ext.exl3_mgemm(x, tB, c3, tsuh, a_had, tsvh, idx3, torch.ones((1, 3), dtype = torch.half, device = device),
+                       bits, -1, False, True, -1, -1, 0, 2)
+    assert (c == 5.0).all() and (c3 == 5.0).all()
     _device_still_works(device)
