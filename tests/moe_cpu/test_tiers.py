@@ -7,7 +7,8 @@ both tolerances. Reference: the avx2 tier (native layout).
 
 The tier is fixed per process by EXL3_MOE_CPU_MAX_ISA (read once at static init), so each tier runs in a
 subprocess; on a VBMI machine that exercises vbmi, vnni, bw, avx2 and scalar. Covers K1-8, gated and gateless
-experts, 1..5 tokens (m = 1..4 rows per expert chunk), the swizzled layout, and a 256-token case that takes the
+experts, 1..5 tokens (m = 1..4 rows per expert chunk), the tier's packed layout (band-8 on AVX-512, band-2 +
+planar on AVX2), and a 256-token case that takes the
 GEMV phases' many-GEMV (strided) regime.
 
 The second test repeats the comparison on real expert weights from the lfm2.5-8b-a1b mul1 ladder (one K per
@@ -51,7 +52,7 @@ def random_weight_outputs() -> dict:
         s = torch.randint(0, 2, (n,), generator = g).float() * 2 - 1
         return (s * (1.0 + 0.1 * torch.randn(n, generator = g))).half().contiguous()
 
-    # The swizzled layout is only ever handed to the tiers that consume it (scalar and avx2 read native only)
+    # The packed layout is only ever handed to tiers whose rules produce it (scalar reads native only)
     swz_capable = True in swizzle_layouts()
 
     results = {}
@@ -90,6 +91,7 @@ def random_weight_outputs() -> dict:
                         ext.exl3_moe_cpu_forward(h, x, sel, w, out, th)
                         results[(K, gated, swz, tokens, th)] = out.clone()
                 ext.exl3_moe_cpu_free_layer(h)
+    assert swz_capable == any(k[2] for k in results), "packed-layout coverage does not match the tier rule"
     return results
 
 
@@ -149,10 +151,9 @@ def rel_l2(a, b):
 def test_tiers_agree_random_weights():
     outs = run_per_tier(random_weight_outputs)
     assert "avx2" in outs
-    ref = outs["avx2"]   # native layout only; swizzled results compare against the same weights natively
+    ref = {k: v for k, v in outs["avx2"].items() if not k[2]}   # native keys form the shared reference
     native = lambda key: (key[0], key[1], False, key[3], key[4])
-    if any(t in outs for t in ("bw", "vnni", "vbmi")):
-        assert any(k[2] for t in ("bw", "vnni", "vbmi") if t in outs for k in outs[t]), "no swizzled case ran"
+    assert any(k[2] for k in outs["avx2"]), "no packed-layout case ran on the avx2 tier"
     for tier, res in outs.items():
         assert {native(k) for k in res} == set(ref), f"{tier}: case set differs from avx2"
         tol = SCALAR_TOL if tier == "scalar" else INT8_TOL

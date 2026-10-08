@@ -10,8 +10,9 @@ Every tier this CPU can run is covered ("scalar" always; the int8 tiers "avx2", 
 CPU has them), and each child's tier is checked against the cap it ran under. `worker` follows the rules of
 testlib.isolated.run_isolated (module-level function, picklable arguments, torch.save-able result).
 
-Layout: on the AVX-512 tiers expert trellises may be band-swizzled (`swizzle`), what the host does when
-has_avx512_bw() (K8 tensors stay native).
+Layout: each tier's packed trellis layout is decided per rate by the kernel rules
+(`swizzle`, mirroring the child loader through exl3_moe_cpu_swizzle_group /
+exl3_moe_cpu_planar_layout); rates the active tier leaves native are returned unchanged.
 
 Runtime: the native worker pool can pin its caller's thread and the tests limit torch's own threads around it;
 the `cpu_runtime` fixture restores the process affinity and torch thread count afterwards. Import it into the
@@ -26,7 +27,7 @@ import pytest
 import torch
 
 from testlib.isolated import run_isolated
-from testlib.moe import swizzle_trellis
+from testlib.moe import repack_trellis
 
 INT8_TIERS = ("avx2", "bw", "vnni", "vbmi")
 TIERS = ("scalar",) + INT8_TIERS
@@ -66,16 +67,23 @@ def run_per_tier(func, *args, tiers = None, env: dict | None = None, **kwargs) -
     return out
 
 
+ALL_PACK_RATES = (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8)
+
+
 def swizzle(t: torch.Tensor) -> torch.Tensor:
-    """Band-contiguous layout of a [k/16, n/16, 16K] trellis: blocks of 8 column tiles become contiguous. K8
-    tensors (16 * 8 words) are left native, as the host does"""
-    return t.contiguous() if t.shape[-1] == 128 else swizzle_trellis(t)
+    """Packed layout of a [k/16, n/16, 16K] trellis for this process's tier and this tensor's
+    rate, exactly what the child loader applies (rates the tier leaves native come back
+    contiguous)"""
+    from exllamav3.ext import exllamav3_ext as ext
+    K = t.shape[-1] / 16.0
+    g = ext.exl3_moe_cpu_swizzle_group(K)
+    return repack_trellis(t, g, bool(ext.exl3_moe_cpu_planar_layout(K))) if g else t.contiguous()
 
 
 def swizzle_layouts() -> tuple[bool, ...]:
-    """(native,) or (native, swizzled): the layouts the active tier takes"""
+    """(native,) or (native, packed): the layouts the active tier takes"""
     from exllamav3.ext import exllamav3_ext as ext
-    return (False, True) if ext.exl3_moe_cpu_has_avx512_bw() else (False,)
+    return (False, True) if any(ext.exl3_moe_cpu_swizzle_group(K) for K in ALL_PACK_RATES) else (False,)
 
 
 @pytest.fixture
