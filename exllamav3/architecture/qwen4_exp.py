@@ -58,10 +58,6 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
         )
         pfx = lambda key: f"text_config->{key}"
 
-        # PLE hashing must see the literal MM placeholder token where the generator substitutes
-        # embedding alias ids (HF hashes the placeholder like any other token)
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
-
         # Gated-residual hyper-connections
         self.hc_mult = self.read_cfg(int, pfx("hc_count"), 4)
 
@@ -265,6 +261,8 @@ class Qwen4ExpModel(Model):
                         eos_token_id = config.ple_eos_token_id,
                         conv_kernel_size = config.ple_conv_kernel_size,
                         rms_norm_eps = config.rms_norm_eps,
+                        # PLE hashing must see the literal MM placeholder token where the generator
+                        # substitutes embedding alias ids (HF hashes the placeholder like any other token)
                         mm_token_id = config.image_token_id,
                     )
                 ]
