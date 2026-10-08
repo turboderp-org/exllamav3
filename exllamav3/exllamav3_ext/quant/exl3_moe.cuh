@@ -47,7 +47,17 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    // Packed trellis layout of the per-projection expert bytes (tile group 0/2/8 + planar
+    // dword order; exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout). 0/0 = native.
+    // Resolved on the host once per layer; the kernel gathers tiles in its B-stage and
+    // remaps the dequant's shared-word indices.
+    const int group_g = 0,
+    const int group_u = 0,
+    const int group_d = 0,
+    const int planar_g = 0,
+    const int planar_u = 0,
+    const int planar_d = 0
 );
 
 void exl3_moe_gather

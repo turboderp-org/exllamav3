@@ -167,11 +167,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
     m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
-    m.def("reconstruct", &reconstruct, "reconstruct");
-    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
-    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
-    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
-    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    // group/planar (packed CPU trellis layout, see cpu/moe_mul1.h) default to the native layout
+    m.def("reconstruct", &reconstruct, "reconstruct",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
@@ -190,7 +201,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
-    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
+    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
@@ -200,6 +213,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
+    m.def("exl3_moe_cpu_swizzle_group", &exl3_moe_cpu_swizzle_group, "exl3_moe_cpu_swizzle_group");
+    m.def("exl3_moe_cpu_planar_layout", &exl3_moe_cpu_planar_layout, "exl3_moe_cpu_planar_layout");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
           py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
           py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
@@ -287,7 +302,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
-    m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe", &exl3_moe, "exl3_moe",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),                      // hidden, output, counts, tok, w
+          py::arg(), py::arg(), py::arg(), py::arg(),                                  // temp buffers
+          py::arg(), py::arg(), py::arg(), py::arg(),                                  // act, K gate/up/down
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),            // g/u/d ptr tables
+          py::arg(), py::arg(), py::arg(),                                             // d ptr table
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),            // codebook flags
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), // limit, active, scratch, base, lo, hi, m_tile
+          py::arg("group_g") = 0, py::arg("group_u") = 0, py::arg("group_d") = 0,      // packed trellis layouts
+          py::arg("planar_g") = 0, py::arg("planar_u") = 0, py::arg("planar_d") = 0);
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 

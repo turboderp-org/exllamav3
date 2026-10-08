@@ -34,7 +34,10 @@ void exl3_gemm_kernel_inner
     const int size_n,
     int* __restrict__ locks,
     const half* post_scale,
-    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+    int size_n_stride = 0,    // full width of B and C when computing a column slice (0: = size_n)
+    const int group = 0,      // B uses a packed CPU trellis tile order (2/8, exl3_moe_cpu_swizzle_group)
+    const int planar = 0      // ... and the planar dword order (exl3_moe_cpu_planar_layout): the
+                              // shared copy stays as loaded, the dequant remaps its word indices
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -272,11 +275,36 @@ void exl3_gemm_kernel_inner
             {
                 const int4* gl = (const int4*) gl_b_ptr;
                 int4* sh = (int4*) sh0_b_ptr;
-                #pragma unroll
-                for (int i = 0; i < load_b_iters; ++i)
+                if (group)
                 {
-                    // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i], pred_b_gl[i]);
-                    if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
+                    // Packed tile order: the gather only changes the tile index, since a
+                    // 16-byte cp.async int4 never straddles a 16x16 tile
+                    const int shift = group == 2 ? 1 : 3;
+                    #pragma unroll
+                    for (int i = 0; i < load_b_iters; ++i)
+                    {
+                        if (pred_b_gl[i])
+                        {
+                            const int v = i * EXL3_GEMM_BASE_THREADS + t;
+                            const int n = v % (TILEBLOCKS_N * TILE_U16 / 8);
+                            const int kt = slice0_k * TILEBLOCKS_K + v / (TILEBLOCKS_N * TILE_U16 / 8);
+                            const int nt = slice0_n * TILEBLOCKS_N + n / (TILE_U16 / 8);
+                            const size_t tile =
+                                (((size_t) (nt >> shift) * (size_k / 16) + kt) << shift)
+                                + (nt & (group - 1));
+                            cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t,
+                                     (const int4*) (B + tile * TILE_U16) + n % (TILE_U16 / 8));
+                        }
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int i = 0; i < load_b_iters; ++i)
+                    {
+                        // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i], pred_b_gl[i]);
+                        if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
+                    }
                 }
             }
             advance0();
@@ -313,7 +341,8 @@ void exl3_gemm_kernel_inner
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * TILE_U16);
 
-            dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+            dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1],
+                                          planar != 0);
         }
 
         __syncthreads();

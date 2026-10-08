@@ -5,12 +5,16 @@
 #include "util.cuh"
 #include "quant/bits_k.cuh"
 
-// Expert weights offloaded to the CPU live in the arena band-swizzled for the VBMI kernels:
-// tile (kt, nt) at (nt / 8) * tiles_k * 8 + kt * 8 + nt % 8 instead of kt * tiles_n + nt. When
-// experts stream back to the GPU for prefill they are staged and DMA'd verbatim, and this kernel
-// restores the native order in VRAM: per (expert, kt, group) the 8 tiles of a group are
-// contiguous in both layouts, so each block moves one such run. One read + one write of the
-// bytes at VRAM bandwidth, instead of tiles_k * groups scattered memcpys on the stager thread.
+// Expert weights offloaded to the CPU live in the arena in a packed trellis layout for the
+// banded CPU kernels (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt)
+// at (nt / g) * tiles_k * g + kt * g + nt % g instead of kt * tiles_n + nt, and on the AVX2
+// tier (g = 2) each tile's dwords planar-repacked (native dword w at 8 * (w % bits) + w / bits).
+// When experts stream back to the GPU for prefill they are staged and DMA'd verbatim, and this
+// kernel restores the native order in VRAM for the HIP build (the CUDA kernels read the packed
+// bytes directly). Per (expert, kt, native 8-tile run) the run is one contiguous block in the
+// native layout and g | 8/g contiguous sub-runs of g tiles in the packed one, so each block
+// moves its run at VRAM bandwidth -- one read + one write, instead of tiles_k * groups
+// scattered memcpys on the stager thread. group = 0 is a plain copy.
 
 #define NUM_THREADS 128
 
@@ -24,21 +28,48 @@ void moe_unswizzle_kernel
     const int tiles_k,
     const int tiles_n,
     const int tile_b,
-    const bool swizzled
+    const int group,              // 0 (native) | 2 | 8
+    const int planar              // 1: also invert the planar dword order (group > 0, integer K)
 )
 {
-    const int groups = tiles_n / 8;
-    const int run = blockIdx.x;             // (kt, g) run index, native order
-    const int kt = run / groups;
-    const int g = run % groups;
+    const int runs = tiles_n / 8;
+    const int kt = blockIdx.x / runs;
+    const int r = blockIdx.x % runs;            // native 8-tile run index
     const size_t base = (size_t) blockIdx.y * expert_stride_b + proj_off_b;
+    const size_t run_off = base + ((size_t) kt * tiles_n + (size_t) r * 8) * tile_b;
     const size_t run_b = (size_t) 8 * tile_b;
-    const size_t dst_off = base + ((size_t) kt * tiles_n + (size_t) g * 8) * tile_b;
-    const size_t src_off = swizzled ? base + ((size_t) g * tiles_k + kt) * run_b : dst_off;
-    const uint4* s = reinterpret_cast<const uint4*>(src + src_off);
-    uint4* d = reinterpret_cast<uint4*>(dst + dst_off);
-    for (int i = threadIdx.x; i < (int) (run_b / 16); i += NUM_THREADS)
-        d[i] = s[i];
+    uint4* d = reinterpret_cast<uint4*>(dst + run_off);
+    if (!group)
+    {
+        const uint4* s = reinterpret_cast<const uint4*>(src + run_off);
+        for (int i = threadIdx.x; i < (int) (run_b / 16); i += NUM_THREADS)
+            d[i] = s[i];
+        return;
+    }
+    const size_t sub_b = (size_t) group * tile_b;
+    for (int s = 0; s < 8 / group; ++s)
+    {
+        const size_t sub_src = base + ((size_t) (r * (8 / group) + s) * tiles_k + kt) * sub_b;
+        uint4* sd = d + (size_t) s * (sub_b / 16);
+        if (!planar)
+        {
+            const uint4* ss = reinterpret_cast<const uint4*>(src + sub_src);
+            for (int i = threadIdx.x; i < (int) (sub_b / 16); i += NUM_THREADS)
+                sd[i] = ss[i];
+            continue;
+        }
+        // Planar inverse: native dword w of a tile is stored at 8 * (w % bits) + w / bits
+        // (integer rates only, tile_b = 32 * bits; per-dword traffic inside one tile)
+        const int bits = tile_b / 32;
+        const int wd = tile_b / 4;                      // dwords per tile
+        const uint32_t* ss = reinterpret_cast<const uint32_t*>(src + sub_src);
+        uint32_t* dd = reinterpret_cast<uint32_t*>(sd);
+        for (int i = threadIdx.x; i < (int) (sub_b / 4); i += NUM_THREADS)
+        {
+            const int w = i % wd;
+            dd[i] = ss[(i - w) + 8 * (w % bits) + w / bits];
+        }
+    }
 }
 
 void moe_unswizzle_trellis
@@ -51,7 +82,8 @@ void moe_unswizzle_trellis
     int64_t tiles_k,
     int64_t tiles_n,
     double K,
-    bool swizzled
+    int64_t group,                // packed tile group of this projection (0/2/8)
+    int64_t planar                // 1: planar dword order to invert
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(src.device());
@@ -59,10 +91,13 @@ void moe_unswizzle_trellis
     TORCH_CHECK(src.is_cuda() && dst.is_cuda() && src.device() == dst.device(), "moe_unswizzle: tensors must share a CUDA device");
     TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "moe_unswizzle: tensors must be contiguous");
     TORCH_CHECK(tiles_n % 8 == 0, "moe_unswizzle: tiles_n must be a multiple of 8");
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, "moe_unswizzle: group must be 0, 2 or 8");
+    TORCH_CHECK(!planar || group, "moe_unswizzle: planar requires a swizzled projection");
     TORCH_CHECK(num_experts >= 0 && tiles_k >= 0 && tiles_n >= 0 && expert_stride_b >= 0 && proj_off_b >= 0,
                 "moe_unswizzle: negative size or offset");
     const BitsK bk = bits_from_K((float) K);
     const int tile_b = bk.bits * 32 + (bk.half ? 16 : 0);
+    TORCH_CHECK(!planar || !bk.half, "moe_unswizzle: planar is undefined for half-integer rates");
     TORCH_CHECK((expert_stride_b | proj_off_b) % 16 == 0, "moe_unswizzle: offsets must be 16-byte aligned");
 
     // No experts or no tiles: nothing to copy
@@ -75,6 +110,7 @@ void moe_unswizzle_trellis
     dim3 grid((unsigned) (tiles_k * (tiles_n / 8)), (unsigned) num_experts);
     moe_unswizzle_kernel<<<grid, NUM_THREADS, 0, stream>>>(
         (const uint8_t*) src.data_ptr(), (uint8_t*) dst.data_ptr(),
-        (size_t) expert_stride_b, (size_t) proj_off_b, (int) tiles_k, (int) tiles_n, tile_b, swizzled);
+        (size_t) expert_stride_b, (size_t) proj_off_b, (int) tiles_k, (int) tiles_n, tile_b,
+        (int) group, (int) planar);
     cuda_check(cudaPeekAtLastError());
 }

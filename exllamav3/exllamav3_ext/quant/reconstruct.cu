@@ -9,6 +9,36 @@
 #include "bits_k.cuh"
 #include "hadamard_inner.cuh"
 
+// CPU-packed trellis layouts (see cpu/moe_mul1.h and exl3_moe_cpu_swizzle_group /
+// exl3_moe_cpu_planar_layout): with group > 0 the tiles live in groups of `group` output
+// tiles, tile (kt, nt) at (nt/group)*tiles_k*group + kt*group + nt%group; with planar each
+// tile's dwords are additionally transposed, native dword w stored at 8*(w%K) + w/K.
+//
+// The GPU prefill path consumes those bytes directly instead of restoring native order in a
+// separate VRAM pass: the tile gather happens in the global->shared load, so the dequant
+// pipeline downstream is untouched, and the planar inverse is a pure reindexing of one tile's
+// dwords inside shared memory. Measured on a 3090: +0.0..0.5% vs the native-order int4 load
+// at K2/K4/K8; the restore pass it replaces was 40-67% of the reconstruct stage for a
+// streamed batch.
+__device__ __forceinline__ size_t packed_tile_index(int kt, int nt, int packed_blocks_k, int group)
+{
+    return ((size_t)(nt / group) * packed_blocks_k + kt) * group + (nt % group);
+}
+
+// The tile gather is rate-agnostic (half rates ride the group-8 layout on the AVX-512
+// tiers); planar partitions integer-rate tiles only, and only exists on top of a swizzle.
+// Reject anything else so bogus caller args cannot read garbage.
+static inline void check_packed_layout(float K_, int64_t group, int64_t planar, const char* who)
+{
+    TORCH_CHECK(group == 0 || group == 2 || group == 8, who, ": tile group must be 0, 2 or 8");
+    TORCH_CHECK(planar == 0 || planar == 1, who, ": planar must be 0 or 1");
+    if (!planar)
+        return;
+    const BitsK bk = bits_from_K(K_);
+    TORCH_CHECK(!bk.half, who, ": planar is undefined for half-integer bitrates");
+    TORCH_CHECK(group, who, ": planar requires a swizzled layout");
+}
+
 template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_tile
@@ -16,7 +46,10 @@ void reconstruct_tile
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);  // in uint16s
@@ -29,11 +62,31 @@ void reconstruct_tile
     int tiles_n = gridDim.x;
     int out_blocks_n = tiles_n * 8;
 
-    // Load packed 16*128 tile
+    // Load packed 16*128 tile (8 consecutive output tiles)
     __shared__ uint32_t s_packed[8][packed_size / 2];
-    g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
-    if (t < packed_size)
-        ((int4*) s_packed)[t] = ((int4*) g_packed)[t];
+    if (!group && !planar)
+    {
+        g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
+        if (t < packed_size)
+            ((int4*) s_packed)[t] = ((int4*) g_packed)[t];
+    }
+    else
+    {
+        // Dword granularity: an int4 never straddles a tile but the planar permutation moves
+        // its dwords apart, so both gather cases go per-dword (coalesced global reads,
+        // scattered stores inside one shared tile)
+        constexpr int DW = packed_size / 2;                   // dwords per tile
+        uint32_t* dst = (uint32_t*) s_packed;                 // [8][DW], contiguous
+        for (int u = t; u < 8 * DW; u += 256)
+        {
+            const int nt = packed_n_offset + n + u / DW;
+            const int w = u % DW;
+            const size_t tile = group ? packed_tile_index(k, nt, packed_blocks_k, group)
+                                      : (size_t)k * packed_blocks_n + nt;
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(g_packed + tile * packed_size);
+            dst[u] = planar ? src[8 * (w % K) + w / K] : src[w];
+        }
+    }
     __syncthreads();
 
     // Dequant
@@ -91,10 +144,14 @@ void reconstruct_kernel
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
-    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
+    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset,
+                                  packed_blocks_k, group, planar);
 }
 
 // Batched variant: blockIdx.z selects the matrix from a pointer table, outputs are consecutive
@@ -106,11 +163,15 @@ void reconstruct_batch_kernel
     half* __restrict__ g_unpacked,
     const uint16_t* const* __restrict__ packed_ptrs,
     int packed_blocks_n,
-    size_t out_stride
+    size_t out_stride,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
     int b = blockIdx.z;
-    reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0);
+    reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0,
+                                  packed_blocks_k, group, planar);
 }
 
 // Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
@@ -145,11 +206,14 @@ void reconstruct_slice
     float K_,
     bool mcg,
     bool mul1,
-    int64_t n_offset
+    int64_t n_offset,
+    int64_t group,
+    int64_t planar
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    check_packed_layout(K_, group, planar, "reconstruct");
 
     // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
     // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
@@ -192,7 +256,10 @@ void reconstruct_slice
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
         packed_cols,
-        packed_n_offset
+        packed_n_offset,
+        rows,
+        (int) group,
+        (int) planar
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -217,7 +284,10 @@ void reconstruct_had_tile
     const half* __restrict__ suh,
     const half* __restrict__ svh,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
@@ -240,13 +310,32 @@ void reconstruct_had_tile
     };
 
     constexpr int j_int4 = packed_size / 8;
-    for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
+    if (!group && !planar)
     {
-        int j = u / (8 * j_int4);
-        int r = u % (8 * j_int4);
-        const uint16_t* gp = g_packed +
-            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
-        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+        for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
+        {
+            int j = u / (8 * j_int4);
+            int r = u % (8 * j_int4);
+            const uint16_t* gp = g_packed +
+                ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+            ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+        }
+    }
+    else
+    {
+        // 8 k-tiles x 8 n-tiles at dword granularity (see reconstruct_tile for the layout math)
+        constexpr int DW = packed_size / 2;
+        for (int u = t; u < 8 * 8 * DW; u += RH_THREADS)
+        {
+            const int j = u / (8 * DW);
+            const int q = u % (8 * DW);
+            const int nt = packed_n_offset + n + q / DW;
+            const int w = q % DW;
+            const size_t tile = group ? packed_tile_index(kb * 8 + j, nt, packed_blocks_k, group)
+                                      : (size_t)(kb * 8 + j) * packed_blocks_n + nt;
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(g_packed + tile * packed_size);
+            s_packed[j][q / DW][w] = planar ? src[8 * (w % K) + w / K] : src[w];
+        }
     }
     __syncthreads();
 
@@ -371,10 +460,14 @@ void reconstruct_had_kernel
     const half* __restrict__ suh,
     const half* __restrict__ svh,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
-    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
+    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset,
+                                      packed_blocks_k, group, planar);
 }
 
 // Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
@@ -388,7 +481,10 @@ void reconstruct_had_batch_kernel
     const half* const* __restrict__ suh_ptrs,
     const half* const* __restrict__ svh_ptrs,
     int packed_blocks_n,
-    size_t out_stride
+    size_t out_stride,
+    int packed_blocks_k,
+    int group,
+    int planar
 )
 {
     int b = blockIdx.z;
@@ -399,7 +495,10 @@ void reconstruct_had_batch_kernel
         suh_ptrs[b],
         svh_ptrs[b],
         packed_blocks_n,
-        0
+        0,
+        packed_blocks_k,
+        group,
+        planar
     );
 }
 
@@ -438,11 +537,14 @@ void reconstruct_had_slice
     float K_,
     bool mcg,
     bool mul1,
-    int64_t n_offset
+    int64_t n_offset,
+    int64_t group,
+    int64_t planar
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    check_packed_layout(K_, group, planar, "reconstruct_had");
 
     // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
     // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
@@ -486,7 +588,10 @@ void reconstruct_had_slice
         (const half*) suh.data_ptr(),
         (const half*) svh.data_ptr(),
         packed.size(1),
-        (int) (n_offset / 16)
+        (int) (n_offset / 16),
+        packed.size(0),
+        (int) group,
+        (int) planar
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -497,11 +602,13 @@ void reconstruct
     at::Tensor packed,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group,
+    int64_t planar
 )
 {
     TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
-    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0);
+    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0, group, planar);
 }
 
 
@@ -519,11 +626,14 @@ void reconstruct_had_batch
     at::Tensor svh_ptrs,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group,
+    int64_t planar
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    check_packed_layout(K_, group, planar, "reconstruct_had_batch");
 
     const BitsK bk = bits_from_K(K_);
     const int K = bk.bits;
@@ -566,7 +676,10 @@ void reconstruct_had_batch
         (const half* const*) suh_ptrs.data_ptr(),
         (const half* const*) svh_ptrs.data_ptr(),
         n / 16,
-        (size_t) k * n
+        (size_t) k * n,
+        k / 16,
+        (int) group,
+        (int) planar
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -583,11 +696,14 @@ void reconstruct_batch
     at::Tensor packed_ptrs,
     float K_,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t group,
+    int64_t planar
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    check_packed_layout(K_, group, planar, "reconstruct_batch");
 
     const BitsK bk = bits_from_K(K_);
     const int K = bk.bits;
@@ -624,7 +740,10 @@ void reconstruct_batch
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
         n / 16,
-        (size_t) k * n
+        (size_t) k * n,
+        k / 16,
+        (int) group,
+        (int) planar
     );
     cuda_check(cudaPeekAtLastError());
 }

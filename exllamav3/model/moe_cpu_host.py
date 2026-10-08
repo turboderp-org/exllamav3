@@ -121,10 +121,11 @@ class MoeCpuTuning:
         # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
         # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
-        # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
-        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
-        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
+        # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
+        # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
+        # AVX-512 tiers, band-2 + planar dwords on AVX2, native on scalar).
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout everywhere.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
         # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
         # into loader tensors and then copied into the arena, so this bounds the transient host
@@ -389,6 +390,24 @@ def _win32_large_page_alloc(size: int, min_size: int):
     return buf
 
 
+def _copy_repacked(dst, tensor, group, planar):
+    """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
+    CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
+    to (nt/group, kt, nt%group), and with planar each tile's dwords are transposed -- dword w
+    to 8*(w%bits) + w/bits, i.e. the trailing (8, bits) dword dims swap (integer rates only,
+    where group is nonzero). One strided copy_; group 0 is a plain copy."""
+    tk, tn, ps = tensor.shape
+    if not group:
+        dst.copy_(tensor)
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
+            tensor.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tn // group, tk, group, ps).copy_(
+            tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
+
+
 class _HugeArena:
     """
     Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
@@ -563,15 +582,15 @@ class _HugeArena:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
                   f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
-    def rehome(self, tensor, band_swizzle = False):
+    def rehome(self, tensor, band_swizzle = 0, planar = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
         returned view stays valid.
 
-        band_swizzle: repack a [k/16, n/16, 16K] trellis tensor band-contiguous during the
-        copy -- physical order becomes (group n/128, k-tile, member, tile), one strided copy_.
-        The returned view keeps the original logical shape; only the byte order differs
-        (consumed by the swz-aware kernels in moe_mul1.cpp)."""
+        band_swizzle/planar: repack a [k/16, n/16, 16K] trellis tensor with the given packed
+        layout during the copy (see _copy_repacked). The returned view keeps the original
+        logical shape; only the byte order differs (consumed by the swz-aware kernels in
+        moe_mul1.cpp)."""
         import torch
         if tensor is None or tensor.numel() == 0:
             return tensor
@@ -589,10 +608,8 @@ class _HugeArena:
         self.cur_off += aligned
         buf = memoryview(self.cur)[off : off + nbytes]
         dst = torch.frombuffer(buf, dtype = torch.uint8)
-        if band_swizzle:
-            tk, tn, ps = tensor.shape
-            dst.view(tensor.dtype).view(tn // 8, tk, 8, ps) \
-               .copy_(tensor.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+        if band_swizzle or planar:
+            _copy_repacked(dst.view(tensor.dtype).view(tensor.shape), tensor, band_swizzle, planar)
         else:
             dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
         return dst.view(tensor.dtype).view(tensor.shape)
@@ -650,12 +667,15 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
-        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
+        # Repack the trellis copies into the packed layout the kernel tier wants for each
+        # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
+        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        swz = TUNING.swizzle
 
         def rehome_trellis(t):
-            return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
+            grp = cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
+            pln = grp and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0)
+            return arena.rehome(t, band_swizzle = grp, planar = pln)
 
         def nbytes(t):
             return t.numel() * t.element_size()
@@ -748,10 +768,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
                 new = stc.get_tensor(key + ".trellis", cpu)
                 assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
-                if swz and v_tr.shape[2] // 16 != 8:
-                    tk, tn, ps = new.shape
-                    v_tr.view(tn // 8, tk, 8, ps) \
-                        .copy_(new.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+                grp = cext.exl3_moe_cpu_swizzle_group(new.shape[2] / 16.0) if swz else 0
+                if grp:
+                    _copy_repacked(v_tr, new, grp, cext.exl3_moe_cpu_planar_layout(new.shape[2] / 16.0))
                 else:
                     v_tr.copy_(new)
                 v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
@@ -1414,16 +1433,15 @@ class MoeCpuHost:
         d = self._dev_bufs.get(key)
         mx = self._max_proj_numel()
         if d is None:
-            # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the
-            # child's arena rehome, K8 excepted per matrix); the GPU restores the native tile
-            # order into a parallel ring after each DMA
-            swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+            # Experts arrive in the packed CPU layout when the tier bands them (same rule as
+            # the child's arena rehome, exl3_moe_cpu_swizzle_group). The CUDA consumers read
+            # those bytes directly; only the HIP restore pass needs native-order bytes, so the
+            # parallel ring is allocated lazily on the first slot that restores (_native_slots).
+            # An eager ring here cost ~4% streamed prefill on hosts where nothing needed it.
             d = dict(
                 vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                               for _ in range(self.num_wslots)],
-                native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                                for _ in range(self.num_wslots)] if swz else None,
-                swz = swz,
+                native_slots = None,
                 w_scratch = None,
                 fused_bufs = {},
                 recon = {},
@@ -1435,6 +1453,16 @@ class MoeCpuHost:
             d["w_scratch"] = torch.empty(mx, dtype = torch.half, device = device)
         return d
 
+    def _native_slots(self, device):
+        """The native-order VRAM ring for restored streamed experts, allocated on first use
+        (see _device_buffers); layers whose experts stay packed never touch it"""
+        bufs = self._dev_bufs[torch.device(device).index or 0]
+        if bufs["native_slots"] is None:
+            bufs["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16,
+                                                device = device)
+                                    for _ in range(self.num_wslots)]
+        return bufs["native_slots"]
+
     def _ensure_stream_state(self, device):
         key = torch.device(device).index or 0
         st = self.sstate.get(key)
@@ -1445,7 +1473,6 @@ class MoeCpuHost:
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = bufs["vram_slots"],
             native_slots = bufs["native_slots"],
-            swz = bufs["swz"],
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
@@ -1489,8 +1516,10 @@ class MoeCpuHost:
         self.sstate[key] = st
         return st
 
-    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
-        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). out_dtype
+    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half,
+                   group = 0, planar = 0):
+        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). group/planar:
+        the packed trellis layout of trellis_view (0/0 = native). out_dtype
         follows the resident experts (fp32 for the down projection, the model's interm_dtype
         for gate/up): on models with massive activations the output-side Hadamard concentrates
         a 128-block past the fp16 range, and an in-place fp16 transform overflows to inf"""
@@ -1498,7 +1527,7 @@ class MoeCpuHost:
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh, None, 1.0)
         w = w_scratch[:k * n].view(k, n)
-        ext.reconstruct(w, trellis_view, K, False, True)
+        ext.reconstruct(w, trellis_view, K, False, True, group, planar)
         y = torch.empty((x.shape[0], n), dtype = out_dtype, device = x.device)
         ext.hgemm(xh, w, y)
         ext.had_r_128(y, y, None, svh, 1.0)
@@ -1702,6 +1731,32 @@ class MoeCpuHost:
         # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path
         blocks = self.layer_blocks[layer_idx] if self.pinned else None
 
+        # Streamed GPU layout policy. The arena holds packed trellis bytes (group 2/8 tile
+        # order, planar dwords on the AVX2 tier) and the CUDA consumers read them directly:
+        # the reconstruct kernels gather tiles in their global->shared load and undo the dword
+        # order as they index the tile, the fused MoE GEMM gathers tiles in its 16-byte
+        # cp.async B-stage and remaps the dequant's shared-word indices. Only the HIP build's
+        # kernels keep native addressing, so there the restore pass (and its ring) stays.
+        # Rates are fixed per layer, so the per-projection layout is cached on the spec; a
+        # layer that needs nothing reads vram_slots exactly as before packed layouts existed
+        # (no ring, no copy pass).
+        if "stream_layout" not in spec:
+            lay = []
+            for nm in ("g", "u", "d"):
+                if pd.get(nm) and TUNING.swizzle:
+                    K = pd[nm][2]
+                    lay.append((int(ext.exl3_moe_cpu_swizzle_group(K)),
+                                int(ext.exl3_moe_cpu_planar_layout(K))))
+                else:
+                    lay.append((0, 0))
+            lay = tuple(lay)
+            spec["stream_layout"] = (lay, torch.version.hip is not None and any(lay))
+        layout, restore = spec["stream_layout"]
+        # Layout the GPU consumers see: the packed bytes, or native order when restoring
+        lay = ((0, 0),) * 3 if restore else layout
+        groups = tuple(g for g, _ in lay)
+        planars = tuple(p for _, p in lay)
+
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
         # experts too hot for the temp buffers take the per-expert reconstruct path. Same
         # eligibility as support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2
@@ -1763,23 +1818,29 @@ class MoeCpuHost:
                     st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
+            if restore and st["native_slots"] is None:
+                # First batch on this device that actually needs native-order bytes: allocate
+                # the ring on the compute stream (the caching allocator ties the block to the
+                # stream it was carved on, and the copy stream only ever writes into it)
+                st["native_slots"] = self._native_slots(y.device)
             with torch.cuda.stream(copy_stream):
-                if st["swz"]:
-                    # Restore the native tile order on the copy stream, one launch per projection
-                    # over the whole batch (K8 matrices were never swizzled: plain copy)
-                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
+                if restore:
+                    # Restore the native tile order on the copy stream, one launch per
+                    # projection over the whole batch (group-0 projections in an otherwise
+                    # packed layer take the plain-copy path in the same kernel)
+                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
                         if not pd.get(name):
                             continue
                         k, n, K = pd[name]
                         ext.moe_unswizzle_trellis(
                             st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, K != 8)
+                            k // 16, n // 16, K, layout[pi][0], layout[pi][1])
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
+            vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
@@ -1833,7 +1894,9 @@ class MoeCpuHost:
                         tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt,
+                        groups[0], groups[1], groups[2],
+                        planars[0], planars[1], planars[2]
                     )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
@@ -1872,7 +1935,8 @@ class MoeCpuHost:
                     recon.run_group(
                         y_ext, out_ext, tok_ext, w_ext,
                         grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
+                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]),
+                        groups = groups, planars = planars)
                 heavy = []
             single_ids = {e for _, e in single} if recon is not None else None
             for bi, e, idx, wseg in per_e:
@@ -1900,16 +1964,19 @@ class MoeCpuHost:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
-                                         st["w_scratch"], out_dtype = idt)
+                                         st["w_scratch"], out_dtype = idt,
+                                         group = groups[0], planar = planars[0])
                 uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
-                                     st["w_scratch"], out_dtype = idt)
+                                     st["w_scratch"], out_dtype = idt,
+                                     group = groups[1], planar = planars[1])
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
                 dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
-                                     st["w_scratch"], out_dtype = torch.float)
+                                     st["w_scratch"], out_dtype = torch.float,
+                                     group = groups[2], planar = planars[2])
                 out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
