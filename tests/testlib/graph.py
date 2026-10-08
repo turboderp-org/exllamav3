@@ -1,16 +1,20 @@
 """
 Model-level helpers for CUDA-graph (BC_*) path tests: greedy generation that keeps each decode step's logits, and
-the teacher-forced check of those logits against the plain (no-cache) model forward over the same tokens.
+the comparison of a scenario's decode run with graphs captured against the same run with capture disabled.
 
-    results = generate_with_logits(model, cache, tokenizer, prompts, max_new_tokens = 12)
-    for prompt, (tokens, logits) in zip(prompts, results):
-        assert_decode_matches_forward(model, tokenizer.encode(prompt, add_bos = True), tokens, logits, tol = 2e-2)
+    def scenario(model_dir):                        # module-level, runs in a child process
+        _, model, (cache,), tok = load_with_caches(model_dir, get_test_device())
+        return [("label", *generate_with_logits(model, cache, tok, prompts, 12)[0])]
 
-Cache-mode decode differs from the no-cache path only at kernel precision; a graph replayed against the wrong state
-(stale strides, unpatched inputs) is off by orders of magnitude, so the relative Frobenius error per step separates
-the two cleanly. On models whose MoE routing amplifies row-count (GEMM tiling) differences, kernel precision itself
-is far coarser, so the tolerance scales with a measured noise floor: the same no-cache reference against forwards
-of exactly prompt + k tokens.
+    graphed, eager = run_with_and_without_graphs(scenario, model_dir, device = device)
+    assert_matches_eager(graphed, eager)
+
+EXL3_GRAPHS=0 runs every graphed site's C++ launch sequence eagerly (the same kernels in the same order), so a
+correctly replayed graph reproduces the eager run's logits bit for bit, while a graph replayed against the wrong
+state (stale strides, unpatched inputs) is off by orders of magnitude. The eager run is a sharper reference than the
+no-cache forward: decode and prefill differ by the decode path's own precision (int8-activation GEMVs, decode
+attention), which MoE routing near-ties amplify into isolated large deviations. Both runs are child processes with
+EXL3_GRAPHS set explicitly, since the default differs per backend (off on ROCm).
 """
 
 import gc
@@ -82,37 +86,24 @@ def _rfn(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a[m] - b[m]).norm() / b[m].norm()).item()
 
 
-def decode_vs_forward_errors(model, input_ids: torch.Tensor, tokens: list[int],
-                             step_logits: list[torch.Tensor]) -> tuple[list[float], list[float]]:
-    """Per-step relative Frobenius errors (decode, floor). decode: the decode logits against the no-cache forward
-    of prompt + tokens (teacher-forced: step k is scored on the prompt and the first k generated tokens). floor:
-    the same reference against a no-cache forward of exactly prompt + k tokens, i.e. what a different GEMM row
-    count alone does to this model's logits (MoE routing near-ties amplify it far above kernel precision on some
-    models)"""
-    n = len(tokens)
-    assert n == len(step_logits), f"{n} tokens but {len(step_logits)} logit rows"
-    ids = torch.cat((input_ids, torch.tensor([tokens[:-1]], dtype = input_ids.dtype)), dim = 1)
-    prompt_len = input_ids.shape[1]
-    with torch.inference_mode():
-        ref = model.forward(ids, params = {"last_tokens_only": n})[0].float()
-        floor = [_rfn(model.forward(ids[:, :prompt_len + k], params = {"last_tokens_only": 1})[0, 0], ref[k])
-                 for k in range(n)]
-    errs = [_rfn(step_logits[k], ref[k]) for k in range(n)]
-    return errs, floor
+def run_with_and_without_graphs(fn, *args, device, timeout: float = 900.0):
+    """(graphed, eager): fn(*args) in two child processes pinned to `device`, with graph capture enabled and
+    disabled. fn is a module-level function of the test module that loads on get_test_device() and returns its
+    generations as [(label, tokens, step logits)], logits on the CPU"""
+    from testlib.isolated import device_env, run_isolated
+    graphed = run_isolated(fn, *args, env = {**device_env(device), "EXL3_GRAPHS": "1"}, timeout = timeout)
+    eager = run_isolated(fn, *args, env = {**device_env(device), "EXL3_GRAPHS": "0"}, timeout = timeout)
+    return graphed, eager
 
 
-def assert_decode_matches_forward(model, input_ids: torch.Tensor, tokens: list[int], step_logits: list[torch.Tensor],
-                                  tol: float, label: str = "", min_steps: int = 1, floor_factor: float = 2.0) -> float:
-    """Assert every decode step's logits are within tolerance (relative Frobenius) of the teacher-forced no-cache
-    forward; returns the worst step's error. The tolerance is tol, or floor_factor times the model's measured
-    row-count noise floor where that is higher: a graph replayed against the wrong state is off by orders of
-    magnitude more than either"""
-    assert len(tokens) >= min_steps, f"{label}: too few decode steps to check ({len(tokens)})"
-    errs, floor = decode_vs_forward_errors(model, input_ids, tokens, step_logits)
-    worst = max(errs)
-    limit = max(tol, floor_factor * max(floor))
-    assert worst < limit, (
-        f"{label}: decode logits deviate from the no-cache reference (per-step rfn "
-        f"{[round(e, 4) for e in errs]}, tol {limit:.4f}; row-count noise floor {[round(e, 4) for e in floor]})"
-    )
-    return worst
+def assert_matches_eager(graphed, eager, tol: float = 1e-3, min_steps: int = 1):
+    """Every generation of the graphed run has the eager run's tokens, and per-step logits within tol (relative
+    Frobenius; expected exact, the tolerance only absorbs atomics-order noise where a kernel has it)"""
+    assert len(graphed) == len(eager), f"{len(graphed)} graphed generations, {len(eager)} eager"
+    for (label, tok_g, lg_g), (label_e, tok_e, lg_e) in zip(graphed, eager):
+        assert label == label_e
+        assert len(tok_g) >= min_steps, f"{label}: too few decode steps to check ({len(tok_g)})"
+        assert tok_g == tok_e, f"{label}: graphed tokens {tok_g} differ from eager {tok_e}"
+        errs = [_rfn(a, b) for a, b in zip(lg_g, lg_e)]
+        assert max(errs) <= tol, f"{label}: graphed decode logits deviate from eager (per-step rfn " \
+                                 f"{[round(e, 6) for e in errs]}, tol {tol})"
