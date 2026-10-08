@@ -85,7 +85,7 @@ def test_cpu_tiers_agree():
         pytest.skip("no vector tier in this build")
     base = outs[tiers[0]]
     assert any(k.startswith("3.5_") for k in base)
-    # Each case against the lowest tier that ran it (swizzled cases exist from AVX-512 BW up)
+    # Each case against the lowest tier that ran it (packed cases exist from AVX2 up).
     first = {}
     for t in tiers:
         for k, v in outs[t].items():

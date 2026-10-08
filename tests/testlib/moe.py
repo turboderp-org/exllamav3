@@ -67,11 +67,19 @@ def contiguous_layout(counts: list[int], device) -> tuple[torch.Tensor, torch.Te
     return torch.arange(A, device = device), expert_count, torch.cumsum(expert_count, 0) - expert_count
 
 
-def swizzle_trellis(t: torch.Tensor) -> torch.Tensor:
-    """Band-swizzled copy of a (k/16, n/16, 16K) trellis as the CPU expert arena stores it: physical order
-    (n/128 group, k-tile, member, tile)"""
+def swizzle_trellis(t: torch.Tensor, group: int = 8, planar: int = 0) -> torch.Tensor:
+    """CPU arena tile order (n/group, k-tile, member), optionally with bit-plane-major dwords.
+    Preserve the source device so pointer tables can consume repacked GPU experts directly."""
     tk, tn, ps = t.shape
-    return t.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3).contiguous().view(tk, tn, ps)
+    if not group:
+        return t.clone()
+    if planar:
+        wd = ps // 2
+        out = torch.empty(tk * tn * wd, dtype = torch.int32, device = t.device)
+        out.view(tn // group, tk, group, wd // 8, 8).copy_(
+            t.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+        return out.view(torch.int16).view(t.shape)
+    return t.view(tk, tn // group, group, ps).permute(1, 0, 2, 3).contiguous().view(t.shape)
 
 
 def exl3_linear_ref(x: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor, K: float,

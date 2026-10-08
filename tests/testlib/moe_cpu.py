@@ -10,8 +10,8 @@ Every tier this CPU can run is covered ("scalar" always; the int8 tiers "avx2", 
 CPU has them), and each child's tier is checked against the cap it ran under. `worker` follows the rules of
 testlib.isolated.run_isolated (module-level function, picklable arguments, torch.save-able result).
 
-Layout: on the AVX-512 tiers expert trellises may be band-swizzled (`swizzle`), what the host does when
-has_avx512_bw() (K8 tensors stay native).
+Layout: expert trellises use the active tier's group/planar descriptors, exactly as the host
+arena does (AVX2 integer rates: group-2 planar; AVX-512: group-8 except K8; scalar: native).
 
 Runtime: the native worker pool can pin its caller's thread and the tests limit torch's own threads around it;
 the `cpu_runtime` fixture restores the process affinity and torch thread count afterwards. Import it into the
@@ -67,15 +67,18 @@ def run_per_tier(func, *args, tiers = None, env: dict | None = None, **kwargs) -
 
 
 def swizzle(t: torch.Tensor) -> torch.Tensor:
-    """Band-contiguous layout of a [k/16, n/16, 16K] trellis: blocks of 8 column tiles become contiguous. K8
-    tensors (16 * 8 words) are left native, as the host does"""
-    return t.contiguous() if t.shape[-1] == 128 else swizzle_trellis(t)
+    """Pack each matrix with the active CPU tier's descriptor for its trellis rate."""
+    from exllamav3.ext import exllamav3_ext as ext
+    K = t.shape[-1] / 16
+    group = ext.exl3_moe_cpu_swizzle_group(K)
+    planar = ext.exl3_moe_cpu_planar_layout(K)
+    return swizzle_trellis(t, group, planar) if group else t.contiguous()
 
 
 def swizzle_layouts() -> tuple[bool, ...]:
     """(native,) or (native, swizzled): the layouts the active tier takes"""
     from exllamav3.ext import exllamav3_ext as ext
-    return (False, True) if ext.exl3_moe_cpu_has_avx512_bw() else (False,)
+    return (False, True) if ext.exl3_moe_cpu_swizzle_group(3) else (False,)
 
 
 @pytest.fixture

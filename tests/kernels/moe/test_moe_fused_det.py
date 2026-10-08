@@ -32,7 +32,7 @@ def launch(y, out, layout_args, bufs, tabs, num_active = -1, scratch = None, bas
     expert_count, token_sorted, weight_sorted = layout_args
     ext.exl3_moe(y, out, expert_count, token_sorted, weight_sorted, *bufs, 0, K, K, K,
                  *tabs["g"], *tabs["u"], *tabs["d"], False, True, False, True, False, True, 0.0, num_active,
-                 scratch, base, lo, hi, m_tile)
+                 scratch, base, lo, hi, m_tile, 0, 0, 0, 0, 0, 0)
 
 
 @pytest.mark.parametrize("seed", [0, 1])

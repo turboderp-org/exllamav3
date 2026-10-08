@@ -42,7 +42,7 @@ def test_fused_prefill_instances(device, K, dims):
     def launch(tabs_, K_down, lo, hi, m_tile, out):
         ext.exl3_moe(y, out, expert_count, token_sorted, weight_sorted, *bufs, 0, K, K, K_down,
                      *tabs_["g"], *tabs_["u"], *tabs_["d"], False, True, False, True, False, True, 0.0, -1,
-                     None, None, lo, hi, m_tile)
+                     None, None, lo, hi, m_tile, 0, 0, 0, 0, 0, 0)
 
     ref = ref_of(exd, K)
     scale = ref.abs().max().item()

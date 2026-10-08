@@ -2,6 +2,17 @@
 
 #include "codebook.cuh"
 
+// Planar dword order (see cpu/moe_mul1.h): native dword i of a tile is stored at
+// 8 * (i % bits) + (i / bits). The fused GEMM's B-stage copies whole tiles into shared with
+// 16-byte cp.async, which cannot express an intra-tile permutation, so the consumer remaps
+// its shared-word indices instead: same bytes, same LDS transaction count (a fragment's
+// window still spans at most two dwords, just not adjacent ones).
+template <int bits>
+__device__ __forceinline__ int dq_word(int i, const bool planar)
+{
+    return planar ? 8 * (i % bits) + (i / bits) : i;
+}
+
 __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift)
 {
      uint64_t merged = ((uint64_t)a << 32) | (uint64_t) b;
@@ -13,7 +24,7 @@ __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, i
 }
 
 template <int bits, int cb>
-__device__ __forceinline__ half dq(const uint32_t* ptr, int t_offset)
+__device__ __forceinline__ half dq(const uint32_t* ptr, int t_offset, const bool planar = false)
 {
     int b0 = t_offset * bits + bits - 16 + 256 * bits;  // bit index, start of word0
     int b1 = b0 + 16;                                   // bit index, end of word0
@@ -22,8 +33,8 @@ __device__ __forceinline__ half dq(const uint32_t* ptr, int t_offset)
     int s0 = (i1 + 1) * 32 - b1;                        // shift value to align word1 to 32-bit boundary
 
     // Load 32 or 64 bits containing word0
-    uint32_t a = ptr[i0 % (bits * 256 / 32)];
-    uint32_t b = ptr[i1 % (bits * 256 / 32)];
+    uint32_t a = ptr[dq_word<bits>(i0 % (bits * 256 / 32), planar)];
+    uint32_t b = ptr[dq_word<bits>(i1 % (bits * 256 / 32), planar)];
 
     // Shift into place
     uint32_t w0 = __funnelshift_r(b, a, s0) & 0xffff;
@@ -31,7 +42,7 @@ __device__ __forceinline__ half dq(const uint32_t* ptr, int t_offset)
 }
 
 template <int bits, int cb>
-__device__ __forceinline__ half2 dq2(const uint32_t* ptr, int t_offset)
+__device__ __forceinline__ half2 dq2(const uint32_t* ptr, int t_offset, const bool planar = false)
 {
     int b0 = t_offset * bits + bits - 16 + 256 * bits;  // bit index, start of word0
     int b1 = b0 + 16;                                   // bit index, end of word0
@@ -40,8 +51,8 @@ __device__ __forceinline__ half2 dq2(const uint32_t* ptr, int t_offset)
     int s0 = (i1 + 1) * 32 - b1;                        // shift value to align word1 to 32-bit boundary
 
     // Load 32 or 64 bits containing word0
-    uint32_t a = ptr[i0 % (bits * 256 / 32)];
-    uint32_t b = ptr[i1 % (bits * 256 / 32)];
+    uint32_t a = ptr[dq_word<bits>(i0 % (bits * 256 / 32), planar)];
+    uint32_t b = ptr[dq_word<bits>(i1 % (bits * 256 / 32), planar)];
 
     // Shift into place
     uint32_t w1 = __funnelshift_r(b, a, s0)        & 0xffff;
@@ -50,7 +61,7 @@ __device__ __forceinline__ half2 dq2(const uint32_t* ptr, int t_offset)
 }
 
 template <int bits, int cb>
-__device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& frag)
+__device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& frag, const bool planar = false)
 {
     int b0 = (t_offset + 257) * bits - 16;      // start of first word
     int b1 = b0 + 3 * bits;                     // start of last word
@@ -59,8 +70,8 @@ __device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& fr
     int i2 = (b2 - 1) / 32;                     // uint32 containing last bit of last word, may be == i0
     int s2 = (i2 + 1) * 32 - b2;                // shift value to align last word to 32-bit boundary
 
-    uint32_t a = ptr[i0 % (bits * 256 / 32)];
-    uint32_t b = ptr[i2 % (bits * 256 / 32)];
+    uint32_t a = ptr[dq_word<bits>(i0 % (bits * 256 / 32), planar)];
+    uint32_t b = ptr[dq_word<bits>(i2 % (bits * 256 / 32), planar)];
     uint32_t w3 = fshift(b, a, s2)            & 0xffff;
     uint32_t w2 = fshift(b, a, s2 + bits)     & 0xffff;
     uint32_t w1 = fshift(b, a, s2 + bits * 2) & 0xffff;
@@ -72,7 +83,7 @@ __device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& fr
 }
 
 template <int bits, int cb>
-__device__ __forceinline__ void dq2x2(const uint32_t* ptr, int t_offset, FragB& frag)
+__device__ __forceinline__ void dq2x2(const uint32_t* ptr, int t_offset, FragB& frag, const bool planar = false)
 {
     #pragma unroll
     for (int i = 0; i < 2; ++i)
@@ -84,8 +95,8 @@ __device__ __forceinline__ void dq2x2(const uint32_t* ptr, int t_offset, FragB& 
         int i2 = (b2 - 1) / 32;                         // uint32 containing last bit of last word, may be == i0
         int s2 = (i2 + 1) * 32 - b2;                    // shift value to align last word to 32-bit boundary
 
-        uint32_t a = ptr[i0 % (bits * 256 / 32)];
-        uint32_t b = ptr[i2 % (bits * 256 / 32)];
+        uint32_t a = ptr[dq_word<bits>(i0 % (bits * 256 / 32), planar)];
+        uint32_t b = ptr[dq_word<bits>(i2 % (bits * 256 / 32), planar)];
         uint32_t w1 = fshift(b, a, s2)        & 0xffff;
         uint32_t w0 = fshift(b, a, s2 + bits) & 0xffff;
         half2 d0d1 = decode_3inst_2<cb>(w0, w1);
@@ -94,7 +105,7 @@ __device__ __forceinline__ void dq2x2(const uint32_t* ptr, int t_offset, FragB& 
 }
 
 template <int bits, int cb, int align>
-__device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     int b1 = (t_offset + 257) * bits;               // end of first word
     int b0 = b1 - 16;                               // start of first word
@@ -103,8 +114,8 @@ __device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& fr
     int i2 = (b2 - 1) / 32;                         // uint32 containing last bit of word0, may be == i0
     int s2 = (i2 + 1) * 32 - b2;                    // shift value to align last word to 32-bit boundary
 
-    uint32_t a = ptr[i0 % (bits * 256 / 32)];
-    uint32_t b = ptr[i2 % (bits * 256 / 32)];
+    uint32_t a = ptr[dq_word<bits>(i0 % (bits * 256 / 32), planar)];
+    uint32_t b = ptr[dq_word<bits>(i2 % (bits * 256 / 32), planar)];
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
     if constexpr (align == 1)
     {
@@ -161,13 +172,13 @@ __device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& fr
 }
 
 template <int cb>
-__device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     uint32_t i0, i1, a, b, s, w0, w1, w2, w3, w4, w5, w6, w7;
     i1 = t_offset >> 3;
     i0 = (i1 + 31) & 31;
-    a = ptr[i0];
-    b = ptr[i1];
+    a = ptr[dq_word<4>(i0, planar)];
+    b = ptr[dq_word<4>(i1, planar)];
     FSHF_IMM(s, b, a, 20);
     w7 = b & 0xffff;
     BFE16_IMM(w6, b, 4);
@@ -184,13 +195,13 @@ __device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_off
 }
 
 template <int cb>
-__device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
     i1 = t_offset >> 4;
     i0 = (i1 + 15) & 15;
-    a = ptr[i0];
-    b = ptr[i1];
+    a = ptr[dq_word<2>(i0, planar)];
+    b = ptr[dq_word<2>(i1, planar)];
     b = fshift(b, a, ((~t_offset) & 8) << 1);
     w7 = b & 0xffff;
     BFE16_IMM(w6, b, 2);
@@ -207,13 +218,13 @@ __device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_off
 }
 
 template <int cb>
-__device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
     i1 = t_offset >> 5;
     i0 = (i1 + 7) & 7;
-    a = ptr[i0];
-    b = ptr[i1];
+    a = ptr[dq_word<1>(i0, planar)];
+    b = ptr[dq_word<1>(i1, planar)];
     b = fshift(b, a, ((~t_offset) & 24));
     w7 = b & 0xffff;
     BFE16_IMM(w6, b, 1);
@@ -231,12 +242,12 @@ __device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offs
 
 
 template <int cb>
-__device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     int i1 = t_offset / 8;
     int i0 = (i1 + 31) % 32;
-    uint32_t a = ptr[i0];
-    uint32_t b = ptr[i1];
+    uint32_t a = ptr[dq_word<4>(i0, planar)];
+    uint32_t b = ptr[dq_word<4>(i1, planar)];
     uint32_t w7 = bfe64(b, a, 0, 16);
     uint32_t w6 = bfe64(b, a, 4, 16);
     uint32_t w5 = bfe64(b, a, 8, 16);
@@ -285,46 +296,46 @@ __device__ __forceinline__ void dq8_half(const uint32_t* ptr, int t_offset, Frag
 }
 
 template <int bits, int cb, bool half_k = false>
-__device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
+__device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1, const bool planar = false)
 {
     if constexpr (half_k)
     {
-        dq8_half<bits, cb>(ptr, idx, frag0, frag1);
+        dq8_half<bits, cb>(ptr, idx, frag0, frag1);   // half-integer rates are never planar
     }
     else if constexpr (bits == 1)
     {
-        dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1);
+        dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1, planar);
     }
     else if constexpr (bits == 2)
     {
-        dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1);
+        dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1, planar);
     }
     else if constexpr (bits == 3)
     {
-        dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+        dq8<bits, cb, 4>(ptr, idx, frag0, frag1, planar);
     }
     else if constexpr (bits == 4)
     {
-        dq8_aligned_4bits<cb>(ptr, idx, frag0, frag1);
+        dq8_aligned_4bits<cb>(ptr, idx, frag0, frag1, planar);
     }
     else if constexpr (bits == 5)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        dq4<bits, cb>(ptr, idx, frag0, planar);
+        dq4<bits, cb>(ptr, idx + 4, frag1, planar);
     }
     else if constexpr (bits == 6)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        dq4<bits, cb>(ptr, idx, frag0, planar);
+        dq4<bits, cb>(ptr, idx + 4, frag1, planar);
     }
     else if constexpr (bits == 7)
     {
-        dq2x2<bits, cb>(ptr, idx, frag0);
-        dq2x2<bits, cb>(ptr, idx + 4, frag1);
+        dq2x2<bits, cb>(ptr, idx, frag0, planar);
+        dq2x2<bits, cb>(ptr, idx + 4, frag1, planar);
     }
     else if constexpr (bits == 8)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        dq4<bits, cb>(ptr, idx, frag0, planar);
+        dq4<bits, cb>(ptr, idx + 4, frag1, planar);
     }
 }

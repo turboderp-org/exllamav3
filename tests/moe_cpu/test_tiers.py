@@ -10,9 +10,10 @@ subprocess; on a VBMI machine that exercises vbmi, vnni, bw, avx2 and scalar. Co
 experts, 1..5 tokens (m = 1..4 rows per expert chunk), the swizzled layout, and a 256-token case that takes the
 GEMV phases' many-GEMV (strided) regime.
 
-The second test repeats the comparison on real expert weights from the lfm2.5-8b-a1b mul1 ladder (one K per
-model, layer 2, single-threaded so the accumulation order is fixed): there the int8 tiers must be bit-identical,
-since real trellis statistics can expose extraction bugs that random states miss.
+Real expert weights from the lfm2.5-8b-a1b mul1 ladder (one K per model, layer 2, single-threaded so the
+accumulation order is fixed) require the int8 tiers to be bit-identical: real trellis statistics can expose
+extraction bugs that random states miss. Real arena rehome and in-place replacement are also checked against
+native weights at every rate, including mixed native/packed projection layouts.
 """
 
 import json
@@ -51,7 +52,7 @@ def random_weight_outputs() -> dict:
         s = torch.randint(0, 2, (n,), generator = g).float() * 2 - 1
         return (s * (1.0 + 0.1 * torch.randn(n, generator = g))).half().contiguous()
 
-    # The swizzled layout is only ever handed to the tiers that consume it (scalar and avx2 read native only)
+    # Only tiers with a packed descriptor receive the corresponding repacked matrices.
     swz_capable = True in swizzle_layouts()
 
     results = {}
@@ -149,7 +150,7 @@ def rel_l2(a, b):
 def test_tiers_agree_random_weights():
     outs = run_per_tier(random_weight_outputs)
     assert "avx2" in outs
-    ref = outs["avx2"]   # native layout only; swizzled results compare against the same weights natively
+    ref = {key: out for key, out in outs["avx2"].items() if not key[2]}   # native-layout oracle
     native = lambda key: (key[0], key[1], False, key[3], key[4])
     if any(t in outs for t in ("bw", "vnni", "vbmi")):
         assert any(k[2] for t in ("bw", "vnni", "vbmi") if t in outs for k in outs[t]), "no swizzled case ran"
@@ -161,6 +162,83 @@ def test_tiers_agree_random_weights():
             rel = rel_l2(out, ref[native(key)])
             assert rel <= tol, \
                 f"tier {tier} vs avx2 differs on (K, gated, swizzled, tokens, threads) = {key}: rel {rel:.3e} > {tol}"
+
+
+def _arena_repack_and_replacement():
+    """Real arena packing and in-place installs, compared with the same weights natively."""
+    from exllamav3.ext import exllamav3_ext as ext
+    from exllamav3.model.moe_cpu_host import _HugeArena, _copy_repacked
+    from testlib.exl3 import rand_experts, rand_scale, rand_trellis
+
+    arena = _HugeArena()
+    arena.CHUNK_BYTES = arena.CHECK_STEP = 4 << 20
+    gen = torch.Generator().manual_seed(1234)
+    H, I, E = 256, 256, 2
+    x = (torch.randn(5, H, generator = gen) * 0.05).half()
+    sel = torch.tensor([[0], [0], [0], [0], [1]], dtype = torch.long)
+    weights = torch.ones(5, 1, dtype = torch.half)
+
+    def layer(ex, packed):
+        lists = [tensors for p in ("g", "u", "d")
+                 for tensors in ([e[0] for e in ex[p]], [e[1] for e in ex[p]], [e[2] for e in ex[p]])]
+        return ext.exl3_moe_cpu_make_layer(*lists, [], [], [], 0 if ex["g"] else 2, 0.0, int(packed))
+
+    def forward(handle):
+        out = torch.empty(5, H, dtype = torch.float)
+        ext.exl3_moe_cpu_forward(handle, x, sel, weights, out, 1)
+        return out
+
+    for K in (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8):
+        for gated in (False, True):
+            ex = rand_experts(E, H, I, K, gen)
+            if not gated:
+                ex["g"] = []
+            # Mixed-rate layers can combine packed gate/up and native down (K8 on AVX-512),
+            # or native gate/up and packed down (fractional gate/up on AVX2).
+            ex["d"] = [(rand_trellis(I, H, 8, gen), su, sv) for _, su, sv in ex["d"]]
+            home = {}
+            for p, experts in ex.items():
+                home[p] = []
+                for tr, su, sv in experts:
+                    rate = tr.shape[-1] / 16
+                    group, planar = ext.exl3_moe_cpu_swizzle_group(rate), ext.exl3_moe_cpu_planar_layout(rate)
+                    home[p].append((arena.rehome(tr, group, planar), arena.rehome(su), arena.rehome(sv)))
+            handle = layer(home, True)
+            try:
+                for replaced in (False, True):
+                    if replaced:
+                        for p, experts in ex.items():
+                            if not experts:
+                                continue
+                            old, _, _ = experts[0]
+                            rate = old.shape[-1] / 16
+                            k, n = (I, H) if p == "d" else (H, I)
+                            tr = rand_trellis(k, n, rate, gen)
+                            su, sv = rand_scale(k, gen), rand_scale(n, gen)
+                            experts[0] = (tr, su, sv)
+                            dst, dst_su, dst_sv = home[p][0]
+                            _copy_repacked(dst, tr, ext.exl3_moe_cpu_swizzle_group(rate),
+                                           ext.exl3_moe_cpu_planar_layout(rate))
+                            dst_su.copy_(su)
+                            dst_sv.copy_(sv)
+                    native = layer(ex, False)
+                    try:
+                        got, ref = forward(handle), forward(native)
+                    finally:
+                        ext.exl3_moe_cpu_free_layer(native)
+                    assert torch.isfinite(got).all(), (K, gated, replaced)
+                    assert rel_l2(got, ref) <= INT8_TOL, (K, gated, replaced)
+                    if replaced:
+                        assert torch.equal(got[-1], before[-1]), "install changed another expert"
+                        assert not torch.equal(ref[:4], before[:4]), "replacement did not change the routed weights"
+                    else:
+                        before = got
+            finally:
+                ext.exl3_moe_cpu_free_layer(handle)
+
+
+def test_arena_repack_and_replacement_match_native():
+    run_per_tier(_arena_repack_and_replacement)
 
 
 @pytest.fixture(scope = "module")

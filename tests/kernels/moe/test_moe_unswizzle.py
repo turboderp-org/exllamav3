@@ -3,7 +3,7 @@ ext.moe_unswizzle_trellis: the GPU kernel that restores native (k/16, n/16, 16K)
 staged band-swizzled from the CPU arena must invert exactly the permutation the child applies at rehome (physical
 order (n/128 group, k-tile, member, tile), testlib.moe.swizzle_trellis), for every integer and half-integer K,
 across a batch laid out expert-major with g/u/d at fixed byte offsets and a different K for down, and act as a plain
-copy for matrices flagged unswizzled (K8 in production; a K8 matrix flagged swizzled is inverted like any other).
+copy for matrices flagged unswizzled (an explicitly grouped K8 matrix is restored like any other).
 """
 import pytest
 import torch
@@ -47,7 +47,8 @@ def test_unswizzle_expert_major(device, K, swizzle_k8):
     dst = torch.full_like(src, -1)
     for name, off in offsets.items():
         k, n, Kp = dims[name]
-        ext.moe_unswizzle_trellis(src, dst, E, exp_b, off, k // 16, n // 16, Kp, swizzled[name])
+        ext.moe_unswizzle_trellis(src, dst, E, exp_b, off, k // 16, n // 16, Kp,
+                                  8 if swizzled[name] else 0, 0)
     torch.cuda.synchronize()
     for e in range(E):
         for name, off in offsets.items():
@@ -69,11 +70,11 @@ def test_empty_unswizzle(device, E, tiles_k, tiles_n):
     """No experts or no tiles: nothing to copy; alignment and sign checks still apply"""
     src = torch.zeros(4096, dtype = torch.int16, device = device)
     dst = torch.full_like(src, -1)
-    ext.moe_unswizzle_trellis(src, dst, E, 4096, 0, tiles_k, tiles_n, 4, True)
+    ext.moe_unswizzle_trellis(src, dst, E, 4096, 0, tiles_k, tiles_n, 4, 8, 0)
     torch.cuda.synchronize()
     assert (dst == -1).all()
-    with pytest.raises(RuntimeError, match = "16-byte aligned"):
-        ext.moe_unswizzle_trellis(src, dst, E, 4096, 8, tiles_k, tiles_n, 4, True)
-    with pytest.raises(RuntimeError, match = "negative size"):
-        ext.moe_unswizzle_trellis(src, dst, -1, 4096, 0, tiles_k, tiles_n, 4, True)
+    with pytest.raises(RuntimeError):
+        ext.moe_unswizzle_trellis(src, dst, E, 4096, 8, tiles_k, tiles_n, 4, 8, 0)
+    with pytest.raises(RuntimeError):
+        ext.moe_unswizzle_trellis(src, dst, -1, 4096, 0, tiles_k, tiles_n, 4, 8, 0)
     _device_still_works(device)

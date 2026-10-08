@@ -1254,7 +1254,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.act_limit,
                         num_active,
                         scratch, tables[0] if tables is not None else None,
-                        count_lo, count_hi, m_tile
+                        count_lo, count_hi, m_tile,
+                        # GPU-resident weights are in the native trellis layout (the packed CPU
+                        # layouts only exist on the moe_cpu_host streaming path)
+                        0, 0, 0, 0, 0, 0
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency

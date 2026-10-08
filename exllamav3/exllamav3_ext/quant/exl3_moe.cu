@@ -299,7 +299,13 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const int group_g,
+    const int group_u,
+    const int group_d,
+    const int planar_g,
+    const int planar_u,
+    const int planar_d
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -319,6 +325,18 @@ void exl3_moe
     }
 
     // Validate args
+    TORCH_CHECK((group_g == 0 || group_g == 2 || group_g == 8) &&
+                (group_u == 0 || group_u == 2 || group_u == 8) &&
+                (group_d == 0 || group_d == 2 || group_d == 8),
+                "exl3_moe: trellis tile groups must be 0, 2 or 8");
+    TORCH_CHECK((planar_g == 0 || planar_g == 1) && (planar_u == 0 || planar_u == 1) &&
+                (planar_d == 0 || planar_d == 1), "exl3_moe: planar must be 0 or 1");
+    TORCH_CHECK((!planar_g || group_g) && (!planar_u || group_u) && (!planar_d || group_d),
+                "exl3_moe: planar requires a swizzled layout");
+#if defined(USE_ROCM)
+    TORCH_CHECK(!group_g && !group_u && !group_d && !planar_g && !planar_u && !planar_d,
+                "exl3_moe: HIP requires native trellis layouts");
+#endif
     TORCH_CHECK_DTYPE(hidden_state, kHalf);
     TORCH_CHECK_DIM(hidden_state, 2);
     size_t bsz = hidden_state.size(0);
@@ -368,6 +386,8 @@ void exl3_moe
     const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
     TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
                 "exl3_moe: half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK((!planar_g || K2_gate % 2 == 0) && (!planar_u || K2_up % 2 == 0) &&
+                (!planar_d || K2_down % 2 == 0), "exl3_moe: planar is undefined for half-integer bitrates");
     int K = 0;
     bool half_k = false;
     if (K2_gate == K2_up && K2_up == K2_down)
@@ -562,7 +582,13 @@ void exl3_moe
         &_output_scratch,
         &_fused_base,
         (void*) &count_lo,
-        (void*) &count_hi
+        (void*) &count_hi,
+        (void*) &group_g,
+        (void*) &group_u,
+        (void*) &group_d,
+        (void*) &planar_g,
+        (void*) &planar_u,
+        (void*) &planar_d
     };
 
     cudaLaunchKernel

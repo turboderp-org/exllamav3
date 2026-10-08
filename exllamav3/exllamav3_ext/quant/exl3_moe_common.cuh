@@ -55,4 +55,10 @@
     const int64_t* __restrict__ fused_base,     \
                                                 \
     const int count_lo,                         \
-    const int count_hi
+    const int count_hi,                         \
+    const int group_g,                          \
+    const int group_u,                          \
+    const int group_d,                          \
+    const int planar_g,                         \
+    const int planar_u,                         \
+    const int planar_d
