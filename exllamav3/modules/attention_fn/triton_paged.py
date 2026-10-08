@@ -736,8 +736,9 @@ _h32_cache = {}
 _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
 
 # Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
-# path reads less gmem (short trailing chunks over long contexts, low bitrates)
-_qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
+# path reads less gmem (short trailing chunks over long contexts, low bitrates). Per device:
+# where the staged window feeds SDPA (sm_75) every prefill chunk stages (util/backend.py)
+from ...util.backend import qc_prefill_two_pass_min_q, sdpa_prefill as _sdpa_prefill
 
 def _get_h32(device):
     if device not in _h32_cache:
@@ -1903,7 +1904,7 @@ def paged_attn_triton_prefill(
         # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
         # for the life of the process. The loader's autosplit budgets for the worst case (a window
         # spanning the pool) through Attention.autosplit_extra_measure
-        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+        if (_qc_staging == 1 and q_len >= qc_prefill_two_pass_min_q(q.device)
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
@@ -1927,6 +1928,21 @@ def paged_attn_triton_prefill(
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
+
+    # sm_75: a prefill chunk over a dense fp16 cache (the staged window above, or the fp16 cache itself)
+    # attends through SDPA / fa75 instead of the Triton kernel (util/backend.py). The direct quantized
+    # kernel is kept for what the staging pass left out (short chunks below its threshold, non-causal)
+    if (
+        qc is None and k_cache is not None and new_kv_mode == 0 and causal and q_len > 8 and
+        window_left < 0 and window_right < 0 and not softcap and not has_sinks and
+        q.dtype == torch.float16 and _sdpa_prefill(q.device)
+    ):
+        from .torch import sdpa_prefill_paged
+        if k is not None and kv_append_len:
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, block_table.shape[1], bsz,
+                             kv_append_len, n_kv_heads, page_size, head_dim)
+        return sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal,
+                                  softmax_scale, out)
 
     # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity

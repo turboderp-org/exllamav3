@@ -1,8 +1,5 @@
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
-from ...constants import PAGE_SIZE
-from ...ext import exllamav3_ext as ext
-from ...util.turing import turing_flag
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
@@ -117,18 +114,12 @@ def attn_dispatch(
     # kernels when possible: new K/V are quantized into the cache up front and never
     # materialized as full fp16 cache-sized temporaries
     q_cache = None
-    window_written = False
-    # Turing: prefill chunks (q_len > 8) attend over a dequantized fp16 window instead of the packed cache, since
-    # the Triton paged-prefill tiles shrink to fit 64 KB of shared memory there and run ~5x slower than PyTorch's
-    # memory-efficient SDPA (or fa75). Decode and draft verification stay quant-direct
-    sdpa_prefill = q_len > 8 and cu_seqlens is None and turing_flag("SDPA_PREFILL", q.device) != 0
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
             _qc_attn and
-            not sdpa_prefill and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and
@@ -138,28 +129,6 @@ def attn_dispatch(
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
-        elif (
-            sdpa_prefill and
-            isinstance(layer, CacheLayer_quant) and
-            layer.compand_a == 0.0 and
-            q.dtype == torch.float16 and
-            dim % 32 == 0 and
-            (window_size is None or window_size < 0)
-        ):
-            # Quantize the new rows straight into the cache, then dequantize only the window this call
-            # references (not the whole cache pool) into a compact fp16 scratch addressed through an
-            # identity block table. The cache is up to date afterwards, so the write-back below is skipped
-            layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
-            npps_w = min(block_table.shape[1], -(-(int(cache_seqlens.max()) + q_len) // PAGE_SIZE))
-            bt = block_table[:, :npps_w].contiguous()
-            k_cache = torch.empty((bsz * npps_w, PAGE_SIZE, num_kv_heads, dim), dtype = torch.half, device = q.device)
-            v_cache = torch.empty_like(k_cache)
-            ext.dequant_cache_paged_window(
-                layer.qk, layer.sk, k_cache, layer.qv, layer.sv, v_cache,
-                cache_seqlens, bt, PAGE_SIZE, q_len, 0.0,
-            )
-            block_table = torch.arange(bsz * npps_w, dtype = block_table.dtype, device = q.device).view(bsz, npps_w)
-            window_written = True
         else:
             k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
     else:
@@ -191,13 +160,8 @@ def attn_dispatch(
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
     # and would accept them as cache-less)
-    # Turing prefill tries the SDPA path first, under its own hint slot
-    if q_cache is not None:
-        candidates, hint_key = _fns_qc, "fn_qc"
-    elif sdpa_prefill and cache is not None:
-        candidates, hint_key = [fn_torch_sdpa_fallback_cache] + attn_fns, "fn_sdpa_pf"
-    else:
-        candidates, hint_key = attn_fns, "fn"
+    candidates = _fns_qc if q_cache is not None else attn_fns
+    hint_key = "fn_qc" if q_cache is not None else "fn"
 
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
@@ -216,8 +180,8 @@ def attn_dispatch(
         if dispatch_cache is not None:
             dispatch_cache[hint_key] = fn
 
-    # Update cache (quant-direct mode and the Turing prefill window already wrote the new K/V before the attention call)
-    if cache is not None and q_cache is None and not window_written:
+    # Update cache (quant-direct mode already wrote the new K/V before the attention call)
+    if cache is not None and q_cache is None:
         if isinstance(cache, CacheLayer):
             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
         elif isinstance(cache, Cache):

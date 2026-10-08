@@ -192,11 +192,30 @@ affects quantized caches.
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
-### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`, `9` on Turing)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
-over long contexts at low cache bitrates). Tuning/testing knob.
+over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
+below) every prefill chunk stages. Tuning/testing knob.
+
+### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+
+Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
+dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
+dequantization of a quantized cache, or the fp16 cache's own pages, viewed where they are
+consecutive and gathered otherwise, then PyTorch's memory-efficient SDPA per KV group (its
+cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions for sm_75, so the
+Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
+kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
+`1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
+off on Turing.
+
+### `EXL3_FA75` (default: on for sm_75, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
+`mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
+its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 

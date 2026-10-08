@@ -1,6 +1,6 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
-from ...util.turing import turing_flag
+from ...util.backend import sdpa_prefill, fa75_prefill
 import torch.nn.functional as F
 
 
@@ -51,7 +51,7 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
     # Turing takes this path for every prefill chunk (see attn_dispatch), not only for head_dim >= 512
-    turing_prefill = args.q_len > 8 and turing_flag("SDPA_PREFILL", args.q.device) != 0
+    turing_prefill = args.q_len > 8 and sdpa_prefill(args.q.device)
     if (
         args.is_varlen() or
         not args.has_kv_cache() or
@@ -98,7 +98,7 @@ def _torch_bighead_fallback(
     _, seqlen_new, nheads_k, _ = k.shape
     block_size = k_cache.shape[1]
 
-    turing = turing_flag("SDPA_PREFILL", q.device) != 0
+    turing = sdpa_prefill(q.device)
     if not turing:
         _warn_sdpa_fallback()
     outputs = []
@@ -109,36 +109,15 @@ def _torch_bighead_fallback(
         # Gather this sequence's blocks into a contiguous page-aligned buffer
         num_blocks_needed = (total_len + block_size - 1) // block_size
         phys_blocks = block_table[b, :num_blocks_needed]
-        p0 = int(phys_blocks[0])
-        if turing and bool((phys_blocks == torch.arange(p0, p0 + num_blocks_needed, device = phys_blocks.device)).all()):
-            # Pages are physically consecutive (always the case for the compact prefill window): view the
-            # cache instead of gathering a copy, which saves ~0.8 GB at 190K context. New K/V land in
-            # place, which is what the write-back below does anyway
-            k_buf = k_cache[p0:p0 + num_blocks_needed].view(-1, nheads_k, headdim)
-            v_buf = v_cache[p0:p0 + num_blocks_needed].view(-1, nheads_k, headdim)
-        else:
-            k_buf = k_cache[phys_blocks].reshape(-1, nheads_k, headdim)
-            v_buf = v_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+        k_buf, v_buf = _window_buffers(k_cache, v_cache, phys_blocks, nheads_k, headdim)
 
         # In-place copy new tokens into the buffer
         k_buf[seq_len:total_len] = k[b]
         v_buf[seq_len:total_len] = v[b]
 
-        if (
-            turing and headdim == 256 and q.dtype == torch.float16 and k_buf.dtype == torch.float16 and
-            not softcap and window_size in (None, -1, (-1, -1)) and total_len >= seqlen_q and
-            turing_flag("FA75", q.device)
-        ):
-            # Turing: one fa75 call covers every q chunk and the whole GQA group (~2.3-3x the cutlass kernel)
-            from ...ext import exllamav3_ext as ext
-            o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q.dtype, device = q.device)
-            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
-            ext.fa75_fwd(q[b], k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
-            outputs.append(o_b)
-        else:
-            outputs.append(_sdpa_chunks(
-                q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing
-            ))
+        plain = not softcap and window_size in (None, -1, (-1, -1))
+        outputs.append(_attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
+                                      fa75 = turing and plain, group_gqa = turing))
 
         # Write back only the new tokens to the paged cache
         first_block = seq_len // block_size
@@ -162,6 +141,54 @@ def _torch_bighead_fallback(
             v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
 
     return torch.stack(outputs)
+
+
+def _window_buffers(k_cache, v_cache, phys_blocks, nheads_k, headdim):
+    """One sequence's pages as flat [tokens, heads, dim] buffers: a view of the cache when the pages are
+    physically consecutive (always so for the compact staged window), else a gathered copy"""
+    n = phys_blocks.numel()
+    p0 = int(phys_blocks[0])
+    if bool((phys_blocks == torch.arange(p0, p0 + n, device = phys_blocks.device)).all()):
+        return (k_cache[p0:p0 + n].view(-1, nheads_k, headdim),
+                v_cache[p0:p0 + n].view(-1, nheads_k, headdim))
+    return (k_cache[phys_blocks].reshape(-1, nheads_k, headdim),
+            v_cache[phys_blocks].reshape(-1, nheads_k, headdim))
+
+
+def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_size, fa75: bool, group_gqa: bool):
+    """Attention of one sequence's queries [seqlen_q, heads, dim] over its dense K/V window: the fa75
+    kernel where it applies (head_dim 256, fp16), else chunked SDPA"""
+    seqlen_q, nheads, headdim = q_b.shape
+    nheads_k = k_buf.shape[1]
+    if (
+        fa75 and headdim == 256 and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+        total_len >= seqlen_q and fa75_prefill(q_b.device)
+    ):
+        # One fa75 call covers every q chunk and the whole GQA group
+        from ...ext import exllamav3_ext as ext
+        o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q_b.dtype, device = q_b.device)
+        scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+        ext.fa75_fwd(q_b, k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
+        return o_b
+    return _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale,
+                        chunk_size, group_gqa)
+
+
+def sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal, softmax_scale, out,
+                       chunk_size = 512):
+    """Prefill attention over a dense fp16 paged cache whose new rows are already written (the sm_75 path
+    of paged_attn_triton_prefill): per sequence, its window viewed or gathered, then fa75 / SDPA"""
+    bsz, seqlen_q, nheads, headdim = q.shape
+    page_size = k_cache.shape[1]
+    nheads_k = k_cache.shape[2]
+    seqlens = cache_seqlens.tolist()
+    for b in range(bsz):
+        total_len = seqlens[b] + kv_append_len
+        num_blocks = (total_len + page_size - 1) // page_size
+        k_buf, v_buf = _window_buffers(k_cache, v_cache, block_table[b, :num_blocks], nheads_k, headdim)
+        out[b] = _attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
+                                fa75 = True, group_gqa = True)
+    return out
 
 
 def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing):

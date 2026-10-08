@@ -1,22 +1,15 @@
-import os
-import sys
+"""
+fa75 (exllamav3_ext/turing/fa75.cu): flash-attention prefill kernel for head_dim 256 on sm_75 HMMA
+(mma.sync.m16n8k8), against an fp32 reference, for prefill chunks appended to a cache (bottom-right causal),
+with and without GQA. The kernel is plain PTX for sm_75 and later, so this runs on every CUDA device.
+"""
 
 import pytest
 import torch
-import torch.nn.functional as F
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exllamav3.ext import exllamav3_ext as ext
 
-# fa75 (flash-attention prefill kernel for head_dim 256 on sm_75 HMMA) against an fp32 reference, for prefill
-# chunks appended to a cache (bottom-right causal), with and without GQA
-
-device = "cuda:0"
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (7, 5),
-    reason = "needs an sm_75+ CUDA device",
-)
+pytestmark = pytest.mark.cuda_only
 
 
 def _reference(q, k, v, scale, causal):
@@ -37,8 +30,7 @@ def _reference(q, k, v, scale, causal):
 @pytest.mark.parametrize("Tq, Tkv", [(256, 256), (300, 1000), (37, 37), (64, 5000), (1000, 1000), (1, 700)])
 @pytest.mark.parametrize("Hq, Hkv", [(24, 4), (8, 8)])
 @pytest.mark.parametrize("causal", [True, False])
-def test_fa75_matches_reference(Tq, Tkv, Hq, Hkv, causal):
-    torch.cuda.set_device(device)
+def test_fa75_matches_reference(Tq, Tkv, Hq, Hkv, causal, device):
     gen = torch.Generator(device = device).manual_seed(Tq * 7 + Tkv)
     q = torch.randn(Tq, Hq, 256, device = device, dtype = torch.half, generator = gen)
     k = torch.randn(Tkv, Hkv, 256, device = device, dtype = torch.half, generator = gen)
@@ -52,9 +44,8 @@ def test_fa75_matches_reference(Tq, Tkv, Hq, Hkv, causal):
     assert err < 2e-3, err
 
 
-def test_fa75_strided_q():
+def test_fa75_strided_q(device):
     # q as a head-slice view of a wider projection output (row stride > Hq * 256)
-    torch.cuda.set_device(device)
     gen = torch.Generator(device = device).manual_seed(5)
     qkv = torch.randn(333, 32, 256, device = device, dtype = torch.half, generator = gen)
     q = qkv[:, :24]

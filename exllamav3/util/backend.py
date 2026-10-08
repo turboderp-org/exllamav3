@@ -71,6 +71,58 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
 
 
+# --- Turing (sm_75) prefill ---------------------------------------------------------------------------------
+#
+# Triton lowers tl.dot to scalar FMA on sm_75 (no tensor-core path for that target), so the paged prefill
+# kernels run at a small fraction of the part's HMMA rate and prefill time grows linearly with context. On
+# sm_75 a prefill chunk attends over a dense fp16 copy of its window instead: the quantized-cache staging
+# pass (which dequantizes the referenced window anyway) or a gather of fp16 pages, then PyTorch's
+# memory-efficient SDPA (cutlass FMHA, tensor cores), or the fa75 kernel (exllamav3_ext/turing) for head_dim
+# 256 where the cutlass kernel is slow. Decode and draft verification stay on the Triton kernels, which read
+# the packed cache directly. EXL3_SDPA_PREFILL / EXL3_FA75 force either path on or off on any CUDA device
+
+_cc_cache = {}
+
+
+def compute_capability(device) -> tuple[int, int]:
+    """(major, minor) of a CUDA device; (0, 0) on ROCm, where the HIP major is a gfx generation"""
+    if ROCM:
+        return (0, 0)
+    idx = device.index if isinstance(device, torch.device) else device
+    if idx is None:
+        idx = torch.cuda.current_device()
+    cc = _cc_cache.get(idx)
+    if cc is None:
+        cc = _cc_cache[idx] = torch.cuda.get_device_capability(idx)
+    return cc
+
+
+def _sm75_switch(name: str, device) -> bool:
+    env = os.environ.get(name)
+    if env is not None:
+        return env.strip().lower() not in ("0", "", "false", "off", "no")
+    return compute_capability(device) == (7, 5)
+
+
+def sdpa_prefill(device) -> bool:
+    """Prefill chunks attend over a dense fp16 window with SDPA / fa75 (sm_75 default; EXL3_SDPA_PREFILL)"""
+    return _sm75_switch("EXL3_SDPA_PREFILL", device)
+
+
+def fa75_prefill(device) -> bool:
+    """The fa75 kernel for head_dim 256 on that path (sm_75 default; EXL3_FA75)"""
+    return _sm75_switch("EXL3_FA75", device)
+
+
+def qc_prefill_two_pass_min_q(device) -> int:
+    """Query length from which quantized-cache prefill stages the window as fp16 (triton_paged.py):
+    EXL3_QC_PF_TWO_PASS_MIN_Q, else 9 where the window path takes every prefill chunk, else 256"""
+    env = os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q")
+    if env is not None:
+        return int(env)
+    return 9 if sdpa_prefill(device) else 256
+
+
 # DSA decode (bc_dsa.py, bc_mla.py, dsa_triton.py): the MQA split kernel (dsa_mqa.py) where the shape allows
 # it on ROCm, fewer key splits per row, and upstream's split kernel at 8 warps (spills far less to scratch on
 # these parts) where it does not
