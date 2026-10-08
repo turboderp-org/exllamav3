@@ -212,6 +212,17 @@ def save_tensor_image(
 
 
 class GTensorCache:
+    """
+    Kept per-device tensors shared between modules, for SMALL decode-class buffers: a decode step is often CPU-bound,
+    and reusing a buffer skips torch.empty. Anything sized by a prefill chunk or the context belongs to torch's
+    caching allocator instead (which shares memory between modules just as well, and gives it back): a kept entry
+    pins its VRAM for the life of the process. get_scratch() applies that rule for workspaces whose size follows a
+    runtime row count.
+    """
+
+    # Row count up to which get_scratch() keeps a workspace (decode, MTP verify, small batches)
+    SCRATCH_STATIC_ROWS = 32
+
     def __init__(self):
         self.cache = {}
 
@@ -235,6 +246,17 @@ class GTensorCache:
         distinct size, and the total kept per tag is bounded by 2x the largest use."""
         nb = 1 << max(numel - 1, 0).bit_length()
         return self.get(device, (nb,), dtype, x)[:numel]
+
+    def get_scratch(self, device, numel, dtype, x, rows: int, static_rows: int | None = None):
+        """Flat workspace of numel elements for one call processing `rows` rows. Decode-class calls (rows up to
+        static_rows, default SCRATCH_STATIC_ROWS) take a kept bucketed backing (get_bucketed); larger calls allocate
+        through the caching allocator, rounded up to a power of two so the freed block is reused across chunk sizes
+        and context lengths instead of one segment being cached per size. Must not be used for buffers a CUDA graph
+        captures (those have to stay static at any size)"""
+        if rows <= (self.SCRATCH_STATIC_ROWS if static_rows is None else static_rows):
+            return self.get_bucketed(device, numel, dtype, x)
+        nb = 1 << max(numel - 1, 0).bit_length()
+        return torch.empty((nb,), dtype = dtype, device = device)[:numel]
 
     # def drop(self, device, shape, dtype, x = ""):
     #     key = self.make_key(device, shape, dtype, x)

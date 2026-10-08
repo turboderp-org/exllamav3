@@ -259,12 +259,8 @@ class QSAIndexer(Module):
     @staticmethod
     def _workspace(rows: int, numel: int, dtype, tag: str, device):
         from ..util.tensor import g_tensor_cache
-        if rows <= QSAIndexer.STATIC_ROWS:
-            return g_tensor_cache.get_bucketed(device, numel, dtype, tag)
-        # Power-of-two size so the caching allocator reuses the freed block across chunks: the
-        # score width grows with the context, and exact sizes would cache one segment per chunk
-        nb = 1 << max(numel - 1, 0).bit_length()
-        return torch.empty((nb,), dtype = dtype, device = device)[:numel]
+        # Power-of-two per-call size beyond the static rows: the score width grows with the context
+        return g_tensor_cache.get_scratch(device, numel, dtype, tag, rows, QSAIndexer.STATIC_ROWS)
 
     def k_pad(self):
         cr = self.compress_ratio

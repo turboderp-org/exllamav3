@@ -27,6 +27,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 (V4 CSA) keys -- only the key tensor differs.
 """
 
+import math
 import os
 import torch
 from ...util.backend import DSA_MQA
@@ -961,7 +962,7 @@ def dsa_attn(
     else:
         out_shape = (groups, R, hpg * D) if group_major else (R, H, D)
         if out is None:
-            out = g_tensor_cache.get(q.device, out_shape, torch.half, "dsa_out")
+            out = g_tensor_cache.get_scratch(q.device, math.prod(out_shape), torch.half, "dsa_out", R).view(out_shape)
         else:
             assert out.shape == out_shape
 
@@ -1048,8 +1049,8 @@ def dsa_attn(
         D_out = D_c if out_latent else D
         def workspace(bh):
             hb = triton.cdiv(H, bh)
-            ws_ml = g_tensor_cache.get(q.device, (R * hb * n_splits * bh * 2,), torch.float, "dsa_ws_ml")
-            ws_acc = g_tensor_cache.get(q.device, (R * hb * n_splits * bh * D_out,), torch.float, "dsa_ws_acc")
+            ws_ml = g_tensor_cache.get_scratch(q.device, R * hb * n_splits * bh * 2, torch.float, "dsa_ws_ml", R)
+            ws_acc = g_tensor_cache.get_scratch(q.device, R * hb * n_splits * bh * D_out, torch.float, "dsa_ws_acc", R)
             return hb, ws_ml, ws_acc
         if multirow is not None:
             mr = multirow
