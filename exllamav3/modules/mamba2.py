@@ -53,6 +53,9 @@ def torch_recurrent_mamba2(
 
 class Mamba2(Module):
 
+    # Mamba2 keeps an fp32 recurrent state; the fp16 option applies to GatedDeltaNet only
+    gdn_state_dtype = torch.float
+
     def __init__(
         self,
         config: Config | None,

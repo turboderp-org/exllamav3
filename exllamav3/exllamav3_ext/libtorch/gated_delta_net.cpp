@@ -350,14 +350,17 @@ void BC_GatedDeltaNetSplit::run_bszN
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_half = recurrent_state.scalar_type() == at::kHalf;
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path. The snapshot is per slot:
-    // another slot's eager run against a second cache must not re-arm this slot's replay
+    // so a cache with different dimensions or state element type falls back to the eager path. The
+    // snapshot is per slot: another slot's eager run against a second cache must not re-arm this
+    // slot's replay
     if ((int) conv_state.size(2) != s.graph_state_size ||
-        (int) recurrent_state.size(1) != s.graph_hist_stride)
+        (int) recurrent_state.size(1) != s.graph_hist_stride ||
+        (recurrent_state.scalar_type() == at::kHalf) != s.graph_state_half)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         return;

@@ -142,6 +142,7 @@ def _run_chunk_gated_delta_rule(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize("state_dtype", [torch.float, torch.half])
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize(
     "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
@@ -159,6 +160,7 @@ def _run_chunk_gated_delta_rule(
 )
 @torch.inference_mode()
 def test_cuda_recurrent_gated_delta_rule_matches_torch(
+    state_dtype,
     history,
     bsz,
     seqlen,
@@ -178,7 +180,7 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
     recurrent_state = torch.randn(
         (num_slots, state_len, num_v_heads, k_head_dim, v_head_dim),
-        dtype = torch.float,
+        dtype = state_dtype,
         device = device,
     ) * 0.05
     slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
@@ -187,7 +189,7 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         mixed_qkv,
         g,
         beta,
-        recurrent_state,
+        recurrent_state.float(),
         slots,
         history,
         num_k_heads,
@@ -207,8 +209,14 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         k_head_dim,
         v_head_dim,
     )
+    cuda_state = cuda_state.float()
 
     torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
+    if state_dtype == torch.half:
+        diff = (cuda_state[:, :state_len] - ref_state[:, :state_len]).norm()
+        ref_norm = ref_state[:, :state_len].norm()
+        assert (diff / ref_norm).item() < 5e-3, "fp16 state relative error too large"
+    # The history region holds per-step states, so it is compared in full.
     torch.testing.assert_close(cuda_state[:, :state_len], ref_state[:, :state_len], rtol = 5e-2, atol = 5e-2)
 
 
