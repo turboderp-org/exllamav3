@@ -1,8 +1,10 @@
 """
 Gated delta rule kernels against a step-by-step fp32 torch recurrence (l2-normalized q / k, exp gates, GQA over
-v heads): the CUDA recurrent kernel (ext.cuda_recurrent_gated_delta_rule, slot-indexed states, optional per-step
-state history) and the vendored fla chunked prefill kernel (exllamav3.vendor.fla.chunk_gated_delta_rule), plus
-bit-reproducibility of the CUDA kernel.
+v heads): the CUDA recurrent kernel (ext.cuda_recurrent_gated_delta_rule over a row-indexed state pool; a
+speculative pass -- history -- reads each row's initial state from slots_in, writes slots and leaves slots_in
+untouched) and the vendored fla chunked prefill kernel (exllamav3.vendor.fla.chunk_gated_delta_rule), plus
+bit-reproducibility of the CUDA kernel and the rewind replay (ext.batched_scan_replay), which must reproduce the
+kernel's own state after the accepted prefix of a speculative pass bit for bit.
 """
 import pytest
 import torch
@@ -44,7 +46,8 @@ def _torch_gated_delta_rule(
 
     for bi in range(bsz):
         slot = int(slots[bi].item()) if slots is not None else bi
-        state = state_out[slot, 0].clone()
+        # A speculative pass starts from the base row (slots_in = slot + 1 here) and leaves it as is
+        state = state_out[slot + 1 if history else slot, 0].clone()
 
         for t in range(seqlen):
             next_state = torch.empty_like(state)
@@ -58,8 +61,6 @@ def _torch_gated_delta_rule(
                 out[bi, t, vh] = ((next_state[vh] * q[bi, t, kh].unsqueeze(-1)).sum(dim = -2) * scale).bfloat16()
 
             state = next_state
-            if history and t < seqlen - 1:
-                state_out[slot, t + 1].copy_(state)
 
         state_out[slot, 0].copy_(state)
 
@@ -84,6 +85,7 @@ def _run_cuda_gated_delta_rule(
         device = mixed_qkv.device,
     )
     state = recurrent_state.clone()
+    slots_in = slots + 1 if history else None
     ext.cuda_recurrent_gated_delta_rule(
         mixed_qkv,
         g,
@@ -96,6 +98,7 @@ def _run_cuda_gated_delta_rule(
         v_head_dim,
         slots,
         history,
+        slots_in,
     )
     torch.cuda.synchronize()
     return out, state
@@ -151,9 +154,7 @@ RECURRENT_SHAPES = [
 
 
 def _recurrent_param(shape, history):
-    # A per-step state history of 1024+ steps, and the reference's copies of it, need very large device memory
-    big = history and shape[1] >= 1024
-    return pytest.param(history, *shape, marks = [pytest.mark.slow, pytest.mark.vram(40)] if big else [])
+    return pytest.param(history, *shape)
 
 
 @pytest.mark.parametrize(
@@ -174,18 +175,18 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     torch.manual_seed(1234)
 
     qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
-    state_len = seqlen if history else 1
-    num_slots = bsz + 2
+    # Rows: slot s writes row 2s + 1 and (history) reads row 2s + 2, so neither overlaps another row
+    num_slots = 2 * bsz + 2
 
     mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
     g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
     beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
     recurrent_state = torch.randn(
-        (num_slots, state_len, num_v_heads, k_head_dim, v_head_dim),
+        (num_slots, 1, num_v_heads, k_head_dim, v_head_dim),
         dtype = torch.float,
         device = device,
     ) * 0.05
-    slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
+    slots = 2 * torch.arange(bsz, dtype = torch.int32, device = device) + 1
 
     ref_out, ref_state = _torch_gated_delta_rule(
         mixed_qkv,
@@ -213,7 +214,67 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     )
 
     torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
-    torch.testing.assert_close(cuda_state[:, :state_len], ref_state[:, :state_len], rtol = 5e-2, atol = 5e-2)
+    torch.testing.assert_close(cuda_state, ref_state, rtol = 5e-2, atol = 5e-2)
+    if history:
+        # The base rows are left exactly as they were
+        assert torch.equal(cuda_state[slots.long() + 1], recurrent_state[slots.long() + 1])
+    else:
+        assert torch.equal(cuda_state[slots.long() + 1], recurrent_state[slots.long() + 1])   # untouched neighbours
+
+
+@pytest.mark.parametrize(
+    "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
+    [
+        (3, 9, 2, 4, 64, 64),        # generic kernel
+        (2, 17, 4, 8, 128, 128),     # 128 kernel
+        (1, 65, 2, 8, 128, 128),     # 128 kernel, a long (suffix-match class) pass
+        (2, 9, 2, 4, 256, 256),      # generic, wide
+    ],
+)
+@pytest.mark.parametrize("layers", [1, 3, 50])
+@torch.inference_mode()
+def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim, layers):
+    """A speculative pass advances scratch rows from base rows; batched_scan_replay over the first p staged
+    tokens of one batch row must leave the scratch row exactly as a p-token pass from the same base row does,
+    for every prefix, with the jobs of several layers (own pools and inputs) in one launch. 50 layers spans
+    two launches (REPLAY_MAX_JOBS)"""
+    torch.manual_seed(7 + layers)
+    qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
+    rr = bsz - 1   # the batch row replayed: the last one
+    L = []
+    for _ in range(layers):
+        mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+        g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
+        beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
+        pool = torch.randn((2 * bsz, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device) * 0.05
+        L.append((mixed_qkv, g, beta, pool))
+    slots = 2 * torch.arange(bsz, dtype = torch.int32, device = device) + 1   # scratch rows
+    slots_in = slots - 1                                                       # base rows
+    for prefix in sorted({1, 2, seqlen // 2, seqlen - 1, seqlen}):
+        if prefix < 1: continue
+        expect = []
+        for mixed_qkv, g, beta, pool in L:
+            ref = pool.clone()
+            out = torch.empty((bsz, prefix, num_v_heads, v_head_dim), dtype = torch.bfloat16, device = device)
+            ext.cuda_recurrent_gated_delta_rule(mixed_qkv[:, :prefix].contiguous(), g[:, :prefix].contiguous(),
+                                                beta[:, :prefix].contiguous(), ref, out, num_k_heads, num_v_heads,
+                                                k_head_dim, v_head_dim, slots, True, slots_in)
+            expect.append(ref)
+        jobs = []
+        pools = []
+        for mixed_qkv, g, beta, pool in L:
+            p2 = pool.clone(); pools.append(p2)
+            rb = p2.stride(0) * 4
+            jobs.append(ext.ScanReplayJob(
+                mixed_qkv[rr].data_ptr(), g[rr].data_ptr(), beta[rr].data_ptr(),
+                p2.data_ptr() + int(slots_in[rr]) * rb, p2.data_ptr() + int(slots[rr]) * rb, 0, prefix))
+        ext.batched_scan_replay(jobs, torch.device(device).index, 0, num_k_heads, num_v_heads, k_head_dim, v_head_dim)
+        torch.cuda.synchronize(device)
+        for p2, ref, (_, _, _, pool) in zip(pools, expect, L):
+            assert torch.equal(p2[int(slots[rr])], ref[int(slots[rr])]), f"prefix {prefix}: replayed row differs"
+            # Nothing else in the pool moved
+            mask = torch.ones(2 * bsz, dtype = torch.bool, device = device); mask[int(slots[rr])] = False
+            assert torch.equal(p2[mask], pool[mask])
 
 
 @pytest.mark.parametrize(
@@ -338,11 +399,12 @@ def test_empty(device, bsz, seqlen, nk, nv, dk, dv, history, use_slots, channelw
     mixed_qkv = torch.randn(bsz, seqlen, 2 * nk * dk + nv * dv, device = device).bfloat16()
     g = -torch.rand((bsz, seqlen, nv, dk) if channelwise else (bsz, seqlen, nv), device = device)
     beta = torch.rand(bsz, seqlen, nv, device = device).bfloat16()
-    state = torch.randn(3, max(seqlen, 1) + 1, nv, dk, dv, device = device)
+    state = torch.randn(2 * max(bsz, 1) + 1, 1, nv, dk, dv, device = device)
     state0 = state.clone()
     out = torch.full((bsz, seqlen, nv, dv), 777.0, dtype = torch.bfloat16, device = device)
     slots = torch.arange(bsz, dtype = torch.int32, device = device) if use_slots else None
-    call = lambda: ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, state, out, nk, nv, dk, dv, slots, history)
+    slots_in = slots + 1 if (use_slots and history) else None
+    call = lambda: ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, state, out, nk, nv, dk, dv, slots, history, slots_in)
     if error:
         with pytest.raises(RuntimeError, match = error):
             call()

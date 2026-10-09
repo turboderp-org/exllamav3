@@ -11,11 +11,12 @@ ext.cuda_recurrent_mamba2(mixed_xbc, g, dt, D, recurrent_state, out, Nk, Nv, Dk,
 recurrence over conv channel order [x (Nv * Dv), B (Nk * Dk), C (Nk * Dk)], v head h using group h // (Nv / Nk):
     S_t = exp(g_t[h]) * S_{t-1} + B_t[grp] (x) (dt_t[h] * x_t[h])        (Dk x Dv per head)
     y_t = C_t[grp] . S_t + D[h] * x_t[h]                                   (bf16, rounded toward zero)
-The state of batch row b lives at recurrent_state[slots[b]] (b without slots), [num_slots, max_history + 1, Nv,
-Dk, Dv] fp32, read from history entry 0. Without history the final state goes to entry 0; with history the state
-after token t (t < seqlen - 1) goes to entry t + 1 and the final state to entry 0. Other entries and slots are
-untouched. Dk must be a multiple of 32 and Dk, Dv <= 256; shapes, dtypes and the slots device are validated.
-Reductions run in a fixed order, so results are bit-reproducible.
+The state of batch row b lives at row slots[b] (b without slots) of the pool [num_rows, 1, Nv, Dk, Dv] fp32.
+Without history the row is read and written in place; with history (a speculative pass) the first token reads
+row slots_in[b] instead and leaves it untouched, and the pass writes row slots[b]. Other rows are untouched. Dk
+must be a multiple of 32 and Dk, Dv <= 256; shapes, dtypes and the slots device are validated. Reductions run in
+a fixed order, so results are bit-reproducible, and the rewind replay (ext.batched_scan_replay, kind 1) over the
+first n staged tokens of a batch row reproduces an n-token pass from the same base row bit for bit.
 """
 
 import math
@@ -130,22 +131,34 @@ def mamba2_reference(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv):
     new_state = state.double().clone()
     for b in range(bsz):
         s = int(slots[b]) if slots is not None else b
-        S = state[s, 0].double()
+        S = state[_base_row(s, history, state.shape[0]), 0].double()
         for t in range(seqlen):
             u = x[b, t] * dt[b, t][:, None]                                           # (nv, dv)
             S = S * g[b, t].exp()[:, None, None] + Bm[b, t][:, :, None] * u[:, None, :]
             out[b, t] = torch.einsum("hkv,hk->hv", S, Cm[b, t]) + D[:, None] * x[b, t]
             mag[b, t] = torch.einsum("hkv,hk->hv", S.abs(), Cm[b, t].abs()) + (D[:, None] * x[b, t]).abs()
-            if history and t < seqlen - 1:
-                new_state[s, t + 1] = S
         new_state[s, 0] = S
     return out, mag, new_state
+
+
+def _base_row(s, history, num_rows):
+    # A speculative pass starts from the row after the written one (wrapping), so both exist in the pool
+    return (s + 1) % num_rows if history else s
+
+
+def _slots_in(slots, history, bsz, num_rows, device):
+    if not history:
+        return None
+    rows = slots.tolist() if slots is not None else list(range(bsz))
+    return torch.tensor([_base_row(s, True, num_rows) for s in rows], dtype = torch.int32, device = device)
 
 
 def _mamba2_run(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv):
     bsz, seqlen, _ = xbc.shape
     out = torch.full((bsz, seqlen, nv, dv), 777.0, dtype = torch.bfloat16, device = xbc.device)
-    ext.cuda_recurrent_mamba2(xbc, g, dt, D, state, out, nk, nv, dk, dv, slots, history)
+    slots_eff = slots if slots is not None else torch.arange(bsz, dtype = torch.int32, device = xbc.device)
+    ext.cuda_recurrent_mamba2(xbc, g, dt, D, state, out, nk, nv, dk, dv, slots_eff if history else slots, history,
+                              _slots_in(slots, history, bsz, state.shape[0], xbc.device))
     torch.cuda.synchronize(xbc.device)
     return out
 
@@ -159,7 +172,7 @@ def _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, num_slots, hist, seed = 
     a = torch.rand((nv,), generator = gen).to(device) * 4
     g = -a[None, None, :] * dt.float()
     D = rn(nv)
-    state = rn(num_slots, hist + 1, nv, dk, dv)
+    state = rn(num_slots, 1, nv, dk, dv)
     return xbc, g, dt, D, state
 
 
@@ -200,20 +213,24 @@ MAMBA2_SHAPES = [
 @torch.inference_mode()
 def test_recurrent_mamba2(device, nk, nv, dk, dv, bsz, seqlen, history, use_slots):
     hist = max(seqlen, 2)
-    num_slots = bsz + 2
+    # With history every written row's base row (the next one, wrapping) must not be a written row itself:
+    # even rows write, odd rows are bases
+    num_slots = 2 * bsz + 2
     xbc, g, dt, D, state = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, num_slots, hist,
                                           seed = nk * 1000 + nv + dk + dv + seqlen)
-    slots = torch.randperm(num_slots)[:bsz].to(torch.int32).to(device) if use_slots else None
+    if use_slots:
+        slots = (2 * torch.randperm(bsz + 1)[:bsz]).to(torch.int32).to(device)
+    elif history:
+        slots = (2 * torch.arange(bsz)).to(torch.int32).to(device)
+    else:
+        slots = None
     ref_out, mag, ref_state = mamba2_reference(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv)
     out = _mamba2_run(xbc, g, dt, D, state, slots, history, nk, nv, dk, dv)
     assert_mamba2_close(out, state, ref_out, mag, ref_state, seqlen)
-    # Entries and slots the call must not write are bit-identical to the input
-    written = torch.zeros(state.shape[:2], dtype = torch.bool)
+    # Rows the call must not write (the base rows included) are bit-identical to the input
+    written = torch.zeros(state.shape[0], dtype = torch.bool)
     for b in range(bsz):
-        s = int(slots[b]) if slots is not None else b
-        written[s, 0] = True
-        if history:
-            written[s, 1 : seqlen] = True
+        written[int(slots[b]) if slots is not None else b] = True
     keep = ~written.to(device)
     assert torch.equal(state[keep], ref_state[keep].float())
 
@@ -222,29 +239,39 @@ def test_recurrent_mamba2(device, nk, nv, dk, dv, bsz, seqlen, history, use_slot
 @torch.inference_mode()
 def test_recurrent_mamba2_deterministic(device, history):
     nk, nv, dk, dv, bsz, seqlen = 8, 64, 128, 64, 4, 4
-    xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, bsz, seqlen, seed = 7)
+    xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, 2 * bsz, seqlen, seed = 7)
+    slots = (2 * torch.arange(bsz)).to(torch.int32).to(device)   # base rows are the odd ones
     results = []
     for _ in range(3):
         s = state0.clone()
-        results.append((_mamba2_run(xbc, g, dt, D, s, None, history, nk, nv, dk, dv), s))
+        results.append((_mamba2_run(xbc, g, dt, D, s, slots, history, nk, nv, dk, dv), s))
     for o, s in results[1:]:
         assert torch.equal(o, results[0][0]) and torch.equal(s, results[0][1])
 
 
 @torch.inference_mode()
-def test_recurrent_mamba2_history_matches_steps(device):
-    # History entry n (1 <= n < seqlen) holds the state after the first n tokens: bit-identical to the final state
-    # of a call over only those n tokens, whose outputs also match the full call position by position
+def test_recurrent_mamba2_replay_matches_steps(device):
+    # A speculative pass over seqlen tokens from base rows, then batched_scan_replay (kind 1, Mamba2) over the
+    # first n staged tokens of each batch row: the replayed scratch row is bit-identical to the final state of
+    # a pass over only those n tokens, whose outputs also match the full pass position by position
     nk, nv, dk, dv, bsz, seqlen = 2, 8, 128, 64, 2, 6
-    xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, bsz, seqlen, seed = 3)
+    xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, 2 * bsz, seqlen, seed = 3)
+    slots = (2 * torch.arange(bsz)).to(torch.int32).to(device)
     full = state0.clone()
-    out_full = _mamba2_run(xbc, g, dt, D, full, None, True, nk, nv, dk, dv)
+    out_full = _mamba2_run(xbc, g, dt, D, full, slots, True, nk, nv, dk, dv)
+    rb = state0.stride(0) * 4
     for n in range(1, seqlen):
         part = state0.clone()
         out_part = _mamba2_run(xbc[:, :n].contiguous(), g[:, :n].contiguous(), dt[:, :n].contiguous(), D, part,
-                               None, False, nk, nv, dk, dv)
+                               slots, True, nk, nv, dk, dv)
         assert torch.equal(out_part, out_full[:, :n])
-        assert torch.equal(part[:, 0], full[:, n])
+        replayed = state0.clone()
+        jobs = [ext.ScanReplayJob(xbc[b].data_ptr(), g[b].data_ptr(), dt[b].data_ptr(),
+                                  replayed.data_ptr() + (2 * b + 1) * rb, replayed.data_ptr() + 2 * b * rb,
+                                  D.data_ptr(), n) for b in range(bsz)]
+        ext.batched_scan_replay(jobs, torch.device(device).index, 1, nk, nv, dk, dv)
+        torch.cuda.synchronize(device)
+        assert torch.equal(replayed, part)
 
 
 @torch.inference_mode()
@@ -274,8 +301,8 @@ def test_recurrent_mamba2_rejects(device):
         call(dt = dt[:, :1].contiguous())
     with pytest.raises(RuntimeError, match = "D must be"):
         call(D = D[:1].contiguous())
-    with pytest.raises(RuntimeError, match = "recurrent_state must be"):
-        call(history = True)  # history over 2 tokens needs at least 2 entries, state has 1
+    with pytest.raises(RuntimeError, match = "needs slots and slots_in"):
+        call(history = True)  # a speculative pass names its base rows
     with pytest.raises(RuntimeError, match = "core_attn_out must be"):
         call(out = out[:, :1].contiguous())
     with pytest.raises(RuntimeError, match = "contiguous"):
@@ -298,7 +325,7 @@ def test_recurrent_mamba2_rejects(device):
 @torch.inference_mode()
 def test_recurrent_mamba2_guard_regions(device, history):
     # out and recurrent_state are contiguous views into larger sentinel-filled buffers: nothing outside is written
-    nk, nv, dk, dv, bsz, seqlen, num_slots, hist = 2, 8, 128, 64, 2, 3, 3, 3
+    nk, nv, dk, dv, bsz, seqlen, num_slots, hist = 2, 8, 128, 64, 2, 3, 4, 3   # bases (3, 1) stay clear of the written rows (2, 0)
     xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, num_slots, hist, seed = 11)
     slots = torch.tensor([2, 0], dtype = torch.int32, device = device)
     guard = 4096
@@ -310,7 +337,8 @@ def test_recurrent_mamba2_guard_regions(device, history):
     state = st_buf[guard : guard + n_state].view(state0.shape)
     state.copy_(state0)
     ref_out, mag, ref_state = mamba2_reference(xbc, g, dt, D, state0, slots, history, nk, nv, dk, dv)
-    ext.cuda_recurrent_mamba2(xbc, g, dt, D, state, out, nk, nv, dk, dv, slots, history)
+    ext.cuda_recurrent_mamba2(xbc, g, dt, D, state, out, nk, nv, dk, dv, slots, history,
+                              _slots_in(slots, history, bsz, num_slots, device))
     torch.cuda.synchronize(device)
     assert_mamba2_close(out, state, ref_out, mag, ref_state, seqlen)
     assert (out_buf[:guard] == 3.0e38).all() and (out_buf[guard + n_out:] == 3.0e38).all()

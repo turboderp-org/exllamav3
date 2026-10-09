@@ -187,6 +187,10 @@ struct BC_GatedDeltaNetSplit
         // be patched): set on the slot's first eager run, checked before every replay
         int graph_state_size = -1;
         int graph_hist_stride = -1;
+        // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
+        // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
+        // another cache reconfigures (and recaptures)
+        int64_t stage_key = 0;
 
         std::unique_ptr<Graph> graph;
     };
@@ -285,7 +289,8 @@ struct BC_GatedDeltaNetSplit
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
     }
 
-    bool needs_configure(int bsz, int seqlen, bool history);
+    bool needs_configure(int bsz, int seqlen, bool history, int64_t stage_key = 0);
+    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key) { slot(bsz, seqlen, history).stage_key = stage_key; }
 
     void configure_slot_kda
     (
@@ -333,8 +338,10 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
-        const at::Tensor& slots,
+        const at::Tensor& slots,            // conv ring rows (cache slots)
+        const at::Tensor& slots_scan,       // recurrent-state pool rows the scan writes
         bool history,
+        const c10::optional<at::Tensor>& slots_in,   // pool rows a speculative pass starts from
         Slot& s,
         Graph* graph
     );
@@ -346,7 +353,9 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        bool history
+        const at::Tensor& slots_scan,
+        bool history,
+        const c10::optional<at::Tensor>& slots_in
     );
 };
 
@@ -410,6 +419,10 @@ struct BC_Mamba2
         // Per-slot state geometry snapshot (see BC_GatedDeltaNetSplit::Slot)
         int graph_state_size = -1;
         int graph_hist_stride = -1;
+        // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
+        // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
+        // another cache reconfigures (and recaptures)
+        int64_t stage_key = 0;
 
         std::unique_ptr<Graph> graph;
     };
@@ -468,7 +481,8 @@ struct BC_Mamba2
         return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
     }
 
-    bool needs_configure(int bsz, int seqlen, bool history);
+    bool needs_configure(int bsz, int seqlen, bool history, int64_t stage_key = 0);
+    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key) { slot(bsz, seqlen, history).stage_key = stage_key; }
 
     void configure_slot
     (
@@ -495,8 +509,10 @@ struct BC_Mamba2
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
-        const at::Tensor& slots,
+        const at::Tensor& slots,            // conv ring rows (cache slots)
+        const at::Tensor& slots_scan,       // recurrent-state pool rows the scan writes
         bool history,
+        const c10::optional<at::Tensor>& slots_in,   // pool rows a speculative pass starts from
         Slot& s,
         Graph* graph
     );
@@ -508,6 +524,8 @@ struct BC_Mamba2
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        bool history
+        const at::Tensor& slots_scan,
+        bool history,
+        const c10::optional<at::Tensor>& slots_in
     );
 };

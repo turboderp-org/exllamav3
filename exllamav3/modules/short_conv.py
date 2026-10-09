@@ -174,7 +174,10 @@ class ShortConvLayerState:
 
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
-        assert num_tokens <= last_history
+        # Without recorded history nothing was provisional: the rewind is a position correction
+        # on the state object only (see GDNState.rewind)
+        assert num_tokens >= 0 and (last_history == 0 or num_tokens <= last_history), \
+            f"short-conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]

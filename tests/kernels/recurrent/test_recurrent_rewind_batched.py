@@ -1,21 +1,19 @@
 """
-Batched recurrent-state rewind kernels (speculative decoding draft rejection), against plain torch copies:
-
-ext.batched_state_rewind(jobs, device_index): for each StateRewindJob(src, dst, n), dst[0:n] <- src[0:n] as fp32
-(n a multiple of 4, rejected otherwise; src/dst never overlap). Nothing outside [dst, dst + n) is written.
+Batched recurrent-layer rewind (speculative decoding draft rejection), against plain torch references:
 
 ext.batched_conv_rewind(jobs, device_index): for each ConvRewindJob(src, dst, dim, cdim, stride), for every channel
 d < dim, dst[d * stride + k] <- src[d * stride + k] for k < cdim, bf16, with the cdim source elements read before
 any is written so overlapping windows (src - dst < cdim elements) copy like a memmove. cdim > CONV1D_MAX_K (16) is
-rejected. Nothing outside the dst windows is written.
+rejected. Nothing outside the dst windows is written. Any number of jobs (the host splits them into launches of
+64), an empty list is a no-op, jobs of one call may target different tensors with different sizes.
 
-Both process any number of jobs (the host splits them into launches of 64), and an empty list is a no-op. Jobs
-of one call may target different tensors with different sizes. Copies are exact.
-
-The GDNLayerState job builders (rewind_conv_job / rewind_state_job) must describe the same copy as the reference
-GDNLayerState.rewind (torch views), and a conv update with history followed by a conv rewind of r tokens must
-leave the window a plain update over the first seqlen - r tokens would leave.
+GDNLayerState: rewind_conv_job must describe the conv-ring shift (window <- last cdim columns before the rejected
+tokens), and a conv update with history followed by a conv rewind of r tokens must leave the window a plain update
+over the first seqlen - r tokens would leave. replay_job over the layer's staged inputs (the views a speculative
+pass writes into) must rebuild, through ext.batched_scan_replay, the state a pass over the accepted prefix would
+have produced from the base row, bit for bit, leaving the base row untouched.
 """
+
 
 import types
 
@@ -25,10 +23,6 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 
 CONV1D_MAX_K = 16
-
-
-def _state_job(t: torch.Tensor, src_idx: tuple, dst_idx: tuple, n: int):
-    return ext.StateRewindJob(t[src_idx].data_ptr(), t[dst_idx].data_ptr(), n)
 
 
 def _conv_job(t: torch.Tensor, slot: int, src_col: int, dst_col: int, cdim: int, dim: int | None = None):
@@ -46,86 +40,6 @@ def _conv_ref(t: torch.Tensor, slot: int, src_col: int, dst_col: int, cdim: int,
     dim = t.shape[1] if dim is None else dim
     src = t[slot, :dim, src_col : src_col + cdim].clone()
     t[slot, :dim, dst_col : dst_col + cdim] = src
-
-
-# batched_state_rewind
-
-@pytest.mark.parametrize("num_layers", [1, 3, 64, 65, 150])
-@pytest.mark.parametrize("state_shape", [(4, 8, 8), (16, 128, 128), (3, 4, 12)])
-@torch.inference_mode()
-def test_batched_state_rewind(device, num_layers, state_shape):
-    # One recurrent_state tensor per layer, (slots, max_history + 1, Hv, Dk, Dv); each job copies one history
-    # entry of one slot into entry 0 of that slot. Every other element of every tensor is unchanged
-    num_slots, history = 3, 5
-    gen = torch.Generator(device = "cpu").manual_seed(num_layers)
-    states = [torch.randn((num_slots, history + 1, *state_shape), generator = gen).to(device) for _ in range(num_layers)]
-    expected = [s.clone() for s in states]
-    n = states[0][0, 0].numel()
-
-    jobs = []
-    for i, (s, e) in enumerate(zip(states, expected)):
-        slot = i % num_slots
-        src = 1 + (i % history)
-        jobs.append(_state_job(s, (slot, src), (slot, 0), n))
-        e[slot, 0] = e[slot, src]
-
-    ext.batched_state_rewind(jobs, device.index)
-    torch.cuda.synchronize(device)
-    for i, (s, e) in enumerate(zip(states, expected)):
-        assert torch.equal(s, e), f"layer {i}"
-
-
-@torch.inference_mode()
-def test_batched_state_rewind_mixed_sizes(device):
-    # Jobs of different lengths in one launch: the grid covers the longest, shorter jobs stop at their own end.
-    # Each destination sits between sentinel guard regions that must not be written
-    guard = 64
-    sizes = [4, 8, 1024, 12, 4096 + 4, 32768, 4]
-    bufs = []
-    jobs = []
-    for i, n in enumerate(sizes):
-        src = torch.randn(n, device = device) + i
-        dst = torch.full((guard + n + guard,), -777.0, device = device)
-        bufs.append((src, dst, n))
-        jobs.append(ext.StateRewindJob(src.data_ptr(), dst[guard:].data_ptr(), n))
-    ext.batched_state_rewind(jobs, device.index)
-    torch.cuda.synchronize(device)
-    for src, dst, n in bufs:
-        assert torch.equal(dst[guard : guard + n], src)
-        assert (dst[:guard] == -777.0).all() and (dst[guard + n:] == -777.0).all()
-
-
-@torch.inference_mode()
-def test_batched_state_rewind_bit_exact(device):
-    # A copy, not arithmetic: NaN payloads, infinities, -0.0 and denormals survive bit for bit
-    n = 1024
-    src_bits = torch.randint(-2**31, 2**31 - 1, (n,), dtype = torch.int32, device = device)
-    src_bits[:4] = torch.tensor([0x7fc00001, 0x7f800000, -2**31, 1], dtype = torch.int32)  # NaN, inf, -0.0, denormal
-    dst = torch.zeros(n, dtype = torch.int32, device = device)
-    ext.batched_state_rewind([ext.StateRewindJob(src_bits.data_ptr(), dst.data_ptr(), n)], device.index)
-    torch.cuda.synchronize(device)
-    assert torch.equal(dst, src_bits)
-
-
-@torch.inference_mode()
-def test_batched_state_rewind_empty(device):
-    ext.batched_state_rewind([], device.index)
-    ext.batched_conv_rewind([], device.index)
-
-
-@torch.inference_mode()
-def test_batched_state_rewind_rejects_unaligned_count(device):
-    src = torch.randn(16, device = device)
-    dst = torch.zeros(16, device = device)
-    with pytest.raises(RuntimeError, match = "multiple of 4"):
-        ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr(), dst.data_ptr(), 6)], device.index)
-    # float4 copy: pointers off a 16-byte boundary
-    with pytest.raises(RuntimeError, match = "16-byte aligned"):
-        ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr() + 4, dst.data_ptr(), 8)], device.index)
-    with pytest.raises(RuntimeError, match = "16-byte aligned"):
-        ext.batched_state_rewind([ext.StateRewindJob(src.data_ptr(), dst.data_ptr() + 4, 8)], device.index)
-    torch.cuda.synchronize(device)
-    assert (dst == 0).all()
 
 
 # batched_conv_rewind
@@ -197,13 +111,14 @@ def test_batched_conv_rewind_rejects_large_cdim(device):
     assert torch.equal(t, e)
 
 
-# Job builders of GDNLayerState against its torch rewind()
+# GDNLayerState: the conv job against a torch reference, the replay against a kernel pass over the prefix
 
-def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv):
+def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None):
     from exllamav3.modules.gated_delta_net import GDNLayerState
     module = types.SimpleNamespace(
         fdim_qkv = fdim,
         conv_kernel_size = k,
+        num_k_heads = nk or nv,
         num_v_heads = nv,
         k_head_dim = dk,
         v_head_dim = dv,
@@ -215,31 +130,69 @@ def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv):
     return ls
 
 
+def _conv_rewind_reference(ls, slot, last_history, num_tokens):
+    cdim = ls.module.conv_kernel_size
+    if last_history > 0:
+        p = ls.conv_state.shape[-1] - num_tokens
+        ls.conv_state[slot, :, :cdim] = ls.conv_state[slot, :, p - cdim : p].clone()
+
+
 @pytest.mark.parametrize("max_history", [1, 3, 7])
 @torch.inference_mode()
-def test_gdn_layer_state_jobs_match_rewind(device, max_history):
+def test_gdn_layer_state_conv_job_matches_reference(device, max_history):
     num_slots = 3
     for slot in range(num_slots):
         for last_history in range(max_history + 1):
             for num_tokens in range(last_history + 1):
                 a = _layer_state(device, num_slots, max_history, 384, 4, 4, 32, 64)
-                b = types.SimpleNamespace(
-                    conv_state = a.conv_state.clone(),
-                    recurrent_state = a.recurrent_state.clone(),
-                )
+                ref = _layer_state(device, num_slots, max_history, 384, 4, 4, 32, 64)
+                ref.conv_state.copy_(a.conv_state)
                 cj = a.rewind_conv_job(slot, last_history, num_tokens)
-                sj = a.rewind_state_job(slot, last_history, num_tokens)
+                assert (cj is None) == (last_history == 0)
                 if cj is not None:
                     ext.batched_conv_rewind([cj], device.index)
-                if sj is not None:
-                    ext.batched_state_rewind([sj], device.index)
                 torch.cuda.synchronize(device)
-                ref = _layer_state(device, num_slots, max_history, 384, 4, 4, 32, 64)
-                ref.conv_state.copy_(b.conv_state)
-                ref.recurrent_state.copy_(b.recurrent_state)
-                ref.rewind(slot, last_history, num_tokens)
+                _conv_rewind_reference(ref, slot, last_history, num_tokens)
                 assert torch.equal(a.conv_state, ref.conv_state), (slot, last_history, num_tokens)
-                assert torch.equal(a.recurrent_state, ref.recurrent_state), (slot, last_history, num_tokens)
+    with pytest.raises(AssertionError):
+        _layer_state(device, 1, 3, 384, 4, 4, 32, 64).rewind_conv_job(0, 3, 4)
+
+
+@pytest.mark.parametrize("max_history", [3, 64])
+@pytest.mark.parametrize("bsz", [1, 3])
+@torch.inference_mode()
+def test_gdn_layer_state_replay(device, max_history, bsz):
+    # A speculative pass of max_history + 1 tokens writes its scan inputs into the staged views; every batch row
+    # and every prefix then replays to the state a prefix-length pass from the same base row produces
+    nk, nv, dk, dv, fdim = 2, 4, 64, 64, 2 * 2 * 64 + 4 * 64
+    seqlen = max_history + 1
+    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk)
+    conv_out, beta, g = ls.staged_views(bsz, seqlen)
+    conv_out.copy_((torch.randn(conv_out.shape, device = device) * 0.25).bfloat16())
+    beta.copy_(torch.sigmoid(torch.randn(beta.shape, device = device)).bfloat16())
+    g.copy_(torch.randn(g.shape, device = device) * 0.5 - 1.0)
+    pool0 = ls.recurrent_state.clone()
+    for row in range(bsz):
+        for parity in (0, 1):
+            base, scratch = 2 * row + parity, 2 * row + 1 - parity
+            for prefix in sorted({1, seqlen // 2, seqlen}):
+                expect = pool0.clone()
+                out = torch.empty((1, prefix, nv, dv), dtype = torch.bfloat16, device = device)
+                ext.cuda_recurrent_gated_delta_rule(
+                    conv_out[row : row + 1, :prefix].contiguous(), g[row : row + 1, :prefix].contiguous(),
+                    beta[row : row + 1, :prefix].contiguous(), expect, out, nk, nv, dk, dv,
+                    torch.tensor([scratch], dtype = torch.int32, device = device), True,
+                    torch.tensor([base], dtype = torch.int32, device = device))
+                ls.recurrent_state.copy_(pool0)
+                ext.batched_scan_replay([ls.replay_job(row, prefix, (bsz, seqlen), base, scratch)],
+                                        device.index, *ls.scan_geometry())
+                torch.cuda.synchronize(device)
+                assert torch.equal(ls.recurrent_state, expect), (row, parity, prefix)
+                assert torch.equal(ls.recurrent_state[base], pool0[base])
+    with pytest.raises(AssertionError):
+        ls.replay_job(0, 1, (bsz, seqlen - 1), 0, 1)   # staged shape mismatch
+    with pytest.raises(AssertionError):
+        ls.staged_views(bsz, seqlen + 1)               # longer than max_history + 1
 
 
 def _conv_window_reference(state_head: torch.Tensor, x: torch.Tensor, k: int):
