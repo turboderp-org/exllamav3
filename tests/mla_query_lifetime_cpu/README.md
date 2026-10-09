@@ -13,6 +13,17 @@ stand-in results, rather than attention-kernel numerics. The public fixture is
 the upstream MIT-licensed method at dev
 `6123763150abbadecdc6e9650dd4c9a02c9a5a98`.
 
+The PR update merges official dev
+`6cd89a908d957afba1cd1659fcf7d99a9e56d776` while retaining the original
+`716533ae84dc70e35cb8d7574afdaf83945d58fc` history. The merge requires no
+query-code conflict resolution. That dev method still exactly matches the
+saved CPU baseline, and this candidate's complete MLA file is byte-identical
+to the separately tested modern engine source at
+`c8666fbbc58d8731b97b972cedf681d0953beddd`. The sixteen CPU cases pass on the
+merged source. These comparisons establish source applicability and storage
+ownership contracts, without repeating the allocator measurements below on
+the current-dev runtime.
+
 ```sh
 CUDA_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= \
   python -m pytest -q tests/mla_query_lifetime_cpu
