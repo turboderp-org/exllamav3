@@ -446,17 +446,20 @@ testing. Read once per process (parent and worker independently).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
-Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
-load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
-(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
-leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
-(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
-and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+Repack the CPU worker's expert trellis copies into a packed layout at load, so each GEMV band
+streams sequentially from DRAM instead of in short strided runs. The layout is per kernel tier
+(rule: `exl3_moe_cpu_swizzle_group`): the AVX-512 tiers (`vbmi`, `bw`, `vnni`) band output tiles
+in groups of 8, except K8 tensors, which route to the dword kernel and stay native (+45-75%
+cold decode GEMV throughput on a 7960X, reaching the sequential-read roofline). The `avx2` tier
+bands integer rates in groups of 2 and additionally repacks each tile's 32-bit words into the
+"planar" order (dword `w` moves to `8 * (w % bits) + w / bits`): under the tensor-core tile
+permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
+collapses to a single `vpermd` instead of walking the tile's registers, which removes the
+rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
+tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
+tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

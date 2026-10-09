@@ -67,11 +67,30 @@ def contiguous_layout(counts: list[int], device) -> tuple[torch.Tensor, torch.Te
     return torch.arange(A, device = device), expert_count, torch.cumsum(expert_count, 0) - expert_count
 
 
-def swizzle_trellis(t: torch.Tensor) -> torch.Tensor:
-    """Band-swizzled copy of a (k/16, n/16, 16K) trellis as the CPU expert arena stores it: physical order
-    (n/128 group, k-tile, member, tile)"""
+def repack_trellis(t: torch.Tensor, group: int = 8, planar: bool = False) -> torch.Tensor:
+    """Packed copy of a (k/16, n/16, 16K) trellis, mirroring the CPU arena loader
+    (_copy_repacked in moe_cpu_host.py): tile (kt, nt) moves to (nt/group, kt, nt%group), and
+    with planar each tile's dwords are transposed (dword w to 8*(w%bits) + w/bits, integer
+    rates only). group 0 is the native layout: a plain copy. Stays on the input's device."""
     tk, tn, ps = t.shape
-    return t.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3).contiguous().view(tk, tn, ps)
+    if not group:
+        return t.clone()
+    if planar:
+        wd = ps // 2
+        out = torch.empty(tk * tn * wd, dtype = torch.int32, device = t.device)
+        out.view(tn // group, tk, group, wd // 8, 8).copy_(
+            t.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+        return out.view(torch.int16).view(t.shape)
+    out = torch.empty_like(t)
+    out.view(tn // group, tk, group, ps).copy_(
+        t.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
+    return out
+
+
+def swizzle_trellis(t: torch.Tensor) -> torch.Tensor:
+    """Band-swizzled copy of a (k/16, n/16, 16K) trellis as the AVX-512 CPU arena stores it:
+    physical order (n/128 group, k-tile, member, tile)"""
+    return repack_trellis(t, 8, False)
 
 
 def exl3_linear_ref(x: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor, K: float,
