@@ -120,6 +120,7 @@ public:
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    bool capture_active;
     bool need_cublas;
     bool ready;
     bool ready_to_record;
@@ -130,6 +131,8 @@ public:
 
     cudaStream_t capture_begin();
     void capture_end();
+    // Best effort, no throwing. Call on the thread/device that began capture.
+    void capture_abort() noexcept;
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);
@@ -137,3 +140,17 @@ public:
     void inspect_graph();
 };
 
+
+// Keep capture lifetime on the same thread/device as the launch sequence.
+// All native capture callers use this scope, including failures in run_gr.
+class GraphCapture
+{
+    Graph& owner;
+    bool finished = false;
+public:
+    explicit GraphCapture(Graph& graph) : owner(graph) { owner.capture_begin(); }
+    ~GraphCapture() noexcept { if (!finished) owner.capture_abort(); }
+    GraphCapture(const GraphCapture&) = delete;
+    GraphCapture& operator=(const GraphCapture&) = delete;
+    void finish() { owner.capture_end(); finished = true; }
+};

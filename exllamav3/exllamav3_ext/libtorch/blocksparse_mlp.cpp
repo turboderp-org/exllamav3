@@ -536,9 +536,9 @@ void BC_BlockSparseMLP::run_single_expert
         {
             prepare_ctx(y.get_device());
 
-            graph_single[graphidx].capture_begin();
+            GraphCapture capture(graph_single[graphidx]);
             run_single_expert_gr(y, expert_idx, &graph_single[graphidx]);
-            graph_single[graphidx].capture_end();
+            capture.finish();
         }
 
         auto args = std::vector<PPTR>();

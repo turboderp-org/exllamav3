@@ -881,9 +881,9 @@ void BC_Attention::run
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
         s.runs = 2;
     }
 
