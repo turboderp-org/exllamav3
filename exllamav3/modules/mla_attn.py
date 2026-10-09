@@ -72,6 +72,9 @@ class MLAttention(Module):
     peak), the absorb is a bmm rather than a GEMM so the exl3 kernels do not apply, and folding
     W_UK into q_b_proj instead would triple that projection (strictly worse than the 33 MB per
     layer this costs on a 128-head model.)
+
+    Optional key_gate adds a native hidden_size -> num_q_heads projection and a head-wise
+    sigmoid gate on the value output, before o_proj mixes heads (Ling-3).
     """
 
     def __init__(
@@ -111,6 +114,7 @@ class MLAttention(Module):
         key_indexer: str = "indexer",
         submodules: dict | None = None,
         tp_affinity: str | None = None,
+        key_gate: str | None = None,
     ):
         super().__init__(config, key, None)
         # Tensor-parallel placement group (see TPAllocation.affinity_key): DSA "shared" layers must
@@ -136,6 +140,7 @@ class MLAttention(Module):
         self.out_dtype = out_dtype
         self.key_kv_b = key_kv_b
         self.key_indexer = key_indexer
+        self.key_gate = key_gate
         self.norm_eps = rms_norm_eps
 
         # The softmax scale follows the *unabsorbed* head dim: absorption does not change the
@@ -177,6 +182,7 @@ class MLAttention(Module):
         self.kv_a_proj_with_mqa = None
         self.kv_a_layernorm = None
         self.o_proj = None
+        self.g_proj = None
         self.idx_wq_b = None
         self.idx_wk = None
         self.idx_k_norm = None
@@ -253,6 +259,14 @@ class MLAttention(Module):
             select_hq_bits = select_hq_bits, qbits_key = qbits_key,
         ))
 
+        # Head-wise output gate (Ling): keep this small projection native, outside the
+        # quantization targets. Register it normally for loading, conversion and TP ownership.
+        if key_gate is not None:
+            self.g_proj = _sub("g_proj", lambda: Linear(
+                config, f"{key}.{key_gate}", hidden_size, num_q_heads,
+                qmap = None, out_dtype = torch.half, pad_to = 1,
+            ))
+
         if indexer_mode == "full":
             assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
             self.idx_wq_b = _sub("idx_wq_b", lambda: Linear(
@@ -281,7 +295,18 @@ class MLAttention(Module):
 
 
 
-    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params):
+    def _project_output(self, o, params, gate = None):
+        # Gate each value head BEFORE o_proj mixes heads. Sigmoid is evaluated in fp32;
+        # the multiply stays in the attention output dtype, like the reference forward.
+        if gate is not None:
+            o = o.unflatten(-1, (self.num_q_heads, self.v_head_dim))
+            o.mul_(torch.sigmoid(gate.float()).to(o.dtype).unsqueeze(-1))
+            o = o.flatten(-2)
+        return self.o_proj.forward(o, params)
+
+
+    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params,
+                  gate = None):
         """MHA-form attention: everything (past and current chunk) is read back from the cache
         and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
         slice cannot reshape into a view), so fold it back into q's pe columns for the kernel's
@@ -299,7 +324,7 @@ class MLAttention(Module):
             qc = qc,
         )
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._project_output(o, params, gate)
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
@@ -816,6 +841,10 @@ class MLAttention(Module):
 
         from .attention_fn.mla_triton import _dbg_sync
 
+        # Project from the incoming hidden state once, before any path can reuse its storage.
+        # Only B*S*H logits stay live, not an extra hidden-state or expanded-K/V copy.
+        gate = self.g_proj.forward(x, params) if self.g_proj is not None else None
+
         # Sparse DSA applies once the visible context exceeds the selection budget; below that,
         # top-k selection is all-inclusive and the dense path is bit-equivalent
         if self.indexer_mode is not None:
@@ -912,10 +941,11 @@ class MLAttention(Module):
             o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
             del o_lat
             o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-            return self.o_proj.forward(o, params)
+            return self._project_output(o, params, gate)
 
         if use_mha:
-            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens,
+                                  bsz, seqlen, qc, params, gate)
 
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
@@ -938,7 +968,8 @@ class MLAttention(Module):
             if host_seqlens is None:
                 host_seqlens = _host_seqlens(params, cache_seqlens)
             del q_lat, q_pe_hm
-            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens,
+                                  bsz, seqlen, qc, params, gate)
 
         from .attention_fn.mla_triton import _debug_sync
         if _debug_sync:
@@ -956,7 +987,7 @@ class MLAttention(Module):
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         del o_lat
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._project_output(o, params, gate)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
@@ -1051,6 +1082,10 @@ class MLAttention(Module):
     def bc_mla_step(self, x, params, layer, block_table, cache_seqlens):
         """Graph-captured decode block, or None when the module/cache-layer pair is not
         supported (caller falls back to the dispatch path)."""
+        # BC fuses through o_proj and has no intervening head gate. Decline only gated
+        # modules, before building or reusing a graph that would silently omit the gate.
+        if self.g_proj is not None:
+            return None
         key = ("bcm", id(layer))
         bcm = self.dispatch_cache.get(key)
         if bcm is None:
@@ -1128,6 +1163,8 @@ class MLAttention(Module):
     def autosplit_prepare(self, params):
         """Decode slot statics for the whole (bsz, q_len) family, allocated before the loader's
         measuring window (they stay resident; nothing is graph-captured at load time)"""
+        if self.g_proj is not None:
+            return
         found = self._autosplit_layer(params)
         if found is None:
             return
@@ -1201,6 +1238,7 @@ class MLAttention(Module):
     _tp_submodules = (
         "q_proj", "q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj_with_mqa",
         "kv_a_layernorm", "o_proj", "idx_wq_b", "idx_wk", "idx_k_norm", "idx_weights",
+        "g_proj",
     )
     _tp_tensors = ("w_uk_flat", "w_uv_flat", "idx_kpool_ape", "idx_kpool_gate")
 
@@ -1227,6 +1265,8 @@ class MLAttention(Module):
             * torch.half.itemsize
         overhead_s += self.num_q_heads * (self.kv_lora_rank + self.v_head_dim) * torch.half.itemsize
         overhead_s += (self.kv_lora_rank + self.qk_rope_head_dim) * torch.half.itemsize
+        if self.g_proj is not None:
+            overhead_s += self.num_q_heads * (2 * torch.half.itemsize + 2 * torch.float.itemsize)
         recons = max((m.recons_size() for m in linears), default = 0)
         tpa = TPAllocation(
             key = self.key,
@@ -1271,6 +1311,7 @@ class MLAttention(Module):
                 "rms_norm_eps": self.norm_eps,
                 "out_dtype": self.out_dtype,
                 "key_kv_b": self.key_kv_b,
+                "key_gate": self.key_gate,
                 "indexer_mode": self.indexer_mode,
                 "index_n_heads": self.index_n_heads,
                 "index_head_dim": self.index_head_dim,

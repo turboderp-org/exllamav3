@@ -109,7 +109,16 @@ class GatedRMSNorm(Module):
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
         gate_act = 1 if self.gate_activation == "sigmoid" else 0
-        if gate_act and not (x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()):
+        result_dtype = out_dtype or self.out_dtype or x.dtype
+        # Match the CUDA kernel's supported types without changing stored weights.
+        # In particular, FP16 KDA norm weights must use the strict-FP32 fallback.
+        if gate_act and not (
+            x.dtype == torch.bfloat16 and
+            self.weight.dtype in (torch.bfloat16, torch.float32) and
+            gate.dtype in (torch.bfloat16, torch.float32) and
+            result_dtype in (torch.float16, torch.float32) and
+            x.is_contiguous() and self.weight.is_contiguous() and gate.is_contiguous()
+        ):
             # KDA torch fallback: strict-fp32 norm and weight, sigmoid gate after the norm
             h = x.to(torch.float32)
             h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim = True) + self.rms_norm_eps)
