@@ -362,6 +362,46 @@ def mp_model_forward_lm_head_argmax(
     return (out_v, out_i) if device == output_device else None
 
 
+def mp_model_forward_lm_head_logits(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+    has_shard: bool,
+    gather_devices: list[int] | None,
+    ldims: list[int] | None,
+):
+    """
+    Full logits through the sharded LM head, gathered to the output device. Same shard walk as
+    mp_model_forward_lm_head_argmax, same gather as OutputGather.
+    """
+    consumer = local_context["inf_consumer"]
+    device = local_context["device"]
+    output_device = local_context["output_device"]
+    backend = local_context["backend"]
+
+    x = consumer.recv(shared_input)
+
+    if has_shard:
+        module = local_context["logits_module"]
+        x = module.prepare_for_device(x, params)
+        x = module.forward(x, params).contiguous()
+    else:
+        x = torch.empty(*x.shape[:-1], 0, dtype = torch.half, device = torch.device("cuda", device))
+
+    if gather_devices is None:
+        return x
+
+    if device == output_device:
+        out_shape = list(x.shape)
+        out_shape[-1] = sum(ldims)
+        out = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
+    else:
+        out = None
+
+    backend.gather(x, out, gather_devices, output_device, ldims)
+    return out if device == output_device else None
+
+
 # def mp_model_forward_lm_head_argmax_old(
 #     local_context: dict,
 #     shared_input: dict,
