@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
-from testlib.moe_cpu import cpu_runtime, swizzle   # noqa: F401 (fixture)
+from testlib.moe_cpu import cpu_runtime, swizzle, swizzle_layouts   # noqa: F401 (fixture)
 
 pytestmark = pytest.mark.nogpu
 
@@ -21,7 +21,7 @@ def test_decode_finish_matches_batch(activation, bias, cpu_runtime):
     gen = torch.Generator().manual_seed(174)
     hidden, intermediate, experts = 384, 256, 3
     gated = activation != 2
-    swizzled = ext.exl3_moe_cpu_has_avx512_bw()
+    swizzled = len(swizzle_layouts()) > 1   # does the active tier pack any rate
 
     def matrices(k, n, enabled = True):
         ts, us, vs, bs = [], [], [], []

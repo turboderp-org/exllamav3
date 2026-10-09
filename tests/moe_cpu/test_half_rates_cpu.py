@@ -1,6 +1,7 @@
 """
-CPU expert kernels (ext.exl3_moe_cpu_*) at every trellis rate, half-integer (1.5 / 2.5 / 3.5 bpw, mul1) and integer,
-native and band-swizzled layouts: the rate decode of a trellis width (trellis_rate), each layer's forward against
+CPU expert kernels (ext.exl3_moe_cpu_*) at every trellis rate, half-integer (1.5 / 2.5 / 3.5 bpw, mul1) and
+integer, native and the tier's packed layout (band-8 on AVX-512, band-2 + planar on AVX2): the rate decode of a
+trellis width (trellis_rate), each layer's forward against
 the GPU dense reconstruct path (testlib.moe.expert_mlp_ref), and agreement between the instruction set tiers (the
 integer tiers bit-identical, the scalar fp32-activation tier to the int8 rounding). The GPU fused kernels at these
 rates are covered in tests/kernels/moe/test_moe_half_rates.py.
@@ -85,7 +86,7 @@ def test_cpu_tiers_agree():
         pytest.skip("no vector tier in this build")
     base = outs[tiers[0]]
     assert any(k.startswith("3.5_") for k in base)
-    # Each case against the lowest tier that ran it (swizzled cases exist from AVX-512 BW up)
+    # Each case against the lowest tier that ran it (packed cases exist from AVX2 up)
     first = {}
     for t in tiers:
         for k, v in outs[t].items():
