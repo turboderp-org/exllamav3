@@ -279,6 +279,8 @@ class Exl3HfQuantizer(HfQuantizer):
             if not key.endswith(".trellis"):
                 continue
             ck = key[:-len(".trellis")]
+            if stc.has_tensor(ck + ".tile_order"):
+                raise ValueError(f"{ck}: colmajor tile order is not supported by the Transformers integration")
             name = rename(ck)
             module = linears.get(name)
             if module is not None:
