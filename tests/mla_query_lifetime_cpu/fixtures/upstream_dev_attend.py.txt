@@ -1,0 +1,161 @@
+# ExLlamaV3 MIT-licensed source snapshot, dev6123763150abbadecdc6e9650dd4c9a02c9a5a98.
+# Only MLAttention._attend is retained for CPU ownership regression checks.
+class MLAttention:
+    def _attend(self, x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
+                append, qc = None, host_seqlens = None, idx_layer = None):
+        """Projections, absorption, attention and o_proj, shared by the cached and cache-less
+        paths. `append` writes the new latent/rope rows into the supplied page tensors.
+        `idx_layer` is the cache layer holding the paged indexer-key plane (full-indexer layers
+        on the cached path only)."""
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        causal = params.get("causal", True)
+
+        H = self.num_q_heads
+        R = bsz * seqlen
+
+        from .attention_fn.mla_triton import _dbg_sync
+
+        # Sparse DSA applies once the visible context exceeds the selection budget; below that,
+        # top-k selection is all-inclusive and the dense path is bit-equivalent
+        if self.indexer_mode is not None:
+            assert causal, "DSA indexer layers are causal-only"
+            assert host_seqlens is not None
+            sparse = max(host_seqlens) + seqlen > self.index_topk
+        else:
+            sparse = False
+
+        # Queries
+        _dbg_sync("attend-entry (upstream modules)", x.device)
+        q, q_resid = self.project_q(x, params, return_resid = True)
+        q = q.view(R, H, self.qk_head_dim)
+        if self.l4_beta:
+            # Whole query (nope + pe), before the split so the absorbed and MHA paths both
+            # inherit it; a per-token scalar commutes with the rotation
+            q *= self._l4_scale(bsz, seqlen, position, positions, position_ids, x.device)
+        _dbg_sync("project_q", x.device)
+        q_nope = q[:, :, :self.qk_nope_head_dim]
+        q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
+
+        # Latent K/V. The normalized latent is what gets cached, matching the reference order
+        # (kv_a_layernorm is applied before kv_b_proj would be)
+        ckv_kpe = self.kv_a_proj_with_mqa.forward(x, params)
+        _dbg_sync("kv_a_proj", x.device)
+        ckv = self.kv_a_layernorm.forward(
+            ckv_kpe[..., :self.kv_lora_rank].contiguous(), params, out_dtype = torch.half
+        )
+        k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
+        _dbg_sync("kv_a_layernorm+slice", x.device)
+
+        if self.rope is not None:
+            q_pe, k_pe = self.rope.apply(
+                q_pe, k_pe, position, positions, position_ids, True,
+                None, None, self.norm_eps, 0.0, inv_freq,
+            )
+            _dbg_sync("rope", x.device)
+
+        use_mha = seqlen > MAX_DECODE_QLEN and _prefill_mode == "mha" and causal and not sparse
+        if not use_mha:
+            # Absorb W_UK into the queries, per head, straight from the flat layout. This runs as
+            # a Triton kernel rather than a cuBLAS batched GEMM: the strided-batched fp16 form
+            # made cuBLAS pick an SM120 nvjet TMA kernel that intermittently MMU-faults (caught
+            # with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
+            # incidence tracked allocation layout), and the kernel reads any strides for free
+            q_lat = mla_absorb(q.view(R, H, self.qk_head_dim), self.w_uk_flat, H, self.qk_nope_head_dim)
+            q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
+
+        append(ckv, k_pe)
+
+        # Full-indexer layers compute this chunk's indexer keys unconditionally: on the cached
+        # path they must land in the paged plane even while the context is still dense, so the
+        # selection has complete history once it activates
+        k_idx = None
+        if self.indexer_mode == "full":
+            k_idx = self._indexer_keys(x, params, position, positions, position_ids, inv_freq)
+            if idx_layer is not None:
+                idx_layer.update_idx_direct(cache_seqlens, block_table, k_idx, seqlen)
+                if self.index_kpool:
+                    self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
+
+        if sparse:
+            if self.indexer_mode == "full":
+                if self.index_kpool:
+                    indices = self._indexer_topk_kpool(
+                        x, params, q_resid, bsz, seqlen, host_seqlens,
+                        k_idx_chunk = k_idx if idx_layer is None else None,
+                        pool_plane = idx_layer.get_pool() if idx_layer is not None else None,
+                        block_table = block_table,
+                    )
+                else:
+                    indices = self._indexer_topk(
+                        x, params, q_resid, bsz, seqlen, host_seqlens,
+                        position, positions, position_ids, inv_freq,
+                        k_idx_chunk = k_idx if idx_layer is None else None,
+                        idx_pool = idx_layer.get_idx() if idx_layer is not None else None,
+                        block_table = block_table,
+                    )
+                params["dsa_topk_indices"] = indices
+            else:
+                indices = params.get("dsa_topk_indices")
+                assert indices is not None, \
+                    "shared-indexer DSA layer found no top-k selection in params"
+                indices = to_device(indices, x.device)
+            # q and q_pe_hm are dead here (the sparse kernel reads q_lat and token-major q_pe);
+            # the queries themselves die once the kernel returns, before the (R, H, v) unfold
+            # allocates.
+            del q, q_pe_hm
+            o_lat = self._attend_sparse(
+                q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
+                pool_len = max(host_seqlens) + seqlen,
+            )
+            del q_lat, q_pe
+            o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+            del o_lat
+            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+            return self.o_proj.forward(o, params)
+
+        if use_mha:
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+
+        kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
+        extra = {}
+        try:
+            o_lat = kernel(
+                q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
+                bsz = bsz, q_len = seqlen,
+                causal = causal, softmax_scale = self.sm_scale,
+                pre_appended_len = seqlen,
+                qc = qc,
+                **extra,
+            )
+        except NoFittingConfig:
+            # No latent-form tile fits this device's shared memory at this query length (the
+            # latent width sets the floor; Turing at 512-wide latents). The MHA form attends
+            # over per-head up-projections from the same cache at any query length, and the
+            # un-absorbed q is still live here. Dense causal only, as for use_mha
+            if not (causal and not sparse and self.w_uk_flat is not None):
+                raise
+            if host_seqlens is None:
+                host_seqlens = _host_seqlens(params, cache_seqlens)
+            del q_lat, q_pe_hm
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+
+        from .attention_fn.mla_triton import _debug_sync
+        if _debug_sync:
+            # NaN/Inf in the attention output would reach the MoE router of the next block, and a
+            # top-k over non-finite logits can select garbage expert ids -> wild pointer loads
+            if not torch.isfinite(o_lat).all():
+                bad = (~torch.isfinite(o_lat)).sum().item()
+                raise RuntimeError(
+                    f"MLA debug: non-finite attention output, layer {self.layer_idx}, "
+                    f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
+
+        # Unfold W_UV per head from the flat layout; the kernel emits token-major output, so it
+        # feeds o_proj without a permute. The queries are dead by now
+        del q, q_lat, q_pe, q_pe_hm
+        o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+        del o_lat
+        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+        return self.o_proj.forward(o, params)
