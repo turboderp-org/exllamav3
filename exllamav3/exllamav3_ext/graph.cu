@@ -8,6 +8,7 @@
 #include "util.cuh"
 #include "cuda_drv.h"
 #include "quant/exl3_devctx.cuh"
+#include "cublas_handle.cuh"
 
 //#define GRAPHDEBUG 1
 
@@ -197,13 +198,7 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
 {
     if (need_cublas)
     {
-        cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-        cublasSetStream(cublas_handle, stream);
-        cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-        int device;
-        cudaGetDevice(&device);
-        void* ws = DevCtx::instance().get_ws(device);
-        cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+        (void) exl3_cublas_handle(stream);
     }
 
     int p = 0;

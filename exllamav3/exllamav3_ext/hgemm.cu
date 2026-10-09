@@ -5,6 +5,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include "cublas_handle.cuh"
 #include <limits>
 #if defined(USE_ROCM)
     #include "rocm/wmma_gemm.cuh"
@@ -28,6 +29,9 @@ static void hgemm_gemmex_impl
     cudaStream_t stream
 )
 {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda() &&
+                a.device() == b.device() && a.device() == c.device(),
+                "hgemm: all tensors must be on the same CUDA device");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
 
     bool output_fp32 = c.dtype() == at::kFloat;
@@ -80,13 +84,7 @@ static void hgemm_gemmex_impl
 #endif
 
     // Set cuBLAS modes and workspace
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+    cublasHandle_t cublas_handle = exl3_cublas_handle(stream);
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
@@ -114,6 +112,7 @@ void hgemm_gr
     Graph* graph
 )
 {
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     hgemm_gemmex_impl(a, b, c, stream);
 
@@ -150,6 +149,9 @@ void hgemm_batched
     at::Tensor c
 )
 {
+    TORCH_CHECK(a.is_cuda() && w.is_cuda() && c.is_cuda() &&
+                a.device() == w.device() && a.device() == c.device(),
+                "hgemm_batched: all tensors must be on the same CUDA device");
     // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS. The ROCm build
     // has no fp16-accumulator kernel (hgemm_f16acc.cu is CUDA-only)
 #if !defined(USE_ROCM)
@@ -185,13 +187,7 @@ void hgemm_batched
         return;
     }
 
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+    cublasHandle_t cublas_handle = exl3_cublas_handle(stream);
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
