@@ -1134,6 +1134,48 @@ class SS_AdaptiveP(SS_Base):
         return None
 
 
+def _fused_probs(fs: SS_Fused, logits: torch.Tensor) -> torch.Tensor:
+    """
+    The distribution SS_Fused samples from, for fp32 logits (n, vocab) with -inf at excluded entries. Each truncation
+    is a threshold on the logit: min-P keeps l >= max + minp_log; top-K keeps every entry tied with the k-th largest;
+    top-P (over the min-P and top-K survivors, in filter-temperature units) drops the tie group that crosses the
+    target mass, unless it is the top group. The kernel resolves the same cutoffs on a fixed-point histogram (1/32768
+    nat sub-buckets, logits more than 32 nats below the max pooled), so the two agree up to that rounding.
+    """
+    neg_inf = -float("inf")
+    m = logits.amax(dim = -1, keepdim = True)
+    if fs.mode == SS_Fused.MODE_GREEDY:
+        return torch.zeros_like(logits).scatter_(-1, logits.argmax(dim = -1, keepdim = True), 1.0)
+    keep = logits > neg_inf
+    if fs.mode == SS_Fused.MODE_SAMPLE_MINP or (fs.mode == SS_Fused.MODE_SAMPLE_FILTERS and fs.filters & SS_Fused.F_MINP):
+        keep &= logits >= m + fs.minp_log
+    if fs.mode == SS_Fused.MODE_SAMPLE_FILTERS:
+        z = ((logits - m) * fs.inv_temp_filter).masked_fill(~keep, neg_inf)
+        top_vals = None
+        if fs.filters & SS_Fused.F_TOPK and fs.top_k < z.shape[-1]:
+            top_vals = torch.topk(z, fs.top_k, dim = -1).values
+            keep &= z >= top_vals[:, -1:]
+            z = z.masked_fill(~keep, neg_inf)
+        if fs.filters & SS_Fused.F_TOPP:
+            if top_vals is not None:
+                # Only the top-k survivors are left: their sorted values, with the mass of the entries tied with
+                # the k-th beyond k added to the last one (they share its value, so its tie group)
+                zs = top_vals
+                w = torch.exp(zs)
+                extra = (keep.sum(dim = -1, keepdim = True) - zs.shape[-1]).clamp_min(0)
+                w[:, -1:] += extra * w[:, -1:]
+            else:
+                zs = torch.sort(z, dim = -1, descending = True).values
+                w = torch.exp(zs)
+            cum = w.cumsum(dim = -1)
+            cross = cum > fs.top_p * cum[:, -1:]
+            v_c = zs.gather(-1, cross.int().argmax(dim = -1, keepdim = True))
+            drop = cross.any(dim = -1, keepdim = True)
+            top = zs[:, :1]
+            keep &= ~drop | torch.where(v_c < top, z > v_c, z >= v_c)
+    return torch.softmax((logits * fs.inv_temp).masked_fill(~keep, neg_inf), dim = -1)
+
+
 class CustomSampler(Sampler):
     def __init__(
         self,
@@ -1166,19 +1208,87 @@ class CustomSampler(Sampler):
             if fused_tail is not None:
                 head = simplified[:i]
 
+        # Unfused step list, also kept when the tail is fused: probs() runs it to get the exact distribution the
+        # final sampling step draws from (speculative sampling needs p(x) for every candidate x)
+        self.plain_steps = []
+        state = SS.INIT
+        for step in simplified:
+            prep_steps = step.prep(state)
+            if prep_steps:
+                for prep_step in prep_steps:
+                    self.plain_steps.append(prep_step())
+            self.plain_steps.append(step)
+        # Speculative (rejection) sampling needs a stateless, past-independent distribution: temperature and the
+        # truncations, ending in a categorical draw
+        # (reqs_past_ids also counts penalty steps that simplified to no-ops, so check the effective steps instead)
+        self.spec_ok = (
+            bool(self.plain_steps) and isinstance(self.plain_steps[-1], SS_Sample) and
+            all(isinstance(s, (SS_Temperature, SS_Normalize, SS_Sort, SS_TopK, SS_TopP, SS_MinP, SS_Sample))
+                for s in self.plain_steps)
+        )
+        temps = [s.temperature for s in self.plain_steps if isinstance(s, SS_Temperature)]
+        self.spec_temperature = temps[0] if temps else 1.0
+
         if fused_tail is not None:
             self.steps = head + [fused_tail]
             self.fused_only = not head
         else:
-            self.steps = []
+            self.steps = list(self.plain_steps)
             self.fused_only = False
-            state = SS.INIT
-            for step in simplified:
-                prep_steps = step.prep(state)
-                if prep_steps:
-                    for prep_step in prep_steps:
-                        self.steps.append(prep_step())
-                self.steps.append(step)
+
+
+    @torch.inference_mode
+    def probs(self, logits: torch.Tensor, tokenizer: Tokenizer | None = None) -> torch.Tensor:
+        """
+        Normalized distribution (n, vocab) the final categorical step samples from, for logits (n, vocab). Only for
+        spec_ok samplers (no past ids, no masks, no stateful steps)
+        """
+        assert self.spec_ok
+        dim = logits.shape[-1]
+        n = logits.numel() // dim
+        logits = logits.reshape(n, dim).float().clone()
+        if tokenizer is not None and tokenizer.actual_vocab_size < dim:
+            logits[:, tokenizer.actual_vocab_size:] = -float("inf")
+        # A collapsed stack samples through the fused step, whose truncations are logit thresholds (ties at a
+        # cutoff are kept or dropped together), not sort positions: follow it rather than the unfused steps
+        if isinstance(self.steps[-1], SS_Fused):
+            return _fused_probs(self.steps[-1], logits)
+        state = SamplingState(rand_u32 = 0, bsz = n, dim = dim, in_logits = logits, tokenizer = tokenizer)
+        steps = self.plain_steps[:-1]
+        for i, ss in enumerate(steps):
+            # A sort that only feeds a top-k needs the k largest entries, in order: torch.topk instead of sorting
+            # the whole vocabulary (same distribution; entries past k are zeroed by the top-k step anyway)
+            if isinstance(ss, SS_Sort) and i + 1 < len(steps) and isinstance(steps[i + 1], SS_TopK) and                     steps[i + 1].top_k < dim and state.state in (SS.INIT, SS.LOGITS, SS.PROBS, SS.PROBS_N):
+                k = steps[i + 1].top_k
+                match state.state:
+                    case SS.INIT:
+                        state.logits, state.indices = torch.topk(state.in_logits.float(), k, dim = -1)
+                        state.state = SS.LOGITS_S
+                    case SS.LOGITS:
+                        state.logits, state.indices = torch.topk(state.logits, k, dim = -1)
+                        state.state = SS.LOGITS_S
+                    case SS.PROBS:
+                        state.probs, state.indices = torch.topk(state.probs, k, dim = -1)
+                        state.state = SS.PROBS_S
+                    case SS.PROBS_N:
+                        state.probs, state.indices = torch.topk(state.probs, k, dim = -1)
+                        state.state = SS.PROBS_N_S
+                continue
+            ss.run(state)
+        match state.state:
+            case SS.INIT:
+                return torch.softmax(state.in_logits, dim = -1)
+            case SS.LOGITS:
+                return torch.softmax(state.logits, dim = -1)
+            case SS.PROBS | SS.PROBS_N:
+                return state.probs / state.probs.sum(dim = -1, keepdim = True)
+            case SS.LOGITS_S:
+                p = torch.softmax(state.logits, dim = -1)
+                return torch.zeros((n, dim), dtype = p.dtype, device = p.device).scatter_(-1, state.indices, p)
+            case SS.PROBS_S | SS.PROBS_N_S:
+                p = state.probs / state.probs.sum(dim = -1, keepdim = True)
+                return torch.zeros((n, dim), dtype = p.dtype, device = p.device).scatter_(-1, state.indices, p)
+        raise ValueError("Sampling logic error")
 
 
     @override

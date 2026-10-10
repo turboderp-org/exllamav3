@@ -176,7 +176,10 @@ void dflash2_selector_walk_kernel
     float* __restrict__ conf,               // [bsz, rows + 1] or nullptr
     const int rows,
     const int k,
-    const int rank
+    const int rank,
+    const float* __restrict__ gumbel,       // [bsz, rows, k] Gumbel noise, or nullptr for the greedy walk
+    const float inv_temp,                   // sampled walk: 1 / temperature
+    float* __restrict__ q_out               // [bsz, rows, k] sampled walk: softmax(score / T) per row, or nullptr
 )
 {
     extern __shared__ float smem[];
@@ -219,7 +222,28 @@ void dflash2_selector_walk_kernel
         }
         __syncthreads();
 
-        if (t == 0)
+        if (t == 0 && gumbel)
+        {
+            // Sampled walk (speculative sampling): draw from q = softmax(score / T) by Gumbel-max, and export q
+            const float* g_row = gumbel + ((int64_t) b * rows + i) * k;
+            float zmax = -INFINITY;
+            for (int c = 0; c < k; ++c) zmax = fmaxf(zmax, scores[c] * inv_temp);
+            float zsum = 0.0f;
+            for (int c = 0; c < k; ++c) zsum += __expf(scores[c] * inv_temp - zmax);
+            int best = 0;
+            float best_v = -INFINITY;
+            for (int c = 0; c < k; ++c)
+            {
+                const float z = scores[c] * inv_temp - zmax;
+                if (q_out) q_out[((int64_t) b * rows + i) * k + c] = __expf(z) / zsum;
+                const float v = z + g_row[c];
+                if (v > best_v) { best_v = v; best = c; }
+            }
+            s_pred = c_row[best];
+            out[(int64_t) b * (rows + 1) + i + 1] = s_pred;
+            if (conf) conf[(int64_t) b * (rows + 1) + i + 1] = scores[best];
+        }
+        else if (t == 0)
         {
             int best = 0;
             float best_score = scores[0];
@@ -243,7 +267,7 @@ out:     (bsz, rows + 1) int64 -> [anchor, path...]
 conf:    (bsz, rows + 1) fp32 -> [0, winning score...] (optional)
 */
 
-void dflash2_selector_walk
+static void dflash2_selector_walk_impl
 (
     const at::Tensor& unary,
     const at::Tensor& cands,
@@ -252,7 +276,10 @@ void dflash2_selector_walk
     const at::Tensor& succ_cb,
     const at::Tensor& anchor,
     at::Tensor& out,
-    const c10::optional<at::Tensor>& conf
+    const c10::optional<at::Tensor>& conf,
+    const float* gumbel_ptr,
+    float inv_temp,
+    float* q_ptr
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unary.device());
@@ -299,12 +326,55 @@ void dflash2_selector_walk
         ( \
             (const float*) unary.data_ptr(), (const int64_t*) cands.data_ptr(), (const TG*) gate.data_ptr(), \
             (const TC*) pred_cb.data_ptr(), (const TC*) succ_cb.data_ptr(), (const int64_t*) anchor.data_ptr(), \
-            (int64_t*) out.data_ptr(), conf_ptr, rows, k, rank \
+            (int64_t*) out.data_ptr(), conf_ptr, rows, k, rank, gumbel_ptr, inv_temp, q_ptr \
         );
     if (gate.dtype() == at::kHalf) { if (pred_cb.dtype() == at::kHalf) { LAUNCH(half, half) } else { LAUNCH(half, __nv_bfloat16) } }
     else                           { if (pred_cb.dtype() == at::kHalf) { LAUNCH(float, half) } else { LAUNCH(float, __nv_bfloat16) } }
     #undef LAUNCH
     cuda_check(cudaPeekAtLastError());
+}
+
+void dflash2_selector_walk
+(
+    const at::Tensor& unary,
+    const at::Tensor& cands,
+    const at::Tensor& gate,
+    const at::Tensor& pred_cb,
+    const at::Tensor& succ_cb,
+    const at::Tensor& anchor,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& conf
+)
+{
+    dflash2_selector_walk_impl(unary, cands, gate, pred_cb, succ_cb, anchor, out, conf, nullptr, 1.0f, nullptr);
+}
+
+/*
+Sampled walk for speculative sampling: as dflash2_selector_walk, but each row draws its token from
+softmax(score / temperature) with the given Gumbel noise and writes that distribution to q.
+gumbel: (bsz, rows, k) fp32; q: (bsz, rows, k) fp32 out
+*/
+void dflash2_selector_walk_sample
+(
+    const at::Tensor& unary,
+    const at::Tensor& cands,
+    const at::Tensor& gate,
+    const at::Tensor& pred_cb,
+    const at::Tensor& succ_cb,
+    const at::Tensor& anchor,
+    at::Tensor& out,
+    const at::Tensor& gumbel,
+    at::Tensor& q,
+    double temperature
+)
+{
+    TORCH_CHECK_DTYPE(gumbel, kFloat);
+    TORCH_CHECK_DTYPE(q, kFloat);
+    TORCH_CHECK(gumbel.is_contiguous() && q.is_contiguous(), "dflash2_selector_walk_sample: gumbel and q must be contiguous");
+    TORCH_CHECK(gumbel.sizes() == unary.sizes() && q.sizes() == unary.sizes(), "dflash2_selector_walk_sample: gumbel and q must be (bsz, rows, k)");
+    TORCH_CHECK(temperature > 0.0, "dflash2_selector_walk_sample: temperature must be positive");
+    dflash2_selector_walk_impl(unary, cands, gate, pred_cb, succ_cb, anchor, out, c10::nullopt,
+                               (const float*) gumbel.data_ptr(), (float) (1.0 / temperature), (float*) q.data_ptr());
 }
 
 
