@@ -103,10 +103,12 @@ class PLELayerState:
             temp = self.id_state[slot, p - self.ctx : p].clone()
             self.id_state[slot, :self.ctx].copy_(temp)
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, parity: int = 0):
+        # parity: GDN scan-pool row selector, carried uniformly through the recurrent stash
+        # protocol; PLE state is not parity-indexed, so it is ignored
         return (host_copy(self.conv_state[slot, :, :self.win]), host_copy(self.id_state[slot, :self.ctx]))
 
-    def unstash(self, slot, stashed, position: int = 0):
+    def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])
         self.id_state[slot, :self.ctx].copy_(stashed[1])
 

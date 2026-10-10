@@ -231,9 +231,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
-    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    // Default args do not survive through a raw function pointer, so the optional slots_in
+    // (Path A base-row input) is defaulted explicitly here
+    m.def("cuda_recurrent_gated_delta_rule", [](const at::Tensor& mixed_qkv, const at::Tensor& g,
+            const at::Tensor& beta, at::Tensor& recurrent_state, at::Tensor& core_attn_out,
+            int num_k_heads, int num_v_heads, int k_head_dim, int v_head_dim,
+            const c10::optional<at::Tensor>& slots, bool history,
+            const c10::optional<at::Tensor>& slots_in)
+        { cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, recurrent_state, core_attn_out,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, slots_in); },
+        py::arg("mixed_qkv"), py::arg("g"), py::arg("beta"), py::arg("recurrent_state"),
+        py::arg("core_attn_out"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("k_head_dim"), py::arg("v_head_dim"), py::arg("slots"), py::arg("history"),
+        py::arg("slots_in") = c10::nullopt,
+        "cuda_recurrent_gated_delta_rule");
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
-    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+    m.def("cuda_recurrent_mamba2", [](const at::Tensor& mixed_xbc, const at::Tensor& g,
+            const at::Tensor& dt, const at::Tensor& D, at::Tensor& recurrent_state,
+            at::Tensor& core_attn_out, int num_k_heads, int num_v_heads, int k_head_dim,
+            int v_head_dim, const c10::optional<at::Tensor>& slots, bool history,
+            const c10::optional<at::Tensor>& slots_in)
+        { cuda_recurrent_mamba2(mixed_xbc, g, dt, D, recurrent_state, core_attn_out,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, slots_in); },
+        py::arg("mixed_xbc"), py::arg("g"), py::arg("dt"), py::arg("D"),
+        py::arg("recurrent_state"), py::arg("core_attn_out"), py::arg("num_k_heads"),
+        py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
+        py::arg("slots"), py::arg("history"),
+        py::arg("slots_in") = c10::nullopt,
+        "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
     m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
@@ -247,10 +272,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
-    py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

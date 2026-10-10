@@ -65,6 +65,7 @@ enum GraphedParams
     GP_conv1d_slots,
     GP_gdn_rule_state,
     GP_gdn_rule_slots,
+    GP_gdn_rule_slots_in,
 
     GP_rope_inv_freq,
     GP_rope_position,
