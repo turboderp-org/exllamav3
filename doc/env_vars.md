@@ -182,10 +182,12 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
-  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
-  pass, so the space is reserved at load time rather than discovered at the first long prefill.
-  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  a per-call transient of one fixed size, the full cache at batch size 1
+  (`2 * max_num_tokens * num_kv_heads * head_dim` fp16 elements; QSA layers use their bounded
+  dense window instead), so the allocator sees the same request on every prefill chunk rather
+  than a size that grows with the context. The autosplit measuring pass budgets it, so the
+  space is accounted for at load time; loads with an explicit split map it at the first long
+  prefill. For very large caches this is the tradeoff to weigh against `0` (e.g. ~4 GB at
   1M tokens with 8 kv heads of dim 128).
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former

@@ -1803,6 +1803,7 @@ def paged_attn_triton_prefill(
     num_stages: int | None = None,
     num_splits: int | None = None,
     max_kv_len: int | None = None,
+    staging_pages: int | None = None,
     qc: tuple | None = None,
     pre_appended_len: int = 0,
     n_kv_heads_override: int | None = None,
@@ -1895,15 +1896,17 @@ def paged_attn_triton_prefill(
         # short query batches stay on the direct path, which reads less gmem
         # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
         # which would repeat the dequant pass per span -- those keep the direct path.) The
-        # scratch is a per-call transient sized to the referenced window: the block-table span
-        # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
-        # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
-        # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
-        # the allocator sees a handful of distinct sizes, but never past the pool itself: the
-        # rounding alone would double a 513-page window to 1024 pages. Context-shaped workspaces
-        # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
-        # for the life of the process. The loader's autosplit budgets for the worst case (a window
-        # spanning the pool) through Attention.autosplit_extra_measure
+        # scratch is a per-call transient of one fixed size per layer: the caller's staging_pages
+        # (the pool, or the bounded window QSA's dense regime can reach), else the pool itself.
+        # The window actually dequantized is the block-table span (a job's pages, not the pool),
+        # narrowed further when the caller bounds the past length, but the allocation never
+        # tracks it: a scratch that grew with the context would hand the allocator a new size
+        # every few chunks of a long prefill, and without expandable segments every size seen
+        # stays cached. A batched table pads every row to the batch's max page count and can
+        # exceed the pool; that rare case is sized exactly. Workspaces are not kept as statics:
+        # the old pool-sized static held a full fp16 copy of the cache for the life of the
+        # process. The loader's autosplit budgets the same fixed size through
+        # Attention.autosplit_extra_measure
         if (_qc_staging == 1 and q_len >= qc_prefill_two_pass_min_q(q.device)
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
@@ -1913,7 +1916,7 @@ def paged_attn_triton_prefill(
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
             pages = bsz * npps_w
-            pages_alloc = min(max(1, 1 << (pages - 1).bit_length()), max(pages, k_cache.shape[0]))
+            pages_alloc = max(pages, staging_pages if staging_pages is not None else k_cache.shape[0])
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
@@ -2418,6 +2421,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        staging_pages=args.staging_pages,
     )
 
 
@@ -2452,4 +2456,5 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        staging_pages=args.staging_pages,
     )
