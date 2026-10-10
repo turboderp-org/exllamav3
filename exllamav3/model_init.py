@@ -1,10 +1,15 @@
 from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
+from .model.config import moe_cpu_layers, moe_cpu_split_sizes
+from .util.misc import parse_int_list
+from .util.backend import ROCM
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
+import os, re
+import torch
 import yaml
 from pathlib import Path
 
@@ -55,12 +60,14 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-lpd", "--layers_per_device", type = str, help = "Number of layers to load on each device, example: 2,12,26 (must add up to the model's number of layers, 0 skips a device). Layer-split mode only; --gpu_split still limits the VRAM used per device")
+    parser.add_argument("-placement", "--placement", type = str, help = "Where the model's parts go, as text that stands for the other placement arguments: clauses 'subject: setting' separated by ';'. Example: \"layers 0..11: on gpu 0; other layers: on gpu 1; gpu 0: at most 22 GB; gpu 1: at most 22 GB\" (default: EXL3_PLACEMENT env)")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
-    parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
-    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcl", "--moe_cpu_offload", type = moe_cpu_layers, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Instead of N, a list of ints or (inclusive) ranges picks the layers by number, example: 8..23 (a single one is written 8..8). Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = moe_cpu_split_sizes, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Instead of N, LAYERS:N items set it per layer, example: 8..23:64,24..39:16. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Layers taken whole by --moe_cpu_offload are not split. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
@@ -125,7 +132,9 @@ def add_args(
         parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
-        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = moe_cpu_layers, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head; a list counts the head's layers from 0)", default = 0)
+        parser.add_argument("-dgs", "--draft_gpu_split", type = str, help = "Maximum amount of VRAM to use per device for the draft model (or MTP head), in GB, default: as --gpu_split", default = None)
+        parser.add_argument("-dlpd", "--draft_layers_per_device", type = str, help = "As --layers_per_device, for the draft model (or MTP head)", default = None)
 
 
 def get_arg_sampler(args):
@@ -152,6 +161,168 @@ def get_arg_sampler(args):
         adaptive_target = args.adaptive_target,
         adaptive_decay = args.adaptive_decay,
     )
+
+
+def placement_args(text: str, model, draft_model = None, strict: bool = True, who: str = "") -> tuple[dict, list[str]]:
+    """
+    Expand a placement description into the arguments it stands for, as they are typed. Clauses are separated by
+    ';' or newlines and read 'subject: setting, setting'; their order does not matter:
+
+        layers 0..11: on gpu 0; other layers: on gpu 1      --layers_per_device (every layer, one run per gpu, in order)
+        gpu 0: at most 22 GB; gpu 1: unused                 --gpu_split (every gpu or none; per load, as the argument)
+        ngram tables: in ram | locked in ram                --ngram_ram | --ngram_lock
+        token embedding: on disk; cpu: 16 threads           --embed_disk; --moe_cpu_threads
+        layers 20..: all experts on cpu                     --moe_cpu_offload
+        layers ..19: 64 experts on cpu                      --moe_cpu_split
+        all draft layers: on gpu 1; gpu 0: draft unused     the same for the draft model, in clauses of their own
+
+    'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
+    is refused, so a word added later changes no text that loads today.
+    Returns ({argument: value}, notes). Without a draft model its clauses raise if strict, else leave a note.
+    """
+    def fail(msg):
+        raise ValueError(f"Placement: {who and 'draft model: '}{msg}")
+
+    def runs(layers):
+        out = []
+        for i in sorted(layers):
+            if out and out[-1][1] == i - 1:
+                out[-1][1] = i
+            else:
+                out.append([i, i])
+        return ",".join(f"{a}..{b}" for a, b in out)
+
+    if len(text) > 4096:
+        fail("the text is longer than 4096 characters")
+    num_gpus = torch.cuda.device_count()
+    idx = [m.layer_idx for m in model.modules if m.layer_idx is not None and m.layer_idx >= 0]
+    n = len(idx)
+    if idx != list(range(n)):
+        fail("the model's layers are not numbered from 0 in order, use the arguments")
+    experts = {
+        m.layer_idx: sm.num_experts for m in model.modules if m.layer_idx in idx
+        for sm in m if hasattr(sm, "cpu_offload")
+    }
+    gpu, cpu, limits, other, draft, out, notes = {}, {}, {}, None, [], {}, []
+    for clause in re.split(r"[;\n]", text.lower()):
+        clause = " ".join(clause.split())
+        if not clause:
+            continue
+        if clause.count(":") != 1:
+            fail(f"'{clause}' needs exactly one ':', as in 'layers 0..11: on gpu 0'")
+        if "draft" in clause:
+            m = re.fullmatch(r"((?:all |other )?)draft (layers?[ :].*)|(gpu ?[0-9]{1,9} ?: ?)draft (.+)", clause)
+            if not m or clause.count("draft") > 1:
+                fail(f"cannot read '{clause}'. Draft model clauses: 'all draft layers: on gpu 1', "
+                     "'draft layers 0..1: on gpu 0', 'gpu 1: draft at most 6 GB', 'gpu 0: draft unused'")
+            draft.append(m[1] + m[2] if m[2] else m[3] + m[4])
+            continue
+        subject, settings = (part.strip() for part in clause.split(":"))
+        settings = [setting.strip() for setting in settings.split(",")]
+        if m := re.fullmatch(r"(?:(all|other) )?layers?(?: (.+))?", subject):
+            which, spec = m[1], m[2]
+            if bool(which) == bool(spec):
+                fail(f"'{subject}': write '{who}layers 0..11', 'all {who}layers' or 'other {who}layers'")
+            layers = list(range(n))
+            if spec:
+                item = r"[0-9]{1,9}|[0-9]{0,9} ?\.\. ?[0-9]{0,9}"
+                if not all(re.fullmatch(item, part.strip()) for part in spec.split(",")):
+                    fail(f"'{subject}': layers are numbers and ranges, example: 0..10,12 (a range is 0..10, not 0-10)")
+                if bad := [int(i) for i in re.findall(r"[0-9]+", spec) if int(i) >= n]:
+                    fail(f"layer {bad[0]} does not exist, the model has layers 0..{n - 1}")
+                layers = parse_int_list(spec, min_value = 0, max_value = n - 1)
+                if layers != sorted(set(layers)):
+                    fail(f"'{subject}': list each layer once, in ascending order")
+            for setting in settings:
+                if m := re.fullmatch(r"(all|[1-9][0-9]{0,5}) experts? on cpu", setting):
+                    if which == "other":
+                        fail(f"'{clause}': 'other layers' are the layers no clause puts on a gpu, name the layers here")
+                    named = [i for i in layers if i in experts]
+                    if (spec or not named) and len(named) < len(layers):
+                        rest = runs(set(layers) - set(named))
+                        notes.append(f"layers {rest} have no routed experts, '{setting}' does nothing there")
+                    for i in named:
+                        if i in cpu:
+                            fail(f"layer {i} has two experts settings")
+                        if m[1] != "all" and int(m[1]) >= experts[i]:
+                            fail(f"layer {i} has {experts[i]} routed experts, '{setting}' needs fewer")
+                        cpu[i] = m[1]
+                    continue
+                if not (m := re.fullmatch(r"on gpu ?([0-9]{1,9})", setting)):
+                    fail(f"'{setting}' is not valid after '{subject}' (on gpu <n>, all experts on cpu, <n> experts on cpu)")
+                if which == "other":
+                    if other is not None:
+                        fail("'other layers' is given twice")
+                    other = int(m[1])
+                    continue
+                for i in layers:
+                    if i in gpu:
+                        fail(f"layer {i} is given a gpu twice")
+                    gpu[i] = int(m[1])
+        elif m := re.fullmatch(r"gpu ?([0-9]{1,9})", subject):
+            g, m = int(m[1]), re.fullmatch(r"at most ([0-9]{1,6}(?:\.[0-9]{1,6})?) ?gb|unused", ",".join(settings))
+            if not m:
+                fail(f"'{clause}': a gpu takes '{who}at most <n> GB' (GB as in --gpu_split) or '{who}unused'")
+            if g in limits:
+                fail(f"gpu {g} has two limits")
+            limits[g] = m[1] or "0"
+        elif subject == "ngram tables" and settings in (["in ram"], ["locked in ram"]):
+            out["ngram_lock" if settings[0][0] == "l" else "ngram_ram"] = True
+        elif subject == "token embedding" and settings == ["on disk"]:
+            out["embed_disk"] = True
+        elif subject == "cpu" and (m := re.fullmatch(r"([1-9][0-9]{0,5}) threads?", ",".join(settings))):
+            if out.setdefault("moe_cpu_threads", int(m[1])) != int(m[1]):
+                fail("'cpu' is given two thread counts")
+        else:
+            fail(f"cannot read '{clause}'. Clauses: 'layers 0..11: on gpu 0', 'all layers: on gpu 0', "
+                 "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused', 'ngram tables: in ram', "
+                 "'ngram tables: locked in ram', 'token embedding: on disk', 'cpu: 16 threads', "
+                 "'layers 20..: all experts on cpu', 'layers ..19: 64 experts on cpu'")
+    if other is not None:
+        if len(gpu) == n:
+            fail("'other layers' names no layer, every layer is already on a gpu")
+        gpu.update((i, other) for i in range(n) if i not in gpu)
+    used = [*gpu.values(), *limits]
+    if used and max(used) >= num_gpus:
+        fail(f"there is no gpu {max(used)}: {num_gpus} visible, numbered from 0")
+    if gpu:
+        if len(gpu) < n:
+            fail(f"layer {min(set(range(n)) - set(gpu))} is not given a gpu (add 'other {who}layers: on gpu <n>')")
+        order = [gpu[i] for i in range(n)]
+        if order != sorted(order):
+            i = next(i for i in range(1, n) if order[i] < order[i - 1])
+            fail(f"layer {i} is on gpu {order[i]} but layer {i - 1} is on gpu {order[i - 1]}: the gpus take the layers in "
+                 f"order. For another order, reorder the visible gpus ({'HIP' if ROCM else 'CUDA'}_VISIBLE_DEVICES)")
+        out["layers_per_device"] = ",".join(str(order.count(g)) for g in range(order[-1] + 1))
+    if limits:
+        if len(limits) < num_gpus:
+            fail(f"gpu {min(set(range(num_gpus)) - set(limits))} has no limit: with one given, every visible gpu needs "
+                 f"'{who}at most <n> GB' or '{who}unused'")
+        if bad := [g for g in set(gpu.values()) if not float(limits[g])]:
+            fail(f"gpu {bad[0]} is 'unused' but holds layers")
+        if not any(float(x) for x in limits.values()):
+            fail("every gpu is 'unused'")
+        out["gpu_split"] = ",".join(limits[g] for g in range(num_gpus))
+    if whole := [i for i in cpu if cpu[i] == "all"]:
+        out["moe_cpu_offload"] = runs(whole)
+    if split := [
+        f"{r}:{k}" for k in dict.fromkeys(cpu.values()) if k != "all"
+        for r in runs(i for i in cpu if cpu[i] == k).split(",")
+    ]:
+        out["moe_cpu_split"] = ",".join(split)
+    if draft and draft_model is None:
+        if strict:
+            fail("the text has clauses for a draft model, and none is loaded")
+        notes.append("no draft model is loaded, its clauses are ignored")
+    elif draft:
+        placed, more = placement_args("; ".join(draft), draft_model, who = "draft ")
+        if "moe_cpu_split" in placed:
+            fail("a draft model's experts go to the cpu whole, write 'all experts on cpu'")
+        names = {"layers_per_device": "draft_layers_per_device", "gpu_split": "draft_gpu_split",
+                 "moe_cpu_offload": "draft_moe_cpu_layers"}
+        out.update((names[name], flag) for name, flag in placed.items())
+        notes += [f"draft model: {note}" for note in more]
+    return out, notes
 
 
 def init(
@@ -209,39 +380,11 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
-    if getattr(args, "moe_cpu_offload", 0):
-        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
-        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
-    if getattr(args, "moe_cpu_split", 0):
-        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
-        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
-        config.infer_params.moe_cpu_split = args.moe_cpu_split
-    if getattr(args, "moe_cpu_threads", None) is not None:
-        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
-    if getattr(args, "ngram_ram", False):
-        config.infer_params.ngram_stream_from_disk = False
-    if getattr(args, "ngram_lock", False):
-        config.infer_params.ngram_lock = True
-    if getattr(args, "embed_disk", False):
-        config.infer_params.embed_stream_from_disk = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
-    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
-    dmclt = getattr(args, "moe_cpu_threads", None)
-    if dmcl:
-        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
-        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
-        config.infer_params.draft_moe_cpu_offload = dmcl
-        if dmclt is not None:
-            config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
-        # Separate config: the draft model's own text component takes the budget
-        draft_config.infer_params.moe_cpu_offload = dmcl
-        if dmclt is not None:
-            draft_config.infer_params.moe_cpu_threads = dmclt
     else:
         draft_config = None
 
@@ -331,11 +474,74 @@ def init(
         cache = None
         draft_cache = None
 
+    # Placement
+    text, strict = (args.placement, True) if getattr(args, "placement", None) is not None \
+        else (os.environ.get("EXL3_PLACEMENT", ""), False)
+    if text.strip():
+        printp(not quiet and not strict, " -- Placement: text from EXL3_PLACEMENT")
+        names = ", ".join(f"gpu {i} = {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count()))
+        printp(not quiet and "gpu" in text.lower() and bool(names), f" -- Placement: {names}")
+        placed, notes = placement_args(text, model, draft_model, strict)
+        for note in notes:
+            printp(not quiet, f" !! Placement: {note}")
+        types = {"moe_cpu_offload": moe_cpu_layers, "draft_moe_cpu_layers": moe_cpu_layers,
+                 "moe_cpu_split": moe_cpu_split_sizes}
+        for name, flag in list(placed.items()):
+            given, value = getattr(args, name, None), types.get(name, lambda flag: flag)(flag)
+            if given and given != value:
+                assert not strict, f"--placement sets --{name} {flag}, and --{name} is given as well: give it once"
+                printp(not quiet, f" !! EXL3_PLACEMENT: --{name} is given on the command line and is used instead")
+                del placed[name]
+            else:
+                setattr(args, name, value)
+        flags = " ".join(f"--{name} {flag}".removesuffix(" True") for name, flag in placed.items())
+        printp(not quiet and bool(placed), f" -- Placement: {flags}")
+
+    # Offload
+    if getattr(args, "moe_cpu_offload", 0):
+        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
+        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
+    if getattr(args, "moe_cpu_split", 0):
+        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
+        config.infer_params.moe_cpu_split = args.moe_cpu_split
+    if getattr(args, "moe_cpu_threads", None) is not None:
+        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "ngram_ram", False):
+        config.infer_params.ngram_stream_from_disk = False
+    if getattr(args, "ngram_lock", False):
+        config.infer_params.ngram_lock = True
+    if getattr(args, "embed_disk", False):
+        config.infer_params.embed_stream_from_disk = True
+    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmclt = getattr(args, "moe_cpu_threads", None)
+    if dmcl:
+        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if getattr(args, "draft_gpu_split", None):
+        assert draft_model_dir, "--draft_gpu_split requires a draft model (or --mtp)"
+    if getattr(args, "draft_layers_per_device", None):
+        assert draft_model_dir, "--draft_layers_per_device requires a draft model (or --mtp)"
+    if use_mtp:
+        # Shared config: the MTP head is a separate component with its own budget and worker
+        config.infer_params.draft_moe_cpu_offload = dmcl
+        if dmclt is not None:
+            config.infer_params.draft_moe_cpu_threads = dmclt
+    elif draft_model_dir:
+        # Separate config: the draft model's own text component takes the budget
+        draft_config.infer_params.moe_cpu_offload = dmcl
+        if dmclt is not None:
+            draft_config.infer_params.moe_cpu_threads = dmclt
+
     # Split
     if args.gpu_split is None or args.gpu_split == "auto":
         split = None
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
+    dgs = getattr(args, "draft_gpu_split", None) or args.gpu_split
+    draft_split = None if dgs in (None, "auto") else [float(alloc) for alloc in dgs.split(",")]
+    layers = [int(n) for n in args.layers_per_device.split(",")] if getattr(args, "layers_per_device", None) else None
+    dlpd = getattr(args, "draft_layers_per_device", None)
+    draft_layers = [int(n) for n in dlpd.split(",")] if dlpd else None
 
     # Parallelism options
     tp_options = {
@@ -361,7 +567,8 @@ def init(
     if draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            use_per_device = split,
+            use_per_device = draft_split,
+            layers_per_device = draft_layers,
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
@@ -374,6 +581,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        layers_per_device = layers,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,

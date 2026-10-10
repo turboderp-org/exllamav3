@@ -63,13 +63,13 @@ def run_pending_swap_sweeps(infer_params):
     if not reg:
         return
     reg[0]._split_sweep_layer_reset()
-    # Quiesce every device holding a split layer, not just the current one: with a
+    # Quiesce every device holding a layer of these workers, not just the current one: with a
     # multi-GPU layer split, worker jobs are issued from each device's stream, and their
     # completion is only guaranteed by the collect memop waits on those streams. A
     # single-device synchronize leaves other devices' jobs in flight while the sweep
     # rewrites arena slots. After the sync, every issued job's collect has completed, so
     # the ring is drained and the worker idle by construction.
-    for d in sorted({m.device.index for m in reg if m.device is not None}):
+    for d in sorted({a["suh_u"][0].device.index for h in {m.cpu_host for m in reg} for a in h.aux.values()}):
         torch.cuda.synchronize(d)
     if os.environ.get("EXL3_MOE_CPU_SWAP_VERIFY"):
         for h in {m.cpu_host for m in reg}:
@@ -113,14 +113,12 @@ class BlockSparseMLP_CPU:
         comp = getattr(ip, "moe_cpu_component", "text")
         budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
             else getattr(ip, "draft_moe_cpu_offload", 0)
-        if budget:
-            assert not getattr(ip, "moe_cpu_split", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        if isinstance(budget, list):
+            claim = ip.moe_cpu_layer_idx.get(self.key) in budget
+        else:
+            claim = budget > 0 and ip.moe_cpu_offload_assigned.get(comp, 0) < budget
         if (
-            budget > 0 and
-            ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
+            claim and
             device is not None and torch.device(device).type == "cuda" and
             (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
@@ -139,12 +137,12 @@ class BlockSparseMLP_CPU:
         # Registration shrinks the module to its GPU slice, then the normal load below loads
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
-        split_k = int(getattr(ip, "moe_cpu_split", 0))
-        if split_k:
-            assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        split_k = getattr(ip, "moe_cpu_split", 0)
+        if isinstance(split_k, dict):
+            # Main model only: an MTP head sharing the config numbers its own layers
+            text = getattr(ip, "moe_cpu_component", "text") == "text"
+            split_k = split_k.get(ip.moe_cpu_layer_idx.get(self.key), 0) if text else 0
+        split_k = int(split_k)
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
@@ -328,8 +326,9 @@ class BlockSparseMLP_CPU:
         # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
         # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
+        split = getattr(self.config.infer_params, "moe_cpu_split", 0)
         if (
-            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
+            (isinstance(split, dict) or int(split) > 0) and
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False
