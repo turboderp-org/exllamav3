@@ -45,10 +45,10 @@ class _PinSet:
     def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
         if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
                 or self.packed.dtype != row_dtype:
-            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
+            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
             self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
             self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
-            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
+            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
 
 
 class RowTable:
