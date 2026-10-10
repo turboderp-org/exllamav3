@@ -337,16 +337,22 @@ int exl3_gemm_gr
             // so the grid may reach the occupancy limit; multiProcessorCount counts WGPs
             int occ = 1;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, (const void*) candidate_kernel, exl3_gemm_blockdim_g[candidate_shape_idx], smem_max);
-            // gfx1150 (RDNA 3.5 APU): the occupancy API over-reports blocks per WGP for these kernels;
-            // any grid beyond true co-residency deadlocks the device barrier (observed on Radeon 890M).
-            // Clamp blocks-per-WGP until proven otherwise. EXL3_RDNA_OCC_MAX overrides (0 = no clamp).
-            int occ_clamp = 1;
-            if (const char* env_occ = std::getenv("EXL3_RDNA_OCC_MAX")) occ_clamp = atoi(env_occ);
+            // The occupancy API's per-target resource accounting is not reliable (gfx1150 reports more
+            // blocks per WGP than its LDS holds for these kernels), and a plain launch past true
+            // co-residency deadlocks the device barrier. Clamp blocks per WGP to 1 (free on gfx1100 and
+            // gfx1201, where the API already returns 1 for the regular shapes); EXL3_RDNA_OCC_MAX raises
+            // the clamp, 0 trusts the API
+            static const int occ_clamp = [] {
+                const char* e = std::getenv("EXL3_RDNA_OCC_MAX");
+                return e ? atoi(e) : 1;
+            }();
+            static const bool debug = std::getenv("EXL3_DEBUG_AUTOTUNE") != nullptr;
+            int occ_api = occ;
             if (occ_clamp > 0) occ = MIN(MAX(occ, 1), occ_clamp);
-            if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
-                fprintf(stderr, "[exl3_gemm autotune cand] shape=%d block=%d smem=%zu occ_api_occ=%d clamp=%d num_sms=%d -> max_sms=%d\n",
-                        candidate_shape_idx, exl3_gemm_blockdim_g[candidate_shape_idx], (size_t) smem_max, occ, occ_clamp, num_sms, MAX(MIN(max_slices, num_sms * MAX(occ, 1)), 1));
             int max_candidate_sms = MAX(MIN(max_slices, num_sms * MAX(occ, 1)), 1);
+            if (debug)
+                fprintf(stderr, "[exl3_gemm autotune cand] shape=%d block=%d smem=%zu occ_api=%d clamp=%d num_sms=%d -> max_sms=%d\n",
+                        candidate_shape_idx, exl3_gemm_blockdim_g[candidate_shape_idx], (size_t) smem_max, occ_api, occ_clamp, num_sms, max_candidate_sms);
 #else
             int max_candidate_sms = MAX(MIN(max_slices, num_sms), 1);
 #endif

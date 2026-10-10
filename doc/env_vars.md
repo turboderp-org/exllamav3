@@ -315,6 +315,24 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
+
+Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels
+use a plain launch with a software device barrier, so every block of a grid must be resident at
+once; the autotuner sizes its candidate grids from `hipOccupancyMaxActiveBlocksPerMultiprocessor`,
+whose per-target resource accounting is not reliable (gfx1150 reports more blocks per WGP than its
+LDS holds for these kernels, and the barrier then deadlocks with the GPU at 100%). The default
+clamps grids to one block per WGP, which is what the API returns anyway for the regular shapes on
+gfx1100 and gfx1201. Set higher to allow more blocks per WGP, or `0` to trust the API. The fused
+MoE kernel has its own bound (`EXL3_ROCM_MOE_BPS=1` forces one block per WGP there).
+
+### `EXL3_DEBUG_AUTOTUNE` (default: unset)
+
+Print every GEMM autotune candidate (shape, LDS, blocks per WGP before and after the clamp, grid)
+and synchronize after each probe and measurement launch, naming it first, so a launch that never
+completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
+launches.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

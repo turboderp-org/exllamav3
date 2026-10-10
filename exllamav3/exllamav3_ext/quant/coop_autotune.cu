@@ -65,6 +65,14 @@ std::mutex disk_mutex;
 bool disk_cache_loaded = false;
 std::map<uint64_t, DiskCacheRecordV1> disk_cache;
 
+// EXL3_DEBUG_AUTOTUNE: print every probe/measurement launch and synchronize after it, so a launch that
+// never completes (a grid-barrier kernel past true co-residency) is named instead of hanging silently
+static bool debug_autotune()
+{
+    static const bool v = std::getenv("EXL3_DEBUG_AUTOTUNE") != nullptr;
+    return v;
+}
+
 uint64_t salt_hash(uint64_t hash)
 {
     hash ^= COOP_AUTOTUNE_VERSION;
@@ -416,7 +424,7 @@ void measure_candidate_sample
             smem,
             stream
         ));
-        if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
+        if (debug_autotune())
         {
             fprintf(stderr, "[measure] grid=%dx%d block=%d rep=%d/%d ... ",
                     candidate.num_sms, candidate.concurrency, candidate.block_dim, i + 1, repeats);
@@ -482,7 +490,7 @@ void measure_stage
             smem,
             stream
         ));
-        if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
+        if (debug_autotune())
         {
             fprintf(stderr, "[autotune probe] kernel=%p grid=%dx%dx%d block=%d smem=%zu ... ",
                     candidate.kernel, candidate.num_sms, 1, candidate.concurrency, candidate.block_dim, smem);
