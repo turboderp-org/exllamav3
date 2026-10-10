@@ -1433,7 +1433,7 @@ inline __m256i avx2_gather_half(const __m256i (&preg)[avx2_regs(bits, hb)])
 // for its single per-half s0/s1).
 template <int bits, bool hb, int row>
 M1_TARGET_AVX2
-inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& codes_lo, __m256i& codes_hi)
+M1_ALWAYS_INLINE void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& codes_lo, __m256i& codes_hi)
 {
     const __m256i a_lo = avx2_gather_half<bits, hb, row, false, 0>(preg);
     const __m256i b_lo = avx2_gather_half<bits, hb, row, true, 0>(preg);
@@ -1466,7 +1466,7 @@ inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& 
 // Rows == MAX_M retains the runtime bound for existing AVX2 callers.
 template <int Rows = MAX_M>
 M1_TARGET_AVX2
-inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
+M1_ALWAYS_INLINE void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
     int m, __m256i (&acc)[Rows][2], const __m256i& mult, const __m256i& ones32, int row)
 {
     static_assert(Rows > 0 && Rows <= MAX_M, "AVX2 row extent");
@@ -1497,7 +1497,7 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 // (K3 -5% 1T / -14% 24T-cold on the 7960X); do not widen the gate without re-measuring.
 template <int bits, bool hb, int row = 0>
 M1_TARGET_AVX2
-inline void avx2_rows_accum(
+M1_ALWAYS_INLINE void avx2_rows_accum(
     const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
     const __m256i& mult, const __m256i& ones32)
 {
@@ -1655,7 +1655,7 @@ inline __m256i avx2_gather_half_planar(const __m256i (&preg)[bits])
 
 template <int bits, int row>
 M1_TARGET_AVX2
-inline void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo, __m256i& codes_hi)
+M1_ALWAYS_INLINE void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo, __m256i& codes_hi)
 {
     const __m256i a_lo = avx2_gather_half_planar<bits, row, false, 0>(preg);
     const __m256i b_lo = avx2_gather_half_planar<bits, row, true, 0>(preg);
@@ -1672,7 +1672,7 @@ inline void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo
 
 template <int bits, int row = 0, int Rows = MAX_M>
 M1_TARGET_AVX2
-inline void avx2_rows_accum_planar(
+M1_ALWAYS_INLINE void avx2_rows_accum_planar(
     const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
@@ -2057,20 +2057,36 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             // never swizzled here and take the hb branch below.
             if (mat.swz)
             {
+                // Compile-time row count for two and three rows (two tokens, or one token split
+                // into a wide pair), which lets the row guards and accumulator extent fold away.
+                // Four rows keep the runtime bound, where the fully unrolled accumulators spill.
+                // One row: GCC already folds the runtime guards into its best code and loses a
+                // little to the constant; Clang needs it (its single-row runtime code keeps the
+                // accumulators in memory)
+                #if defined(__clang__)
+                #define AVX2_SWZ2_ROW1(B) case 1: avx2_swz2<B, 1>(mat, in, tout, m, tn0, tn1); return;
+                #else
+                #define AVX2_SWZ2_ROW1(B)
+                #endif
+                #define AVX2_SWZ2_ROWS(B) \
+                    switch (m) { \
+                        AVX2_SWZ2_ROW1(B) \
+                        case 2: avx2_swz2<B, 2>(mat, in, tout, m, tn0, tn1); return; \
+                        case 3: avx2_swz2<B, 3>(mat, in, tout, m, tn0, tn1); return; \
+                        default: avx2_swz2<B>(mat, in, tout, m, tn0, tn1); return; }
                 switch (mat.bits)
                 {
-                    case 1: avx2_swz2<1>(mat, in, tout, m, tn0, tn1); return;
-                    case 2: avx2_swz2<2>(mat, in, tout, m, tn0, tn1); return;
-                    case 3:
-                        if (m == 2) avx2_swz2<3, 2>(mat, in, tout, m, tn0, tn1);
-                        else avx2_swz2<3>(mat, in, tout, m, tn0, tn1);
-                        return;
-                    case 4: avx2_swz2<4>(mat, in, tout, m, tn0, tn1); return;
-                    case 5: avx2_swz2<5>(mat, in, tout, m, tn0, tn1); return;
-                    case 6: avx2_swz2<6>(mat, in, tout, m, tn0, tn1); return;
-                    case 7: avx2_swz2<7>(mat, in, tout, m, tn0, tn1); return;
-                    default: avx2_swz2<8>(mat, in, tout, m, tn0, tn1); return;
+                    case 1: AVX2_SWZ2_ROWS(1)
+                    case 2: AVX2_SWZ2_ROWS(2)
+                    case 3: AVX2_SWZ2_ROWS(3)
+                    case 4: AVX2_SWZ2_ROWS(4)
+                    case 5: AVX2_SWZ2_ROWS(5)
+                    case 6: AVX2_SWZ2_ROWS(6)
+                    case 7: AVX2_SWZ2_ROWS(7)
+                    default: AVX2_SWZ2_ROWS(8)
                 }
+                #undef AVX2_SWZ2_ROWS
+                #undef AVX2_SWZ2_ROW1
             }
             if (mat.hb)
             {
