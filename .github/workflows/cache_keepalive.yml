@@ -1,14 +1,15 @@
 name: Compiler Cache Keepalive
 run-name: Compiler Cache Keepalive
 
-# The Actions cache drops an entry that has not been restored for seven days, and releases can be
-# weeks apart. Restoring every compiler-cache entry once a week keeps the build cache alive between
-# them (a read is an access; the build workflow's own restore-key fallbacks then find a warm cache).
-# Lists the entries through the API so nothing here duplicates the build matrix.
+# The Actions cache drops an entry that has not been restored within the repository's cache
+# retention period (Settings > Actions > General; 7 days by default, raised to 30 here). Restoring
+# every compiler-cache entry counts as an access and keeps the build cache alive across a longer
+# gap between releases (the build workflow's own restore-key fallbacks then find a warm cache).
+# Run by hand when a gap is coming up; the schedule was dropped with the longer retention, since
+# touching every entry also kept superseded generations from ever expiring. Lists the entries
+# through the API so nothing here duplicates the build matrix.
 
 on:
-  schedule:
-    - cron: '0 4 * * 1,4'
   workflow_dispatch:
 
 permissions:

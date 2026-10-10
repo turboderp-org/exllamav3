@@ -102,10 +102,25 @@ jobs:
           elif target == "rocm":
               combos = [c for c in combos if c["rocm"]]
 
+          # One job per OS, backend and torch saves the compiler cache (Python 3.12 where present);
+          # the other Python versions of the same torch only restore it, their compiles being
+          # identical (see the cache steps). One cache per torch rather than per job keeps the
+          # repository's cache storage to a generation or two of full builds. The smoke build
+          # never saves: its single-arch entries would seed the real builds with a near-empty cache
+          for c in combos:
+              c["save_cache"] = False
+          if target != "windows_smoke":
+              groups = {}
+              for c in combos:
+                  groups.setdefault((c["os"], c["cuda"], c["rocm"], c["torch"]), []).append(c)
+              for group in groups.values():
+                  saver = max(group, key = lambda c: (c["pyver"] == "3.12", c["pyver"]))
+                  saver["save_cache"] = True
+
           print(f"{len(combos)} jobs:")
           for c in combos:
               backend = f"CUDA {c['cuda']}" if c["cuda"] else f"ROCm {c['rocm']}"
-              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}")
+              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}" + (" (saves the compiler cache)" if c["save_cache"] else ""))
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": combos}) + "\n")
@@ -172,12 +187,15 @@ jobs:
       # wraps the compilers there, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
       # compiler stays uncached since older torch versions name cl directly in the ninja rule, and
       # the .cpp units are a small share of the build). The cache directory is carried between runs
-      # through the Actions cache. Keys end in the commit so every run saves its own state; the
-      # restore prefixes fall back to the latest cache for the same OS/backend/torch and, failing
-      # that, any Python version of it. The kernel translation units include no Python headers, so
-      # their compiles are identical across Python versions once the torch include path is too: the
-      # site-packages (whose path carries the Python version) is reached through a fixed link on
-      # PYTHONPATH (next step), and that is the path the cache sees in the preprocessed source
+      # through the Actions cache: one cache per OS, backend and torch, saved by one job of the
+      # matrix (save_cache, see the matrix step) and restored by every job of that torch through
+      # the key prefix, falling back to any torch of the same backend (the kernel units that include
+      # no torch headers, most of the build, compile identically under every torch). Keys end in the
+      # commit so every save is a new entry and the restore takes the latest. The kernel
+      # translation units include no Python headers, so their compiles are
+      # identical across Python versions once the torch include path is too: the site-packages
+      # (whose path carries the Python version) is reached through a fixed link on PYTHONPATH
+      # (next step), and that is the path the cache sees in the preprocessed source
       - name: Set up ccache
         if: runner.os == 'Linux'
         run: |
@@ -189,7 +207,10 @@ jobs:
           Write-Output "CCACHE_NOHASHDIR=1" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines,locale" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_COMPRESS=1" >> "$env:GITHUB_ENV"
-          Write-Output "CCACHE_MAXSIZE=3G" >> "$env:GITHUB_ENV"
+          # zstd level: the default fast level leaves a good share of the object size on the table
+          # and compression only runs on a miss, so a mid level is a cheap way to keep the caches small
+          Write-Output "CCACHE_COMPRESSLEVEL=10" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_MAXSIZE=2G" >> "$env:GITHUB_ENV"
 
       - name: Set up sccache
         if: runner.os == 'Windows'
@@ -206,7 +227,10 @@ jobs:
           Write-Output $bin >> "$env:GITHUB_PATH"
           $dir = Join-Path $env:RUNNER_TEMP 'ccache'
           Write-Output "SCCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
-          Write-Output "SCCACHE_CACHE_SIZE=3G" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_CACHE_SIZE=2G" >> "$env:GITHUB_ENV"
+          # sccache already stores entries zstd-compressed (hence the Actions cache's own zstd gains
+          # nothing on top); a mid level shrinks them further at a cost paid only on misses
+          Write-Output "SCCACHE_CACHE_ZSTD_LEVEL=10" >> "$env:GITHUB_ENV"
 
       - name: Stable site-packages path for the compiler cache
         run: |
@@ -221,10 +245,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-
             ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-
 
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
@@ -547,7 +571,7 @@ jobs:
         run: |
           python -c "import sys; print('python prefix:', sys.prefix)"
           if ($IsWindows) {
-            sccache --show-stats
+            sccache --show-adv-stats
             # flush the server's pending writes before the cache directory is saved
             sccache --stop-server
             $global:LASTEXITCODE = 0
@@ -556,11 +580,11 @@ jobs:
           }
 
       - name: Save compiler cache
-        if: matrix.cuda != '' || matrix.rocm != ''
+        if: matrix.save_cache
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
 
       - name: Verify extension size
         if: matrix.cuda != '' || matrix.rocm != ''
