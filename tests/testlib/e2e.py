@@ -54,6 +54,7 @@ class LoadedModel:
             draft_cache = self.draft_cache,
             num_draft_tokens = a.num_draft_tokens,
             ngram_match_min = a.ngram_match_min,
+            hybrid_draft_tokens = a.hybrid_draft_tokens,
             ngram_corpus = a.ngram_corpus,
             dynamic_draft_tokens = a.dynamic_draft,
             draft_confidence = a.draft_confidence,

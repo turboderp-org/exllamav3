@@ -312,6 +312,7 @@ class Job:
 
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
+        self.sam_match = None
 
         # MTP state
         self.mtp_last_hidden = None
@@ -917,7 +918,7 @@ class Job:
                     "cached_pages": cached[0],
                     "cached_tokens": cached[1],
                 })
-                if self.generator.draft_model or self.generator.ngram_match_min:
+                if self.generator.draft_model or self.generator.ngram_match_min or self.generator.hybrid_draft_tokens:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
@@ -1028,6 +1029,8 @@ class Job:
             # fed to the filters when it was sampled)
             for f in self.filters:
                 f.rewind(offset)
+            # The suffix automaton re-accepts from the truncated sequence on its next query
+            self.sam_match = None
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent
@@ -1257,7 +1260,7 @@ class Job:
         # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+                                      - 1 - self.generator.max_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1273,11 +1276,11 @@ class Job:
             # (early by the window misses the boundary and replays up to a checkpoint interval; early by
             # a page shortens every segment by a page and requeues up to twice as often)
             self.rq_margin = 0
-            self.rq_headroom = self.generator.num_draft_tokens
+            self.rq_headroom = self.generator.max_draft_tokens
         else:
             # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
-            self.rq_margin = self.generator.num_draft_tokens
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
+            self.rq_margin = self.generator.max_draft_tokens
             self.rq_headroom = 0
 
         # Compatibility checks
@@ -1319,7 +1322,8 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.sam = ext.BC_SAM() if (generator.ngram_match_min or generator.hybrid_draft_tokens) else None
+            self.sam_match = None   # (sequence length, match begin, match end) of the last suffix-automaton query
             self.corpus_cursor = generator.ngram_corpus.cursor() if generator.ngram_corpus else None
 
         self.time_enqueue = time.time()
@@ -1800,6 +1804,40 @@ class Job:
             self.recurrent_state = None
 
 
+    def suffix_match(self, seq: torch.Tensor):
+        """(begin, end) of the earlier occurrence of the longest suffix of seq found by the job's suffix
+        automaton; end - begin is the match length. The automaton only accepts new tokens, so a second query
+        over the same sequence in one round (n-gram draft, then hybrid draft) reuses the first answer"""
+        n = seq.shape[-1]
+        if self.sam_match is not None and self.sam_match[0] == n:
+            return self.sam_match[1], self.sam_match[2]
+        beg, end = self.sam.accept_tensor(seq)
+        self.sam_match = (n, beg, end)
+        return beg, end
+
+
+    def get_hybrid_draft(self, length: int):
+        """
+        Continuation of the longest suffix match for the hybrid draft: (tokens, match length), with up to
+        `length` tokens following the earlier occurrence of the match. The caller decides whether the match
+        is long enough.
+        """
+        assert self.sam
+        seq = self.sequences[0].sequence_ids.torch()
+        beg, end = self.suffix_match(seq)
+        if end <= beg:
+            return torch.empty((1, 0), dtype = torch.long), 0
+        # The match sits `lag` tokens behind the present, so the continuation in the buffer is at most that
+        # long. A match longer than its lag means the sequence is periodic over it ("A B C A B C A B"), and the
+        # same rule that found it (x[n] = x[n - lag]) extends the continuation past the buffer by repeating
+        # the lag window; a match against distant context has a lag beyond `length` and tiles nothing
+        cont = seq[:, end:]
+        lag = cont.shape[-1]
+        if lag < length:
+            cont = cont.repeat(1, -(-length // lag))
+        return cont[:, :length], end - beg
+
+
     def get_ngram_draft(self, draft_length: int):
         """
         Return the continuation of the longest live/corpus suffix match.
@@ -1808,7 +1846,7 @@ class Job:
 
         # Update SAM with current history and find longest suffix
         seq = self.sequences[0].sequence_ids.torch()
-        beg, end = self.sam.accept_tensor(seq)
+        beg, end = self.suffix_match(seq)
 
         # Grab continuation after longest match or return empty seq
         if end - beg >= self.generator.ngram_match_min:

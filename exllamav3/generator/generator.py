@@ -47,6 +47,7 @@ class Generator:
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
+        hybrid_draft_tokens: int = 0,
         **kwargs
     ):
         """
@@ -90,6 +91,15 @@ class Generator:
 
         :param ngram_corpus:
             Optional frozen SAM file shared by n-gram jobs; requires ngram_match_min > 0.
+
+        :param hybrid_draft_tokens:
+            Long suffix-match drafting on top of whichever drafting mode is active (or on its own). Every
+            round, each job's suffix automaton is consulted; when the longest match of the current suffix
+            against the job's earlier context is at least this many tokens, the draft becomes the same number
+            of tokens that followed that earlier occurrence, unless they disagree with the regular drafter's
+            own guess. The intent is to catch verbatim repetition of context (reciting a drafted reply, editing
+            source) and gamble a long verification pass on advancing many tokens at prefill speed. A recurrent
+            model's cache needs max_history of at least this many tokens.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -187,9 +197,12 @@ class Generator:
             from .ngram import NgramCorpus
             self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
         self.ngram_match_min = ngram_match_min
+        # The widest verification pass any round can take: the regular drafter's window or a hybrid draft
+        self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
+        self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
-        max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+        max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
@@ -204,6 +217,9 @@ class Generator:
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
         self.filter_queue = []
 
+        # Rounds that verified a hybrid (long suffix-match) draft
+        self.hybrid_rounds = 0
+
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
@@ -211,14 +227,14 @@ class Generator:
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
         # into draft_ids_pinned
-        if draft_model or ngram_match_min:
+        if draft_model or ngram_match_min or self.hybrid_draft_tokens:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
                 pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
-                (max_batch_size, self.num_draft_tokens),
+                (max_batch_size, self.max_draft_tokens),
                 dtype = torch.long,
                 pin_memory = True
             )
@@ -243,6 +259,12 @@ class Generator:
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
+            if self.max_draft_tokens > cache.max_history:
+                raise ValueError(
+                    f"Speculative passes of up to {self.max_draft_tokens} draft tokens need a cache with "
+                    f"max_history >= {self.max_draft_tokens} on a recurrent model (this cache has "
+                    f"max_history = {cache.max_history})"
+                )
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
             self.recurrent_cache.pagetable = self.pagetable
             # The new page table owns every page, so every state slot is ours too
@@ -554,22 +576,24 @@ class Generator:
         if self.draft_model:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
-                self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results)
-                self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
-                self.iterate_gen(results, draft_tokens)
 
         # Generation with n-gram draft
         elif self.ngram_match_min:
             draft_tokens = self.iterate_ngram_gen(results)
-            self.iterate_gen(results, draft_tokens)
 
         # Regular generation
         else:
-            self.iterate_gen(results)
+            draft_tokens = None
+
+        # Long suffix-match draft over the regular one, when a job is repeating its context
+        if self.hybrid_draft_tokens:
+            draft_tokens = self.iterate_hybrid_gen(draft_tokens)
+
+        self.iterate_gen(results, draft_tokens)
 
         # Visualization
         if self.visualizer:
@@ -971,6 +995,55 @@ class Generator:
         # Trim to minimum length in batch
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
         return draft_ids
+
+
+    def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None):
+        """
+        Replace the round's draft with hybrid_draft_tokens tokens of suffix-match continuation when some job's
+        current suffix matches at least that many tokens of its earlier context and the continuation agrees
+        with the regular draft (the model's own short-range guess). The verification pass is rectangular, so
+        when any row takes the long draft every row does: rows without a qualifying match keep their regular
+        draft and are padded with whatever continuation their longest match offers, then with repeats of
+        their last token, which verification rejects at the first mismatch. Returns the (rows, width) draft
+        for iterate_gen, or the regular draft unchanged.
+        """
+        H = self.hybrid_draft_tokens
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if not jobs:
+            return draft_tokens
+        rows = []
+        fire = False
+        for i, job in enumerate(jobs):
+            short = draft_tokens[i : i + 1] if draft_tokens is not None else None
+            long, matched = job.get_hybrid_draft(H)
+            # A qualifying row: a match of at least H tokens, H tokens following it, and no disagreement with
+            # the regular drafter over the positions it covers
+            ok = matched >= H and long.shape[-1] == H
+            if ok and short is not None and short.shape[-1] and not torch.equal(long[:, :short.shape[-1]], short):
+                ok = False
+            fire = fire or ok
+            rows.append((ok, short, long))
+        if not fire:
+            return draft_tokens
+
+        out = torch.empty((len(jobs), H), dtype = torch.long)
+        for i, (ok, short, long) in enumerate(rows):
+            if ok:
+                out[i] = long[0]
+                continue
+            parts = []
+            if short is not None and short.shape[-1]:
+                parts.append(short[0])
+            if long.shape[-1]:
+                parts.append(long[0])
+            fill = torch.cat(parts) if parts else jobs[i].sequences[0].sequence_ids.torch()[0, -1:]
+            fill = fill[:H]
+            out[i, : fill.shape[-1]] = fill
+            out[i, fill.shape[-1] :] = fill[-1]
+        # The regular drafter's confidence record no longer describes the verified window
+        self._draft_conf_round = None
+        self.hybrid_rounds += 1
+        return out
 
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):

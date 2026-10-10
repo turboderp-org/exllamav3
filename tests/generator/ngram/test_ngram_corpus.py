@@ -107,10 +107,12 @@ def test_live_vs_corpus_selection(bank):
     seq = torch.tensor([[1, 2, 3]])
     job = SimpleNamespace(
         sam = ext.BC_SAM(),
+        sam_match = None,
         corpus_cursor = corpus.cursor(),
         generator = SimpleNamespace(ngram_match_min = 2),
         sequences = [SimpleNamespace(sequence_ids = SimpleNamespace(torch = lambda: seq))],
     )
+    job.suffix_match = lambda seq: Job.suffix_match(job, seq)
     assert Job.get_ngram_draft(job, 15).tolist() == [[4]]
     # Live tie wins, even if the corpus has a different continuation.
     seq = torch.tensor([[1, 2, 9, 1, 2]])

@@ -21,7 +21,7 @@ def make_generator(recurrent = True, default_interval = None, **kwargs):
     if default_interval is not None:
         caps["default_recurrent_checkpoint_interval"] = default_interval
     model = SimpleNamespace(config = SimpleNamespace(vocab_size = 256), caps = caps)
-    cache = SimpleNamespace(num_slots = 4, reset_states = Mock())
+    cache = SimpleNamespace(num_slots = 4, max_history = 0, reset_states = Mock())
     with patch("exllamav3.generator.generator.PageTable", return_value = SimpleNamespace(max_pages = 16)), \
          patch("exllamav3.generator.generator.ThreadPoolExecutor"):
         return Generator(model, cache, tokenizer = None, **kwargs)

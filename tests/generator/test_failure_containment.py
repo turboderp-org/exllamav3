@@ -142,8 +142,9 @@ def test_failing_prefill_is_contained_in_iterate():
     generator.recurrent_cache = None
     generator.draft_model = None
     generator.ngram_match_min = 0
+    generator.hybrid_draft_tokens = 0
     generator.visualizer = None
-    generator.iterate_gen = lambda results: None
+    generator.iterate_gen = lambda results, draft_tokens = None: None
     results = generator.iterate()
     assert bad not in generator.active_jobs
     assert good in generator.active_jobs
