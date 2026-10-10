@@ -416,6 +416,14 @@ void measure_candidate_sample
             smem,
             stream
         ));
+        if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
+        {
+            fprintf(stderr, "[measure] grid=%dx%d block=%d rep=%d/%d ... ",
+                    candidate.num_sms, candidate.concurrency, candidate.block_dim, i + 1, repeats);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaEventRecord(end, stream));
     cuda_check(cudaEventSynchronize(end));
@@ -474,6 +482,14 @@ void measure_stage
             smem,
             stream
         ));
+        if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
+        {
+            fprintf(stderr, "[autotune probe] kernel=%p grid=%dx%dx%d block=%d smem=%zu ... ",
+                    candidate.kernel, candidate.num_sms, 1, candidate.concurrency, candidate.block_dim, smem);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaStreamSynchronize(stream));
 

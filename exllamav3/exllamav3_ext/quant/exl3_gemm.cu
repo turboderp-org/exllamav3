@@ -337,6 +337,15 @@ int exl3_gemm_gr
             // so the grid may reach the occupancy limit; multiProcessorCount counts WGPs
             int occ = 1;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, (const void*) candidate_kernel, exl3_gemm_blockdim_g[candidate_shape_idx], smem_max);
+            // gfx1150 (RDNA 3.5 APU): the occupancy API over-reports blocks per WGP for these kernels;
+            // any grid beyond true co-residency deadlocks the device barrier (observed on Radeon 890M).
+            // Clamp blocks-per-WGP until proven otherwise. EXL3_RDNA_OCC_MAX overrides (0 = no clamp).
+            int occ_clamp = 1;
+            if (const char* env_occ = std::getenv("EXL3_RDNA_OCC_MAX")) occ_clamp = atoi(env_occ);
+            if (occ_clamp > 0) occ = MIN(MAX(occ, 1), occ_clamp);
+            if (std::getenv("EXL3_DEBUG_AUTOTUNE"))
+                fprintf(stderr, "[exl3_gemm autotune cand] shape=%d block=%d smem=%zu occ_api_occ=%d clamp=%d num_sms=%d -> max_sms=%d\n",
+                        candidate_shape_idx, exl3_gemm_blockdim_g[candidate_shape_idx], (size_t) smem_max, occ, occ_clamp, num_sms, MAX(MIN(max_slices, num_sms * MAX(occ, 1)), 1));
             int max_candidate_sms = MAX(MIN(max_slices, num_sms * MAX(occ, 1)), 1);
 #else
             int max_candidate_sms = MAX(MIN(max_slices, num_sms), 1);
