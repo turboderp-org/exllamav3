@@ -373,9 +373,9 @@ void BC_GatedDeltaNetSplit::run_bszN
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     std::vector<PPTR> args;
@@ -619,9 +619,9 @@ void BC_Mamba2::run_bszN
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     std::vector<PPTR> args;
