@@ -697,7 +697,10 @@ void BC_Attention::run_gr
                 graph->record_param(s.k_qsa_fewq->handle(), GP_end, 0);
             }
         }
-        dsa_topk_gr(s.qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
+        // Eager calls scan only the freshly scored [0, t_scan): the static's tail can hold
+        // scores from an earlier, longer sequence. Graphs patch the scan width per replay
+        const at::Tensor qsa_scores = graph ? s.qsa_scores : s.qsa_scores.narrow(1, 0, t_scan);
+        dsa_topk_gr(qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
         {
             std::vector<void*> args =
             {
