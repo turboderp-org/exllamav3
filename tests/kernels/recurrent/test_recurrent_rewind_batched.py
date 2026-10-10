@@ -184,15 +184,48 @@ def test_gdn_layer_state_replay(device, max_history, bsz):
                     torch.tensor([scratch], dtype = torch.int32, device = device), True,
                     torch.tensor([base], dtype = torch.int32, device = device))
                 ls.recurrent_state.copy_(pool0)
-                ext.batched_scan_replay([ls.replay_job(row, prefix, (bsz, seqlen), base, scratch)],
+                ext.batched_scan_replay([ls.replay_job(row, prefix, (bsz, seqlen, 1), base, scratch)],
                                         device.index, *ls.scan_geometry())
                 torch.cuda.synchronize(device)
                 assert torch.equal(ls.recurrent_state, expect), (row, parity, prefix)
                 assert torch.equal(ls.recurrent_state[base], pool0[base])
     with pytest.raises(AssertionError):
-        ls.replay_job(0, 1, (bsz, seqlen - 1), 0, 1)   # staged shape mismatch
+        ls.replay_job(0, 1, (bsz, seqlen - 1, 1), 0, 1)   # staged shape mismatch
     with pytest.raises(AssertionError):
-        ls.staged_views(bsz, seqlen + 1)               # longer than max_history + 1
+        ls.staged_views(bsz, seqlen + 1)                  # longer than max_history + 1
+
+
+@pytest.mark.parametrize("bsz", [1, 3])
+@torch.inference_mode()
+def test_gdn_layer_state_replay_token_major(device, bsz):
+    # The same pass staged one step at a time (token-major rows, a recurrent drafter's loop) replays to the same
+    # states as the row-major staging of the whole pass, through the replay job's token stride
+    nk, nv, dk, dv, fdim, max_history = 2, 4, 64, 64, 2 * 2 * 64 + 4 * 64, 5
+    steps = max_history + 1
+    conv_all = (torch.randn((bsz, steps, fdim), device = device) * 0.25).bfloat16()
+    beta_all = torch.sigmoid(torch.randn((bsz, steps, nv), device = device)).bfloat16()
+    g_all = torch.randn((bsz, steps, nv), device = device) * 0.5 - 1.0
+    rm = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk)
+    c, b, g = rm.staged_views(bsz, steps)
+    c.copy_(conv_all); b.copy_(beta_all); g.copy_(g_all)
+    tm = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk)
+    tm.recurrent_state.copy_(rm.recurrent_state)
+    for t in range(steps):
+        c, b, g = tm.staged_step_views(bsz, t)
+        c.copy_(conv_all[:, t : t + 1]); b.copy_(beta_all[:, t : t + 1]); g.copy_(g_all[:, t : t + 1])
+    assert tm.spec_shape == (bsz, steps, bsz) and rm.spec_shape == (bsz, steps, 1)
+    pool0 = rm.recurrent_state.clone()
+    for row in range(bsz):
+        for prefix in (1, steps // 2, steps):
+            rm.recurrent_state.copy_(pool0); tm.recurrent_state.copy_(pool0)
+            ext.batched_scan_replay([rm.replay_job(row, prefix, (bsz, steps, 1), 2 * row, 2 * row + 1)],
+                                    device.index, *rm.scan_geometry())
+            ext.batched_scan_replay([tm.replay_job(row, prefix, (bsz, steps, bsz), 2 * row, 2 * row + 1)],
+                                    device.index, *tm.scan_geometry())
+            torch.cuda.synchronize(device)
+            assert torch.equal(tm.recurrent_state, rm.recurrent_state), (row, prefix)
+    with pytest.raises(AssertionError):
+        tm.staged_step_views(bsz, 2)   # a step must continue the staged pass
 
 
 def _conv_window_reference(state_head: torch.Tensor, x: torch.Tensor, k: int):

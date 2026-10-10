@@ -36,7 +36,17 @@ DRAFT_CASES = {
     "hybrid": ("dense", lambda dirs: ["-hdt", str(HYBRID)], _RECITE_TEXT),
     "hybrid-mtp": ("mtp", lambda dirs: ["-mtp", "-hdt", str(HYBRID)], _RECITE_TEXT),
     "hybrid-ngram-recurrent": ("recurrent", lambda dirs: ["-ngram", "2", "-hdt", str(HYBRID)], _RECITE_TEXT),
+    # A recurrent (GDN) autoregressive drafter for a recurrent target of the same family: the draft runs a
+    # token-by-token speculative pass on its own state pool and is settled by the verification
+    "ar-recurrent": ("mtp", lambda dirs: ["-dm", dirs["recurrent"]], REFERENCE_TEXT),
+    # A DFlash2 drafter whose sliding-window layers are window rings (recurrent states paired with the
+    # target's), and the same drafter on a paged cache with -swa_full. The rings case prefills a prompt
+    # longer than the drafter's window in one chunk, so the ring writer drops the chunk's own leading pages
+    "dflash2-rings": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-chunk_size", "4096"], REFERENCE_TEXT * 16),
+    "dflash2-swa-full": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-swa_full"], REFERENCE_TEXT),
 }
+LONG_PROMPT_CASES = {"dflash2-rings"}
+EXTRA_MODELS = {"ar-recurrent": ["recurrent"]}
 
 
 @pytest.mark.parametrize("case", list(DRAFT_CASES))
@@ -46,15 +56,17 @@ def test_drafting_is_lossless(case, model_registry, device):
     entry = model_registry.get(role)
     if not entry.available:
         pytest.skip(f"test model '{role}' not available")
-    dirs = {mid: model_registry.get(mid).path for mid in ([entry.draft] if entry.draft else [])}
+    dirs = {mid: model_registry.get(mid).path for mid in ([entry.draft] if entry.draft else []) + EXTRA_MODELS.get(case, [])}
     for mid, d in dirs.items():
         if not model_registry.get(mid).available:
             pytest.skip(f"draft model '{mid}' not available")
 
     hybrid = case.startswith("hybrid")
     with load_model(entry.path, device, *draft_args(dirs)) as lm:
+        if case == "dflash2-rings":
+            assert lm.draft_model.caps.get("recurrent_states"), "the drafter's sliding-window layers should be window rings"
         ids = lm.tokenizer.encode(text, add_bos = True)
-        if not hybrid:
+        if not hybrid and case not in LONG_PROMPT_CASES:
             ids = ids[:, :PROMPT_TOKENS]
         plain = lm.generator(draft_model = None, draft_cache = None, ngram_match_min = 0, hybrid_draft_tokens = 0)
         ref_tokens, ref_logits, _ = greedy(plain, ids, NEW_TOKENS, return_logits = True)

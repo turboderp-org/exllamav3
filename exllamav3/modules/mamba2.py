@@ -373,6 +373,9 @@ class Mamba2(Module):
 
         bsz, seqlen, _ = x.shape
         save_history = params.get("recurrent_history", False)
+        # Token-by-token speculative pass (recurrent draft models), see GatedDeltaNet.forward
+        spec_step = params.get("recurrent_spec_step") if save_history else None
+        scan_history = save_history and not spec_step
 
         # Post load, fill the fp32 working copies for the dt/decay math and the flattened conv
         # weight (allocated in load_local, source tensors materialized by now)
@@ -390,7 +393,7 @@ class Mamba2(Module):
             # starts from (prepare_for_recurrence)
             recurrent_slots = get_for_device(params, "recurrent_slots", self.device)
             slots_scan = get_for_device(params, "recurrent_slots_scan", self.device)
-            slots_scan_in = get_for_device(params, "recurrent_slots_scan_in", self.device) if save_history else None
+            slots_scan_in = get_for_device(params, "recurrent_slots_scan_in", self.device) if scan_history else None
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
             if rsg[0].exported:
                 rsl = self.tp_recurrent_lookup[rsg[0].cache]
@@ -404,6 +407,11 @@ class Mamba2(Module):
             conv_state, recurrent_state = None, None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
+            scan_history = False
+            spec_step = None
+
+        def stage(bsz, seqlen):
+            return rsl.staged_step_views(bsz, spec_step) if spec_step is not None else rsl.staged_views(bsz, seqlen)
 
         # Fused C++ path for decode, generalized over (bsz, seqlen) up to (_BC_MAX_BSZ,
         # _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs the entire
@@ -413,13 +421,14 @@ class Mamba2(Module):
             self.bc is not None and save_state and
             recurrent_slots is not None and
             x.dtype == torch.float16 and x.is_contiguous() and
-            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
+            not spec_step
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
                 self._bc_configure_slot(bsz, seqlen, save_history, rsl)
-            elif save_history:
-                rsl.staged_views(bsz, seqlen)   # records the pass shape for the rewind
+            if save_history:
+                stage(bsz, seqlen)   # records the pass shape for the rewind
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan, save_history, slots_scan_in)
             if self.tp_reduce:
@@ -437,7 +446,7 @@ class Mamba2(Module):
         # Discretization: dt = clamp(softplus(dt_raw + dt_bias)), g = dt * A. A speculative pass
         # produces its scan inputs in the cache's staging buffers for the rewind's replay
         if save_history:
-            staged_conv, dt, g = rsl.staged_views(bsz, seqlen)
+            staged_conv, dt, g = stage(bsz, seqlen)
         else:
             staged_conv = None
             dt = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
@@ -454,6 +463,7 @@ class Mamba2(Module):
             conv1d_bias = self.conv1d_bias,
             history = save_history,
             params = params,
+            incremental = bool(spec_step),
         )
         if save_history:
             mixed_xbc = staged_conv.copy_(mixed_xbc)
@@ -461,7 +471,7 @@ class Mamba2(Module):
         # SSM
         if seqlen >= self.num_v_heads:
             core_attn_out = self.ssd_chunked(mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen,
-                                             history = save_history)
+                                             history = scan_history)
         else:
             core_attn_out = torch.empty(
                 (bsz, seqlen, self.num_v_heads, self.v_head_dim),
@@ -486,7 +496,7 @@ class Mamba2(Module):
                 self.k_head_dim,
                 self.v_head_dim,
                 slots_scan,
-                save_history,
+                scan_history,
                 slots_scan_in,
             )
 

@@ -6,10 +6,11 @@ import weakref
 from ..cache import Cache
 from ..model.config import no_default
 from ..model.model import Model
-from ..modules import RMSNorm, Attention, GatedMLP
+from ..modules import RMSNorm, Attention, SlidingAttention, SWAState, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.arch_specific.dflash2 import DFlash2Block, DFlash2DynConv, DFlash2Selector
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from .dflash import DFlashConfig, dflash_update_kv_from_target
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
@@ -87,9 +88,11 @@ class DFlash2Model(Model):
     def __init__(
         self,
         config: DFlash2Config,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.input_layer = DFlashInputLayer(
             config = config,
@@ -111,7 +114,10 @@ class DFlash2Model(Model):
         for idx in range(config.num_hidden_layers):
             window_left, window_right = config.block_window(idx)
 
-            attn = Attention(
+            # Sliding-window layers keep a window ring per sequence (see DFlashModel); -swa_full
+            # keeps the paged cache
+            swa = config.layer_types[idx] == "sliding_attention" and not swa_full
+            attn = (SlidingAttention if swa else Attention)(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -217,6 +223,13 @@ class DFlash2Model(Model):
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
+        self.recurrent_state_cls = None
+        if any(isinstance(m, SlidingAttention) for m in self.attn_modules):
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.attached_model = None
 
@@ -313,7 +326,10 @@ class DFlash2Model(Model):
         # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
         # flag is only needed when every layer is causal; windowed layers carry their own bounds
         params["causal"] = self.config.is_causal is True
-        return prepare_for_attn(input_ids, params)
+        input_ids = prepare_for_attn(input_ids, params)
+        if self.recurrent_state_cls is not None:
+            prepare_for_recurrence(input_ids, params, self)
+        return input_ids
 
 
     @override

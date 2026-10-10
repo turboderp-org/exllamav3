@@ -134,6 +134,34 @@ def test_conv1d_update_matches_sequential_steps(device):
     assert torch.equal(s1, s2)
 
 
+@pytest.mark.parametrize("seqlen, max_history", [(1, 1), (3, 3), (6, 6), (4, 7), (8, 64)])
+@torch.inference_mode()
+def test_conv1d_update_incremental_matches_history_pass(device, seqlen, max_history):
+    # A history pass fed one token at a time (step 0 a plain history call, later steps incremental) must leave the
+    # tail of the ring, outputs included, exactly as one history pass over all the tokens does: the rewind that
+    # ends every speculative pass reads that tail (and rewrites the committed window from it)
+    bsz, dim, K = 2, 1024, 4
+    slots = torch.tensor([1, 0], dtype = torch.int32, device = device)
+    x = torch.randn((bsz, dim, seqlen), device = device).bfloat16()
+    w = torch.randn((dim, K), device = device).bfloat16()
+    bias = torch.randn((dim,), device = device).bfloat16()
+    state0 = torch.randn((2, dim, K + max_history), device = device).bfloat16()
+    s1 = state0.clone()
+    out1 = _run(x, s1, slots, w, bias, True, True)
+    s2 = state0.clone()
+    outs = []
+    for t in range(seqlen):
+        out = torch.full((bsz, 1, dim), 12345.0, dtype = torch.bfloat16, device = device)
+        ext.cuda_causal_conv1d_update(x[:, :, t : t + 1].contiguous(), s2, slots, w, bias, out, True, True, t > 0)
+        outs.append(out)
+    torch.cuda.synchronize(device)
+    assert torch.equal(torch.cat(outs, dim = 1), out1)
+    tail = K + seqlen
+    assert torch.equal(s1[:, :, -tail:], s2[:, :, -tail:])
+    with pytest.raises(RuntimeError, match = "incremental steps are history steps"):
+        ext.cuda_causal_conv1d_update(x[:, :, :1].contiguous(), s2, slots, w, bias, outs[0], True, False, True)
+
+
 @torch.inference_mode()
 def test_conv1d_update_deterministic(device):
     bsz, dim, K, seqlen = 4, 4096, 4, 8

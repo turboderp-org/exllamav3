@@ -3,7 +3,7 @@ import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
-from ..cache.recurrent import RecurrentCache, host_pool, mp_host_pool_release
+from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -174,8 +174,12 @@ class Generator:
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
                 "Cache and draft cache must be same size"
-            assert not draft_model.caps.get("recurrent_states"), \
-                "Speculative decoding with recurrent draft model not supported."
+            if draft_model.caps.get("recurrent_states"):
+                # An autoregressive drafter with recurrent layers drafts through a token-by-token
+                # speculative pass on its own state pool (iterate_draftmodel_gen); a DFlash-family
+                # drafter's sliding-window rings take the projected rows directly. MTP heads with
+                # recurrent layers have neither path yet
+                assert not draft_model.caps.get("mtp_draft"), "Recurrent MTP draft models are not supported."
             if num_draft_tokens:
                 self.num_draft_tokens = num_draft_tokens
             else:
@@ -256,25 +260,39 @@ class Generator:
         # Defrag
         self.enable_defrag = enable_defrag
 
-        # Recurrent cache
+        # Recurrent cache. A job's recurrent state is a PairedState over the target and draft sides;
+        # both sides checkpoint together into this one pool (see PairedState)
         self.recurrent_cache_size = recurrent_cache_size
-        if self.model.caps.get("recurrent_states"):
+        self.target_recurrent = bool(self.model.caps.get("recurrent_states"))
+        self.draft_recurrent = bool(draft_model is not None and draft_model.caps.get("recurrent_states"))
+        if self.target_recurrent:
             if self.max_draft_tokens > cache.max_history:
                 raise ValueError(
                     f"Speculative passes of up to {self.max_draft_tokens} draft tokens need a cache with "
                     f"max_history >= {self.max_draft_tokens} on a recurrent model (this cache has "
                     f"max_history = {cache.max_history})"
                 )
-            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+        if self.draft_recurrent and not draft_model.caps.get("dflash_draft") and self.num_draft_tokens > draft_cache.max_history:
+            raise ValueError(
+                f"A recurrent draft model drafting {self.num_draft_tokens} tokens needs a draft cache with "
+                f"max_history >= {self.num_draft_tokens} (this cache has max_history = {draft_cache.max_history})"
+            )
+        if self.target_recurrent or self.draft_recurrent:
+            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size, draft_model)
             self.recurrent_cache.pagetable = self.pagetable
             # The new page table owns every page, so every state slot is ours too
-            cache.reset_states()
-            # Limit batch size if cache has recurrent states
-            self.max_batch_size = min(self.max_batch_size, cache.num_slots)
+            for c, recurrent in ((cache, self.target_recurrent), (draft_cache, self.draft_recurrent)):
+                if recurrent:
+                    c.reset_states()
+                    # Limit batch size if cache has recurrent states
+                    self.max_batch_size = min(self.max_batch_size, c.num_slots)
         else:
             self.recurrent_cache = None
         if recurrent_checkpoint_interval is None:
-            recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
+            # The target sets the checkpoint schedule; a recurrent draft under a non-recurrent target
+            # lends it its own
+            schedule_model = model if self.target_recurrent or not self.draft_recurrent else draft_model
+            recurrent_checkpoint_interval = schedule_model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
@@ -707,6 +725,28 @@ class Generator:
             assert not job.embeddings, \
                 "MM embeddings not supported while using draft model."
 
+        # Recurrent drafter: its states must stand exactly at the K/V position before the round (the
+        # draft consumes every token it drafts, so this holds unless a hybrid round accepted past its
+        # window); a lagging state first consumes the gap in a plain pass
+        draft_states = None
+        if self.draft_recurrent:
+            draft_states = []
+            for job in self.active_jobs:
+                if not job.is_prefill_done(): continue
+                seq = job.sequences[0]
+                ds = job.recurrent_state.draft
+                if ds.position < seq.kv_position:
+                    gap = seq.sequence_ids.torch_slice(ds.position, seq.kv_position)
+                    self.draft_model.prefill(gap, {
+                        "attn_mode": "flash_attn",
+                        "block_table": seq.block_index_tensor,
+                        "cache": self.draft_cache,
+                        "cache_seqlens": torch.tensor([ds.position], dtype = torch.int32),
+                        "recurrent_states": [ds],
+                    })
+                assert ds.position == seq.kv_position, "recurrent draft state out of step with the K/V position"
+                draft_states.append(ds)
+
         # Collect input IDs
         input_ids_list = []
         for job in self.active_jobs:
@@ -719,21 +759,26 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
+        def draft_params(step):
+            p = {
+                "attn_mode": "flash_attn",
+                "block_table": block_index,
+                "cache": self.draft_cache,
+                "cache_seqlens": cache_seqlens,
+            }
+            if draft_states is not None:
+                # One speculative pass over the drafted tokens, fed one step at a time; the round's
+                # verification settles it (rewind to the accepted prefix) in iterate_gen
+                p.update({"recurrent_states": draft_states, "recurrent_history": True, "recurrent_spec_step": step})
+            return p
+
         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
         window = self.num_draft_tokens
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
         for idx in range(window):
-            batch_logits = self.draft_model.forward(
-                input_ids = batch_ids,
-                params = {
-                    "attn_mode": "flash_attn",
-                    "block_table": block_index,
-                    "cache": self.draft_cache,
-                    "cache_seqlens": cache_seqlens,
-                }
-            )
+            batch_logits = self.draft_model.forward(input_ids = batch_ids, params = draft_params(idx))
             if cal is not None:
                 conf, new_ids = torch.max(batch_logits, dim = -1)
             else:
@@ -750,15 +795,9 @@ class Generator:
                     window = idx + 1
                     break
 
-        self.draft_model.prefill(
-            input_ids = batch_ids,
-            params = {
-                "attn_mode": "flash_attn",
-                "block_table": block_index,
-                "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens
-            }
-        )
+        # The last drafted token goes into the draft cache too, so a fully accepted round leaves the
+        # drafter at the next unprocessed token
+        self.draft_model.prefill(input_ids = batch_ids, params = draft_params(window))
 
         if conf_cols:
             self._draft_conf_round = {
@@ -918,13 +957,17 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
-        # Run draft model
+        # Run draft model. A drafter with sliding-window states appends its block to each row's
+        # window ring; the rows the verification accepts are written over it afterwards
+        # (update_kv_from_target below), which also rolls the state back to the K/V position
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
             "cache": self.draft_cache,
             "cache_seqlens": cache_seqlens,
         }
+        if self.draft_recurrent:
+            params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
         out_state = self.draft_model.forward(
@@ -995,6 +1038,22 @@ class Generator:
         # Trim to minimum length in batch
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
         return draft_ids
+
+
+    def new_recurrent_state(self) -> PairedState:
+        """A fresh (cleared) pair of recurrent states for a new sequence, one side per recurrent model"""
+        return PairedState(
+            self.cache.get_new_state() if self.target_recurrent else None,
+            self.draft_cache.get_new_state() if self.draft_recurrent else None,
+        )
+
+
+    def recurrent_state_from_stashed(self, stashed: dict, position: int) -> PairedState:
+        """The pair restored from a checkpoint stash (PairedState.stash) at `position`"""
+        return PairedState(
+            self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None,
+            self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None,
+        )
 
 
     def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None):
@@ -1129,8 +1188,8 @@ class Generator:
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
         # the model can advance or rewind it consistently with accepted draft tokens.
         batch_states = None
-        if self.recurrent_cache is not None:
-            batch_states = [job.recurrent_state for job in batch_jobs]
+        if self.target_recurrent:
+            batch_states = [job.recurrent_state.target for job in batch_jobs]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
@@ -1411,17 +1470,41 @@ class Generator:
                     cal.add_label(conf[a].item(), ids_full[a].item() == tail)
             cal.decay_step()
 
+        # Settle a recurrent drafter's speculative pass: it consumed the round's input token and every
+        # drafted token (last_history of them); the rejected drafts are undone, leaving its state at
+        # the accepted prefix, i.e. at the new K/V position (or behind it after a long hybrid round)
+        if self.draft_recurrent and draft_tokens is not None:
+            accepted_idx = 0
+            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a_idx == b_idx:
+                    continue
+                accepted_drafts = accepted_lengths[accepted_idx] - 1
+                accepted_idx += 1
+                if id(job) in rewound_jobs or job.recurrent_state is None:
+                    continue   # a checkpoint rewind replaced the pair
+                ds = job.recurrent_state.draft
+                ds.rewind(max(0, ds.last_history - accepted_drafts))
+
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
+            update_params = {
+                "block_table": block_index,
+                "cache_seqlens": p_cache_seqlens,
+            }
+            lengths = accepted_lengths
+            if self.draft_recurrent:
+                # A row whose pair a checkpoint rewind replaced gets its window from the replay
+                # prefill instead; its length 0 skips the write (and the rollback)
+                drafting = [job for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
+                update_params["recurrent_states"] = [job.recurrent_state.draft for job in drafting]
+                lengths = [0 if id(job) in rewound_jobs or job.recurrent_state is None else n
+                           for job, n in zip(drafting, accepted_lengths)]
             self.draft_model.update_kv_from_target(
                 target_hidden = p_export_states,
                 cache = self.draft_cache,
-                lengths = accepted_lengths,
-                params = {
-                    "block_table": block_index,
-                    "cache_seqlens": p_cache_seqlens,
-                }
+                lengths = lengths,
+                params = update_params,
             )
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden

@@ -460,6 +460,7 @@ struct ScanOperands
     bfloat16* out;          // nullptr: discard the attention output (replay)
     const float* D;
     int steps;
+    int tstride;            // staged token rows between consecutive tokens (replay); 1 otherwise
 };
 
 template <int MODE>
@@ -496,6 +497,7 @@ __device__ __forceinline__ bool resolve_scan_operands
         op.out = nullptr;
         op.D = (const float*) j.D;
         op.steps = j.prefix;
+        op.tstride = j.tstride;
         return true;
     }
     op.qkv = mixed_qkv + (size_t) bi * seqlen * qkv_row;
@@ -507,6 +509,7 @@ __device__ __forceinline__ bool resolve_scan_operands
     op.out = core_attn_out + (size_t) bi * seqlen * out_row;
     op.D = D;
     op.steps = seqlen;
+    op.tstride = 1;
     return true;
 }
 
@@ -707,9 +710,9 @@ __device__ __forceinline__ void scan_body
         }
 
         // Next seq index
-        mixed_qkv +=        2 * k_head_dim * num_k_heads + v_head_dim * num_v_heads;
-        g +=                num_v_heads;
-        beta +=             num_v_heads;
+        mixed_qkv +=        (size_t) op.tstride * (2 * k_head_dim * num_k_heads + v_head_dim * num_v_heads);
+        g +=                (size_t) op.tstride * num_v_heads;
+        beta +=             (size_t) op.tstride * num_v_heads;
         if (core_attn_out) core_attn_out += num_v_heads * v_head_dim;
     }
 }
@@ -861,9 +864,9 @@ __device__ __forceinline__ void scan_body_128
             out[t] = __float2bfloat16_rz(v_out * scale);
         }
 
-        mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
-        g +=                num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);
-        beta +=             num_v_heads;
+        mixed_qkv +=        (size_t) op.tstride * (2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads);
+        g +=                (size_t) op.tstride * num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);
+        beta +=             (size_t) op.tstride * num_v_heads;
         if (core_attn_out) core_attn_out += num_v_heads * HEAD_DIM;
     }
 }
@@ -1493,8 +1496,15 @@ void cuda_recurrent_mamba2
 // concatenation of conv_state[slot,d,0:K] and x[b,d,0:seqlen]. Without history, the last K
 // inputs are written back to conv_state[slot,d,0:K]; with history, the last
 // min(state_size, K+seqlen) inputs are written to the tail of the state buffer (rewindable).
+// INCREMENTAL continues a history pass one step at a time (a recurrent draft model drafting
+// token by token): the window is the tail of the buffer (the last K inputs the pass has seen,
+// not the committed window at [0:K]), and the whole row shifts left by seqlen before the new
+// inputs land at the tail, so after t such steps the tail holds exactly what one history pass
+// over those t tokens would have written. The shift runs over the committed window too; that is
+// fine because every speculative pass ends in a rewind, which rewrites [0:K] from the tail
+// before anything reads it again.
 
-template <bool ACT, bool HISTORY>
+template <bool ACT, bool HISTORY, bool INCREMENTAL = false>
 __global__ __launch_bounds__(CONV1D_NUM_THREADS)
 void conv1d_update_kernel
 (
@@ -1528,9 +1538,10 @@ void conv1d_update_kernel
     // Previous window; win[K-1] slot is filled with the current input each step
     float old_state[CONV1D_MAX_K];
     float win[CONV1D_MAX_K];
+    const int win_off = INCREMENTAL ? state_size - K : 0;
     #pragma unroll
     for (int k = 0; k < CONV1D_MAX_K; ++k)
-        if (k < K) old_state[k] = __bfloat162float(state_d[k]);
+        if (k < K) old_state[k] = __bfloat162float(state_d[win_off + k]);
     #pragma unroll
     for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
         if (k < K - 1) win[k] = old_state[k + 1];
@@ -1568,6 +1579,15 @@ void conv1d_update_kernel
             }
         }
     }
+    else if constexpr (INCREMENTAL)
+    {
+        // Shift the row left by seqlen (one thread owns the whole row, so in order), then append
+        int n = seqlen < state_size ? seqlen : state_size;
+        for (int j = 0; j < state_size - n; ++j)
+            state_d[j] = state_d[j + n];
+        for (int j = 0; j < n; ++j)
+            state_d[state_size - n + j] = x_d[seqlen - n + j];
+    }
     else
     {
         int total = K + seqlen;
@@ -1593,9 +1613,11 @@ void cuda_causal_conv1d_update_gr
     at::Tensor& out,
     bool activation,
     bool history,
-    Graph* graph
+    Graph* graph,
+    bool incremental
 )
 {
+    TORCH_CHECK(!incremental || history, "cuda_causal_conv1d_update: incremental steps are history steps");
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(!graph || slots.has_value(), "cuda_causal_conv1d_update: graph capture requires slots");
@@ -1664,13 +1686,15 @@ void cuda_causal_conv1d_update_gr
 
     if (activation)
     {
-        if (history) LAUNCH_CONV(conv1d_update_kernel<true, true>)
-        else         LAUNCH_CONV(conv1d_update_kernel<true, false>)
+        if (incremental)  LAUNCH_CONV(conv1d_update_kernel<true, true, true>)
+        else if (history) LAUNCH_CONV(conv1d_update_kernel<true, true>)
+        else              LAUNCH_CONV(conv1d_update_kernel<true, false>)
     }
     else
     {
-        if (history) LAUNCH_CONV(conv1d_update_kernel<false, true>)
-        else         LAUNCH_CONV(conv1d_update_kernel<false, false>)
+        if (incremental)  LAUNCH_CONV(conv1d_update_kernel<false, true, true>)
+        else if (history) LAUNCH_CONV(conv1d_update_kernel<false, true>)
+        else              LAUNCH_CONV(conv1d_update_kernel<false, false>)
     }
     #undef LAUNCH_CONV
     #undef KERNEL_ARGS
@@ -1687,10 +1711,11 @@ void cuda_causal_conv1d_update
     const c10::optional<at::Tensor>& bias,
     at::Tensor& out,
     bool activation,
-    bool history
+    bool history,
+    bool incremental
 )
 {
-    cuda_causal_conv1d_update_gr(x, conv_state, slots, weight, bias, out, activation, history, nullptr);
+    cuda_causal_conv1d_update_gr(x, conv_state, slots, weight, bias, out, activation, history, nullptr, incremental);
 }
 
 // Split-projection (Qwen3.5) decode helper. Replaces the qkv transpose/cast done in Torch plus
@@ -2208,6 +2233,7 @@ void batched_scan_replay
         {
             batch.jobs[i] = jobs[base + i];
             TORCH_CHECK(batch.jobs[i].prefix >= 1, "batched_scan_replay: prefix must be at least 1");
+            TORCH_CHECK(batch.jobs[i].tstride >= 1, "batched_scan_replay: tstride must be at least 1");
             TORCH_CHECK(batch.jobs[i].base != batch.jobs[i].scratch, "batched_scan_replay: base and scratch rows must differ");
             TORCH_CHECK(!mamba2 || batch.jobs[i].D, "batched_scan_replay: Mamba2 jobs need D");
         }

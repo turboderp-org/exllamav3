@@ -77,16 +77,93 @@ def note_freed(nbytes: int):
         malloc_trim()
 
 
+class PairedState:
+    """
+    One sequence's recurrent state across the target model and the draft model, as the generator and
+    jobs see it: each side that keeps recurrent state (GDN / Mamba2 pools, SWA rings, DSA pools) has its
+    own state object from its own cache, and the pair moves together. Checkpoints stash both sides
+    under one key at the target's page boundary, so a prompt-cache resume restores both, and one LRU
+    eviction drops both. Either side may be absent (a dense target with a recurrent draft, or the
+    common case today, a recurrent target and no recurrent draft).
+
+    The verification pass advances the target side only; the draft side is advanced by the draft's own
+    forwards, or by the projected rows a DFlash-family drafter writes, so rewind() after verification
+    and after a prefill overshoot rewinds the target side alone. A checkpoint rewind (banned strings)
+    brings every side to the same position (rewind_to), in place where each side's rollback capacity
+    allows, otherwise the job restores the pair from a stash.
+    """
+
+    def __init__(self, target = None, draft = None):
+        assert target is not None or draft is not None, "PairedState needs at least one side"
+        self.target = target
+        self.draft = draft
+
+    @property
+    def components(self):
+        return [s for s in (self.target, self.draft) if s is not None]
+
+    @property
+    def primary(self):
+        return self.target if self.target is not None else self.draft
+
+    @property
+    def position(self) -> int:
+        return self.primary.position
+
+    @property
+    def last_history(self) -> int:
+        return self.primary.last_history
+
+    @property
+    def checkpoint_size(self) -> int:
+        return sum(s.checkpoint_size for s in self.components)
+
+    def rewind(self, num_tokens: int):
+        """Settle the target side after a speculative pass, or correct its position after a prefill
+        overshoot (see the class note)"""
+        if self.target is not None:
+            self.target.rewind(num_tokens)
+
+    def can_rewind_to(self, position: int) -> bool:
+        return all(0 <= s.position - position <= s.rollback_capacity() for s in self.components)
+
+    def rewind_to(self, position: int):
+        for s in self.components:
+            s.rewind(s.position - position)
+
+    def stash(self) -> dict:
+        stashed = {
+            "position": self.position,
+            "checkpoint_size": self.checkpoint_size,
+        }
+        if self.target is not None:
+            stashed["target"] = self.target.stash()
+        if self.draft is not None:
+            stashed["draft"] = self.draft.stash()
+        return stashed
+
+    def free(self):
+        for s in self.components:
+            s.free()
+
+    def reset(self):
+        for s in self.components:
+            s.reset()
+
+
 class RecurrentCache(OrderedDict):
     def __init__(
         self,
         model,
         max_size: int = 4 * 1024**3,
+        draft_model = None,
     ):
         super().__init__()
         self.max_size = max_size
         self.current_size = 0
         self.model = model
+        # The models behind each side of a stashed pair, for the tensor-parallel ranks' copies
+        self.models = {"target": model, "draft": draft_model}
 
         # Optionally set by the Generator; enables stranded-first eviction and staleness metrics
         self.pagetable = None
@@ -143,10 +220,7 @@ class RecurrentCache(OrderedDict):
                             self.metrics["stash_evictions_live_kv"] += 1
 
                 self.metrics["stash_evictions"] += 1
-                host_pool.give(popped)
-                note_freed(popped["checkpoint_size"])
-                if self.model.loaded_tp:
-                    self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+                self._release(popped)
 
             self[key] = state.stash()
             self.update_total_size()
@@ -165,10 +239,7 @@ class RecurrentCache(OrderedDict):
         for k in stranded:
             popped = self.pop(k)
             self.metrics["stash_pruned"] += 1
-            host_pool.give(popped)
-            note_freed(popped["checkpoint_size"])
-            if self.model.loaded_tp:
-                self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+            self._release(popped)
         if stranded:
             self.update_total_size()
         return len(stranded)
@@ -191,8 +262,7 @@ class RecurrentCache(OrderedDict):
             seen.add(id(popped))
             host_pool.give(popped)
             freed += popped["checkpoint_size"]
-            if self.model.loaded_tp:
-                self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+            self._release_tp(popped)
         self.current_size = 0
         self.pagetable = None
         if freed:
@@ -202,6 +272,22 @@ class RecurrentCache(OrderedDict):
             self.model.tp_dispatch_all(mp_host_pool_release, ())
         malloc_trim()
 
+
+    def _release_tp(self, stashed: dict):
+        """Drop the tensor-parallel ranks' copies of a stash: one handle per side of a pair (or at
+        the top level of a bare state stash)"""
+        for key in ("target", "draft", None):
+            s = stashed if key is None else stashed.get(key)
+            if not isinstance(s, dict) or "tp_handle" not in s:
+                continue
+            model = self.model if key is None else self.models[key]
+            if model is not None and model.loaded_tp:
+                model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), s["tp_handle"]))
+
+    def _release(self, stashed: dict):
+        host_pool.give(stashed)
+        note_freed(stashed["checkpoint_size"])
+        self._release_tp(stashed)
 
     def update_total_size(self):
         seen = set()

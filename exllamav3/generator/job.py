@@ -1040,20 +1040,20 @@ class Job:
             replay_from = None
             if self.recurrent_state is not None:
                 target = self.sequences[0].kv_position - offset
-                # During draft verification the state runs ahead of the accepted K/V position, so rewind by the
-                # state's actual distance from the target rather than by the checkpoint offset
-                rw = self.recurrent_state.position - target
-                if rw <= self.recurrent_state.rollback_capacity():
-                    self.recurrent_state.rewind(rw)
+                # During draft verification the state runs ahead of the accepted K/V position, so rewind to the
+                # target position rather than by the checkpoint offset; every side of the pair must be able to
+                # roll back in place, else the pair is restored from a stash
+                if self.recurrent_state.can_rewind_to(target):
+                    self.recurrent_state.rewind_to(target)
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.recurrent_state.free()
                     if stashed is not None:
                         replay_from = stashed["position"]
-                        self.recurrent_state = self.generator.cache.new_from_stashed(stashed, replay_from)
+                        self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
                     else:
                         replay_from = 0
-                        self.recurrent_state = self.generator.cache.get_new_state()
+                        self.recurrent_state = self.generator.new_recurrent_state()
                     self.last_recurrent_checkpoint_pos = replay_from or None
 
             for seq in self.sequences:
@@ -1537,7 +1537,8 @@ class Job:
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
+                    "recurrent_states": [self.recurrent_state.target] if self.recurrent_state is not None and
+                                        self.recurrent_state.target is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
@@ -1559,6 +1560,8 @@ class Job:
                         params = {
                             "block_table": seq.block_index_tensor,
                             "cache_seqlens": params["cache_seqlens"],
+                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                and self.recurrent_state.draft is not None else None,
                         }
                     )
                 elif self.generator.draft_model:
@@ -1581,6 +1584,8 @@ class Job:
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                                and self.recurrent_state.draft is not None else None,
                         }
                     )
 
@@ -1589,7 +1594,7 @@ class Job:
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
                 if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
-                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
+                    self.recurrent_state.rewind_to(prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1670,9 +1675,9 @@ class Job:
             self.free_recurrent_state()
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
-                    self.recurrent_state = self.generator.cache.get_new_state()
+                    self.recurrent_state = self.generator.new_recurrent_state()
                 else:
-                    self.recurrent_state = self.generator.cache.new_from_stashed(
+                    self.recurrent_state = self.generator.recurrent_state_from_stashed(
                         stashed_recurrent_state,
                         position = cached_pages * PAGE_SIZE,
                     )

@@ -301,12 +301,16 @@ def init(
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
+            # The draft cache gets the same speculative headroom and slot count: a recurrent drafter
+            # keeps its own state pool and checkpoints alongside the target's
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             ) if draft_model_dir else None
         else:
             cache = Cache(
@@ -319,7 +323,9 @@ def init(
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             ) if draft_model_dir else None
     else:
         cache = None

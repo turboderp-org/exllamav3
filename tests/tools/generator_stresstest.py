@@ -49,10 +49,13 @@ def start_new_job(args, generator, tokenizer, suffix, rng):
 def check_result(result, num_pending, num_active, total_tps):
     cached_tokens = result["cached_tokens"]
     cached_pages = result["cached_pages"]
+    accepted = result.get("accepted_draft_tokens", 0)
+    drafted = accepted + result.get("rejected_draft_tokens", 0)
+    draft_rate = f"{accepted / drafted:6.1%}" if drafted else "   n/a"
     print(
         f"{str(result['job']):20}  pending: {num_pending:3}  active: {num_active:3}  "
         f"cached_p: {cached_pages:3}  cached_t: {cached_tokens:5}  "
-        f"tps: {total_tps:8.2f}  -  ",
+        f"draft_acc: {draft_rate}  tps: {total_tps:8.2f}  -  ",
         end = "",
     )
 
@@ -110,7 +113,12 @@ def iterate(
         if result["eos"]:
             reset_throughput = True
             serial = result["serial"]
-            if not requeued and serial not in completed_serials:
+            if result.get("stage") == "error":
+                # A failed job is reaped with just the error (generator.reap_failed_job)
+                completed_serials.add(serial)
+                suspicious_results += 1
+                print(f"{str(result['job']):20}  FAILED: {result['error']!r}")
+            elif not requeued and serial not in completed_serials:
                 completed_serials.add(serial)
                 if check_result(result, num_pending, num_active, total_tps):
                     passed_results += 1

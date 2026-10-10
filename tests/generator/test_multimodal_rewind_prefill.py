@@ -64,7 +64,8 @@ def make_job(prompt_length, sequence_length, replay_start, *, image = True, imag
     seq.sequence_ids.append(ids[:, prompt_length:])
     seq.kv_position = replay_start
     seq.block_index_tensor = torch.tensor([[0]], dtype = torch.int32)
-    job.recurrent_state = SimpleNamespace(position = replay_start)
+    # The job hands the target side of its PairedState to the forward and reads the pair's position
+    job.recurrent_state = SimpleNamespace(position = replay_start, target = SimpleNamespace(position = replay_start))
     job.generator = SimpleNamespace(
         model = ModelProbe(rope),
         max_chunk_size = PAGE_SIZE,

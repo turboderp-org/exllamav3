@@ -269,6 +269,7 @@ class SlidingAttention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
         sliding_window_overp: int = 2 * PAGE_SIZE,
+        window_right: int = 0,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -308,6 +309,9 @@ class SlidingAttention(Module):
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.sliding_window_overp = sliding_window_overp
+        # Keys ahead of the query a row may see (block-diffusion drafters attend bidirectionally
+        # within their block); the block's rows are appended to the ring before the step runs
+        self.window_right = window_right
         # The state buffer holds the window plus overprovisioned history so speculative decoding can
         # roll back rejected drafts without recompute; the shift logic drops up to a page at a time,
         # so round UP to whole pages to preserve at least the requested slack after a shift
@@ -846,6 +850,69 @@ class SlidingAttention(Module):
         return x
 
 
+    def plan_state_rows(self, rsg, positions: list[int], lengths: list[int] | None, n_default: int):
+        """Ring geometry for rows written outside a forward (a DFlash-family drafter projects K/V from the
+        target's hidden states): row i's lengths[i] rows (default n_default) go at absolute position
+        positions[i], after rolling the state back to it in place (dropping the provisional block the
+        draft forward appended). When the run passes the end of the buffer, whole pages drop from the
+        front as in the prefill path. One SWAState serves every sliding layer, so the plan is taken from
+        the states before any layer writes (write_state_rows) and the states move once (commit_state_rows).
+        Returns per row (slot, pos0, cache_pos, n, shift), or None for a row with nothing to write"""
+        S = self.kv_state_size
+        plan = []
+        for i, rs in enumerate(rsg):
+            n = n_default if lengths is None else lengths[i]
+            if n <= 0:
+                plan.append(None)
+                continue
+            pos0 = positions[i]
+            assert rs.window_beg <= pos0 <= rs.position, \
+                f"SlidingAttention.plan_state_rows: position {pos0} outside the state's window [{rs.window_beg}, {rs.position}]"
+            cache_pos = pos0 - rs.window_beg
+            shift = 0 if cache_pos + n <= S else (cache_pos + n + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE - S
+            plan.append((rs.slot, pos0, cache_pos, n, shift))
+        return plan
+
+
+    def write_state_rows(self, rsg, plan: list, k: torch.Tensor, v: torch.Tensor):
+        """Write this layer's rows per plan_state_rows into its window rings"""
+        layer_instance = (self.layer_idx, 0)
+        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        k_states, v_states = rsl.get_state_tensors()
+        for i, p in enumerate(plan):
+            if p is None:
+                continue
+            slot, _, cache_pos, n, shift = p
+            if shift == 0:
+                k_states[slot, cache_pos : cache_pos + n].copy_(k[i, :n])
+                v_states[slot, cache_pos : cache_pos + n].copy_(v[i, :n])
+                continue
+            # Keep what fits of the old run (moved down by the dropped pages), then append
+            n_keep = cache_pos - shift
+            if n_keep > 0:
+                k_states[slot, :n_keep].copy_(k_states[slot, shift : cache_pos].clone())
+                v_states[slot, :n_keep].copy_(v_states[slot, shift : cache_pos].clone())
+                k_states[slot, n_keep : n_keep + n].copy_(k[i, :n])
+                v_states[slot, n_keep : n_keep + n].copy_(v[i, :n])
+            else:
+                skip = -n_keep
+                k_states[slot, : n - skip].copy_(k[i, skip : n])
+                v_states[slot, : n - skip].copy_(v[i, skip : n])
+
+
+    @staticmethod
+    def commit_state_rows(rsg, plan: list):
+        """Move the states past the rows every layer wrote"""
+        for rs, p in zip(rsg, plan):
+            if p is None:
+                continue
+            _, pos0, _, n, shift = p
+            rs.window_beg += shift
+            rs.position = pos0 + n
+            rs.last_history = 0
+            rs.wshift = 0
+
+
     def _decode_state_prep(self, rsg, k_states, v_states, seqlen):
         """Per-row page shift when the window run reaches the end of the state buffer, cached
         per-slot block table, and the in-state sequence lengths for a decode step."""
@@ -876,7 +943,7 @@ class SlidingAttention(Module):
         return bt, cache_seqlens
 
 
-    def bc_swa_step(self, x, rsg, params, seqlen):
+    def bc_swa_step(self, x, rsg, params, seqlen, causal = True):
         """Graph-captured decode step over the sliding-window state (projections through
         o_proj as one replayed CUDA graph). Returns the block output, or None when the
         configuration is unsupported."""
@@ -901,7 +968,7 @@ class SlidingAttention(Module):
 
         k_states, v_states = rsl.get_state_tensors()
         bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
-        return bca.step(x, cache_seqlens, bt, position, positions, position_ids, inv_freq)
+        return bca.step(x, cache_seqlens, bt, position, positions, position_ids, inv_freq, causal = causal)
 
 
     def decode_flash_attn_nc(
@@ -973,13 +1040,15 @@ class SlidingAttention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         # Graph-captured C++ path for the whole decode step
+        # The graph kernels have no right-window mask: a non-causal block qualifies when its right
+        # window covers the whole block (the only keys past a row are the block's own)
         if (
-            _bc_attn_enable and causal and non_causal_spans is None and
+            _bc_attn_enable and non_causal_spans is None and (causal or self.window_right >= seqlen - 1) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:
-                o = self.bc_swa_step(x, rsg, params, seqlen)
+                o = self.bc_swa_step(x, rsg, params, seqlen, causal = causal)
                 if o is not None:
                     return o
 
@@ -1034,7 +1103,7 @@ class SlidingAttention(Module):
                 q, k, v, k_pages, v_pages, bt, cache_seqlens,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (sw, 0),
+                window_size = (sw, self.window_right),
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 max_kv_len = S,
@@ -1062,7 +1131,7 @@ class SlidingAttention(Module):
                     q, None, None, k_pages, v_pages, bt, cache_seqlens,
                     causal = causal,
                     softmax_scale = self.sm_scale,
-                    window_size = (sw, 0),
+                    window_size = (sw, self.window_right),
                     softcap = self.logit_softcapping,
                     sinks = self.sinks,
                     k_new = k,

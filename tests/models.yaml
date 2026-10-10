@@ -35,6 +35,17 @@ models:
     path: qwen3-8b-dflash/hf
     tags: [draft, dflash]
 
+  # DFlash2 drafter with sliding-window layers (window rings as recurrent states unless -swa_full)
+  dflash2-target:
+    path: qwen3.8-27b/exl3/4.00bpw
+    tags: [dflash2]     # a role for the DFlash2 cases only: too large for the recurrent/gdn matrices
+    draft: dflash2-27b
+    vram: 40
+
+  dflash2-27b:
+    path: qwen3.8-27b-dflash2/exl3/4.00bpw
+    tags: [draft, dflash, swa]
+
   moe:
     path: qwen3-30b-a3b/exl3/4.0bpw
     tags: [moe, attention]

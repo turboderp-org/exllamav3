@@ -142,7 +142,8 @@ void cuda_causal_conv1d_update
     const c10::optional<at::Tensor>& bias,
     at::Tensor& out,
     bool activation,
-    bool history
+    bool history,
+    bool incremental = false
 );
 
 void cuda_causal_conv1d_update_gr
@@ -155,7 +156,8 @@ void cuda_causal_conv1d_update_gr
     at::Tensor& out,
     bool activation,
     bool history,
-    Graph* graph
+    Graph* graph,
+    bool incremental = false
 );
 
 // Split-projection (Qwen3.5) helper: cast/transpose qkv to bf16 mixed_qkv and compute beta/g from
@@ -251,11 +253,13 @@ struct ScanReplayJob
     uintptr_t scratch;      // state row written (first token from base, then in place)
     uintptr_t D;            // Mamba2 skip scales [heads] fp32, else 0
     int prefix;
+    int tstride;            // staged rows between consecutive tokens: 1 for a pass staged (row, token),
+                            // the batch size for one staged token-major, one step at a time
 
     ScanReplayJob() = default;
     ScanReplayJob(uintptr_t _qkv, uintptr_t _g, uintptr_t _beta, uintptr_t _base, uintptr_t _scratch,
-                  uintptr_t _D, int _prefix) :
-        qkv(_qkv), g(_g), beta(_beta), base(_base), scratch(_scratch), D(_D), prefix(_prefix) {}
+                  uintptr_t _D, int _prefix, int _tstride = 1) :
+        qkv(_qkv), g(_g), beta(_beta), base(_base), scratch(_scratch), D(_D), prefix(_prefix), tstride(_tstride) {}
 };
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
