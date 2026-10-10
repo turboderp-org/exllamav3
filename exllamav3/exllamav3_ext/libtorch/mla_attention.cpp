@@ -608,12 +608,12 @@ void BC_MLAttention::run_gr
             at::Tensor wts_rows = s.wts;   // full padded height (cuBLASLt M >= 8)
             hgemm_gr(s.x_st, idx_weights_w.value(), wts_rows, graph);
             dbg("wts_hgemm");
+            // Scoring writes [0, t_scan) with the causal bound as -inf; the static's tail past
+            // t_scan keeps whatever an earlier, longer sequence scored. T / q_pos0 / bound_max
+            // patch. kpool: score over the pooled plane; scan width and causal bound count in
+            // POOL units (the kernel's compress_rate handles the per-row token bound)
+            int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
             {
-                // Scoring covers the full static width every step (bounds written as -inf), so
-                // no stale region survives shorter contexts. T / q_pos0 / bound_max patch
-                // kpool: score over the pooled plane; scan width and causal bound count in
-                // POOL units (the kernel's compress_rate handles the per-row token bound)
-                int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
                 std::vector<void*> args =
                 {
                     (void*) s.qidx.data_ptr(),
@@ -645,14 +645,18 @@ void BC_MLAttention::run_gr
                 }
             }
             // Batched: the per-job bound rides as a device pointer (t_seq = q_len), so the
-            // top-k needs no scan-width patch and only reads freshly written score rows
+            // top-k needs no scan-width patch and only reads freshly written score rows.
+            // Single-row: the scoring kernel retires tiles past t_scan without writing, so the
+            // static's tail can hold scores from an earlier, longer sequence; an eager call
+            // scans only [0, t_scan) (graphs patch the scan width per replay)
+            const at::Tensor scores_scan = (graph || multirow) ? s.scores : s.scores.narrow(1, 0, t_scan);
             if (multirow)
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, q_len);
             else if (index_kpool)
             {
                 // Select pools, then expand to raw token indices (x P) and append the query's
                 // incomplete tail pool per row
-                dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph);
+                dsa_topk_gr(scores_scan, s.pool_idx, index_topk / index_kpool, graph);
                 dbg("pool_topk");
                 std::vector<void*> args =
                 {
@@ -669,7 +673,7 @@ void BC_MLAttention::run_gr
                 }
             }
             else
-                dsa_topk_gr(s.scores, s.indices, index_topk, graph);
+                dsa_topk_gr(scores_scan, s.indices, index_topk, graph);
         dbg("topk");
         }
 
