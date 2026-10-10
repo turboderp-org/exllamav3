@@ -89,11 +89,10 @@ class Lfm2Model(Model):
     def __init__(
         self,
         config: Lfm2Config,
+        key_prefix: str = "model",
         **kwargs,
     ):
         super().__init__(config, **kwargs)
-
-        key_prefix = "model"
 
         self.modules += [
             Embedding(
