@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
+from .model.config import moe_cpu_layers, moe_cpu_split_sizes
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
@@ -55,12 +56,13 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-lpd", "--layers_per_device", type = str, help = "Number of layers to load on each device, example: 2,12,26 (must add up to the model's number of layers, 0 skips a device). Layer-split mode only; --gpu_split still limits the VRAM used per device")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
-    parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
-    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcl", "--moe_cpu_offload", type = moe_cpu_layers, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Instead of N, a list of ints or (inclusive) ranges picks the layers by number, example: 8..23 (a single one is written 8..8). Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = moe_cpu_split_sizes, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Instead of N, LAYERS:N items set it per layer, example: 8..23:64,24..39:16. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Layers taken whole by --moe_cpu_offload are not split. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
@@ -125,7 +127,9 @@ def add_args(
         parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
-        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = moe_cpu_layers, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head; a list counts the head's layers from 0)", default = 0)
+        parser.add_argument("-dgs", "--draft_gpu_split", type = str, help = "Maximum amount of VRAM to use per device for the draft model (or MTP head), in GB, default: as --gpu_split", default = None)
+        parser.add_argument("-dlpd", "--draft_layers_per_device", type = str, help = "As --layers_per_device, for the draft model (or MTP head)", default = None)
 
 
 def get_arg_sampler(args):
@@ -214,7 +218,6 @@ def init(
         config.infer_params.moe_cpu_offload = args.moe_cpu_offload
     if getattr(args, "moe_cpu_split", 0):
         assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
-        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
         config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads
@@ -230,6 +233,10 @@ def init(
     if dmcl:
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if getattr(args, "draft_gpu_split", None):
+        assert draft_model_dir, "--draft_gpu_split requires a draft model (or --mtp)"
+    if getattr(args, "draft_layers_per_device", None):
+        assert draft_model_dir, "--draft_layers_per_device requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
         # Shared config: the MTP head is a separate component with its own budget and worker
@@ -336,6 +343,11 @@ def init(
         split = None
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
+    dgs = getattr(args, "draft_gpu_split", None) or args.gpu_split
+    draft_split = None if dgs in (None, "auto") else [float(alloc) for alloc in dgs.split(",")]
+    layers = [int(n) for n in args.layers_per_device.split(",")] if getattr(args, "layers_per_device", None) else None
+    dlpd = getattr(args, "draft_layers_per_device", None)
+    draft_layers = [int(n) for n in dlpd.split(",")] if dlpd else None
 
     # Parallelism options
     tp_options = {
@@ -361,7 +373,8 @@ def init(
     if draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            use_per_device = split,
+            use_per_device = draft_split,
+            layers_per_device = draft_layers,
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
@@ -374,6 +387,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        layers_per_device = layers,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,

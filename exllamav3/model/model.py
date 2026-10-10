@@ -475,6 +475,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_batch_size: int = 1,
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
+        layers_per_device: list[int] | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -564,6 +565,12 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param autosplit_no_forward:
             For debug purposes, skip reference forward pass during autosplit load.
+
+        :param layers_per_device:
+            (optional, layer-split only) Number of layers to load on each device, instead of filling each device
+            until a layer no longer fits, e.g. [2, 12, 26]. Must add up to the model's number of layers; devices
+            not included, or included with a value of 0, get no layers. reserve_per_device / use_per_device still
+            limit the memory, and loading fails if a device cannot hold its layers.
         """
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
@@ -582,10 +589,33 @@ class Model(Model_TPMixin, Model_LSMixin):
         try:
             # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
             # shares the config but loads after the main model's worker has already started)
-            self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+            ip = self.config.infer_params
+            ip.moe_cpu_component = getattr(self, "component", "text")
+            # Layer number of each MoE module of this component, for the settings that name layers
+            ip.moe_cpu_layer_idx = {
+                sm.key: m.layer_idx for m in self.modules if m.layer_idx is not None
+                for sm in m if hasattr(sm, "cpu_offload")
+            }
+            known = set(ip.moe_cpu_layer_idx.values())
+            for name in ("moe_cpu_offload", "moe_cpu_split") if ip.moe_cpu_component == "text" else \
+                    ("draft_moe_cpu_offload",):
+                named = getattr(ip, name)
+                unknown = sorted(set(named) - known) if known and isinstance(named, (list, dict)) else []
+                if unknown:
+                    more = " and more" if unknown[8:] else ""
+                    print(f" !! {name}: layers {unknown[:8]}{more} are not MoE layers of this model, ignored")
+            both = sorted(set(ip.moe_cpu_offload) & set(ip.moe_cpu_split)) if ip.moe_cpu_component == "text" and \
+                isinstance(ip.moe_cpu_offload, list) and isinstance(ip.moe_cpu_split, dict) else []
+            if both:
+                more = " and more" if both[8:] else ""
+                print(f" !! moe_cpu_offload and moe_cpu_split both name layers {both[:8]}{more}: "
+                      "offloaded whole where eligible")
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
+
+            assert layers_per_device is None or (device is None and not tensor_p), \
+                "layers_per_device requires layer-split mode."
 
             assert max_chunk_size >= 1, "max_chunk_size must be positive"
             assert max_output_size >= 1, "max_output_size must be positive"
@@ -652,6 +682,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         max_batch_size,
                         self.cache_weakrefs,
                         autosplit_no_forward,
+                        layers_per_device,
                     )
                     self.output_device = self.modules[-1].device
 
