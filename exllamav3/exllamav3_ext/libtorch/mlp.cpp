@@ -98,12 +98,16 @@ void BC_GatedMLP::run_bszN
 {
     int num_tokens = (int) x.numel() / (int) x.size(-1);
     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_FLOAT_HALF(d);
+    TORCH_CHECK(x.is_contiguous() && d.is_contiguous(), "run_bszN: x and d must be contiguous");
+    TORCH_CHECK(x.size(-1) == guh.size(2) && d.numel() == num_tokens * down->svh.size(0), "run_bszN: incorrect shapes");
     int graphidx = num_tokens - 1;
 
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    Graph& g = graph_bszN[graphidx];
+    Graph& g = graph_bszN[d.dtype() == at::kFloat][graphidx];
 
     if (g.disabled || (!g.ready && !g.ready_to_record))
     {
@@ -191,21 +195,28 @@ void BC_MLP::run_bsz1
     at::Tensor& d
 )
 {
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_FLOAT_HALF(d);
+    TORCH_CHECK(x.is_contiguous() && d.is_contiguous(), "run_bsz1: x and d must be contiguous");
+    TORCH_CHECK(x.numel() == hidden_size && d.numel() == out_size, "run_bsz1: incorrect shapes");
+
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    Graph& g = graph_bsz1[d.dtype() == at::kFloat];
+
+    if (g.disabled || (!g.ready && !g.ready_to_record))
     {
         run_bsz1_gr(x, d, nullptr);
-        graph_bsz1.ready_to_record = true;
+        g.ready_to_record = true;
     }
     else
     {
-        if (!graph_bsz1.ready)
+        if (!g.ready)
         {
-            graph_bsz1.capture_begin();
-            run_bsz1_gr(x, d, &graph_bsz1);
-            graph_bsz1.capture_end();
+            g.capture_begin();
+            run_bsz1_gr(x, d, &g);
+            g.capture_end();
         }
 
         std::vector<PPTR> args;
@@ -234,6 +245,6 @@ void BC_MLP::run_bsz1
             }
         }
 
-        graph_bsz1.launch(args, stream);
+        g.launch(args, stream);
     }
 }

@@ -37,9 +37,10 @@ struct BC_GatedMLP
     std::shared_ptr<BC_LinearEXL3> down;
     float act_limit;
 
-    // graph_bszN[num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves exactly as
-    // the original dedicated bsz-1 path)
-    Graph graph_bszN[MAX_BSZN];
+    // graph_bszN[fp32 output][num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves
+    // exactly as the original dedicated bsz-1 path). The output dtype is part of the key since the
+    // captured down projection stores either fp16 or fp32 and only the output pointer is patched
+    Graph graph_bszN[2][MAX_BSZN];
 
     // guh/gu hold TWO slots (gate, up) side by side; the fused mgemm kernel addresses slot j at
     // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
@@ -128,7 +129,7 @@ struct BC_MLP
     int hidden_size;                // exact width of x
     int out_size;                   // exact width of d
 
-    Graph graph_bsz1;
+    Graph graph_bsz1[2];            // per output dtype (fp16, fp32), as BC_GatedMLP::graph_bszN
 
     BC_MLP
     (

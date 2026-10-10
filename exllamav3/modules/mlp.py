@@ -396,7 +396,8 @@ class MLP(Module):
         bsz, q_len, _ = x.shape
         if (
             self.bc is not None and bsz == 1 and q_len == 1 and
-            x.dtype == torch.float16 and x.is_contiguous()
+            x.dtype == torch.float16 and x.is_contiguous() and
+            out_dtype in (None, self.out_dtype)     # the padded-output staging buffer has the module's dtype
         ):
             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
@@ -865,7 +866,10 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                if (
+                    self.bc is not None and bsz * q_len <= MAX_BSZN and
+                    x.dtype == torch.float16 and x.is_contiguous()
+                ):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
