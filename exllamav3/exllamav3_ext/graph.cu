@@ -1,5 +1,6 @@
 #include <Python.h>
 #include <cstring>
+#include <cstdlib>
 #include "graph.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -81,8 +82,13 @@ void Graph::capture_end()
     node_params_drv.resize(num_nodes);
     node_is_driver.resize(num_nodes);
     node_needs_update.resize(num_nodes);
+    node_template_stale.resize(num_nodes);
     for (int i = 0; i < num_nodes; ++i)
+    {
         node_needs_update[i] = false;
+        node_template_stale[i] = false;
+    }
+    exec_updates = 0;
 
     int n = 0;
     int c = 0;
@@ -189,9 +195,50 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         if (n == graph_node_sites.size()) TORCH_CHECK(false, "Graph update failed");
     }
 
+    #if defined(USE_ROCM)
+        // See graph.cuh: bound the VRAM HIP leaks per exec update by rebuilding the exec once enough
+        // updates have accumulated. The template graph receives the current params of every node changed
+        // since the last rebuild (hipGraphKernelNodeSetParams on a template node allocates no kernargs),
+        // then the old exec is destroyed (HIP keeps it alive until in-flight launches finish) and a new
+        // one is instantiated with all current values, so no exec update is needed for this launch.
+        static const int rebuild_after = []
+        {
+            const char* e = getenv("EXL3_HIP_GRAPH_REBUILD");
+            return e ? atoi(e) : 1024;
+        }();
+        int pending = 0;
+        for (int n = 0; n < nodes.size(); ++n) pending += node_needs_update[n] ? 1 : 0;
+        if (rebuild_after > 0 && pending > 0 && exec_updates + pending > rebuild_after)
+        {
+            for (int n = 0; n < nodes.size(); ++n)
+            {
+                if (!node_needs_update[n] && !node_template_stale[n]) continue;
+                // On ROCm CUDA_KERNEL_NODE_PARAMS is hipKernelNodeParams (rocm/compat.h), so driver-API
+                // (Triton) nodes go through the same call
+                if (node_is_driver[n])
+                {
+                    cuda_check(cudaGraphKernelNodeSetParams(nodes[n], &node_params_drv[n]));
+                }
+                else
+                {
+                    cuda_check(cudaGraphKernelNodeSetParams(nodes[n], &node_params[n]));
+                }
+                node_needs_update[n] = false;
+                node_template_stale[n] = false;
+            }
+            cuda_check(cudaGraphExecDestroy(graph_exec));
+            cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+            exec_updates = 0;
+        }
+    #endif
+
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;
+        #if defined(USE_ROCM)
+            node_template_stale[n] = true;
+            exec_updates++;
+        #endif
         if (node_is_driver[n])
         {
             CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);

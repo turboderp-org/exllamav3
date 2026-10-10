@@ -121,6 +121,13 @@ public:
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    // ROCm: hipGraphExecKernelNodeSetParams allocates fresh kernarg space (~4 KB of VRAM) on every call and
+    // never releases it until the exec is destroyed, so per-step updates leak VRAM until an allocation fails
+    // and the runtime dereferences a null kernarg pointer (segfault in VirtualGPU::submitKernelInternal).
+    // We count exec updates and periodically rebuild the exec from the template graph, which frees them.
+    std::vector<bool> node_template_stale;  // node's current params differ from the template graph's
+    int exec_updates = 0;                   // exec node updates since the last instantiation
+
     bool need_cublas;
     bool ready;
     bool ready_to_record;
