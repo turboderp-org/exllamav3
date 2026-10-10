@@ -18,6 +18,32 @@ from .utils import check_shared_mem
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
+# #411 added the Turing configs but left the 96 KB 128x128 base config unconditional.
+# Triton's autotuner caches the chosen config process-wide, keyed on shapes/dtypes but
+# NOT device; on a mixed rig the larger-smem device benches first (128x128 wins there),
+# then the cached config launches on a 64 KB-smem device and dies with OutOfResources at
+# launch (the bench path does not catch launch-time OOR). Restrict the list to what the
+# smallest visible device fits — fla's own check_shared_mem doctrine. The 64 KB tier
+# keeps the two smaller base configs that fit 64 KB plus #411's measured-best Turing
+# configs; the autotuner still benches and picks per key, and every candidate then fits
+# every visible device.
+if check_shared_mem('ada'):
+    _FWD_O_CONFIGS = [
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+    ]
+else:
+    _FWD_O_CONFIGS = [
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+        # sm_75 (Turing, 64 KB smem): ~15x faster than the (32,32,w2) fallback at T=1792
+        # on a 2080 Ti (#411 measurement)
+        triton.Config({'BK': 16, 'BV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=1),
+    ]
+
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -25,18 +51,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ] + ([
-        # sm_75 (Turing, 64 KB smem): the configs above don't fit at num_stages >= 2, so the
-        # autotuner falls back to the tiny (32,32,w2) tile. These fit and are ~15x faster
-        # (measured 24.6 ms -> 1.4 ms per GDN layer at T=1792 on a 2080 Ti)
-        triton.Config({'BK': 16, 'BV': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=1),
-    ] if not check_shared_mem('ada') else []),
+    configs=_FWD_O_CONFIGS,
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
