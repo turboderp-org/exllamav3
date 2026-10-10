@@ -486,6 +486,20 @@ def _assert_moe_supported(key: str, mlp) -> None:
         f"supported, got router_type {mlp.router_type!r} (grouped ds3 MoE " \
         f"routing not wired up)"
     assert mlp.routing_gate is not None, f"{key}: MoE block has no routing gate"
+    # The inference side's CPU expert offload (EXL3_MOE_CPU_OFFLOAD: whole
+    # layers registered with the CPU MoE worker, their Linears never loaded;
+    # EXL3_MOE_CPU_SPLIT: the tail experts removed from the module tree) runs
+    # the experts as fp16 GEMMs in a worker process -- not differentiable, and
+    # the weights are not on the GPU for the training forward to read. The
+    # training path's own offload is ``--stream-experts`` (expert_stream.py),
+    # offline trainer only; the realtime (tabbyAPI) path needs resident experts.
+    assert not getattr(mlp, "cpu_offload", False) and \
+        getattr(mlp, "cpu_split_first", None) is None, \
+        f"{key}: the inference CPU expert offload (EXL3_MOE_CPU_OFFLOAD / " \
+        f"EXL3_MOE_CPU_SPLIT) is not supported for training: the offloaded " \
+        f"experts run in the CPU worker and are not differentiable. Unset it; " \
+        f"to train with experts in host RAM use the offline trainer's " \
+        f"--stream-experts (not available on the realtime path)"
     assert mlp.num_local_experts == mlp.num_experts, \
         f"{key}: expert/tensor-parallel MoE split ({mlp.num_local_experts} of " \
         f"{mlp.num_experts} experts local) is not supported for training"
