@@ -1463,10 +1463,13 @@ inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& 
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
+// Rows == MAX_M retains the runtime bound for existing AVX2 callers.
+template <int Rows = MAX_M>
 M1_TARGET_AVX2
 inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
+    int m, __m256i (&acc)[Rows][2], const __m256i& mult, const __m256i& ones32, int row)
 {
+    static_assert(Rows > 0 && Rows <= MAX_M, "AVX2 row extent");
     // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
     // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
     // at full +-127 activations; one vpmaddwd per token row against splat_dup (x8 in both 16-bit
@@ -1477,7 +1480,8 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
     const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
     const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
     #define ACC_ROW(i) \
-        if ((i) < m) { \
+        if constexpr ((i) < Rows) \
+        if (Rows != MAX_M || (i) < m) { \
             const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
             acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
             acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
@@ -1666,18 +1670,18 @@ inline void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
-template <int bits, int row = 0>
+template <int bits, int row = 0, int Rows = MAX_M>
 M1_TARGET_AVX2
 inline void avx2_rows_accum_planar(
-    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum_planar<bits, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum_planar<bits, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
@@ -1707,10 +1711,11 @@ inline void avx2_rows_accum_planar(
 //
 // tn0/tn1 are always even: assign_gemvs splits in 8-tile groups (2-tile aligned) and
 // tiles_n is a multiple of 8. There is no per-tile edge handling.
-template <int bits>
+template <int bits, int Rows = MAX_M>
 M1_TARGET_AVX2
 void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
+    const int rows = Rows == MAX_M ? m : Rows;
     const int tiles_k = mat.k / 16;
     constexpr int packed_size = 16 * bits;
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
@@ -1720,8 +1725,8 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 
     for (int pair = tn0; pair < tn1; pair += 2)
     {
-        __m256i accA[MAX_M][2], accB[MAX_M][2];
-        for (int i = 0; i < m; ++i)
+        __m256i accA[Rows][2], accB[Rows][2];
+        for (int i = 0; i < rows; ++i)
         {
             accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
             accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
@@ -1735,12 +1740,12 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             __m256i preg[bits];
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
-            avx2_rows_accum_planar<bits>(preg, dup, mat.k, m, accA, mult, ones32);
+            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accA, mult, ones32);
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
-            avx2_rows_accum_planar<bits>(preg, dup, mat.k, m, accB, mult, ones32);
+            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accB, mult, ones32);
         }
-        for (int i = 0; i < m; ++i)
+        for (int i = 0; i < rows; ++i)
         {
             const float scale = mul1_k_inv() * in.q[i];
             const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
@@ -2056,7 +2061,10 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 {
                     case 1: avx2_swz2<1>(mat, in, tout, m, tn0, tn1); return;
                     case 2: avx2_swz2<2>(mat, in, tout, m, tn0, tn1); return;
-                    case 3: avx2_swz2<3>(mat, in, tout, m, tn0, tn1); return;
+                    case 3:
+                        if (m == 2) avx2_swz2<3, 2>(mat, in, tout, m, tn0, tn1);
+                        else avx2_swz2<3>(mat, in, tout, m, tn0, tn1);
+                        return;
                     case 4: avx2_swz2<4>(mat, in, tout, m, tn0, tn1); return;
                     case 5: avx2_swz2<5>(mat, in, tout, m, tn0, tn1); return;
                     case 6: avx2_swz2<6>(mat, in, tout, m, tn0, tn1); return;
