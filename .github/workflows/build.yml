@@ -165,10 +165,11 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
-      # Compiler cache: on Linux ccache in front of nvcc / hipcc and the host compiler (torch's
-      # BuildExtension does this itself for CUDA when ccache is on PATH; the HIP compiler is named
-      # through PYTORCH_NVCC below), on Windows sccache in front of nvcc (torch never wraps the
-      # compilers there by itself, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
+      # Compiler cache: on Linux ccache in front of nvcc / hipcc (named through PYTORCH_NVCC in the
+      # build steps: torch only wraps the compilers by itself from 2.13 on) and the host compiler
+      # (ccache's masquerade directory ahead on PATH, which torch 2.13's own "ccache c++" also
+      # resolves through, ccache skipping itself), on Windows sccache in front of nvcc (torch never
+      # wraps the compilers there, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
       # compiler stays uncached since older torch versions name cl directly in the ninja rule, and
       # the .cpp units are a small share of the build). The cache directory is carried between runs
       # through the Actions cache. Keys end in the commit so every run saves its own state; the
@@ -181,6 +182,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y ccache
+          Write-Output "/usr/lib/ccache" >> "$env:GITHUB_PATH"
           $dir = Join-Path $env:RUNNER_TEMP 'ccache'
           Write-Output "CCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_BASEDIR=${{ github.workspace }}" >> "$env:GITHUB_ENV"
@@ -510,6 +512,8 @@ jobs:
             # torch takes this command verbatim for the ninja nvcc rule (nvcc is on PATH from the
             # CUDA install step; the host compiler from the VS shell)
             $env:PYTORCH_NVCC = "sccache nvcc"
+          } else {
+            $env:PYTORCH_NVCC = "ccache ${{ steps.cuda-toolkit-Linux.outputs.CUDA_PATH }}/bin/nvcc"
           }
 
           # --- Build wheel
@@ -548,7 +552,7 @@ jobs:
             sccache --stop-server
             $global:LASTEXITCODE = 0
           } else {
-            ccache -s
+            ccache -s -v
           }
 
       - name: Save compiler cache
