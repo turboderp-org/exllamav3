@@ -226,10 +226,6 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
-        if target.loaded_tp:
-            raise NotImplementedError(
-                "DFlash2 does not support tensor-parallel targets because the selector needs top-k logits"
-            )
         if target.config.vocab_size != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
@@ -272,9 +268,16 @@ class DFlash2Model(Model):
         anchor. The selector is greedy; sampling remains lossless because the
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
-        lm = target.modules[target.logit_layer_idx]
-        logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
+        if target.loaded_tp:
+            # Tensor-parallel target: each rank runs its vocabulary slice of the head over the
+            # draft block and the slices are gathered to the output device, so the selector sees
+            # the same full-width logits as on layer split. The drafter stays on one device
+            staged = target.tp_producer.send(state.half())
+            logits = target.tp_dispatch_lm_head_logits((staged, {}))
+        else:
+            lm = target.modules[target.logit_layer_idx]
+            logits = lm.prepare_for_device(state.half(), params)
+            logits = lm.forward(logits, params)
 
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
