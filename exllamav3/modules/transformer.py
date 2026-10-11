@@ -27,7 +27,8 @@ class TransformerBlock(Module):
         key_mlp_resid_scalar: str | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
-        out_dtype: torch.dtype = None
+        out_dtype: torch.dtype = None,
+        post_mlp: Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -38,6 +39,7 @@ class TransformerBlock(Module):
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
+        self.post_mlp = post_mlp
         self.attn_hc = attn_hc
         self.mlp_hc = mlp_hc
         self.qbits_key = qbits_key
@@ -70,6 +72,7 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp_norm)
         self.register_submodule(self.mlp)
         self.register_submodule(self.mlp_post_norm)
+        self.register_submodule(self.post_mlp)
 
         self.num_slices = mlp.num_slices if mlp else 1
 
@@ -78,7 +81,8 @@ class TransformerBlock(Module):
     def optimizer_targets(self):
         a = self.attn.optimizer_targets() if self.attn else []
         m = self.mlp.optimizer_targets() if self.mlp else []
-        return [a, m]
+        p = self.post_mlp.optimizer_targets() if self.post_mlp else []
+        return [a, m, p] if p else [a, m]
 
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
@@ -200,6 +204,9 @@ class TransformerBlock(Module):
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
+
+        if self.post_mlp is not None:
+            x = self.post_mlp.forward(x, params)
 
         if export_state:
             s = params.get("export_states")
