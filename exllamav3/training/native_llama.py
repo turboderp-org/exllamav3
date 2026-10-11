@@ -1326,6 +1326,19 @@ class NativeLlamaQLoRA(nn.Module):
         if attention_mask is not None:
             key_pad = (attention_mask == 0)[:, None, None, :]    # [b,1,1,t]
             bias = bias.masked_fill(key_pad, neg)
+            # A sliding window plus right-padding CAN fully mask a row: a pad
+            # query more than `window` past its row's last real token sees only
+            # pad keys, all masked. Its softmax is NaN, and on the next layer
+            # that NaN pad key/value poisons every real query in the row
+            # (probs 0 * v NaN = NaN in the matmul) -- the DPO/KTO NaN on
+            # Spark-X2.5 (window 512) whenever chosen/rejected lengths differ
+            # by more than the window. Let such rows attend to themselves:
+            # real queries never see pad keys, so loss-bearing outputs are
+            # unchanged.
+            dead = torch.isinf(bias).all(dim=-1, keepdim=True)  # [b,1,t,1]
+            if bool(dead.any()):
+                eye = torch.eye(t, dtype=torch.bool, device=device)
+                bias = bias.masked_fill(dead & eye, 0.0)
         return bias
 
     # --- sublayer sites: pre-norm + residual add, or hyper-connection mix + inject
