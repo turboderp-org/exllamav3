@@ -365,17 +365,24 @@ def mp_model_forward_lm_head_argmax(
     return (out_v, out_i) if device == output_device else None
 
 
-def mp_model_forward_lm_head_logits(
+def mp_model_forward_lm_head_topk(
     local_context: dict,
     shared_input: dict,
     params: dict,
-    has_shard: bool,
+    offset: int,
     gather_devices: list[int] | None,
     ldims: list[int] | None,
+    vocab_size: int,
+    top_k: int,
+    scale: float,
+    softcap: float,
 ):
     """
-    Full logits through the sharded LM head, gathered to the output device. Same shard walk as
-    mp_model_forward_lm_head_argmax, same gather as OutputGather.
+    Per-row top-k of the logits through this rank's shard of the LM head, as (scores, vocabulary ids)
+    k wide, gathered to the output device where the shards' candidates are merged (DFlash2's selector
+    needs the top-k, not the logits). Same shard walk and padding crop as mp_model_forward_lm_head_argmax;
+    the selector's scaling and softcap are applied here so the scores compare across shards. A shard
+    narrower than k pads with -inf.
     """
     consumer = local_context["inf_consumer"]
     device = local_context["device"]
@@ -384,25 +391,42 @@ def mp_model_forward_lm_head_logits(
 
     x = consumer.recv(shared_input)
 
-    if has_shard:
+    if offset >= 0:
         module = local_context["logits_module"]
         x = module.prepare_for_device(x, params)
-        x = module.forward(x, params).contiguous()
+        x = module.forward(x, params)
+        if offset + x.shape[-1] > vocab_size:
+            x = x[..., :max(0, vocab_size - offset)]
+        x = x.float() * scale
+        if softcap > 0.0:
+            x = torch.tanh(x / softcap) * softcap
+        k = min(top_k, x.shape[-1])
+        if k > 0:
+            v, i = torch.topk(x, k, dim = -1, sorted = False)
+            i = i + offset
+        else:
+            v = torch.empty(*x.shape[:-1], 0, dtype = torch.float, device = x.device)
+            i = torch.empty(*x.shape[:-1], 0, dtype = torch.long, device = x.device)
+        if k < top_k:
+            pad = top_k - k
+            v = torch.cat([v, torch.full((*v.shape[:-1], pad), -float("inf"), dtype = v.dtype, device = v.device)], dim = -1)
+            i = torch.cat([i, torch.zeros((*i.shape[:-1], pad), dtype = i.dtype, device = i.device)], dim = -1)
     else:
-        x = torch.empty(*x.shape[:-1], 0, dtype = torch.half, device = torch.device("cuda", device))
+        v = torch.empty(*x.shape[:-1], 0, dtype = torch.float, device = torch.device("cuda", device))
+        i = torch.empty(*x.shape[:-1], 0, dtype = torch.long, device = v.device)
 
     if gather_devices is None:
-        return x
+        return v, i
 
     if device == output_device:
-        out_shape = list(x.shape)
-        out_shape[-1] = sum(ldims)
-        out = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
+        out_v = torch.empty(*v.shape[:-1], sum(ldims), dtype = v.dtype, device = v.device)
+        out_i = torch.empty(*i.shape[:-1], sum(ldims), dtype = i.dtype, device = i.device)
     else:
-        out = None
+        out_v = out_i = None
 
-    backend.gather(x, out, gather_devices, output_device, ldims)
-    return out if device == output_device else None
+    backend.gather_small(v.contiguous(), out_v, gather_devices, output_device, ldims)
+    backend.gather_small(i.contiguous(), out_i, gather_devices, output_device, ldims)
+    return (out_v, out_i) if device == output_device else None
 
 
 # def mp_model_forward_lm_head_argmax_old(
