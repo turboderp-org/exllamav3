@@ -273,8 +273,7 @@ class Sequence:
         if recurrent_cache is not None:
             recurrent_pages = []
             for pi, ph in enumerate(page_hashes):
-                rs = recurrent_cache.get(ph)
-                if rs:
+                if recurrent_cache.has(ph):
                     recurrent_pages.append(pi)
             # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
             # rewrites those pages anyway
@@ -343,6 +342,7 @@ class PageTable:
             "alloc_pages": 0,             # pages claimed by starting jobs
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
+            "alloc_disk_pages": 0,        # of those, promoted from the disk tier by the allocation itself
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
         }
 
@@ -587,16 +587,22 @@ class PageTable:
                 else:
                     op = next_evictable()
                     op.add_ref_clear(self.access_serial, h)
-                    if (
-                        self.cpu_tier is not None and
-                        (restore_limit is None or lp < restore_limit) and
-                        h in self.cpu_tier
-                    ):
-                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial)
-                        op.sequence.copy_(entry["tokens"])
-                        op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
-                        op.kv_position = PAGE_SIZE
-                        self.metrics["alloc_tier_pages"] += 1
+                    tier = self.cpu_tier
+                    if tier is not None and (restore_limit is None or lp < restore_limit):
+                        entry = None
+                        if h in tier:
+                            entry = tier.fetch(h, op.page_index, self.access_serial)
+                        elif tier.disk_tier is not None and tier.disk_tier.has_page(h):
+                            # On disk only: promote into a slot (waiting for the read) and restore from there
+                            if tier.promote(h, self.access_serial, protected_hashes) is not None:
+                                entry = tier.fetch(h, op.page_index, self.access_serial)
+                                if entry is not None:
+                                    self.metrics["alloc_disk_pages"] += 1
+                        if entry is not None:
+                            op.sequence.copy_(entry["tokens"])
+                            op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
+                            op.kv_position = PAGE_SIZE
+                            self.metrics["alloc_tier_pages"] += 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -659,24 +665,29 @@ class PageTable:
     def is_resumable(self, phash: bytes) -> bool:
         """
         Whether a job claiming a prompt that ends in the page identified by phash could resume from it: an
-        unbroken chain of pages down to the root, each either complete in VRAM or restorable from the CPU tier.
-        This is the anchor condition for a recurrent checkpoint stashed under phash.
+        unbroken chain of pages down to the root, each either complete in VRAM or restorable from the CPU or
+        disk tier. This is the anchor condition for a recurrent checkpoint stashed under phash.
         """
         h = phash
         steps = 0
+        tier = self.cpu_tier
+        disk = tier.disk_tier if tier is not None else None
+        limit = self.max_pages + (len(tier) if tier is not None else 0) + (len(disk) if disk is not None else 0)
         while True:
             page = self.get_live_page(h)
             if page is not None:
                 prev = page.prev_hash
-            elif self.cpu_tier is not None and h in self.cpu_tier:
-                prev = self.cpu_tier.entries[h]["prev_hash"]
+            elif tier is not None and h in tier:
+                prev = tier.entries[h]["prev_hash"]
+            elif disk is not None and disk.has_page(h):
+                prev = disk.page_prev_hash(h)
             else:
                 return False
             if prev is None:
                 return True
             h = prev
             steps += 1
-            if steps > self.max_pages + (len(self.cpu_tier) if self.cpu_tier is not None else 0):
+            if steps > limit:
                 return False
 
 

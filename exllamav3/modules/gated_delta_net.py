@@ -462,6 +462,31 @@ class GDNLayerState:
         self.conv_state[slot, :, :cdim].copy_(c)
 
 
+    def tp_stash_pieces(self):
+        """
+        How this rank's stash maps into the layout-independent checkpoint the disk tier stores, one entry per
+        stashed tensor: the split dimension, its full size, and (local start, local end, canonical start)
+        pieces. The recurrent state is split by v head; the conv state's channels are the q, k and v
+        projections' rows in sequence, each split by its own head range. None for a tensor that is not split.
+        """
+        m = self.module
+        first = getattr(m, "tp_kv_first", None)
+        if first is None:
+            return [None, None]
+        nk, nv, kd, vd = m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim
+        gk = m.tp_k_heads_total
+        G = nv // nk
+        assert m.fdim_qkv == 2 * nk * kd + nv * vd, "conv channel layout differs from q|k|v, cannot map the stash"
+        return [
+            {"dim": 2, "total": gk * G, "pieces": [(0, nv, first * G)]},
+            {"dim": 0, "total": 2 * gk * kd + gk * G * vd, "pieces": [
+                (0, nk * kd, first * kd),
+                (nk * kd, 2 * nk * kd, (gk + first) * kd),
+                (2 * nk * kd, 2 * nk * kd + nv * vd, 2 * gk * kd + first * G * vd),
+            ]},
+        ]
+
+
     def tp_export(self, plan):
         return {
             "cls": GDNLayerState,
@@ -1618,6 +1643,9 @@ class GatedDeltaNet(Module):
                     module.recurrent_layers.append(rli)
                     module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
 
+        # This rank's k-head range within the layer, for the disk tier's canonical checkpoint layout
+        module.tp_kv_first = first
+        module.tp_k_heads_total = global_num_k_heads
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True

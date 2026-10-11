@@ -660,8 +660,8 @@ class Job:
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
         rc = self.generator.recurrent_cache
-        if rc is not None and old_hash in rc and new_hash not in rc:
-            rc[new_hash] = rc.pop(old_hash)
+        if rc is not None:
+            rc.rekey(old_hash, new_hash)
 
         # If another referenced page has the same hash, switch to referencing that instead
         if new_hash in self.pagetable.referenced_pages:

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
+from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
@@ -39,6 +40,10 @@ class Generator:
         show_visualizer: bool = False,
         enable_defrag: bool = True,
         cpu_cache_size: int = 0,
+        disk_cache_dir: str | None = None,
+        disk_cache_size: int = 50 * 1024**3,
+        disk_cache_flush_on_idle: bool = True,
+        disk_cache_checkpoint_interval: int = 4096,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -134,6 +139,31 @@ class Generator:
             K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
             being recomputed by prefill. In tensor-parallel mode each rank pins its own shard of the tier and
             the budget counts whole pages across all of them
+
+        :param disk_cache_dir:
+            Directory for a third, persistent tier behind the CPU page cache (requires cpu_cache_size > 0),
+            None (default) to disable. Pages entering the CPU tier and recurrent checkpoints are written
+            through to a per-model subdirectory (keyed by a fingerprint of the model, cache configuration and
+            kernel sources) and read back, in this or a later process, when a prompt's pages are in no other
+            tier. Page images and checkpoints are stored in a layout independent of the tensor-parallel
+            split, so a directory is shared between TP loads with different splits and non-TP loads of the
+            same model and cache configuration
+
+        :param disk_cache_size:
+            Budget in bytes for the whole disk_cache_dir, shared by every model and cache configuration
+            stored under it (the least recently used of the others are removed whole when a load finds the
+            root over budget). Default is 50 GB
+
+        :param disk_cache_flush_on_idle:
+            Also write every complete page still in VRAM (and every checkpoint) to the disk tier whenever the
+            generator goes idle, so a context never has to be evicted first to be persisted. Default True;
+            flush_cache_to_disk() does the same on demand
+
+        :param disk_cache_checkpoint_interval:
+            Minimum spacing, in tokens, between the recurrent checkpoints the disk tier keeps along any chain
+            of cached pages, counted from the start of the chain; closer ones (and checkpoints whose page is
+            gone) are pruned when the generator goes idle, so a resumed prompt replays at most this many
+            tokens. Checkpoints take far more space than pages on hybrid models. Default 4096; 0 keeps all
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -243,13 +273,21 @@ class Generator:
                 pin_memory = True
             )
 
-        # CPU page cache tier
+        # CPU page cache tier, and the disk tier behind it
         self.cpu_page_cache = None
+        self.disk_page_cache = None
+        self.disk_cache_flush_on_idle = disk_cache_flush_on_idle
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
+            if disk_cache_dir:
+                self.disk_page_cache = DiskPageCache(disk_cache_dir, tier_caches, self.cpu_page_cache, disk_cache_size,
+                                                     min_state_distance = disk_cache_checkpoint_interval)
+                self.cpu_page_cache.attach_disk(self.disk_page_cache)
+        elif disk_cache_dir:
+            raise ValueError("disk_cache_dir needs a CPU page cache tier to write through from (cpu_cache_size > 0)")
 
         # Visualizer
         if show_visualizer:
@@ -280,6 +318,16 @@ class Generator:
         if self.target_recurrent or self.draft_recurrent:
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size, draft_model)
             self.recurrent_cache.pagetable = self.pagetable
+            self.recurrent_cache.disk_tier = self.disk_page_cache
+            if self.disk_page_cache is not None:
+                # Which model and cache stash under each side of a PairedState: a tensor-parallel side's
+                # checkpoints are written and read by that model's ranks
+                self.disk_page_cache.recurrent_sides = {
+                    side: (m, c) for side, m, c, on in (
+                        ("target", self.model, cache, self.target_recurrent),
+                        ("draft", draft_model, draft_cache, self.draft_recurrent),
+                    ) if on
+                }
             # The new page table owns every page, so every state slot is ours too
             for c, recurrent in ((cache, self.target_recurrent), (draft_cache, self.draft_recurrent)):
                 if recurrent:
@@ -344,12 +392,22 @@ class Generator:
             tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
                 same chain rule; 0 without a tier
             tier_max_tokens: capacity of the system-memory tier, 0 without one
+            disk_cached_tokens: reusable tokens held only in the disk tier, by the same chain rule (a chain
+                may run through all three tiers; the disk tier is persistent, so these survive a restart);
+                0 without a disk tier
+            disk_pages, disk_states: pages and recurrent checkpoints the disk tier holds for this model
+            disk_used_bytes, disk_max_bytes: the disk tier's occupancy and budget (the budget is for the whole
+                directory, every model and cache configuration under it); 0 without a disk tier
             alloc_pages: cumulative pages claimed by started jobs
             alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
-            alloc_tier_pages: of those, pages restored from the system-memory tier
+            alloc_tier_pages: of those, pages restored from the system-memory tier (including pages that were
+                promoted there from disk first)
+            alloc_disk_pages: of those, pages the allocation itself had to promote from the disk tier (pages
+                the enqueue-time prefetch had already promoted count under alloc_tier_pages only)
             hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
             tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
                 tier, or None before any job has started
+            disk_hit_rate: alloc_disk_pages / alloc_pages, or None before any job has started
             active_jobs, pending_jobs: current job counts
 
         The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
@@ -357,6 +415,7 @@ class Generator:
         """
         pt = self.pagetable
         tier = pt.cpu_tier
+        disk = self.disk_page_cache
 
         # The chain walk is linear in the number of pages, which can be large with a big system-memory
         # tier, so it only reruns when something that can change the outcome has moved
@@ -369,6 +428,7 @@ class Generator:
             pt.last_defrag_serial,
             len(tier) if tier is not None else 0,
             (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+            (len(disk), len(disk.states), disk.metrics["page_writes"], disk.metrics["evictions"]) if disk is not None else None,
         )
         memo_signature, memo = self._cache_stats_memo
         if signature == memo_signature:
@@ -381,6 +441,11 @@ class Generator:
                 if is_content_hash(h):
                     gpu_links[h] = page.prev_hash
         tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+        if disk is not None:
+            with disk._lock:
+                disk_links = {h: m["prev_hash"] for h, m in disk.pages.items()}
+        else:
+            disk_links = {}
 
         # A page is reusable when its whole chain is present in either tier
         resumable = {}
@@ -392,6 +457,8 @@ class Generator:
                     h = gpu_links[h]
                 elif h in tier_links:
                     h = tier_links[h]
+                elif h in disk_links:
+                    h = disk_links[h]
                 else:
                     resumable[h] = False
                     break
@@ -402,11 +469,13 @@ class Generator:
 
         cached = sum(1 for h in gpu_links if is_resumable(h))
         tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        disk_cached = sum(1 for h in disk_links if h not in gpu_links and h not in tier_links and is_resumable(h))
         used = len(pt.referenced_pages)
         free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
         alloc = pt.metrics["alloc_pages"]
         alloc_cached = pt.metrics["alloc_cached_pages"]
         alloc_tier = pt.metrics["alloc_tier_pages"]
+        alloc_disk = pt.metrics["alloc_disk_pages"]
         stats = {
             "page_size": PAGE_SIZE,
             "max_tokens": pt.max_pages * PAGE_SIZE,
@@ -415,11 +484,18 @@ class Generator:
             "free_tokens": free * PAGE_SIZE,
             "tier_cached_tokens": tier_cached * PAGE_SIZE,
             "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "disk_cached_tokens": disk_cached * PAGE_SIZE,
+            "disk_pages": len(disk) if disk is not None else 0,
+            "disk_states": len(disk.states) if disk is not None else 0,
+            "disk_used_bytes": disk.total_size if disk is not None else 0,
+            "disk_max_bytes": disk.root_size if disk is not None else 0,
             "alloc_pages": alloc,
             "alloc_cached_pages": alloc_cached,
             "alloc_tier_pages": alloc_tier,
+            "alloc_disk_pages": alloc_disk,
             "hit_rate": alloc_cached / alloc if alloc else None,
             "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "disk_hit_rate": alloc_disk / alloc if alloc else None,
             "active_jobs": len(self.active_jobs),
             "pending_jobs": len(self.pending_jobs),
         }
@@ -468,6 +544,12 @@ class Generator:
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
+        if self.disk_page_cache is not None:
+            # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
+            # the CPU tier (or in flight) rather than waiting on the disk itself
+            for seq in job.sequences:
+                hashes = seq.page_hashes if seq.max_cached_pages is None else seq.page_hashes[:seq.max_cached_pages]
+                self.disk_page_cache.prefetch(hashes, self.pagetable.access_serial)
         return job.serial_number
 
 
@@ -633,6 +715,14 @@ class Generator:
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
         the pinned staging and draft buffers, and the filter thread pool.
         """
+        if self.disk_page_cache is not None:
+            # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away
+            if self.disk_cache_flush_on_idle:
+                self.flush_cache_to_disk()
+            self.disk_page_cache.close()
+            self.disk_page_cache = None
+            if self.recurrent_cache is not None:
+                self.recurrent_cache.disk_tier = None
         if self.recurrent_cache is not None:
             self.recurrent_cache.close()
         if self.cpu_page_cache is not None:
@@ -647,6 +737,43 @@ class Generator:
 
 
     @torch.inference_mode()
+    def flush_cache_to_disk(self, wait: bool = False) -> dict:
+        """
+        Queue every complete, content-hashed page that is in VRAM but in neither the CPU nor the disk tier for
+        persistence (through the CPU tier, whose store is the write-through point), and every recurrent
+        checkpoint not yet on disk. Returns counts of what was queued; with wait = True returns once the
+        writer has finished.
+        """
+        disk = self.disk_page_cache
+        tier = self.cpu_page_cache
+        queued = {"pages": 0, "states": 0}
+        if disk is None:
+            return queued
+        pt = self.pagetable
+        for pages in (pt.unreferenced_pages, pt.referenced_pages):
+            for h, page in list(pages.items()):
+                if page.kv_position != PAGE_SIZE or not is_content_hash(h):
+                    continue
+                if h in tier or disk.has_page(h) or h in disk.pending_pages:
+                    continue
+                if not disk.persistable_tokens(page.sequence):
+                    continue
+                tier.store(page, pt.access_serial)
+                queued["pages"] += 1
+        rc = self.recurrent_cache
+        if rc is not None and rc.disk_tier is not None:
+            # Checkpoints follow their pages: every complete page is queued above, so an anchored checkpoint
+            # is written now, the rest stay candidates
+            for h, stashed in list(rc.items()):
+                if is_content_hash(h) and (disk.has_page(h) or h in disk.pending_pages) and disk.write_state(h, stashed):
+                    queued["states"] += 1
+        queued["states_pruned"] = disk.prune_states()
+        if wait:
+            disk.flush()
+        return queued
+
+
+    @torch.inference_mode()
     def on_queue_drained(self):
         """
         Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
@@ -654,6 +781,9 @@ class Generator:
         glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
         in the arenas for the whole idle period.
         """
+        if self.disk_page_cache is not None and self.disk_cache_flush_on_idle:
+            # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk
+            self.flush_cache_to_disk()
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
