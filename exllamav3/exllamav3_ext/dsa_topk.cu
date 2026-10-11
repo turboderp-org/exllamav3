@@ -312,6 +312,19 @@ static at::Tensor& dsa_topk_ws(int device)
     return it->second;
 }
 
+// Allocate the split workspace ahead of a graph capture over `scores_static` (the full-width score
+// static a captured top-k scans). The eager pass that precedes a capture may scan only the live
+// prefix of that static, below TOPK_SPLIT_MIN_T, and so never take the split path itself; without
+// this the replay-side split kernel would allocate its workspace under capture (cudaMalloc is not
+// permitted while a stream is capturing)
+void dsa_topk_prepare(const at::Tensor& scores_static, int k_pad)
+{
+    static const bool allow_split = [](){ const char* e = getenv("EXL3_DSA_TOPK_SPLIT"); return !(e && *e == '0'); }();
+    if (!allow_split || scores_static.dim() != 2) return;
+    if (scores_static.size(1) < TOPK_SPLIT_MIN_T || k_pad > TOPK_SPLIT_MAX_KPAD) return;
+    (void) dsa_topk_ws(scores_static.device().index());
+}
+
 template <bool VEC>
 __global__ __launch_bounds__(TOPK_THREADS)
 void dsa_topk_split_kernel
