@@ -5492,6 +5492,71 @@ with the adapter on a 16 GB card, untested here.
 
 ---
 
+### Session 60 — Upstream sync v1.6.1 (spec-decode rewinds in GDN/Mamba, QSA top-k bound; nothing on the training path to adopt)
+
+> Written 2026-10-11 on branch `feat/qwen38-flash-next` (merge commit as usual, on top of
+> Session 59). 59 upstream commits, v1.6.0 → v1.6.1. CPU-tested in the scratch CPU-torch
+> venv — see the test note at the end of this entry. **Not box-verified** — smoke list below.
+
+**Merge:** four conflicts, all at the fork's runtime-LoRA guards or the test tree.
+`gated_delta_net.py` and `mamba2.py`: upstream added `not spec_step` to the condition that
+picks the graph-captured `bc.run_bszN` path (speculative steps now go through the python
+path so the recurrent state can be rewound); kept both, `not spec_step and not
+has_runtime_lora(...)`. `sliding_attn.py`: upstream widened the graph-attention gate from
+`causal` to `causal or self.window_right >= seqlen - 1` (non-causal blocks whose right window
+covers the block); kept the widened gate and the `has_runtime_lora` clause behind it. The
+`has_runtime_lora` site count is unchanged in every module (`attn` 5, `block_sparse_mlp` 5,
+`gated_delta_net` 3, `linear` 1, `mamba2` 2, `mla_attn` 2, `mlp` 4, `sliding_attn` 5).
+`tests/util.py`: upstream deleted it (its own tests moved to the new `tests/testlib/`
+package, `tests/<subsystem>/` tree); our 15 root-level `tests/test_*.py` still import
+`assert_close_mr` / `run_timed` from it, so the fork's copy stays. README parity note
+bumped in both places; `version.py` is upstream's 1.6.1.
+
+**What v1.6.1 is:** a recurrent-state rework for speculative decoding (GDN/KDA/Mamba keep
+one initial state + the input hidden state and re-advance instead of reverting to a
+checkpoint; 2-slot parity scan pool with staged-input replay; hybrid draft mode; recurrent
+mode for draft models), RowTable hardening for the PLE n-gram table (staging-set release on
+failed lookups, capacity buffer replaced last, host-memory check before loading a
+single-tensor table), the QSA eager sparse-decode top-k bounded to the scored width (#494,
+also MLA), planar AVX2 CPU-MoE layouts with K3 GEMV specialisations, a Triton
+multi-architecture autotune cache workaround, more accurate sin/cos in the RoPE kernel
+(`rope.cu`, long-context drift), a GDN eager-path `beta_scale` fix (now multiplies after the
+sigmoid), the big upstream test reorganisation, and the Turing (sm_75) prefill path. The
+`g_tensor_cache.get_scratch` refactor touches `hyperconnections.py` and `qsa_indexer.py`
+(scratch allocation only; the `_mix_ref` / indexer math our `training/hyperconnections.py`
+transcribes is unchanged). `qwen4_exp.py` moves the `image_token_id` read into the base
+config class.
+
+**Training-path check:** nothing to adopt. `training/gdn.py` already computes
+`beta = sigmoid(b) * beta_scale`, i.e. the form upstream's eager path was fixed to (latent
+anyway, `beta_scale = 1.0` for every GDN model we train). The RoPE accuracy change is in
+the CUDA kernel; the differentiable forward builds its own fp32 sin/cos tables, so the two
+sides should if anything agree more closely at long context now. `PLELayer` /
+`NGramEmbedding.forward` (used under `no_grad` by `backbone.ple_ngram_embed`) keep their
+signature; the RowTable changes are failure-path and memory-check hardening.
+
+**Box list:** (1) `qlora_validate_native.py` on a Qwen3.5/3.6 hybrid quant — the GDN
+module's forward was reworked around the spec-decode state (the `bc.run_bszN` call now
+takes `slots_scan` / `slots_scan_in`), and that is the module the differentiable GDN
+layers are validated against; (2) same on a Gemma-3 or Spark-X2.5 quant for the widened
+`sliding_attn` graph gate next to the LoRA guard; (3) a short Qwen3.8-Flash-Next
+validate once Phase A's own box run happens — the RowTable hardening sits under the
+PLE n-gram lookup.
+
+**Test note (CPU, scratch venv, torch 2.14.1):** upstream's new `tests/conftest.py` skips
+every test not marked `nogpu` on a machine without a device, which would silently skip all
+of our CPU-first training suites. Added one clause to its `pytest_collection_modifyitems`:
+tests directly under `tests/` (all of ours — upstream's now live in the subsystem tree) are
+marked `nogpu`; they gate their own GPU tiers on `EXL3_TEST_MODEL` as before. With that,
+native_llama / gdn / qlora_grad / fused_ce / hyperconnections_train / ple_train /
+expert_stream / dequant_fast / realtime / preference / chat_turns / chat_jinja: **122 pass**.
+The two `test_real_exl3_layer` tiers (qlora_grad, dequant_fast) now error on upstream's
+registry-backed `model_dir` fixture instead of "fixture not found" — still box-only, still
+run via each file's `__main__` with `--model`. `test_moe_cpu_offload_rejected_.py` imports
+the `exllamav3` package directly and so needs the built extension (box-only, unchanged).
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the

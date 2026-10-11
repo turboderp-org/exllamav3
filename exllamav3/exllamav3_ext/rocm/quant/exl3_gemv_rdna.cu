@@ -457,13 +457,14 @@ void exl3_gemv
     const half* suh_ptr = (const half*) OPTPTR(suh);
     half* A_had_ptr = (half*) OPTPTR(A_had);
     const half* svh_ptr = (const half*) OPTPTR(svh);
-    TORCH_CHECK(suh_ptr && A_had_ptr && svh_ptr, "exl3_gemv requires suh, A_had and svh");
+    TORCH_CHECK(suh.has_value() && A_had.has_value() && svh.has_value(), "exl3_gemv requires suh, A_had and svh");
 
     int size_m = 1;
     int dim = A.dim();
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    TORCH_CHECK(C.numel() >= (int64_t) size_m * size_n, "exl3_gemv: C must hold one output row per row of A");
     // A half-integer tile (16 * K + 8 uint16) has no RDNA GEMV core; see exl3_gemv_try_launch
     TORCH_CHECK(B.size(2) % 16 == 0, "exl3_gemv: half-integer bitrates are not supported by the RDNA GEMV kernel "
                 "(exl3_gemm runs them on the cooperative GEMM)");
@@ -472,6 +473,14 @@ void exl3_gemv
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+
+    // No rows or no output columns: nothing to compute. Empty reduction (k = 0): the product is zero
+    if (!size_m || !size_n) return;
+    if (!size_k)
+    {
+        cuda_check(cudaMemsetAsync(C.data_ptr(), 0, (size_t) size_m * size_n * C.element_size(), stream));
+        return;
+    }
 
     TORCH_CHECK(exl3_gemv_rdna_eligible(size_m, size_k, size_n, K, suh_ptr, A_had_ptr),
         "exl3_gemv: call is not eligible for the RDNA GEMV kernel "

@@ -736,8 +736,9 @@ _h32_cache = {}
 _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
 
 # Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
-# path reads less gmem (short trailing chunks over long contexts, low bitrates)
-_qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
+# path reads less gmem (short trailing chunks over long contexts, low bitrates). Per device:
+# where the staged window feeds SDPA (sm_75) every prefill chunk stages (util/backend.py)
+from ...util.backend import qc_prefill_two_pass_min_q, sdpa_prefill as _sdpa_prefill
 
 def _get_h32(device):
     if device not in _h32_cache:
@@ -1802,6 +1803,7 @@ def paged_attn_triton_prefill(
     num_stages: int | None = None,
     num_splits: int | None = None,
     max_kv_len: int | None = None,
+    staging_pages: int | None = None,
     qc: tuple | None = None,
     pre_appended_len: int = 0,
     n_kv_heads_override: int | None = None,
@@ -1894,16 +1896,18 @@ def paged_attn_triton_prefill(
         # short query batches stay on the direct path, which reads less gmem
         # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
         # which would repeat the dequant pass per span -- those keep the direct path.) The
-        # scratch is a per-call transient sized to the referenced window: the block-table span
-        # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
-        # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
-        # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
-        # the allocator sees a handful of distinct sizes, but never past the pool itself: the
-        # rounding alone would double a 513-page window to 1024 pages. Context-shaped workspaces
-        # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
-        # for the life of the process. The loader's autosplit budgets for the worst case (a window
-        # spanning the pool) through Attention.autosplit_extra_measure
-        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+        # scratch is a per-call transient of one fixed size per layer: the caller's staging_pages
+        # (the pool, or the bounded window QSA's dense regime can reach), else the pool itself.
+        # The window actually dequantized is the block-table span (a job's pages, not the pool),
+        # narrowed further when the caller bounds the past length, but the allocation never
+        # tracks it: a scratch that grew with the context would hand the allocator a new size
+        # every few chunks of a long prefill, and without expandable segments every size seen
+        # stays cached. A batched table pads every row to the batch's max page count and can
+        # exceed the pool; that rare case is sized exactly. Workspaces are not kept as statics:
+        # the old pool-sized static held a full fp16 copy of the cache for the life of the
+        # process. The loader's autosplit budgets the same fixed size through
+        # Attention.autosplit_extra_measure
+        if (_qc_staging == 1 and q_len >= qc_prefill_two_pass_min_q(q.device)
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
@@ -1912,7 +1916,7 @@ def paged_attn_triton_prefill(
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
             pages = bsz * npps_w
-            pages_alloc = min(max(1, 1 << (pages - 1).bit_length()), max(pages, k_cache.shape[0]))
+            pages_alloc = max(pages, staging_pages if staging_pages is not None else k_cache.shape[0])
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
@@ -1927,6 +1931,21 @@ def paged_attn_triton_prefill(
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
+
+    # sm_75: a prefill chunk over a dense fp16 cache (the staged window above, or the fp16 cache itself)
+    # attends through SDPA / fa75 instead of the Triton kernel (util/backend.py). The direct quantized
+    # kernel is kept for what the staging pass left out (short chunks below its threshold, non-causal)
+    if (
+        qc is None and k_cache is not None and new_kv_mode == 0 and causal and q_len > 8 and
+        window_left < 0 and window_right < 0 and not softcap and not has_sinks and
+        q.dtype == torch.float16 and _sdpa_prefill(q.device)
+    ):
+        from .torch import sdpa_prefill_paged
+        if k is not None and kv_append_len:
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, block_table.shape[1], bsz,
+                             kv_append_len, n_kv_heads, page_size, head_dim)
+        return sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal,
+                                  softmax_scale, out)
 
     # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
@@ -2402,6 +2421,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        staging_pages=args.staging_pages,
     )
 
 
@@ -2436,4 +2456,5 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        staging_pages=args.staging_pages,
     )

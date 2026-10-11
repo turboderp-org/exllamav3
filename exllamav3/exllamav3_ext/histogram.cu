@@ -90,6 +90,7 @@ void histogram
     uint64_t numel = input.numel();
     uint64_t num_bins = output.numel();
     TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
+    TORCH_CHECK(num_bins > 0, "histogram: empty output (no bins)");
 
     if (float32)
         histogram_kernel<float><<<1, NUM_THREADS, 0, stream>>>

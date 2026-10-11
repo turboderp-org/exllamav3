@@ -105,8 +105,10 @@ void gumbel_noise_f16
 
     TORCH_CHECK_DTYPE(logits_in, kHalf);
     TORCH_CHECK_DTYPE(logits, kHalf);
+    TORCH_CHECK_SHAPES_FULL(logits_in, logits);
 
     int size = logits.numel();
+    if (!size) return;
     int blocks = CEIL_DIVIDE(CEIL_DIVIDE(size, 2), NUM_THREADS);
 
     gumbel_noise_kernel_f16<<<blocks, NUM_THREADS, 0, stream>>>
@@ -116,6 +118,7 @@ void gumbel_noise_f16
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_noise_f32
@@ -130,8 +133,10 @@ void gumbel_noise_f32
 
     TORCH_CHECK_DTYPE(logits_in, kFloat);
     TORCH_CHECK_DTYPE(logits, kFloat);
+    TORCH_CHECK_SHAPES_FULL(logits_in, logits);
 
     int size = logits.numel();
+    if (!size) return;
     int blocks = CEIL_DIVIDE(size, NUM_THREADS);
 
     gumbel_noise_kernel_f32<<<blocks, NUM_THREADS, 0, stream>>>
@@ -141,6 +146,7 @@ void gumbel_noise_f32
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_noise_log
@@ -158,6 +164,7 @@ void gumbel_noise_log
     TORCH_CHECK_SHAPES_FULL(probs, logits);
 
     int size = probs.numel();
+    if (!size) return;
     int blocks = CEIL_DIVIDE(size, NUM_THREADS);
 
     gumbel_noise_kernel_log<<<blocks, NUM_THREADS, 0, stream>>>
@@ -167,4 +174,5 @@ void gumbel_noise_log
         size,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }

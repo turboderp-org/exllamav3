@@ -613,9 +613,9 @@ at::Tensor BC_DSV4BatchAttention::run(const at::Tensor& x, int B, int S)
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, B, S, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     // Everything is device-driven; the input pointer is the only patched parameter
@@ -643,9 +643,9 @@ at::Tensor BC_DSV4Attention::run(const at::Tensor& x, int pos, int win_beg, int 
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, seq, regime, pos, win_beg, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     int ec = comp_bc ? (pos + seq) / m : 0;

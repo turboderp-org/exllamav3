@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -931,7 +932,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
             acc[b][i] = _mm512_setzero_si512();
 
     // Layout and prefetch handling as in vnni_band (see the comments there); the host hands
-    // this tier the swizzled layout too (moe_cpu_host gates it on has_avx512_bw)
+    // this tier the swizzled layout too (exl3_moe_cpu_swizzle_group, group 8)
     const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
     const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
     const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
@@ -1432,7 +1433,7 @@ inline __m256i avx2_gather_half(const __m256i (&preg)[avx2_regs(bits, hb)])
 // for its single per-half s0/s1).
 template <int bits, bool hb, int row>
 M1_TARGET_AVX2
-inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& codes_lo, __m256i& codes_hi)
+M1_ALWAYS_INLINE void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& codes_lo, __m256i& codes_hi)
 {
     const __m256i a_lo = avx2_gather_half<bits, hb, row, false, 0>(preg);
     const __m256i b_lo = avx2_gather_half<bits, hb, row, true, 0>(preg);
@@ -1462,10 +1463,13 @@ inline void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)], __m256i& 
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
+// Rows == MAX_M retains the runtime bound for existing AVX2 callers.
+template <int Rows = MAX_M>
 M1_TARGET_AVX2
-inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
+M1_ALWAYS_INLINE void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
+    int m, __m256i (&acc)[Rows][2], const __m256i& mult, const __m256i& ones32, int row)
 {
+    static_assert(Rows > 0 && Rows <= MAX_M, "AVX2 row extent");
     // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
     // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
     // at full +-127 activations; one vpmaddwd per token row against splat_dup (x8 in both 16-bit
@@ -1476,7 +1480,8 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
     const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
     const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
     #define ACC_ROW(i) \
-        if ((i) < m) { \
+        if constexpr ((i) < Rows) \
+        if (Rows != MAX_M || (i) < m) { \
             const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
             acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
             acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
@@ -1492,7 +1497,7 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 // (K3 -5% 1T / -14% 24T-cold on the 7960X); do not widen the gate without re-measuring.
 template <int bits, bool hb, int row = 0>
 M1_TARGET_AVX2
-inline void avx2_rows_accum(
+M1_ALWAYS_INLINE void avx2_rows_accum(
     const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
     const __m256i& mult, const __m256i& ones32)
 {
@@ -1544,9 +1549,10 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     const int32_t* splat_dup = in.splat_dup;
 
     // The k-major stream strides row_stride (>= 8 KB) per step, beyond what the HW prefetcher
-    // tracks (and the swizzled layout the VNNI path uses is not applied for AVX2). Cold-stack
-    // (offloaded expert) microbench: +20..70% at K>=4, largest at K8, warm-neutral, so always
-    // on. Distance 4 measured best cold (>= 2 everywhere within noise, 4 adds another +10..35%
+    // tracks (swizzled AVX2 matrices skip this kernel: they run the prefetch-free band-2
+    // avx2_swz2). Cold-stack (offloaded expert) microbench: +20..70% at K>=4, largest at K8,
+    // warm-neutral, so always on. Distance 4 measured best cold (>= 2 everywhere within noise,
+    // 4 adds another +10..35%
     // at K5-K8 cold); prefetching past the allocation end is architecturally safe.
     constexpr int pf_lines = (packed_size * 2 + 63) / 64;   // cache lines per tile row
     // bits==6 (96B rows) collapses at distance 4 when cold (reproducibly ~2x slower on both
@@ -1596,6 +1602,159 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
             float* out = tout + static_cast<size_t>(i) * mat.n + tile_n * 16;
             _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));
             _mm256_storeu_ps(out + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+//   AVX2 swizzle: band-2 kernel over the group-2 + planar layout
+// -------------------------------------------------------------------------------------------
+
+// Register holding a half-row's source dwords under the planar order: the half-row's dword
+// residue class mod bits. All 8 columns must agree (the orbit property); a disagreement is
+// a layout bug, caught at compile time by the caller's static_assert.
+template <int bits, int row, bool second_word, int half>
+constexpr int planar_reg()
+{
+    constexpr auto idx = make_row_indices<bits, false, row, second_word>();
+    const int r = idx[half * 8] % bits;
+    for (int c = 1; c < 8; ++c)
+        if (idx[half * 8 + c] % bits != r) return -1;
+    return r;
+}
+
+// True when the half-row's lanes are already 0..7 inside the register: GCC does not fold an
+// identity vpermd (it emits the permute plus its constant), so those slots must return the
+// register directly. Most row/half slots qualify at every rate, so the wasted permutes would
+// be a measurable share of the kernel's ALU work.
+template <int bits, int row, bool second_word, int half>
+constexpr bool planar_identity()
+{
+    constexpr auto idx = make_row_indices<bits, false, row, second_word>();
+    for (int c = 0; c < 8; ++c)
+        if (idx[half * 8 + c] / bits != c) return false;
+    return true;
+}
+
+// One vpermd replaces avx2_gather_half's register walk: native dword w of the tile lives at
+// planar position 8 * (w % bits) + w / bits, i.e. in register w % bits at lane w / bits
+template <int bits, int row, bool second_word, int half>
+M1_TARGET_AVX2
+inline __m256i avx2_gather_half_planar(const __m256i (&preg)[bits])
+{
+    static_assert(planar_reg<bits, row, second_word, half>() >= 0, "half-row words span registers");
+    if constexpr (planar_identity<bits, row, second_word, half>())
+        return preg[planar_reg<bits, row, second_word, half>()];
+    constexpr auto idx = make_row_indices<bits, false, row, second_word>();
+    const __m256i lane = _mm256_setr_epi32(
+        idx[half * 8 + 0] / bits, idx[half * 8 + 1] / bits, idx[half * 8 + 2] / bits,
+        idx[half * 8 + 3] / bits, idx[half * 8 + 4] / bits, idx[half * 8 + 5] / bits,
+        idx[half * 8 + 6] / bits, idx[half * 8 + 7] / bits);
+    return _mm256_permutevar8x32_epi32(preg[planar_reg<bits, row, second_word, half>()], lane);
+}
+
+template <int bits, int row>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i& codes_lo, __m256i& codes_hi)
+{
+    const __m256i a_lo = avx2_gather_half_planar<bits, row, false, 0>(preg);
+    const __m256i b_lo = avx2_gather_half_planar<bits, row, true, 0>(preg);
+    const __m256i a_hi = avx2_gather_half_planar<bits, row, false, 1>(preg);
+    const __m256i b_hi = avx2_gather_half_planar<bits, row, true, 1>(preg);
+    const __m256i mask16 = _mm256_set1_epi32(0xffff);
+    constexpr int s0 = row_shift<bits, false, row>(0);
+    constexpr int s1 = row_shift<bits, false, row>(8);
+    codes_lo = _mm256_and_si256(_mm256_or_si256(
+        _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
+    codes_hi = _mm256_and_si256(_mm256_or_si256(
+        _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
+}
+
+template <int bits, int row = 0, int Rows = MAX_M>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_rows_accum_planar(
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
+    const __m256i& mult, const __m256i& ones32)
+{
+    if constexpr (row < 16)
+    {
+        __m256i codes_lo, codes_hi;
+        avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
+        avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum_planar<bits, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
+    }
+}
+
+// The AVX2 analogue of the AVX-512 band kernels: two adjacent n-tiles per k-step, each
+// accumulated with the production per-tile body, so output is bit-identical to avx2_tiles.
+// On the group-2 tile order (tile (kt, nt) at (nt/2, kt, nt%2)) the pair's k-stream is one
+// sequential run: no software prefetch needed, and the native layout's row_stride-sized
+// k-step (tens of KB, a new page every step) collapses to one page per 8-16 steps. Group 2
+// is the widest band that pays: 2 tiles x 2 ymm accumulators plus the tile registers already
+// use most of the 16 ymm at m=1 (the AVX-512 group-8 order cannot be banded here at all),
+// and a band-4 kernel over a group-4 order was measured anyway -- spill-free, yet slower at
+// every rate on Zen 3 and Zen 5: band-2 already runs the kernel at its throughput ceiling,
+// and a wider band removes no per-weight work.
+//
+// The tile dwords are additionally planar-repacked by the loader: native dword w of a tile
+// moves to 8 * (w % bits) + w / bits. Under the tc-perm layout a half-row's 8 source dwords
+// advance by exactly `bits` per column, i.e. they form one residue class mod bits, and the
+// planar order puts that class in a single 8-dword register. Every gather then collapses to
+// one vpermd (or nothing) instead of avx2_tiles' O(bits) register walk with blends. That
+// removes the rate-proportional ALU wall of the walk (every rate lands at the accumulate
+// ceiling) and frees the registers the walk needed -- without planar the band-2 body spills
+// at the odd and high rates, which would lock those rates out of the swizzle. Half-integer
+// rates are never packed on this tier: their per-column word step is not integral, so the residue classes do not
+// partition the tile, and avx2_swz2 has no hb instances. K1's dword permutation is the
+// identity, so "planar" is a no-op repack there and the gathers degenerate to the walking
+// gather of a single-register tile anyway.
+//
+// tn0/tn1 are always even: assign_gemvs splits in 8-tile groups (2-tile aligned) and
+// tiles_n is a multiple of 8. There is no per-tile edge handling.
+template <int bits, int Rows = MAX_M>
+M1_TARGET_AVX2
+void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    const int rows = Rows == MAX_M ? m : Rows;
+    const int tiles_k = mat.k / 16;
+    constexpr int packed_size = 16 * bits;
+    const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+    const size_t step = static_cast<size_t>(2) * packed_size;
+
+    for (int pair = tn0; pair < tn1; pair += 2)
+    {
+        __m256i accA[Rows][2], accB[Rows][2];
+        for (int i = 0; i < rows; ++i)
+        {
+            accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
+            accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
+        }
+        const uint16_t* pA = mat.trellis
+            + static_cast<size_t>(pair >> 1) * tiles_k * 2 * packed_size;
+        const uint16_t* pB = pA + packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
+        {
+            const int32_t* dup = splat_dup + tile_k * 16;
+            __m256i preg[bits];
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
+            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accA, mult, ones32);
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
+            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accB, mult, ones32);
+        }
+        for (int i = 0; i < rows; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* outA = tout + static_cast<size_t>(i) * mat.n + pair * 16;
+            float* outB = outA + 16;
+            _mm256_storeu_ps(outA, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outA + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][1]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
         }
     }
 }
@@ -1892,6 +2051,43 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         }
         case Isa::Avx2:
         {
+            // Swizzled matrices on this tier are always group-2 + planar dwords (the rule
+            // couples the two, the loader repacks accordingly and make_matrix re-derives the
+            // flag from the same rule, so bytes and kernel cannot drift). Half rates are
+            // never swizzled here and take the hb branch below.
+            if (mat.swz)
+            {
+                // Compile-time row count for two and three rows (two tokens, or one token split
+                // into a wide pair), which lets the row guards and accumulator extent fold away.
+                // Four rows keep the runtime bound, where the fully unrolled accumulators spill.
+                // One row: GCC already folds the runtime guards into its best code and loses a
+                // little to the constant; Clang needs it (its single-row runtime code keeps the
+                // accumulators in memory)
+                #if defined(__clang__)
+                #define AVX2_SWZ2_ROW1(B) case 1: avx2_swz2<B, 1>(mat, in, tout, m, tn0, tn1); return;
+                #else
+                #define AVX2_SWZ2_ROW1(B)
+                #endif
+                #define AVX2_SWZ2_ROWS(B) \
+                    switch (m) { \
+                        AVX2_SWZ2_ROW1(B) \
+                        case 2: avx2_swz2<B, 2>(mat, in, tout, m, tn0, tn1); return; \
+                        case 3: avx2_swz2<B, 3>(mat, in, tout, m, tn0, tn1); return; \
+                        default: avx2_swz2<B>(mat, in, tout, m, tn0, tn1); return; }
+                switch (mat.bits)
+                {
+                    case 1: AVX2_SWZ2_ROWS(1)
+                    case 2: AVX2_SWZ2_ROWS(2)
+                    case 3: AVX2_SWZ2_ROWS(3)
+                    case 4: AVX2_SWZ2_ROWS(4)
+                    case 5: AVX2_SWZ2_ROWS(5)
+                    case 6: AVX2_SWZ2_ROWS(6)
+                    case 7: AVX2_SWZ2_ROWS(7)
+                    default: AVX2_SWZ2_ROWS(8)
+                }
+                #undef AVX2_SWZ2_ROWS
+                #undef AVX2_SWZ2_ROW1
+            }
             if (mat.hb)
             {
                 switch (mat.bits)
@@ -1949,11 +2145,12 @@ typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 
 // Physical-core-first CPU ordering: one logical CPU per distinct physical core, SMT siblings
 // appended after. Pinning the workers to it keeps two of them off one physical core and, with
-// the host process confined to the reserved core (EXL3_MOE_HOST_CORES), off the host's spinning
-// threads. Whether that beats the OS scheduler depends on the scheduler: on Windows it does; on
-// Linux CFS places the host's spin-waits and the workers onto distinct cores by itself and the
-// fixed placement only pins each run to whichever layout it started with, so the default is
-// per platform (EXL3_MOE_CPU_PIN overrides either way).
+// the host process confined to the reserved core (EXL3_MOE_HOST_CORES), off the host's threads:
+// a worker that shares a core with other work is the straggler at every per-phase barrier. A
+// floating pool relies on the scheduler keeping the layout apart, which holds on some
+// hosts and fails badly on others (small L3 domains, VM guests), while a pinned layout can
+// only lose to whatever else lands on its cores, so pinning is the default (EXL3_MOE_CPU_PIN=0
+// floats the workers; the reserved core and the host confinement stay in effect either way).
 //
 // Linux: entries are plain logical CPU indices (as taken by CPU_SET). Windows: entries encode
 // (processor group << 16) | bit-within-group, decoded by Pool::pin_self -- SetThreadAffinityMask
@@ -2038,11 +2235,7 @@ inline bool pin_threads_enabled()
 {
     static const bool v = [] {
         const char* e = std::getenv("EXL3_MOE_CPU_PIN");
-#ifdef __linux__
-        return e && *e == '1';
-#else
         return !(e && *e == '0');
-#endif
     }();
     return v;
 }
@@ -2328,7 +2521,8 @@ inline void fold_rows(float* tout, const PreparedIn& p, int m, int n, int c0, in
 // Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
 // calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
 // once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
-// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; n % 128 == 0
+// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; 8-tile groups are
+// also 2-tile aligned, covering the AVX2 group-2 layout. n % 128 == 0
 // makes every tiles_n a multiple of 8). Whole-GEMV assignment left a 2:1 imbalance whenever
 // 2 * cold experts fell between multiples of the worker count (16 gate/up GEMVs on 20 workers:
 // twelve single-worker GEMVs set the phase time while eight workers idled half of it). Many
@@ -2555,9 +2749,9 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
     return static_cast<size_t>(m.k / 16) * (m.n / 16) * tile_u16(m.bits, m.hb != 0) * 2;
 }
 
-// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
-// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
-// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
+// Staged bytes are copied verbatim, packed or not: the GPU restores the native tile order (and
+// dword order) after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM
+// bandwidth instead of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
 // whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
 {
@@ -2622,6 +2816,24 @@ bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 
+// Packed-layout rules (see moe_mul1.h). Band-8 feeds the AVX-512 band kernels (bw/vnni/vbmi
+// share the structure); K8 is exempt (it routes to the dword kernel, which gains nothing);
+// half rates ride the hb template instances there. Band-2 + planar feeds the AVX2 avx2_swz2
+// kernel, which measures above native at every integer rate (numbers in its header comment);
+// half rates stay native on this tier.
+int exl3_moe_cpu_swizzle_group(double K)
+{
+    const int bits = static_cast<int>(K);
+    if (g_isa >= Isa::Bw) return bits != 8 ? 8 : 0;
+    if (g_isa == Isa::Avx2) return K == bits && bits >= 1 && bits <= 8 ? 2 : 0;
+    return 0;
+}
+
+int exl3_moe_cpu_planar_layout(double K)
+{
+    return g_isa == Isa::Avx2 && exl3_moe_cpu_swizzle_group(K) == 2 ? 1 : 0;
+}
+
 static MoeCpuMatrix make_matrix
 (
     const at::Tensor& trellis,
@@ -2644,12 +2856,12 @@ static MoeCpuMatrix make_matrix
     m.bits = tile_w / 16;
     m.hb = tile_w % 16 == 8 ? 1 : 0;
     TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
-    // K8 tensors are exempt from swizzling (routed to the dword kernel, which would gain
-    // nothing) -- the child loader applies the same bits != 8 rule when repacking, so the two
-    // sides agree per tensor
-    m.swz = swizzled && m.bits != 8 ? 1 : 0;
+    // The caller repacks each tensor with the group exl3_moe_cpu_swizzle_group returns for
+    // this matrix's rate; apply the same rule here so the flag matches the bytes per tensor
+    m.swz = swizzled && exl3_moe_cpu_swizzle_group(tile_w / 16.0) ? 1 : 0;
     TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
+    TORCH_CHECK(m.k > 0 && m.n > 0, "CPU MoE: empty expert weight dimension");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
     return m;
 }
@@ -2673,10 +2885,12 @@ int64_t exl3_moe_cpu_make_layer
     int64_t swizzled
 )
 {
-    auto* layer = new MoeCpuLayer;
+    auto layer_owner = std::make_unique<MoeCpuLayer>();
+    MoeCpuLayer* layer = layer_owner.get();
     const bool swz = swizzled != 0;
     const size_t E = up_trellis.size();
     const bool gated = !gate_trellis.empty();
+    TORCH_CHECK(E > 0, "exl3_moe_cpu_make_layer: no experts");
     TORCH_CHECK(down_trellis.size() == E && (!gated || gate_trellis.size() == E), "expert count mismatch");
     TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
     TORCH_CHECK(gate_bias.empty() || gate_bias.size() == E, "gate bias count mismatch");
@@ -2708,7 +2922,7 @@ int64_t exl3_moe_cpu_make_layer
                 "expert shape mismatch");
 
     std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(layer);
+    g_layers.push_back(layer_owner.release());
     return static_cast<int64_t>(g_layers.size() - 1);
 }
 
@@ -2729,11 +2943,12 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     return g_layers[handle];
 }
 
-// Topology as the pool sees it: physical-core-first order and the physical core count, so the
-// Python host can keep its own threads off the worker LPs. Empty when pinning is disabled.
+// Topology as the pool sees it: physical-core-first order and the physical core count, for the
+// Python host's worker-count default and for keeping its own threads on the reserved core(s).
+// Reported whether or not the workers themselves are pinned: a floating pool still leaves the
+// reserved cores alone on average, and the host on them is still out of the workers' way
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order()
 {
-    if (!pin_threads_enabled()) return { {}, 0 };
     const CoreOrder co = physical_core_order();
     return { std::vector<int64_t>(co.order.begin(), co.order.end()), co.n_phys };
 }
@@ -2874,6 +3089,7 @@ void exl3_moe_cpu_forward_raw(
     // exl3_moe_cpu_set_prof (MoeCpuTuning.cpu_prof in moe_cpu_host.py, EXL3_MOE_CPU_PROF env)
     const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
     static double phase_us[6] = {};
+    static double phase_bytes[6] = {};
     static long prof_jobs = 0;
 
     const int num_phases = rows == 1 ? 5 : 6;
@@ -2881,9 +3097,21 @@ void exl3_moe_cpu_forward_raw(
         ctx.phase = phase;
         if (prof)
         {
+            // Trellis bytes the GEMV phases must stream (per-job, summed over chunks): the
+            // GB/s below says whether a phase runs at the machine's read-bandwidth wall
+            // (only byte-reducing levers remain) or well under it (job structure still costs)
+            double jb = 0;
+            if (phase == 1)
+                for (const Chunk& ch : ctx.chunks)
+                    jb += trellis_bytes(layer->ups[ch.expert])
+                        + (layer->gates.empty() ? 0.0 : (double) trellis_bytes(layer->gates[ch.expert]));
+            else if (phase == 3)
+                for (const Chunk& ch : ctx.chunks)
+                    jb += trellis_bytes(layer->downs[ch.expert]);
             const auto t0 = std::chrono::steady_clock::now();
             g_pool.run(&forward_phase, &ctx, n_run);
             phase_us[phase] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            phase_bytes[phase] += jb;
         }
         else
         {
@@ -2892,10 +3120,12 @@ void exl3_moe_cpu_forward_raw(
     }
     if (prof && ++prof_jobs % 512 == 0)
     {
-        printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f | act+prep_d %.1f"
-               " | gemv_d %.1f | tf_d/finish %.1f | accum %.1f\n",
-               prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs, phase_us[2] / prof_jobs,
-               phase_us[3] / prof_jobs, phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
+        printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f (%.1f GB/s)"
+               " | act+prep_d %.1f | gemv_d %.1f (%.1f GB/s) | tf_d/finish %.1f | accum %.1f\n",
+               prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs,
+               phase_bytes[1] / phase_us[1] / 1000.0, phase_us[2] / prof_jobs,
+               phase_us[3] / prof_jobs, phase_bytes[3] / phase_us[3] / 1000.0,
+               phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
         fflush(stdout);
     }
 }
@@ -2912,6 +3142,14 @@ void exl3_moe_cpu_forward
 {
     TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu() && out.device().is_cpu(), "CPU MoE tensors must be on CPU");
     TORCH_CHECK(x.scalar_type() == at::kHalf && out.scalar_type() == at::kFloat, "dtype mismatch");
+    TORCH_CHECK(weights.scalar_type() == at::kHalf, "weights must be float16");
+    TORCH_CHECK(x.dim() == 2 && selected.dim() == 2 && selected.size(0) == x.size(0) && weights.sizes() == selected.sizes(),
+                "exl3_moe_cpu_forward: x must be (rows, hidden), selected and weights (rows, top_k)");
+    TORCH_CHECK(x.is_contiguous() && selected.is_contiguous() && weights.is_contiguous() && out.is_contiguous(),
+                "exl3_moe_cpu_forward: tensors must be contiguous");
+    const MoeCpuLayer* layer = get_layer(handle);
+    TORCH_CHECK(x.size(1) == layer->hidden_size && out.sizes() == x.sizes(),
+                "exl3_moe_cpu_forward: x and out must be (rows, hidden_size)");
 
     const int m_total = static_cast<int>(x.size(0));
     const int top_k = static_cast<int>(selected.size(-1));
@@ -2954,6 +3192,8 @@ bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+int exl3_moe_cpu_swizzle_group(double) { return 0; }
+int exl3_moe_cpu_planar_layout(double) { return 0; }
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,

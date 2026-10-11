@@ -61,9 +61,16 @@ void add_gr
     uint64_t numel_y = y.numel();
     if (numel_y != numel_x)
     {
-        TORCH_CHECK(numel_y < numel_x, "Tensor shape mismatch (y > x)");
+        // y repeats over x: an empty y can't fill a non-empty x, any y divides an empty x (bias over no rows)
+        TORCH_CHECK(numel_y > 0, "Tensor shape mismatch (empty y cannot broadcast to x)");
+        TORCH_CHECK(numel_y < numel_x || numel_x == 0, "Tensor shape mismatch (y > x)");
         TORCH_CHECK(numel_x % numel_y == 0, "Tensor shape mismatch (y must divide x)");
     }
+    TORCH_CHECK((uint64_t) z.numel() == numel_x, "Tensor shape mismatch (z must match x)");
+    TORCH_CHECK_FLOAT_HALF(x);
+    TORCH_CHECK_FLOAT_HALF(y);
+    TORCH_CHECK_FLOAT_HALF(z);
+    if (!numel_x) return;
 
     #define INSTANCE(xt_, yt_, zt_, xt__, yt__, zt__, kernel) \
     if (xt == xt_ && yt == yt_ && zt == zt_) \

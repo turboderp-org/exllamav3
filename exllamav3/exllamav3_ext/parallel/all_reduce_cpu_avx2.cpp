@@ -491,8 +491,13 @@ void perform_cpu_reduce_avx2
             }
         }
 
-        // Handle case where only one device contributed (no add needed, just copy)
-        if (first_src != nullptr && first_src != host_ptr(MAX_DEVICES, stage))
+        // No device contributed: the sum is zero (the slot still holds an earlier stage's result)
+        if (first_src == nullptr)
+        {
+            memset(host_ptr(MAX_DEVICES, stage), 0, stage_size);
+        }
+        // Only one device contributed (no add needed, just copy)
+        else if (first_src != host_ptr(MAX_DEVICES, stage))
         {
             memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }

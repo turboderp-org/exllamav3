@@ -17,6 +17,7 @@ from .op import gather
 from .utils import IS_GATHER_SUPPORTED
 from .utils import IS_TF32_SUPPORTED
 from .utils import autotune_cache_kwargs
+from .utils import autotune
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -27,7 +28,7 @@ else:
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({'BK': BK}, num_warps=num_warps)
         for BK in [32, 64]
@@ -379,7 +380,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]

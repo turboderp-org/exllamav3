@@ -210,9 +210,7 @@ class HyperConnection(Module):
             # the graphed callers rely on them); prefill chunks allocate per call so the static
             # cache holds only small buffers
             def ws(numel, dtype, tag):
-                if R <= 32:
-                    return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
-                return torch.empty((numel,), dtype = dtype, device = dev)
+                return g_tensor_cache.get_scratch(dev, numel, dtype, tag, R)
             partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
             post = ws(R * H, torch.float, "hc_post").view(R, H)
             comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
@@ -808,9 +806,7 @@ class HyperHead(Module):
             # Decode-class row counts take the static workspaces (same rule as _mix); prefill
             # chunks allocate per call, or the collapsed rows alone would pin 64 MiB per device
             def ws(numel, tag):
-                if R <= 32:
-                    return g_tensor_cache.get_bucketed(x.device, numel, torch.float, tag)
-                return torch.empty((numel,), dtype = torch.float, device = x.device)
+                return g_tensor_cache.get_scratch(x.device, numel, torch.float, tag, R)
             partials = ws(R * chunks * (H + 1), "hc_head_partials").view(R, chunks, H + 1)
             collapsed = ws(R * D, "hc_head_coll").view(R, D)
             if R <= 32:
