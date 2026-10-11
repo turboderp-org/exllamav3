@@ -23,7 +23,9 @@ def preserve(params, key, value):
 
 class Gemma4PerLayerEmbedding(Embedding):
     def forward(self, x, params, out_dtype=None):
-        ids = params["input_ids"].to(self.device)
+        # Quantized tables gather rows on the CPU. Respect the embedding's
+        # placement policy instead of uploading IDs only to read them back.
+        ids = self.prepare_for_device(params["input_ids"], params)
         p = super().forward(ids, params, out_dtype=torch.float)
         preserve(params, "gemma4_ple", p)
         return x
