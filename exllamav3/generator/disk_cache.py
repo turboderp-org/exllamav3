@@ -4,19 +4,20 @@ import errno
 import hashlib
 import heapq
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import struct
 import threading
 import time
+import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
 from ..constants import PAGE_SIZE
-from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..version import __version__
 from ..cache.recurrent import host_pool, new_checkpoint_handle
 from ..model.model_tp_fn import (
@@ -25,41 +26,38 @@ from ..model.model_tp_fn import (
 )
 from .cpu_cache import _align
 
+logger = logging.getLogger(__name__)
+
 PAGE_MAGIC = b"EXL3KVP1"
 STATE_MAGIC = b"EXL3RCS1"
 _HEADER = struct.Struct("<II")       # (header json length, payload-descriptor length)
+
+# Several processes can use the same root. A process does not remove a file that it does not know (a temporary
+# file, a rank marker) if the file changed in the last _STRAY_AGE seconds: the file can belong to a write of
+# an other process. For the same reason, the root budget does not remove a directory whose index changed in
+# the last _STRAY_AGE seconds. The writer touches the index at least each _TOUCH_INTERVAL seconds while it works
+_STRAY_AGE = 600
+_TOUCH_INTERVAL = 60
+
+# Bump when a change to the code alters the bytes of a page image or a checkpoint (a kernel or module computing
+# K/V differently, a new checkpoint layout). Part of the fingerprint, so existing caches are left alone until
+# then; the version string and the model/cache identity cover the rest
+DISK_CACHE_FORMAT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # Fingerprint: everything that changes the bytes of a page image or a checkpoint. A cache directory belongs to
 # exactly one fingerprint, so a requantized model, a different cache layer or bit width, a different draft cache
-# or a kernel change that alters K/V numerics (RoPE accuracy, say) can never restore stale pages.
+# or a code change that alters K/V numerics (DISK_CACHE_FORMAT_VERSION) can never restore stale pages.
 # ---------------------------------------------------------------------------------------------------------------
 
-_ext_hash_memo = None
-
-def ext_source_hash() -> str:
-    """Hash of the extension's kernel sources (hipify twins excluded: they are generated per build)"""
-    global _ext_hash_memo
-    if _ext_hash_memo is None:
-        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "exllamav3_ext")
-        h = hashlib.blake2b(digest_size = 16)
-        for dirpath, dirnames, filenames in sorted(os.walk(root)):
-            dirnames.sort()
-            for name in sorted(filenames):
-                if not name.endswith((".cu", ".cuh", ".cpp", ".h", ".hpp", ".c")) or "_hip." in name:
-                    continue
-                path = os.path.join(dirpath, name)
-                h.update(os.path.relpath(path, root).encode())
-                with open(path, "rb") as f:
-                    h.update(f.read())
-        _ext_hash_memo = h.hexdigest()
-    return _ext_hash_memo
-
-
 def model_identity(config) -> str:
-    """config.json plus the raw safetensors headers (names, shapes, dtypes, offsets): identifies the weights
-    without reading them, so a requantization or a differently sharded copy is a different model"""
+    """
+    config.json, the raw safetensors headers (names, shapes, dtypes, offsets) and samples of the weights. A
+    requantization at the same bitrate can give the same headers and the same file sizes, but not the same
+    weights. Thus each file adds its size and seven 64 kB samples, spread through the file. This reads less
+    than 1 MB per file.
+    """
     h = hashlib.blake2b(digest_size = 16)
     h.update(json.dumps(getattr(config, "config_dict", {}), sort_keys = True, default = str).encode())
     directory = getattr(config, "directory", None)
@@ -67,10 +65,16 @@ def model_identity(config) -> str:
         for name in sorted(os.listdir(directory)):
             if not name.endswith(".safetensors"):
                 continue
-            with open(os.path.join(directory, name), "rb") as f:
+            path = os.path.join(directory, name)
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
                 h.update(name.encode())
+                h.update(str(size).encode())
                 h.update(f.read(n))
+                for k in range(1, 8):
+                    f.seek(size * k // 8)
+                    h.update(f.read(65536))
     return h.hexdigest()
 
 
@@ -85,7 +89,7 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
     cache tensor: rows, row bytes, dtype, image offset), which does not depend on a tensor-parallel split"""
     parts = {
         "exllamav3": __version__,
-        "ext_sources": ext_source_hash(),
+        "format": DISK_CACHE_FORMAT_VERSION,
         "page_size": PAGE_SIZE,
         "image_size": image_size,
         "segments": [[seg["rows"], seg["canonical_row_bytes"], seg["dtype"], seg["image_offset"]] for seg in canonical],
@@ -151,8 +155,8 @@ class DiskPageCache:
     Layout: <root>/<fingerprint>/manifest.json, index.sqlite, pages/<hh>/<phash>.kv, states/<phash>.rs. Each
     file is self-describing (its header carries the hash, the parent hash, the tokens and the fingerprint), so
     the SQLite index is a rebuildable cache of the metadata and the directory is reconciled against it at open.
-    The fingerprint covers the model weights (safetensors headers), the cache configuration (layer types, bit
-    widths, the slot segment table), the checkpoint layout, the page size and the extension's kernel sources, so
+    The fingerprint covers the model weights (safetensors headers and samples), the cache configuration (layer
+    types, bit widths, the slot segment table), the checkpoint layout, the page size and the format version, so
     a directory can never serve pages computed under a different configuration.
 
     Write path: every page entering the CPU tier is queued for the writer thread, which waits for the tier's
@@ -204,6 +208,7 @@ class DiskPageCache:
         read_threads: int = 4,
         fingerprint: str | None = None,
         min_state_distance: int = 4096,
+        min_free: int | None = None,
     ):
         """
         :param root_dir:
@@ -218,6 +223,10 @@ class DiskPageCache:
             Reader pool size for promotions
         :param fingerprint:
             Override of the computed fingerprint (tests)
+        :param min_free:
+            Free space in bytes that the tier leaves on the file system. Below it, no new writes start. Default
+            is 2% of the file system, but not more than 16 GB
+
         :param min_state_distance:
             Minimum spacing, in tokens, between the recurrent checkpoints kept along any root-to-leaf chain of
             pages on disk; closer ones are pruned at idle (see prune_states). 0 keeps every checkpoint
@@ -288,6 +297,9 @@ class DiskPageCache:
         self.states_dir = os.path.join(self.dir, "states")
         os.makedirs(self.pages_dir, exist_ok = True)
         os.makedirs(self.states_dir, exist_ok = True)
+        if min_free is None:
+            st = os.statvfs(self.dir)
+            min_free = min(16 * 1024**3, st.f_blocks * st.f_frsize // 50)
         manifest = os.path.join(self.dir, "manifest.json")
         if not os.path.exists(manifest):
             with open(manifest, "w") as f:
@@ -324,7 +336,7 @@ class DiskPageCache:
         self.metrics = {
             "page_writes": 0, "page_write_bytes": 0, "page_reads": 0, "page_read_bytes": 0,
             "page_read_failures": 0, "state_writes": 0, "state_reads": 0, "evictions": 0, "skipped_mm": 0,
-            "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0,
+            "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
         }
 
         self._lock = threading.RLock()
@@ -336,6 +348,21 @@ class DiskPageCache:
         # whatever is on disk still restores, nothing new is queued, one message says so
         self.write_disabled = False
         self._consecutive_failures = 0
+        # A full disk pauses the writes for a time and does not stop them for the session: space comes back
+        # when files are removed. Writes also stop while the free space is below min_free
+        self.min_free = min_free
+        self._space_pause_until = 0.0
+        self._space_checked = 0.0
+        self._space_ok = True
+
+        # Temporary files carry the process id, so two processes never write the same temporary file
+        self._tmp_suffix = f".{os.getpid()}.tmp"
+        self._last_touch = 0.0
+        # Activity summary for the log: metric values at the last report, and the times of the last report and
+        # the last activity
+        self._report_base = None
+        self._report_time = time.time()
+        self._activity_time = 0.0
 
         self._load_index()
         self._reclaim_root()
@@ -353,7 +380,8 @@ class DiskPageCache:
     # -- index -------------------------------------------------------------------------------------------------
 
     def _connect(self):
-        conn = sqlite3.connect(os.path.join(self.dir, "index.sqlite"))
+        # An other process can hold the write lock of the index for a short time
+        conn = sqlite3.connect(os.path.join(self.dir, "index.sqlite"), timeout = 60)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("CREATE TABLE IF NOT EXISTS pages (phash BLOB PRIMARY KEY, prev_hash BLOB, size INTEGER, "
@@ -394,7 +422,9 @@ class DiskPageCache:
                     except ValueError:
                         phash = None
                     if phash is None:
-                        os.remove(path)         # a .tmp, a rank marker of an interrupted transfer, or a stray
+                        # A .tmp, a rank marker of an interrupted transfer, or a stray. A new one can belong to
+                        # a write of an other process
+                        self._remove_stray(path)
                         continue
                     if phash in self.pages:
                         continue
@@ -412,7 +442,7 @@ class DiskPageCache:
                 except ValueError:
                     phash = None
                 if phash is None:
-                    os.remove(path)         # a .tmp, a rank marker of an interrupted transfer, or a stray
+                    self._remove_stray(path)
                     continue
                 if phash in self.states:
                     continue
@@ -429,6 +459,15 @@ class DiskPageCache:
         self.total_size = sum(m["size"] for m in self.pages.values()) + sum(m["size"] for m in self.states.values())
         self.access_serial = max([m["last_access"] for m in self.pages.values()] +
                                  [m["last_access"] for m in self.states.values()] + [0])
+
+
+    @staticmethod
+    def _remove_stray(path: str):
+        try:
+            if os.path.getmtime(path) < time.time() - _STRAY_AGE:
+                os.remove(path)
+        except OSError:
+            pass
 
 
     @staticmethod
@@ -451,15 +490,20 @@ class DiskPageCache:
         on every flush and close.
         """
         siblings = []
+        active = 0
         for name in os.listdir(self.root_dir):
             path = os.path.join(self.root_dir, name)
             if path == self.dir or not os.path.isfile(os.path.join(path, "manifest.json")):
                 continue
             index = os.path.join(path, "index.sqlite")
             used = os.path.getmtime(index) if os.path.exists(index) else os.path.getmtime(path)
+            if used > time.time() - _STRAY_AGE:
+                # An other process can use this directory now: count its size, but do not remove it
+                active += self._dir_size(path)
+                continue
             siblings.append((used, path, self._dir_size(path)))
         siblings.sort()
-        others = sum(sz for _, _, sz in siblings)
+        others = active + sum(sz for _, _, sz in siblings)
         while siblings and others + self.total_size > self.root_size:
             _, path, sz = siblings.pop(0)
             shutil.rmtree(path, ignore_errors = True)
@@ -472,6 +516,7 @@ class DiskPageCache:
 
 
     def _touch_dir(self):
+        self._last_touch = time.time()
         try:
             os.utime(os.path.join(self.dir, "index.sqlite"))
         except OSError:
@@ -533,11 +578,18 @@ class DiskPageCache:
         return len(self.pages)
 
 
-    @staticmethod
-    def persistable_tokens(tokens: torch.Tensor) -> bool:
-        """Multimodal placeholder ids are allocated per process, so a page hash over them is never looked up
-        again; such pages are not worth a write"""
-        return bool((tokens < FIRST_MM_EMBEDDING_INDEX).all().item())
+    def chain_prev(self, phash: bytes):
+        """The hash of the page before phash, from VRAM, the CPU tier or the disk tier. None for a first page
+        or for a page that is in no tier"""
+        pt = self.pagetable
+        page = pt.get_live_page(phash) if pt is not None else None
+        if page is not None:
+            return page.prev_hash
+        e = self.cpu_tier.entries.get(phash)
+        if e is not None:
+            return e["prev_hash"]
+        m = self.pages.get(phash)
+        return m["prev_hash"] if m is not None else None
 
 
     # -- write path --------------------------------------------------------------------------------------------
@@ -548,16 +600,22 @@ class DiskPageCache:
         self._enqueue(("touch", kind, phash, self.access_serial))
 
 
-    def write_page(self, phash: bytes, prev_hash: bytes | None, tokens: torch.Tensor, slot: int, events: list):
+    def write_page(self, phash: bytes, prev_hash: bytes | None, tokens: torch.Tensor, slot: int, events: list,
+                   persistable: bool = True):
         """
         Queue the page image in CPU-tier slot `slot` for writing (called by CPUPageCache.store once the
         device-to-host copies are enqueued; `events` are recorded after them, one per device). Returns True if
         queued, in which case the slot must stay untouched until the write completes (pending_pages).
+
+        `persistable` is the page's CachePage.persistable: False when a multimodal placeholder id precedes the
+        end of the page's chain. Placeholder ids are allocated per process, so after a restart a different
+        image can take the same ids and so the same page hashes, and every text page hashed behind it would
+        then serve K/V computed for the old image. Such pages stay in the in-process tiers only.
         """
         self.drain_ready_states()
-        if phash in self.pages or phash in self.pending_pages or self._closed or self.write_disabled:
+        if phash in self.pages or phash in self.pending_pages or not self._can_write():
             return False
-        if not self.persistable_tokens(tokens):
+        if not persistable:
             self.metrics["skipped_mm"] += 1
             return False
         tokens_bytes = tokens.contiguous().numpy().tobytes()
@@ -567,7 +625,7 @@ class DiskPageCache:
             # The ranks write straight into the file, so it has to exist before they are told; the dispatch
             # must come from this thread. Their chunks land asynchronously (rank worker threads), the
             # writer thread picks the file up once every rank's marker is there
-            tmp = self._page_path(phash) + ".tmp"
+            tmp = self._page_path(phash) + self._tmp_suffix
             try:
                 data_offset = self._create_page_file(tmp, phash, prev_hash, tokens_bytes)
             except OSError as e:
@@ -585,19 +643,23 @@ class DiskPageCache:
         return True
 
 
-    def _page_header(self, phash: bytes, prev_hash: bytes | None) -> bytes:
-        return json.dumps({
+    def _page_header(self, phash: bytes, prev_hash: bytes | None, crc: int | None = None) -> bytes:
+        meta = {
             "phash": phash.hex(),
             "prev_hash": prev_hash.hex() if prev_hash is not None else None,
             "fingerprint": self.fingerprint,
             "image_size": self.image_size,
             "page_size": PAGE_SIZE,
-        }).encode()
+        }
+        if crc is not None:
+            meta["crc32"] = crc
+        return json.dumps(meta).encode()
 
 
-    def _create_page_file(self, tmp: str, phash: bytes, prev_hash: bytes | None, tokens_bytes: bytes) -> int:
+    def _create_page_file(self, tmp: str, phash: bytes, prev_hash: bytes | None, tokens_bytes: bytes,
+                          crc: int | None = None) -> int:
         """Write the header and tokens and size the file for the whole image; returns the image's offset"""
-        header = self._page_header(phash, prev_hash)
+        header = self._page_header(phash, prev_hash, crc)
         os.makedirs(os.path.dirname(tmp), exist_ok = True)
         with open(tmp, "wb") as f:
             f.write(PAGE_MAGIC)
@@ -633,17 +695,18 @@ class DiskPageCache:
         return info is not None and bool(getattr(info[0], "loaded_tp", False))
 
 
-    def write_state(self, phash: bytes, stashed: dict):
+    def write_state(self, phash: bytes, stashed: dict, force: bool = False):
         """
         Queue a checkpoint stash for writing. Non-TP sides are serialized from the stash on the writer thread;
         a tensor-parallel side is described by its ranks (dispatch, main thread), the file is created here and
         the ranks write their pieces, the writer thread publishing the file once their markers are in. The
         stash's buffers (and rank handles) stay alive until then, so the caller routes their release through
-        release_after_write.
+        release_after_write. With force = True, the spacing test (min_state_distance) does not apply: the
+        caller writes the last checkpoint of a chain (see Generator.flush_cache_to_disk).
         """
-        if phash in self.states or phash in self.pending_states or self._closed or self.write_disabled:
+        if phash in self.states or phash in self.pending_states or not self._can_write():
             return False
-        if not self._spaced(phash, stashed.get("position", 0)):
+        if not force and not self._spaced(phash, stashed.get("position", 0)):
             self.metrics["state_candidates_dropped"] += 1
             return False
         top, sides = self._sides(stashed)
@@ -735,7 +798,7 @@ class DiskPageCache:
                 tp_writes.append((model, id(cache), d["tp_handle"], image_offset, layers))
         header = json.dumps(manifest).encode()
         path = self._state_path(phash)
-        tmp = path + ".tmp"
+        tmp = path + self._tmp_suffix
         layout = {"header": header, "tmp": tmp, "path": path, "local": local_writes, "image_size": image_end, "markers": None}
         if tp_writes:
             data_offset = self._create_state_file(tmp, header, image_end)
@@ -766,7 +829,7 @@ class DiskPageCache:
         Returns True if written or kept.
         """
         self.drain_ready_states()
-        if phash in self.states or phash in self.pending_states or self._closed or self.write_disabled:
+        if phash in self.states or phash in self.pending_states or not self._can_write():
             return False
         if phash in self.pages or phash in self.pending_pages:
             return self.write_state(phash, stashed)
@@ -815,17 +878,31 @@ class DiskPageCache:
         if self.min_state_distance <= 0:
             return True
         with self._lock:
-            h = self.pages[phash]["prev_hash"] if phash in self.pages else None
+            h = self._prev_of(phash)
             steps = 0
-            while h is not None and steps <= len(self.pages):
+            while h is not None and steps <= len(self.pages) + len(self.pending_pages):
                 m = self.states.get(h)
                 if m is not None:
                     return position - m["position"] >= self.min_state_distance
                 if h in self.pending_states:
                     return position - self.pending_states[h].get("position", 0) >= self.min_state_distance
-                h = self.pages[h]["prev_hash"] if h in self.pages else None
+                h = self._prev_of(h)
                 steps += 1
         return position >= self.min_state_distance
+
+
+    def _prev_of(self, phash: bytes) -> bytes | None:
+        """Lock held. The previous page of a page on disk or queued for it (a flush queues a whole chain at
+        once, so the chain walks must see queued pages or the spacing test would take every candidate above
+        them for a root), None for a root or a page in neither"""
+        m = self.pages.get(phash)
+        if m is not None:
+            return m["prev_hash"]
+        if phash in self.pending_pages:
+            e = self.cpu_tier.entries.get(phash)
+            if e is not None:
+                return e["prev_hash"]
+        return None
 
 
     def prune_states(self) -> int:
@@ -840,8 +917,15 @@ class DiskPageCache:
         with self._lock:
             if not self.states:
                 return 0
-            pages = self.pages
+            # Queued pages and checkpoints count as present (nothing queued is dropped here): the leaf a flush
+            # has just queued, on pages it has just queued, then retires the previous leaf in this same prune
+            # instead of lingering until the next one
+            pages = dict(self.pages)
+            for h in self.pending_pages:
+                if h not in pages:
+                    pages[h] = {"prev_hash": self._prev_of(h)}
             states = {h: m["position"] for h, m in self.states.items()}
+            states.update({h: st.get("position", 0) for h, st in self.pending_states.items()})
             children = {h: [] for h in pages}
             for h, m in pages.items():
                 ph = m["prev_hash"]
@@ -856,11 +940,20 @@ class DiskPageCache:
                     chain.append(h)
                     h = pages[h]["prev_hash"] if h in pages else None
                 last_kept = 0
+                deepest = None
                 for h in reversed(chain):
                     pos = states.get(h)
-                    if pos is not None and pos - last_kept >= self.min_state_distance:
+                    if pos is None:
+                        continue
+                    deepest = h
+                    if pos - last_kept >= self.min_state_distance:
                         keep.add(h)
                         last_kept = pos
+                # Always keep the last checkpoint of the chain. A conversation continues from the end of its
+                # chain, so this checkpoint is the resume point of the next request. Without it, the next
+                # request processes up to min_state_distance tokens again
+                if deepest is not None:
+                    keep.add(deepest)
             drop = [h for h in states if h not in keep and h not in self.pending_states]
             for h in drop:
                 self._drop("state", h)
@@ -875,19 +968,45 @@ class DiskPageCache:
             if old in self.state_candidates:
                 self.state_candidates[new] = self.state_candidates.pop(old)
                 return
-        if old in self.pending_states:
-            # Not written yet: just change the key it will be written under
-            with self._lock:
-                self.pending_states.pop(old, None)
-                self.pending_states[new] = stashed
+            if old in self.pending_states:
+                # Not written yet. The queued op holds a layout whose header and path carry the old hash, so
+                # replace it: queue a new write under the new hash, then remove the old op. In this order, the
+                # stash always has a pending write, so its buffers do not go back to the pool. A
+                # tensor-parallel write is already dispatched to the ranks and cannot be replaced; it stays
+                # under the old hash, which is then an orphan
+                self.write_state(new, stashed)
                 for i, op in enumerate(self._queue):
-                    if op[0] == "state" and op[1] == old:
-                        self._queue[i] = ("state", new, op[2], op[3])
-            return
+                    if op[0] == "state" and op[1] == old and op[4]["markers"] is None:
+                        del self._queue[i]
+                        self.total_size -= op[3]
+                        self._state_written(old)
+                        break
+                return
         if old in self.states:
             with self._lock:
                 self._drop("state", old)
         self.write_state(new, stashed)
+
+
+    def _can_write(self) -> bool:
+        """Main thread. Return False when no new write may start: closed, disabled, paused after a full disk,
+        or free space below min_free (examined at most each 5 seconds)"""
+        if self._closed or self.write_disabled:
+            return False
+        now = time.time()
+        if now < self._space_pause_until:
+            self.metrics["skipped_low_space"] = self.metrics.get("skipped_low_space", 0) + 1
+            return False
+        if now - self._space_checked > 5.0:
+            self._space_checked = now
+            try:
+                st = os.statvfs(self.dir)
+                self._space_ok = st.f_bavail * st.f_frsize >= self.min_free
+            except OSError:
+                self._space_ok = True
+        if not self._space_ok:
+            self.metrics["skipped_low_space"] = self.metrics.get("skipped_low_space", 0) + 1
+        return self._space_ok
 
 
     def _enqueue(self, op):
@@ -996,7 +1115,14 @@ class DiskPageCache:
             while True:
                 with self._cv:
                     while not self._queue and not self._tp_waits:
-                        self._cv.wait()
+                        if self._report_base is not None:
+                            # Unreported activity: wake up to write the summary when the activity stops.
+                            # The write-behind of the generator queues pages each 2 seconds, so a shorter
+                            # quiet time would give one line for each of its steps
+                            if not self._cv.wait(timeout = 5.0):
+                                self._report_activity()
+                        else:
+                            self._cv.wait()
                     if self._tp_waits and (not self._queue or self._queue[0][0] in ("flush", "stop")):
                         # Transfers the ranks are still doing: poll their markers, and hold a flush/stop
                         # behind them (they are what the flush is for)
@@ -1006,6 +1132,8 @@ class DiskPageCache:
                             continue
                     op = self._queue.popleft()
                 kind = op[0]
+                if kind in ("page", "state", "touch"):
+                    self._note_activity()
                 try:
                     if kind == "page":
                         self._do_write_page(conn, *op[1:])
@@ -1030,6 +1158,7 @@ class DiskPageCache:
                     elif kind == "stop":
                         conn.commit()
                         self._touch_dir()
+                        self._report_activity()
                         op[1].set()
                         return
                 except Exception as e:
@@ -1042,8 +1171,49 @@ class DiskPageCache:
                         conn.commit()
                     except sqlite3.Error as e:
                         self._write_failed("index commit", None, e)
+                    if time.time() - self._last_touch > _TOUCH_INTERVAL:
+                        # Shows other processes that this directory is in use (see _reclaim_root)
+                        self._touch_dir()
         finally:
             conn.close()
+
+
+    _REPORTED = ("page_writes", "page_write_bytes", "state_writes", "page_reads", "page_read_bytes", "state_reads")
+
+    def _note_activity(self):
+        """Writer thread. Start an activity summary, or write the current one if it is 10 seconds old"""
+        now = time.time()
+        self._activity_time = now
+        if self._report_base is None:
+            self._report_base = {k: self.metrics[k] for k in self._REPORTED}
+            self._report_time = now
+        elif now - self._report_time >= 10.0:
+            self._report_activity(final = False)
+
+
+    def _report_activity(self, final: bool = True):
+        """Writer thread. Log what was written and read since the last summary"""
+        base = self._report_base
+        if base is None:
+            return
+        d = {k: self.metrics[k] - base[k] for k in self._REPORTED}
+        now = time.time()
+        self._report_base = None if final else {k: self.metrics[k] for k in self._REPORTED}
+        self._report_time = now
+        parts = []
+        if d["page_writes"] or d["state_writes"]:
+            parts.append(f"saved {d['page_writes']} pages ({d['page_writes'] * PAGE_SIZE} tokens) and "
+                         f"{d['state_writes']} checkpoints, {d['page_write_bytes'] / 1024**2:.0f} MB of pages")
+        if d["page_reads"] or d["state_reads"]:
+            parts.append(f"restored {d['page_reads']} pages ({d['page_reads'] * PAGE_SIZE} tokens) and "
+                         f"{d['state_reads']} checkpoints")
+        if not parts:
+            return
+        logger.info(
+            f"Disk cache tier: {'; '.join(parts)}{'' if final else ' (continues)'}. On disk: {len(self.pages)} "
+            f"pages, {len(self.states)} checkpoints, {self.total_size / 1024**3:.1f} of "
+            f"{self.max_size / 1024**3:.1f} GB"
+        )
 
 
     def _write_failed(self, kind: str, op, e: Exception):
@@ -1055,38 +1225,67 @@ class DiskPageCache:
             if op is not None and kind == "page":
                 self.pending_pages.discard(op[1])
                 self.total_size -= op[6]
-                self._remove_tmp(self._page_path(op[1]) + ".tmp")
+                tmp = self._page_path(op[1]) + self._tmp_suffix
+                self._remove_tmp(tmp)
                 for model, cache_ids, devices in self.tp_groups:
                     for dev in devices:
-                        self._remove_tmp(f"{self._page_path(op[1])}.tmp.d{dev}")
-                        self._remove_tmp(f"{self._page_path(op[1])}.tmp.d{dev}.err")
+                        self._remove_tmp(f"{tmp}.d{dev}")
+                        self._remove_tmp(f"{tmp}.d{dev}.err")
             elif op is not None and kind == "state":
                 self.total_size -= op[3]
-                self._remove_tmp(self._state_path(op[1]) + ".tmp")
+                self._remove_tmp(self._state_path(op[1]) + self._tmp_suffix)
                 self._state_written(op[1])
-            self._consecutive_failures += 1
-            out_of_space = isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT, errno.EROFS)
+            out_of_space = isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT)
             if self.write_disabled:
                 return
-            if out_of_space or self._consecutive_failures >= 3:
+            if out_of_space:
+                # Pause, do not stop: space comes back when files are removed. A full disk is not a fault of
+                # the tier, so it does not count to the limit of consecutive failures
+                if time.time() >= self._space_pause_until:
+                    logger.warning(f"Disk cache tier: {kind} failed ({e}); writes paused for 60 seconds "
+                          f"(restores from what is already on disk continue)")
+                self._space_pause_until = time.time() + 60
+                self._drop_queued_writes()
+                return
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3 or (isinstance(e, OSError) and e.errno == errno.EROFS):
                 self.write_disabled = True
-                reason = "no space left on the device" if out_of_space else f"{self._consecutive_failures} consecutive failures"
-                print(f" !! Disk cache tier: {kind} failed ({e}); {reason}, writes disabled for the rest of this "
+                reason = "read-only file system" if isinstance(e, OSError) and e.errno == errno.EROFS else \
+                    f"{self._consecutive_failures} consecutive failures"
+                logger.warning(f"Disk cache tier: {kind} failed ({e}); {reason}, writes disabled for the rest of this "
                       f"session (restores from what is already on disk continue)")
-                # Drop the queued writes: their slots and stashes must not stay held for writes that will not happen
-                kept = deque()
-                for q in self._queue:
-                    if q[0] == "page":
-                        self.pending_pages.discard(q[1])
-                        self.total_size -= q[6]
-                    elif q[0] == "state":
-                        self.total_size -= q[3]
-                        self._state_written(q[1])
-                    else:
-                        kept.append(q)
-                self._queue = kept
+                self._drop_queued_writes()
             else:
-                print(f" !! Disk cache tier: {kind} failed: {e}")
+                logger.warning(f"Disk cache tier: {kind} failed: {e}")
+
+
+    def _drop_queued_writes(self):
+        """Lock held. Remove the queued page and state writes. Their slots and stash buffers are then free"""
+        kept = deque()
+        for q in self._queue:
+            if q[0] == "page":
+                self.pending_pages.discard(q[1])
+                self.total_size -= q[6]
+            elif q[0] == "state":
+                self.total_size -= q[3]
+                self._state_written(q[1])
+            else:
+                kept.append(q)
+        self._queue = kept
+
+
+    def abort(self):
+        """
+        Stop all writes for the rest of the session. Call this after a generator error. After an error, the
+        contents of the cache are not known to be correct, and the disk tier must not keep them for the next
+        process. Queued writes are removed. Restores from the files on disk continue.
+        """
+        with self._lock:
+            if not self.write_disabled:
+                logger.warning("Disk cache tier: generator error, writes disabled for the rest of this session")
+            self.write_disabled = True
+            self.state_candidates.clear()
+            self._drop_queued_writes()
 
 
     @staticmethod
@@ -1101,10 +1300,16 @@ class DiskPageCache:
         for ev in events:
             ev.synchronize()
         path = self._page_path(phash)
-        tmp = path + ".tmp"
+        tmp = path + self._tmp_suffix
         slab = self.cpu_tier.slab_view(slot)
         if markers is None:
-            data_offset = self._create_page_file(tmp, phash, prev_hash, tokens_bytes)
+            # The full image is here, so the header can carry a checksum of the tokens and the image. The file
+            # is published by rename after the write, so a killed process leaves only a temp file; but the file
+            # gets its full size before the image is written, and a power loss between the rename and the data
+            # writeback can leave a published file of the right size with zeros in place of data. The checksum
+            # finds this on read. (Tensor-parallel pages are written in parts by the ranks and have no checksum.)
+            crc = zlib.crc32(memoryview(slab.numpy()), zlib.crc32(tokens_bytes)) if slab is not None else None
+            data_offset = self._create_page_file(tmp, phash, prev_hash, tokens_bytes, crc)
         else:
             data_offset = len(PAGE_MAGIC) + _HEADER.size + len(self._page_header(phash, prev_hash)) + len(tokens_bytes)
         if slab is not None:
@@ -1262,7 +1467,11 @@ class DiskPageCache:
                     f.seek(meta["image_offset"])
                     if f.readinto(memoryview(slab.numpy())) != self.local_bytes:
                         raise ValueError("short read")
-            except (OSError, ValueError):
+                crc = meta.get("crc32")
+                if crc is not None and zlib.crc32(memoryview(slab.numpy()), zlib.crc32(tokens.numpy().tobytes())) != crc:
+                    raise ValueError("checksum mismatch")
+            except (OSError, ValueError) as e:
+                logger.warning(f"Disk cache tier: page {phash.hex()[:12]} unreadable ({e}), dropped")
                 self.metrics["page_read_failures"] += 1
                 with self._lock:
                     if phash in self.pages:
@@ -1343,7 +1552,7 @@ class DiskPageCache:
                     model.tp_dispatch_all(mp_cache_recurrent_del, (cache_id, handle))
                 except Exception:
                     pass
-            print(f" !! Disk cache tier: checkpoint {phash.hex()[:12]} unreadable ({e}), dropped")
+            logger.warning(f"Disk cache tier: checkpoint {phash.hex()[:12]} unreadable ({e}), dropped")
             with self._lock:
                 if phash in self.states:
                     self._drop("state", phash)

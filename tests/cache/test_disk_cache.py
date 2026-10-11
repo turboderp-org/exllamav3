@@ -117,14 +117,27 @@ def test_a_slot_with_a_queued_write_is_not_recycled(device, tmp_path):
     tier.close()
 
 
-def test_multimodal_pages_are_not_written(device, tmp_path):
-    tier, disk, tensor = build(4, device, tmp_path)
-    p = page(1, 1)
-    p.sequence[3] = FIRST_MM_EMBEDDING_INDEX + 7
-    tier.store(p, serial = 1)
+def test_multimodal_chains_are_not_written(device, tmp_path):
+    # A sequence flags every page from the first one whose chain holds a placeholder id (the image page and all
+    # text pages behind it): placeholder ids start again in each process, so after a restart a different image
+    # can give those pages the same hashes. They stay in the in-process tiers only.
+    from exllamav3.constants import PAGE_SIZE as REAL_PAGE_SIZE      # the page table's, not testlib's small one
+    from exllamav3.generator.pagetable import Sequence
+    ids = torch.zeros((1, 5 * REAL_PAGE_SIZE), dtype = torch.long)
+    ids[0, 2 * REAL_PAGE_SIZE + 3] = FIRST_MM_EMBEDDING_INDEX + 7
+    assert Sequence(ids, ids).mm_first_page == 2
+    assert Sequence(ids, torch.zeros_like(ids)).mm_first_page is None
+
+    tier, disk, tensor = build(8, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    image = page(2, 2, phash(1))._replace(persistable = False)
+    image.sequence[3] = FIRST_MM_EMBEDDING_INDEX + 7
+    tier.store(image, serial = 2)
+    tier.store(page(3, 3, phash(2))._replace(persistable = False), serial = 3)
     disk.flush()
-    assert len(disk) == 0 and disk.metrics["skipped_mm"] == 1
-    assert phash(1) in tier     # still a perfectly good CPU-tier entry
+    assert disk.has_page(phash(1)) and not disk.has_page(phash(2)) and not disk.has_page(phash(3))
+    assert disk.metrics["skipped_mm"] == 2
+    assert phash(2) in tier and phash(3) in tier     # still perfectly good CPU-tier entries
     disk.close()
     tier.close()
 
@@ -238,7 +251,7 @@ def test_root_budget_evicts_least_recently_used_sibling_directories(device, tmp_
     disk_c.close(); tier_c.close()
 
 
-def test_a_full_disk_turns_the_tier_read_only_and_frees_the_slots(device, tmp_path, monkeypatch):
+def test_a_full_disk_pauses_writes_and_frees_the_slots(device, tmp_path, monkeypatch):
     tier, disk, tensor = build(4, device, tmp_path)
     tier.store(page(1, 1), serial = 1)
     disk.flush()
@@ -255,19 +268,43 @@ def test_a_full_disk_turns_the_tier_read_only_and_frees_the_slots(device, tmp_pa
     disk.write_state(phash(9), {"position": 256, "checkpoint_size": 64, "x": torch.ones(16)})
     disk.flush()
 
-    assert disk.write_disabled and disk.metrics["write_errors"] >= 1
+    # Paused, not disabled: space comes back when files are removed
+    assert not disk.write_disabled and disk._space_pause_until > 0 and disk.metrics["write_errors"] >= 1
     assert not disk.pending_pages and not disk.pending_states, "failed writes left slots or stashes pinned"
     assert disk.total_size == size_before, "reservations of failed writes were not rolled back"
     assert not any(n.endswith(".tmp") for _, _, names in os.walk(disk.dir) for n in names)
-    # Nothing more is queued, the higher tiers are untouched, the page already on disk still restores
+    # During the pause nothing is queued, the higher tiers are untouched
     assert disk.write_page(phash(6), None, torch.zeros(PAGE_SIZE, dtype = torch.long), 0, []) is False
     assert all(phash(t) in tier for t in range(1, 5))
+
+    # The disk has space again and the pause is over: writes start again
+    monkeypatch.undo()
+    disk._space_pause_until = 0.0
+    tier.store(page(7, 7), serial = 7)
+    disk.flush()
+    assert disk.has_page(phash(7))
     tier.close()
     disk.close()
     tier2, disk2, tensor2 = build(4, device, tmp_path)
     assert tier2.promote(phash(1), serial = 5) is not None
     disk2.close()
     tier2.close()
+
+
+def test_no_writes_below_min_free(device, tmp_path):
+    tier, disk, tensor = build(4, device, tmp_path)
+    disk.min_free = 1 << 62
+    disk._space_checked = 0.0
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    assert not disk.has_page(phash(1)) and disk.metrics["skipped_low_space"] >= 1 and not disk.write_disabled
+    disk.min_free = 0
+    disk._space_checked = 0.0
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    assert disk.has_page(phash(2))
+    disk.close()
+    tier.close()
 
 
 def test_checkpoints_follow_their_pages_and_are_pruned_by_spacing(device, tmp_path):
@@ -341,18 +378,198 @@ def test_open_discards_leftovers_of_interrupted_transfers(device, tmp_path):
     disk.flush()
     disk.close()
     tier.close()
-    # What a process killed mid-write leaves behind: partial temp files and rank markers, in both directories
+    # What a process killed mid-write leaves behind: partial temp files and rank markers, in both directories.
+    # They are old. A new temporary file can belong to a write of an other process and must stay
+    def leftover(path, old = True):
+        open(path, "w").close()
+        if old:
+            os.utime(path, (1, 1))
     h = phash(7).hex()
-    for name in (f"{h}.rs.tmp", f"{h}.rs.tmp.d0", f"{h}.rs.tmp.d1.err", "junk"):
-        open(os.path.join(disk.states_dir, name), "w").close()
+    for name in (f"{h}.rs.123.tmp", f"{h}.rs.123.tmp.d0", f"{h}.rs.123.tmp.d1.err", "junk"):
+        leftover(os.path.join(disk.states_dir, name))
     pdir = os.path.join(disk.pages_dir, phash(7)[:1].hex())
     os.makedirs(pdir, exist_ok = True)
-    for name in (f"{h}.kv.tmp", f"{h}.kv.tmp.d0", "junk"):
-        open(os.path.join(pdir, name), "w").close()
+    for name in (f"{h}.kv.123.tmp", f"{h}.kv.123.tmp.d0", "junk"):
+        leftover(os.path.join(pdir, name))
+    fresh = os.path.join(pdir, f"{h}.kv.456.tmp")
+    leftover(fresh, old = False)
 
     tier2, disk2, _ = build(4, device, tmp_path)
     assert disk2.has_page(phash(1)) and disk2.has_state(phash(2))
     assert sorted(os.listdir(disk2.states_dir)) == [phash(2).hex() + ".rs"]
-    assert sorted(os.listdir(pdir)) == [] or all(n.endswith(".kv") for n in os.listdir(pdir))
+    assert [n for n in os.listdir(pdir) if not n.endswith(".kv")] == [os.path.basename(fresh)]
     disk2.close()
     tier2.close()
+
+
+def test_unreadable_checkpoint_falls_back_to_a_lower_one():
+    # has() also counts checkpoints on disk, and a disk read can fail. Then the allocation must use the next
+    # lower checkpoint, and not stop with an assertion error.
+    from exllamav3.constants import PAGE_SIZE      # the real page size, not the small one of testlib
+    from exllamav3.generator.pagetable import Sequence
+    hashes = [bytes([i]) * 16 for i in range(6)]
+
+    class Recurrent:
+        good = {hashes[1]: {"position": 2 * PAGE_SIZE}}
+        def has(self, h):
+            return h in (hashes[1], hashes[3])        # the checkpoint at page 3 is on disk, but damaged
+        def get_stashed(self, h):
+            return self.good.get(h)
+
+    class Table:
+        metrics = {"alloc_cached_pages": 0, "alloc_kv_only_pages": 0}
+        def allocate_pages(self, page_hashes, new_unique_pages, recurrent_pages, protected, restore_limit):
+            assert recurrent_pages == [1, 3]
+            self.metrics["alloc_cached_pages"] += 4
+            return [SimpleNamespace(page_index = i) for i in range(6)], 4 * PAGE_SIZE, 4, 0
+
+    seq = Sequence.__new__(Sequence)
+    seq.page_hashes = hashes
+    seq.max_cached_pages = None
+    seq.mm_first_page = None
+    seq.new_unique_pages = 0
+    table = Table()
+    _, cached_pages, _, stashed = seq.allocate_pages(table, Recurrent())
+    assert cached_pages == 2 and seq.kv_position == 2 * PAGE_SIZE and stashed["position"] == 2 * PAGE_SIZE
+    assert table.metrics == {"alloc_cached_pages": 2, "alloc_kv_only_pages": 2}
+
+    # No readable checkpoint at all: start from the beginning
+    Recurrent.good = {}
+    table = Table()
+    _, cached_pages, _, stashed = seq.allocate_pages(table, Recurrent())
+    assert cached_pages == 0 and seq.kv_position == 0 and stashed is None
+
+
+def test_abort_stops_all_writes(device, tmp_path):
+    # After a generator error the cache contents are not known to be correct. abort() removes the queued
+    # writes and refuses new ones. Files on disk stay readable.
+    tier, disk, tensor = build(8, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    # The writer takes ops under this lock, so page 2 stays in the queue until abort() removes it
+    with disk._cv:
+        tier.store(page(2, 2, phash(1)), serial = 2)
+        assert phash(2) in disk.pending_pages
+        disk.abort()
+    assert disk.write_disabled and not disk.pending_pages
+    tier.store(page(3, 3, phash(2)), serial = 3)
+    disk.flush()
+    assert disk.has_page(phash(1)) and not disk.has_page(phash(2)) and not disk.has_page(phash(3))
+    disk.close()
+    tier.close()
+
+
+def test_model_identity_sees_new_weights_with_the_same_header(tmp_path):
+    # A requantization at the same bitrate can keep the header and the file size. The weight samples must
+    # still give a different identity.
+    import json, struct
+    from exllamav3.generator.disk_cache import model_identity
+    header = json.dumps({"w": {"dtype": "F16", "shape": [1 << 20], "data_offsets": [0, 2 << 20]}}).encode()
+    def write(d, fill):
+        d.mkdir()
+        with open(d / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(header)) + header + bytes([fill]) * (2 << 20))
+        return SimpleNamespace(config_dict = {"a": 1}, directory = str(d))
+    a, b, c = write(tmp_path / "a", 1), write(tmp_path / "b", 2), write(tmp_path / "c", 1)
+    assert model_identity(a) != model_identity(b)
+    assert model_identity(a) == model_identity(c)
+
+
+def test_a_damaged_page_file_fails_the_checksum(device, tmp_path):
+    # The file gets its full size before the image is written, so a crash can leave a file of correct size
+    # with zeros in place of data. The checksum must find this.
+    tier, disk, tensor = build(4, device, tmp_path)
+    fill(tensor, 1, 1.0)
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    path = disk._page_path(phash(1))
+    disk.close()
+    tier.close()
+    size = os.path.getsize(path)
+    with open(path, "r+b") as f:
+        f.seek(size - 64)
+        f.write(b"\xff" * 16)
+
+    tier2, disk2, tensor2 = build(4, device, tmp_path)
+    assert disk2.has_page(phash(1))
+    assert tier2.promote(phash(1), serial = 2) is None
+    assert disk2.metrics["page_read_failures"] == 1 and not disk2.has_page(phash(1))
+    disk2.close()
+    tier2.close()
+
+
+
+def test_root_budget_keeps_a_directory_in_use(device, tmp_path):
+    # An other process can use a sibling directory now (its index changed recently). The budget counts its
+    # size, but must not remove it
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    for tag in range(1, 5):
+        tier_a.store(page(tag, tag), serial = tag)
+    disk_a.flush(); disk_a.close(); tier_a.close()
+    size_a = DiskPageCache._dir_size(disk_a.dir)
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1, fingerprint = "bbbb")
+    assert os.path.isdir(disk_a.dir) and disk_b.metrics.get("dirs_evicted", 0) == 0
+    assert disk_b.max_size == 0
+    disk_b.close(); tier_b.close()
+
+
+def test_activity_is_logged_when_it_stops(device, tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger = "exllamav3.generator.disk_cache")
+    tier, disk, tensor = build(4, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    tier.store(page(2, 2, phash(1)), serial = 2)
+    disk.flush()
+    disk.close()
+    tier.close()
+    lines = [r.getMessage() for r in caplog.records if "Disk cache tier: saved" in r.getMessage()]
+    assert len(lines) == 1 and "saved 2 pages" in lines[0], lines
+
+
+def test_rekey_of_a_queued_state_writes_it_under_the_new_hash(device, tmp_path):
+    tier, disk, tensor = build(4, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    stashed = {"position": 256, "checkpoint_size": 64, "x": torch.ones(16)}
+    # The writer takes ops under this lock, so the first write is still queued when the key changes
+    with disk._cv:
+        assert disk.write_state(phash(1), stashed)
+        disk.rekey_state(phash(1), phash(2), stashed)
+    disk.flush()
+    assert disk.has_state(phash(2)) and not disk.has_state(phash(1))
+    assert disk.read_state(phash(2))["position"] == 256
+    disk.close()
+    tier.close()
+
+
+def test_prune_keeps_the_last_checkpoint_of_each_chain(device, tmp_path):
+    # A conversation continues from the end of its chain. The last checkpoint must stay, also when it is
+    # closer than min_state_distance to the checkpoint before it
+    tier, disk, tensor = build(16, device, tmp_path)
+    disk.min_state_distance = 0
+    def state(pos):
+        return {"position": pos, "checkpoint_size": 64, "x": torch.full((16,), float(pos))}
+    positions = {16: 4096, 32: 8192, 40: 10240}
+    prev = None
+    for tag in range(1, 41):
+        tier.store(page(tag, tag % NUM_PAGES, prev), serial = tag)
+        prev = phash(tag)
+    disk.flush()
+    for tag, pos in positions.items():
+        assert disk.write_state(phash(tag), state(pos))
+    disk.flush()
+    disk.min_state_distance = 4096
+    disk.prune_states()
+    kept = sorted(positions[t] for t in positions if disk.has_state(phash(t)))
+    assert kept == [4096, 8192, 10240], f"kept {kept}"
+    # The write-time test refuses a close checkpoint, but force writes it (the generator uses force for the
+    # last checkpoint of a chain)
+    tier.store(page(41, 1, phash(40)), serial = 41)
+    disk.flush()
+    assert not disk.write_state(phash(41), state(10496))
+    assert disk.write_state(phash(41), state(10496), force = True)
+    disk.flush()
+    assert disk.has_state(phash(41))
+    disk.close()
+    tier.close()

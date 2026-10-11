@@ -76,6 +76,10 @@ class CachePage:
     children: list[CachePage]
     longest_chain: int
 
+    # False when a multimodal placeholder id precedes the end of this page's chain: such a chain's hashes are
+    # only meaningful within this process (see Sequence.allocate_pages), so the disk tier does not keep the page
+    persistable: bool = True
+
     def __repr__(self):
         return (
             f"CachePage: idx = {self.page_index}, ref_count = {self.ref_count}, "
@@ -222,6 +226,11 @@ class Sequence:
 
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
+        # First page whose chain holds a placeholder id (the hash chain of page i covers the first (i + 1) pages
+        # of sequence_ids), None if the prompt has none. Placeholder ids are allocated per process, so pages
+        # from here on, generated ones included, are not persistable across processes
+        mm = (seq_ids[0] >= FIRST_MM_EMBEDDING_INDEX).nonzero()
+        self.mm_first_page = int(mm[0]) // PAGE_SIZE if mm.numel() else None
 
         # MTP carry hidden — last hidden state of the previous prefill chunk, used to seed
         # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
@@ -283,15 +292,29 @@ class Sequence:
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
             pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
 
+        # A page's hash fixes its whole chain, so every sequence that claims the page computes the same flag
+        for i, page in enumerate(self.allocated_pages):
+            page.persistable = self.mm_first_page is None or i < self.mm_first_page
+
         # Prepare block index
         self.build_block_index_tensor()
 
-        # If recurrent model, grab cached state for prefix length
+        # If recurrent model, grab cached state for prefix length. has() also counts checkpoints on disk, and a
+        # disk read can fail (for example, a damaged file). Then use the next lower checkpoint. If no checkpoint
+        # is left, start from the beginning. The pages after the resume point stay allocated, and the replay
+        # prefill writes them again, as it does when the page table limits the prefix to the last checkpoint.
         stashed_recurrent_state = None
         if recurrent_cache is not None:
-            if cached_pages > 0:
+            while cached_pages > 0:
                 stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
-                assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
+                if stashed_recurrent_state is not None:
+                    break
+                lower = [pi for pi in recurrent_pages if pi < cached_pages - 1]
+                resume = (max(lower) + 1) if lower else 0
+                pagetable.metrics["alloc_cached_pages"] -= cached_pages - resume
+                pagetable.metrics["alloc_kv_only_pages"] += cached_pages - resume
+                cached_pages = resume
+                self.kv_position = cached_pages * PAGE_SIZE
 
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
 

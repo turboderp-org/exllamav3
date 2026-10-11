@@ -330,7 +330,7 @@ class CPUPageCache:
             events = self._copy_events()
             self.slot_events[slot] = events
             # Write-through: the writer waits for the copies above before it reads the slab
-            self.disk_tier.write_page(page.phash, page.prev_hash, tokens, slot, events)
+            self.disk_tier.write_page(page.phash, page.prev_hash, tokens, slot, events, page.persistable)
 
 
     def _copy_events(self) -> list:

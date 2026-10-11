@@ -44,6 +44,7 @@ class Generator:
         disk_cache_size: int = 50 * 1024**3,
         disk_cache_flush_on_idle: bool = True,
         disk_cache_checkpoint_interval: int = 4096,
+        disk_cache_write_interval: float = 2.0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -165,6 +166,14 @@ class Generator:
             gone) are pruned when the generator goes idle, so a resumed prompt replays at most this many
             tokens. Checkpoints take far more space than pages on hybrid models. Default 4096; 0 keeps all
 
+        :param disk_cache_write_interval:
+            While jobs run, each this many seconds, queue the complete pages of the active sequences for the disk
+            tier (through the CPU tier). Without this, a page goes to disk only when it leaves VRAM or when the
+            generator becomes idle, so a process that stops during a long prefill loses all of it. With this, it
+            loses only the pages after the last checkpoint on disk. The last two pages before the position of
+            each sequence are not queued: speculative decoding can still rewind them, and the MTP draft cache
+            writes the last slot of a page one step later. 0 disables. Default 2.0
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -277,6 +286,8 @@ class Generator:
         self.cpu_page_cache = None
         self.disk_page_cache = None
         self.disk_cache_flush_on_idle = disk_cache_flush_on_idle
+        self.disk_cache_write_interval = disk_cache_write_interval
+        self._write_behind_time = 0.0
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
@@ -706,6 +717,10 @@ class Generator:
         if self.visualizer:
             self.update_visualizer()
 
+        # Disk tier: queue the complete pages of the active sequences (see disk_cache_write_interval)
+        if self.disk_page_cache is not None and self.active_jobs and self.disk_cache_write_interval > 0:
+            self.write_behind()
+
         # Finished iteration
         return results
 
@@ -723,8 +738,9 @@ class Generator:
         the pinned staging and draft buffers, and the filter thread pool.
         """
         if self.disk_page_cache is not None:
-            # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away
-            if self.disk_cache_flush_on_idle:
+            # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
+            # After abort() (generator error), nothing is written
+            if self.disk_cache_flush_on_idle and not self.disk_page_cache.write_disabled:
                 self.flush_cache_to_disk()
             self.disk_page_cache.close()
             self.disk_page_cache = None
@@ -744,40 +760,124 @@ class Generator:
 
 
     @torch.inference_mode()
-    def flush_cache_to_disk(self, wait: bool = False) -> dict:
+    def flush_cache_to_disk(self, wait: bool = False, max_pages: int | None = None) -> dict:
         """
         Queue every complete, content-hashed page that is in VRAM but in neither the CPU nor the disk tier for
         persistence (through the CPU tier, whose store is the write-through point), and every recurrent
         checkpoint not yet on disk. Returns counts of what was queued; with wait = True returns once the
         writer has finished.
+
+        max_pages limits the number of pages queued in one call. Each page takes a CPU-tier slot until its
+        write is complete. If the pages are more than the free slots, the tier must wait for the writer, and
+        this call stops the generator for that time. With a limit, the call stops early and sets "more" in the
+        result. The idle loop then calls again (see idle_work).
         """
         disk = self.disk_page_cache
         tier = self.cpu_page_cache
-        queued = {"pages": 0, "states": 0}
+        queued = {"pages": 0, "states": 0, "more": False}
         if disk is None:
             return queued
         pt = self.pagetable
-        for pages in (pt.unreferenced_pages, pt.referenced_pages):
-            for h, page in list(pages.items()):
-                if page.kv_position != PAGE_SIZE or not is_content_hash(h):
-                    continue
-                if h in tier or disk.has_page(h) or h in disk.pending_pages:
-                    continue
-                if not disk.persistable_tokens(page.sequence):
-                    continue
-                tier.store(page, pt.access_serial)
-                queued["pages"] += 1
+        pages = list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
+        queued["pages"], queued["more"] = self._queue_pages_to_disk(pages, max_pages)
         rc = self.recurrent_cache
         if rc is not None and rc.disk_tier is not None:
             # Checkpoints follow their pages: every complete page is queued above, so an anchored checkpoint
-            # is written now, the rest stay candidates
-            for h, stashed in list(rc.items()):
-                if is_content_hash(h) and (disk.has_page(h) or h in disk.pending_pages) and disk.write_state(h, stashed):
+            # is written now, the rest stay candidates. The last checkpoint of each chain (no other checkpoint
+            # in RAM is after it on its chain) is written also when it is closer than min_state_distance to
+            # the one before: a conversation continues from the end of its chain
+            keys = [h for h in rc.keys() if is_content_hash(h)]
+            keyset = set(keys)
+            covered = set()
+            limit = pt.max_pages + len(tier) + len(disk)
+            for k in keys:
+                h = disk.chain_prev(k)
+                steps = 0
+                while h is not None and steps <= limit and h not in covered:
+                    if h in keyset:
+                        covered.add(h)
+                    h = disk.chain_prev(h)
+                    steps += 1
+            for h in keys:
+                stashed = rc.get(h)
+                if stashed is None or not (disk.has_page(h) or h in disk.pending_pages):
+                    continue
+                if disk.write_state(h, stashed, force = h not in covered):
                     queued["states"] += 1
         queued["states_pruned"] = disk.prune_states()
+        self._disk_backlog = queued["more"]
         if wait:
             disk.flush()
         return queued
+
+
+    def _queue_pages_to_disk(self, pages, budget: int | None) -> tuple[int, bool]:
+        """
+        Queue the complete, content-hashed, persistable pages among `pages` that are in VRAM but in neither the
+        CPU nor the disk tier, through the CPU tier (its store is the write-through point; the copy to host
+        memory goes on the current stream, after the kernels that wrote the page and before any that could
+        write it again). Stops after `budget` pages. Returns (pages queued, stopped early).
+        """
+        disk, tier, pt = self.disk_page_cache, self.cpu_page_cache, self.pagetable
+        queued = 0
+        for page in pages:
+            h = page.phash
+            if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
+                continue
+            if h in tier or disk.has_page(h) or h in disk.pending_pages:
+                continue
+            if budget is not None and queued >= budget:
+                return queued, True
+            tier.store(page, pt.access_serial)
+            queued += 1
+        return queued, False
+
+
+    @torch.inference_mode()
+    def write_behind(self):
+        """
+        Queue the complete pages of the active sequences for the disk tier, at most once per
+        disk_cache_write_interval seconds, so a process that dies during a long prefill loses only what came
+        after the last page (and checkpoint) written. The generator does not wait for the copies or the disk.
+
+        The last two pages before a sequence's position are not queued: speculative decoding can still rewind
+        them, and the MTP draft cache writes the last slot of a page one step later. One call queues at most
+        a quarter of the CPU tier, less the writes still queued, so the tier never has to wait for the writer
+        to free a slot.
+        """
+        now = time.monotonic()
+        if now - self._write_behind_time < self.disk_cache_write_interval:
+            return
+        self._write_behind_time = now
+        disk = self.disk_page_cache
+        if disk.write_disabled:
+            return
+        budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
+        if budget <= 0:
+            return
+        pages = []
+        for job in self.active_jobs:
+            for seq in job.sequences:
+                if seq.allocated_pages:
+                    pages.extend(seq.allocated_pages[:max(0, seq.kv_position // PAGE_SIZE - 2)])
+        self._queue_pages_to_disk(pages, budget)
+
+
+    def _idle_flush_budget(self) -> int:
+        """Pages for one idle flush step: half the CPU tier, less the writes still queued"""
+        return max(1, self.cpu_page_cache.max_slots // 2 - len(self.disk_page_cache.pending_pages))
+
+
+    def has_idle_work(self) -> bool:
+        """True if the idle flush stopped early and has more pages to queue"""
+        return self.disk_page_cache is not None and getattr(self, "_disk_backlog", False)
+
+
+    @torch.inference_mode()
+    def idle_work(self):
+        """Do one more idle flush step, if no job is queued. The async generator calls this while idle"""
+        if self.has_idle_work() and not self.num_remaining_jobs():
+            self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
 
 
     @torch.inference_mode()
@@ -788,9 +888,11 @@ class Generator:
         glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
         in the arenas for the whole idle period.
         """
-        if self.disk_page_cache is not None and self.disk_cache_flush_on_idle:
-            # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk
-            self.flush_cache_to_disk()
+        if self.disk_page_cache is not None and self.disk_cache_flush_on_idle and \
+                not self.disk_page_cache.write_disabled:
+            # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
+            # step only; the async generator does the rest while idle (idle_work)
+            self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
