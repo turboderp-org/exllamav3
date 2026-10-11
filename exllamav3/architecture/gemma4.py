@@ -467,8 +467,7 @@ class Gemma4TextModel(Model):
             "atomic_mm_prefill": config.use_bidirectional_attention == "vision",
         })
         if config.hidden_size_per_layer_input or config.num_kv_shared_layers:
-            # Side inputs held in quant_preserve are not part of upstream checkpoints.
-            self.caps["can_resume_quant"] = False
+            self.caps["quant_preserve_tensors"] = True
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
         self.recurrent_state_cls = None

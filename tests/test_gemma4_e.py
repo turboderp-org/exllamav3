@@ -13,6 +13,7 @@ from transformers import Gemma4TextConfig
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
 
 from exllamav3 import Config, Model, Cache
+from exllamav3.conversion.preserved_state import save_preserved_state, load_preserved_state
 
 
 @pytest.fixture(scope="module")
@@ -102,3 +103,16 @@ def test_cache_only_prefill_skips_shared_tail(pair):
         "past_len": ids.shape[1] - 1, "batch_shape": (1, 256),
     })
     check(got, hf(ids.cuda(), use_cache=False).logits[:, -1:])
+
+
+def test_calibration_side_inputs_checkpoint(tmp_path):
+    rows = [{"gemma4_ple": torch.randn(1, 3, 4, 128),
+             "gemma4_k_1": torch.randn(1, 3, 2, 64)}, {}]
+    path = tmp_path / "preserved.safetensors"
+    save_preserved_state(rows, path)
+    restored = load_preserved_state(path, len(rows))
+    assert restored[1] == {}
+    for key in rows[0]:
+        assert torch.equal(rows[0][key], restored[0][key])
+    with pytest.raises(ValueError):
+        load_preserved_state(path, 3)
