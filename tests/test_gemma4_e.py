@@ -9,8 +9,11 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import save_file
-from transformers import Gemma4TextConfig
-from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+transformers = pytest.importorskip("transformers", minversion="5.14.1")
+Gemma4TextConfig = transformers.Gemma4TextConfig
+Gemma4ForCausalLM = pytest.importorskip(
+    "transformers.models.gemma4.modeling_gemma4"
+).Gemma4ForCausalLM
 
 from exllamav3 import Config, Model, Cache
 from exllamav3.conversion.preserved_state import save_preserved_state, load_preserved_state
