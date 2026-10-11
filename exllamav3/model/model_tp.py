@@ -407,6 +407,52 @@ class Model_TPMixin:
         return argmax
 
 
+    def tp_dispatch_lm_head_logits(self, args):
+        """
+        Full logits over a tensor-parallel sharded LM head, gathered to the output device, for
+        drafters that need more than the argmax (DFlash2's selector takes the top-k per row).
+
+        Shards are concatenated in sorted device order, the order the plan assigns vocabulary
+        ranges in, so the result has the same (padded) width and layout as the layer-split head.
+        Dispatch follows self.active_devices order so the output-device pseudo-worker, if
+        participating, runs after the spawned workers have been sent their command.
+        """
+        head_key = self.modules[self.logit_layer_idx].key
+        ad = {}
+        for device in self.active_devices:
+            a, b, _ = self.plan[device][head_key]
+            if b > a:
+                ad[device] = b - a
+
+        if len(ad) == 1 and self.tp_output_device in ad:
+            return self.tp_worker_dispatch_single(
+                self.tp_output_device,
+                mp_model_forward_lm_head_logits,
+                args + (True, None, None)
+            )
+
+        gd = sorted(set(ad.keys()) | {self.tp_output_device})
+        ldims = [ad.get(d, 0) for d in gd]
+
+        dispatched = []
+        for device in self.active_devices:
+            if device in gd:
+                self.tp_worker_dispatch(
+                    device,
+                    mp_model_forward_lm_head_logits,
+                    args + (device in ad, gd, ldims)
+                )
+                dispatched.append(device)
+
+        out = None
+        for device in dispatched:
+            r = self.tp_worker_result(device)
+            if device == self.tp_output_device:
+                out = r
+        assert out is not None, "TP logic error"
+        return out
+
+
     # def tp_dispatch_lm_head_argmax_old(self, args):
     #     ad = []
     #     for device in self.active_devices:
