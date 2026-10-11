@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "all_reduce.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -98,7 +99,15 @@ void run_cpu_reduce_jobs
     {
         // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
         // forward pass that feeds it
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+        // Tunable queue-idle deadline (EXL3_TP_HELPER_IDLE_TIMEOUT seconds, 0 = wait forever):
+        // kernel compilation before the first collective can exceed the stock 50 s
+        static const long long idle_timeout_s = [] {
+            const char* e = getenv("EXL3_TP_HELPER_IDLE_TIMEOUT");
+            return e ? atoll(e) : 50;
+        }();
+        const auto deadline = idle_timeout_s > 0
+            ? std::chrono::steady_clock::now() + std::chrono::seconds(idle_timeout_s)
+            : std::chrono::steady_clock::time_point::max();
 
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
         // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
