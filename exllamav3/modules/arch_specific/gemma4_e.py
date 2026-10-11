@@ -46,7 +46,7 @@ class Gemma4PerLayerProjection(Module):
         self.register_submodule(self.norm)
 
     def optimizer_targets(self):
-        return [self.proj.optimizer_targets()]
+        return [[[self.proj.optimizer_targets()]]]
 
     def get_compile_sizes(self, stc):
         return [n for m in self.modules for n in m.get_compile_sizes(stc)]
@@ -78,7 +78,7 @@ class Gemma4PerLayerInput(Module):
             self.register_submodule(m)
 
     def optimizer_targets(self):
-        return [self.gate.optimizer_targets(), self.proj.optimizer_targets()]
+        return [[self.gate.optimizer_targets(), self.proj.optimizer_targets()]]
 
     def forward(self, x, params, out_dtype=None):
         p = params["gemma4_ple"].to(x.device)[..., self.ple_idx, :]
