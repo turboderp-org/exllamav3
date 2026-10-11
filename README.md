@@ -3,6 +3,81 @@
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
+## E4B on Orin Nano
+
+This fork adds **Gemma 4 E4B text inference and conversion on Jetson Orin** to
+[upstream ExLlamaV3](https://github.com/turboderp-org/exllamav3). It uses the
+existing model, paged-cache, dynamic Generator and conversion APIs, including
+cache-only prefill through the last KV-producing layer. The full target
+vocabulary is retained.
+
+- [Orin setup, conversion and scope](doc/gemma4_e.md)
+- [E4B QAT EXL3 4.0 bpw weights](https://huggingface.co/cortexist/gemma-4-E4B-it-qat-exl3-4.0bpw)
+- [little-gemma v1.0 GGUF baseline](https://github.com/cortexist/little-gemma/tree/v1.0)
+
+Build this fork's source for SM 8.7. The upstream installation instructions and
+architecture list below describe the base project; upstream wheels do not
+include this fork's E4B additions. E4B image/audio and tensor-parallel paths
+remain unvalidated. See the model card for requantization quality limits.
+
+Measured on **Orin Nano 8 GB Super (`cortex1`)**, MAXN_SUPER with pinned
+clocks, on 2026-10-11. Median of three warm runs after one discarded run.
+All engines receive identical input IDs and generate 128 plain greedy tokens;
+MTP/speculation is disabled. Values are model-only, excluding load and tokenization.
+
+| Runtime | Input tokens | Cache-only prefill, tok/s | Decode, tok/s | Prompt → first token, ms |
+| --- | ---: | ---: | ---: | ---: |
+| EXL3, default | 400 | 810.8 | 16.60 | 554.1 |
+| EXL3, default | 930 | 1001.6 | 16.57 | 988.2 |
+| EXL3, 512 MiB cache budget | 400 | 849.1 | 16.62 | 530.1 |
+| EXL3, 512 MiB cache budget | 930 | 1062.2 | 16.56 | 935.8 |
+| EXL3, 1536 MiB cache budget | 400 | 902.2 | 16.55 | 502.8 |
+| EXL3, 1536 MiB cache budget | 930 | 1136.4 | 16.45 | 878.5 |
+| little-gemma v1.0, INT8 CUDA | 400 | 891.2 | 26.84 | 484.9 |
+| little-gemma v1.0, INT8 CUDA | 930 | 947.5 | 26.36 | 1018.4 |
+| llama.cpp, FA off | 400 | 534.2 | 17.48 | 810.1 |
+| llama.cpp, FA off | 930 | 533.6 | 17.89 | 1802.2 |
+| llama.cpp, FA on | 400 | 574.9 | 19.76 | 750.1 |
+| llama.cpp, FA on | 930 | 622.1 | 19.49 | 1550.1 |
+
+**Prefill benefits from the optional FP16 weight cache.** At 930 input tokens,
+the 1536 MiB budget reaches 1,136 tok/s versus little-gemma’s 948, with first
+token time 878 ms versus 1,018 ms. At 400 tokens, little-gemma still reaches
+the first token sooner (485 versus 503 ms). little-gemma also retains faster
+plain decoding. These measurements do not establish speech/first-PCM latency.
+
+The cache is **off by default**. The 512/1536 MiB budgets actually allocate
+**507.5/1507.5 MiB** and leave minimum whole-system available RAM of
+**2.15/1.17 GiB** in these runs. They keep packed decode weights and add FP16
+prefill copies. See the [cache API and exact selection policy](doc/gemma4_e.md#optional-fp16-prefill-weight-cache).
+Original-basis caching changes rounding: the 930-token generated sequence
+matched uncached EXL3; the 400-token run matched the first pick and 111 further
+decode picks before diverging. Last-prompt-logit relative RMSE remained below
+0.00274 across these checks. Evaluate this rounding change on your workload.
+
+<details>
+<summary>Comparison versions and timing boundaries</summary>
+
+- Cache-only prefill processes **399/929** tokens without requesting logits.
+  Prompt-to-first-token adds a normal final-token forward and greedy selection.
+  Decode measures 128 further greedy steps, ignoring EOS to keep work fixed.
+- Cache capacity is 4096, maximum prefill chunk 768, batch size one. The fixed
+  prompt repeats neutral geography prose; it is a throughput fixture.
+- EXL3 uses streamed embedding rows, `EXL3_INT8_GEMV=1`, ordinary upstream
+  block graphs, and the full vocabulary. Optional cache preparation time is
+  excluded. No custom assistant, outer session graph or Nano GEMM is used.
+- little-gemma is [v1.0 (`9269b47`)](https://github.com/cortexist/little-gemma/tree/v1.0).
+  llama.cpp is upstream [`458681e1d`, 2026-08-31](https://github.com/ggml-org/llama.cpp/commit/458681e1d5d4a29a1463c4732e03226cf384b997),
+  built for SM 8.7 with CUDA offload, F16 KV and four CPU threads. It is an
+  explicitly pinned historical snapshot, not a benchmark of latest llama.cpp.
+- Both GGUF engines use `gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`, SHA-256
+  `df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3`.
+  EXL3 uses the linked QAT conversion: 4-bit body/embeddings and a 6-bit full
+  output head. The formats are different quantizations; equivalent task quality
+  has not been established. Consult the model card for numerical validation.
+
+</details>
+
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
@@ -198,7 +273,7 @@ python examples/chat.py -h
 | **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
 | **Gemma 2**                                      | `Gemma2ForCausalLM` |  |  |
 | **Gemma 3**                                      | `Gemma3ForCausalLM`<br>`Gemma3ForConditionalGeneration` | ✓ |  |
-| **Gemma 4**                                      | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration` | ✓ | E2B/E4B unsupported |
+| **Gemma 4**                                      | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration` | ✓ (non-E) | E4B text supported in this fork; E2B untested; E-series TP/image/audio unvalidated |
 | **GLM 4**, **GLM 4.6**, etc.                     | `Glm4ForCausalLM`<br>`Glm4MoeForCausalLM` |  |  |
 | **GLM 4.1V**, **GLM 4.5V**                       | `Glm4vForConditionalGeneration`<br>`Glm4vMoeForConditionalGeneration` | ✓ |  |
 | **GLM 4.7 Flash**                                | `Glm4MoeLiteForCausalLM` |  |  |
