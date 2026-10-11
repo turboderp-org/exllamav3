@@ -1,5 +1,6 @@
 from __future__ import annotations
 import multiprocessing
+import torch
 from multiprocessing import Process, Pipe
 from multiprocessing.reduction import ForkingPickler
 from ..util import find_free_port
@@ -514,6 +515,18 @@ class Model_TPMixin:
         # main process before child workers have received their commands.
         active_devices.remove(self.tp_output_device)
         active_devices.append(self.tp_output_device)
+
+        # Fix a TP crash on gfx1100: a loading thread's first CUDA call, made mid-load,
+        # can hang the ROCm runtime (no PCIe atomics). Warm the thread's per-device state up front,
+        # leaving the current device as it was
+        torch.cuda.init()
+        current = torch.cuda.current_device()
+        for d in active_devices:
+            torch.cuda.set_device(d)
+            w = torch.zeros(1, device = torch.device("cuda", d))
+            torch.cuda.synchronize(d)
+            del w
+        torch.cuda.set_device(current)
 
         # Create TP context
         self.active_devices = active_devices

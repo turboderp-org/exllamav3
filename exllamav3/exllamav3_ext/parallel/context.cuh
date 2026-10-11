@@ -37,6 +37,8 @@ struct ReduceJob
 struct alignas(64) PGContext
 {
     uint32_t sync_timeout;
+    // Kernel that raised the sticky timeout, for the host to report (ROCm: see timeout.cuh)
+    char sync_timeout_name[64];
     // Barrier handshake, per device: a participant bumps its arrive counter and waits for the
     // coordinator to copy it into its release counter. Per-device counters keep barriers over
     // different device subsets independent (a shared epoch would let a subset barrier's release
