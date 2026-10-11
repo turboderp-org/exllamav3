@@ -2421,7 +2421,6 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
-        staging_pages=args.staging_pages,
     )
 
 
