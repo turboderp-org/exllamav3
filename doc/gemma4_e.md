@@ -104,6 +104,57 @@ Cache-only tokens/s excludes the final prompt forward and token selection.
 Prompt-to-first-token includes that work. Neither is end-to-end speech latency.
 See the [README measurements](../README.md#e4b-on-orin-nano) for exact boundaries.
 
+## Optional FP16 prefill-weight cache
+
+`LinearEXL3.prepare_reconstruct_cache(original_basis=True)` retains a dense FP16
+copy of one projection and returns its byte count. This avoids reconstructing
+that weight on each large-row prefill. Small-row/decode dispatch still uses the
+packed EXL3 weights. Nothing is cached by default; model placement does not
+reserve this additional memory. Allocate after loading and before graph capture.
+
+This reproducible E4B policy selects small projections first within an explicit
+budget, considering only modules before the final KV producer. It leaves the
+last producer and shared-KV tail uncached. It is a simple policy, not a claim of
+optimal allocation for every model or prompt length:
+
+```python
+from exllamav3.modules.quant.exl3 import LinearEXL3, MAX_RECONSTRUCT_SLICE_N
+
+# model has already been loaded; run before constructing/using Generator.
+budget = 512 * 1024**2  # extra device memory, separate from packed weights and KV
+candidates, seen = [], set()
+for top in model.modules[:model.last_kv_module_idx]:
+    for module in top:
+        inner = getattr(module, "inner", None)
+        if not isinstance(inner, LinearEXL3) or id(inner) in seen:
+            continue
+        seen.add(id(inner))
+        if (inner.out_features > MAX_RECONSTRUCT_SLICE_N
+                or inner.in_features % 128 or inner.out_features % 128):
+            continue
+        size = 2 * inner.in_features * inner.out_features
+        candidates.append((size, inner.key, inner))
+used = 0
+for size, key, inner in sorted(candidates, key=lambda item: (item[0], item[1])):
+    if used + size <= budget:
+        used += inner.prepare_reconstruct_cache(original_basis=True)
+print(f"Extra FP16 weights: {used / 1024**2:.1f} MiB")
+```
+
+Use the same model/cache with the ordinary `Generator` afterwards. Increasing
+the budget consumes unified system RAM and may leave less room for other
+applications. The README reports both uncached and explicitly budgeted results.
+Initialization/reconstruction time is outside the warm throughput measurements.
+
+Original-basis reconstruction folds the Hadamard transforms into FP16 weights,
+changing rounding relative to the usual rotated-basis path. Check numerical and
+task behavior for your workload; greedy sequences need not always be identical.
+`original_basis=False` caches rotated weights and retains per-forward Hadamards.
+The cache does not change the checkpoint or vocabulary. Sliced wide projections
+are rejected. `clear_reconstruct_cache()` releases a projection's extra weights;
+unloading also clears them. Do not clear or replace buffers while a captured
+CUDA graph that references them can still be replayed.
+
 ## Validation
 
 ```sh
