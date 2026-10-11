@@ -398,16 +398,21 @@ class Generator:
             disk_pages, disk_states: pages and recurrent checkpoints the disk tier holds for this model
             disk_used_bytes, disk_max_bytes: the disk tier's occupancy and budget (the budget is for the whole
                 directory, every model and cache configuration under it); 0 without a disk tier
-            alloc_pages: cumulative pages claimed by started jobs
-            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
+            alloc_pages: cumulative pages claimed by started jobs, the pages reserved for generation included
+            alloc_prompt_pages: of those, the complete prompt pages, i.e. the ones a prompt-cache hit can serve
+            alloc_cached_pages: of those, pages that were reused from the prompt cache
             alloc_tier_pages: of those, pages restored from the system-memory tier (including pages that were
                 promoted there from disk first)
-            alloc_disk_pages: of those, pages the allocation itself had to promote from the disk tier (pages
-                the enqueue-time prefetch had already promoted count under alloc_tier_pages only)
-            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
-            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
-                tier, or None before any job has started
-            disk_hit_rate: alloc_disk_pages / alloc_pages, or None before any job has started
+            alloc_disk_pages: of those, pages that came from the disk tier, whether the enqueue-time prefetch
+                or the allocation itself promoted them; a page counts here the first time it is restored after
+                its promotion and as an ordinary tier page from then on
+            hit_rate: alloc_cached_pages / alloc_prompt_pages, or None before any job has started. The
+                denominator is the prompt pages only, so this matches the per-request cached fraction rather
+                than being diluted by the pages each job reserves for its output
+            tier_hit_rate: alloc_tier_pages / alloc_prompt_pages, the part of hit_rate served from the
+                system-memory tier (disk promotions included), or None before any job has started
+            disk_hit_rate: alloc_disk_pages / alloc_prompt_pages, the part of tier_hit_rate that was read from
+                disk, or None before any job has started
             active_jobs, pending_jobs: current job counts
 
         The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
@@ -473,6 +478,7 @@ class Generator:
         used = len(pt.referenced_pages)
         free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
         alloc = pt.metrics["alloc_pages"]
+        alloc_prompt = pt.metrics["alloc_prompt_pages"]
         alloc_cached = pt.metrics["alloc_cached_pages"]
         alloc_tier = pt.metrics["alloc_tier_pages"]
         alloc_disk = pt.metrics["alloc_disk_pages"]
@@ -490,12 +496,13 @@ class Generator:
             "disk_used_bytes": disk.total_size if disk is not None else 0,
             "disk_max_bytes": disk.root_size if disk is not None else 0,
             "alloc_pages": alloc,
+            "alloc_prompt_pages": alloc_prompt,
             "alloc_cached_pages": alloc_cached,
             "alloc_tier_pages": alloc_tier,
             "alloc_disk_pages": alloc_disk,
-            "hit_rate": alloc_cached / alloc if alloc else None,
-            "tier_hit_rate": alloc_tier / alloc if alloc else None,
-            "disk_hit_rate": alloc_disk / alloc if alloc else None,
+            "hit_rate": alloc_cached / alloc_prompt if alloc_prompt else None,
+            "tier_hit_rate": alloc_tier / alloc_prompt if alloc_prompt else None,
+            "disk_hit_rate": alloc_disk / alloc_prompt if alloc_prompt else None,
             "active_jobs": len(self.active_jobs),
             "pending_jobs": len(self.pending_jobs),
         }

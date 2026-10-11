@@ -363,6 +363,7 @@ class CPUPageCache:
             "tokens": None,
             "pending": threading.Event(),
             "failed": False,
+            "from_disk": True,
         }
         self.entries[phash] = e
 

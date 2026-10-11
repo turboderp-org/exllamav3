@@ -339,10 +339,11 @@ class PageTable:
             "evictions": 0,               # unreferenced pages repurposed for new sequences
             "evictions_live": 0,          # of those, complete hashed pages (i.e. lost prompt-cache entries)
             "stashes_stranded": 0,        # live evictions that anchored a recurrent checkpoint, making it unusable
-            "alloc_pages": 0,             # pages claimed by starting jobs
+            "alloc_pages": 0,             # pages claimed by starting jobs, generation budget included
+            "alloc_prompt_pages": 0,      # of those, the complete prompt pages (the ones a cache hit can serve)
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
-            "alloc_disk_pages": 0,        # of those, promoted from the disk tier by the allocation itself
+            "alloc_disk_pages": 0,        # of those, read from the disk tier (by the prefetch or the allocation)
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
         }
 
@@ -596,13 +597,15 @@ class PageTable:
                             # On disk only: promote into a slot (waiting for the read) and restore from there
                             if tier.promote(h, self.access_serial, protected_hashes) is not None:
                                 entry = tier.fetch(h, op.page_index, self.access_serial)
-                                if entry is not None:
-                                    self.metrics["alloc_disk_pages"] += 1
                         if entry is not None:
                             op.sequence.copy_(entry["tokens"])
                             op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
                             op.kv_position = PAGE_SIZE
                             self.metrics["alloc_tier_pages"] += 1
+                            # A promotion is attributed to the disk the first time it is restored, whether
+                            # the prefetch or this allocation brought it in; from then on it is a tier entry
+                            if entry.pop("from_disk", False):
+                                self.metrics["alloc_disk_pages"] += 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -640,6 +643,7 @@ class PageTable:
             cached_pages = max_recur
 
         self.metrics["alloc_pages"] += len(allocated_pages)
+        self.metrics["alloc_prompt_pages"] += len(page_hashes)
         self.metrics["alloc_cached_pages"] += cached_pages
 
         # Advance cache over prefilled pages
