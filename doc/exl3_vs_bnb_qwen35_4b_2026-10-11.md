@@ -11,7 +11,8 @@ Five runs of the same fine-tune, changing only the frozen base format:
 - axolotl 0.20.0 (transformers 5.17, peft 0.21, bitsandbytes 0.50.2) with
   `load_in_4bit` NF4 on the BF16 `Qwen/Qwen3.5-4B`
 
-Everything else is matched:
+Everything else is matched (exl3 runs on branch `fix/lora-a-init`, which is
+master plus the two fixes described below):
 
 | | |
 |---|---|
@@ -23,6 +24,25 @@ Everything else is matched:
 | batch | 8 sequences per step, no grad accumulation, no packing, seq 512 |
 | length | 1 epoch = 13 optimizer steps, eval every 2 steps |
 | eval | mean of per-example mean CE on the 24 held-out rows (axolotl: `eval_batch_size: 1`, which makes HF's `eval_loss` the same reduction the exl3 trainer prints) |
+
+## Result (the table to quote)
+
+Fixed LoRA-A init, lr 1e-4, the 17 held-out rows both tools score, branch
+`fix/lora-a-init`:
+
+| step | 0 | 2 | 4 | 6 | 8 | 10 | 12 | drop |
+|---|---|---|---|---|---|---|---|---|
+| exl3 6.00bpw | 2.873 | 2.370 | 2.207 | 2.128 | 2.118 | 2.128 | 2.128 | 0.746 |
+| exl3 4.00bpw | 2.849 | 2.415 | 2.227 | 2.157 | 2.150 | 2.154 | 2.152 | 0.696 |
+| exl3 3.00bpw | 2.805 | 2.381 | 2.214 | 2.160 | 2.159 | 2.166 | 2.165 | 0.641 |
+| bnb NF4 (axolotl) | 2.880 | 2.310 | 2.215 | 2.207 | 2.205 | 2.187 | 2.179 | 0.701 |
+
+Finish order 6bpw < 4bpw < 3bpw < NF4; NF4 drops fastest in the first two
+steps and plateaus highest. 13 steps at this lr: 44 to 46 s on exl3 at every
+bitrate, 81 s on axolotl including 7 checkpoint saves.
+
+Everything below is the path to that table: the earlier passes, the init bug
+they exposed, and what was ruled out.
 
 ## Held-out loss
 
@@ -162,9 +182,9 @@ both passes). Bitrate does not change exl3 training speed (3/4/6 bpw all 55 s).
 
 ## Reproduce
 
-exl3: `training/experiments/love_qwen35_4b_exl3_{3,4,6}bpw_fixinit.yaml` (second pass), `love_qwen35_4b_exl3_4bpw_fixinit_lr9e5.yaml` (third pass), `love_qwen35_4b_exl3_{3,4,6}bpw_fixinit_lr{1e5,9e5}_ev17.yaml` (matched 17-row eval, the final table; the
+exl3: `training/experiments/love_qwen35_4b_exl3_{3,4,6}bpw_lr1e4_ev17.yaml` (the headline table), `..._fixinit.yaml` (second pass), `love_qwen35_4b_exl3_4bpw_fixinit_lr9e5.yaml` (third pass), `love_qwen35_4b_exl3_{3,4,6}bpw_fixinit_lr{1e5,9e5}_ev17.yaml` (matched 17-row eval, the final table; the
 files without `_fixinit` are the first pass, same settings) via
 `python training/qlora_train.py --config <yaml>`.
-axolotl: `training/experiments/axolotl/love_qwen35_4b_bnb4_v2.yaml` (1e-5) `_v3_lr9e5.yaml` (9e-5) and `_v4_lr9e5_nokernels.yaml` via
+axolotl: `training/experiments/axolotl/love_qwen35_4b_bnb4_v2.yaml` (1e-5) `_v3_lr9e5.yaml` (9e-5) `_v4_lr9e5_nokernels.yaml` and `_v5_lr1e4.yaml` (headline) via
 `axolotl train <yaml>` (needs torchvision for the Qwen3.5 processor).
 Adapters, run reports and trainer states: `/mnt/two/qlora_out/love_qwen35_4b_*`.
