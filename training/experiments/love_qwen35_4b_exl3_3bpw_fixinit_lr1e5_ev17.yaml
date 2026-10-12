@@ -1,0 +1,84 @@
+# fixinit: rerun after the LoRA-A init fix (PEFT bound 1/sqrt(in_features)); otherwise identical.
+# EXL3 QLoRA vs axolotl bnb-4bit -- Qwen3.5-4B on the love set, 2026-10-11.
+#
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python training/qlora_train.py --config training/experiments/love_qwen35_4b_exl3_3bpw.yaml
+#
+# The EXL3 arm of a matched comparison. The axolotl arm (bnb nf4 on the BF16
+# Qwen/Qwen3.5-4B) uses the same data, template, LoRA shape, optimizer, lr,
+# schedule, batch and seed-free settings; see training/experiments/axolotl/.
+# The 3bpw and 6bpw arms are this file with only `model` / `out` / `run_name`
+# changed.
+#
+# RECIPE (user, 2026-10-11): love_accepted (98 rows) SFT, 1 epoch, effective
+# batch 8 -> 13 optimizer steps (12 full + 1 of 2 rows), eval every 2 steps on
+# love_test (24 held-out rows), r = alpha = 32 rslora, lr 1e-5 cosine, no warmup.
+# Rows top out ~360 tokens, so seq_len 512.
+#
+# TEMPLATE: the model's own chat_template.jinja with thinking off (empty
+# <think></think> pre-closed in the assistant turn), same as the axolotl arm.
+
+model: /mnt/two/weights/Qwen3.5-4B-exl3-3.00bpw
+out: /mnt/two/qlora_out/love_qwen35_4b_exl3_3bpw_fixinit_lr1e5_ev17
+
+method: sft
+parallel: single
+device: cuda:0
+
+r: 32
+alpha: 32
+use_rslora: true
+lora_dropout: 0.0
+
+targets:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+lora_embed: false
+lora_head: false
+train_embeddings: false
+train_head: false
+
+lr: 0.00001
+scheduler: cosine
+warmup_ratio: 0.0
+weight_decay: 0.0
+epochs: 1
+batch: 8
+grad_accum: 1
+optim: adamw
+max_grad_norm: 1.0
+
+dataset: /home/unstable/datasets/love/love_accepted.jsonl
+dataset_split: train
+messages_key: messages
+shuffle: true
+seq_len: 512
+pack: false                # GDN: no packing
+
+prompt_format: jinja
+chat_template_file: /mnt/two/weights/Qwen3.5-4B-exl3-3.00bpw/chat_template.jinja
+template_vars: '{"enable_thinking": false}'
+strip_sys_prompt_extras: false
+
+compute_dtype: bfloat16
+attn_impl: auto
+offload_activations: false
+sample_every: 0
+
+eval_dataset: /home/unstable/datasets/love/love_test_le512.jsonl
+eval_split: train
+eval_every: 2
+save_best: false
+checkpoint_every: 0
+keep_checkpoints: 0
+
+live_report: true
+live_report_port: 8137
+run_name: love_qwen35_4b_exl3_3bpw_fixinit_lr1e5_ev17
+run_log: qlora_runs.csv
