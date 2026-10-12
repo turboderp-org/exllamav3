@@ -392,7 +392,8 @@ class QLoRALinear(nn.Module):
         # as a no-op and training begins from the exact base model.
         self.lora_a = nn.Parameter(torch.empty(in_features, r, dtype=dtype, device=device))
         self.lora_b = nn.Parameter(torch.zeros(r, out_features, dtype=dtype, device=device))
-        nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+        from .native_llama import init_lora_a_
+        init_lora_a_(self.lora_a, in_features)   # PEFT bound 1/sqrt(in), see native_llama
 
         # Bias from the base layer is frozen (not trained here).
         if bias is not None:

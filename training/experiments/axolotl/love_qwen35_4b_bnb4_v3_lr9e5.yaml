@@ -1,0 +1,83 @@
+# v2: targets extended with the GDN projections (in_proj_qkv, in_proj_z, out_proj) so the
+# adapted module set matches the EXL3 arm exactly (60.9M params; v1 had 42.5M: its
+# q/k/v/o names only exist on the 8 full-attention layers in the HF checkpoint).
+# axolotl arm of the EXL3-vs-bnb comparison -- Qwen3.5-4B BF16 -> bitsandbytes nf4
+# QLoRA on the love set, 2026-10-11. Matched to
+# training/experiments/love_qwen35_4b_exl3_4bpw.yaml: same data, held-out set,
+# template (model's own, thinking off), targets, r = alpha = 32 rslora, AdamW
+# lr 1e-5 cosine, no warmup, 1 epoch at batch 8, seq 512, assistant-only loss.
+#
+#   CUDA_VISIBLE_DEVICES=1 ~/pyvenv/axolotl2/bin/axolotl train training/experiments/axolotl/love_qwen35_4b_bnb4.yaml
+#
+# eval_batch_size 1 makes HF's eval_loss a mean of per-example means, the same
+# reduction the EXL3 trainer reports. Checkpoints every 2 steps match eval_steps.
+
+base_model: /mnt/two/weights/Qwen_Qwen3.5-4B
+output_dir: /mnt/two/qlora_out/love_qwen35_4b_axolotl_bnb4_v3_lr9e5
+dataset_prepared_path: /mnt/two/qlora_out/love_qwen35_4b_axolotl_bnb4_v3_lr9e5/prepared
+
+load_in_4bit: true
+adapter: qlora
+lora_r: 32
+lora_alpha: 32
+lora_dropout: 0.0
+peft_use_rslora: true
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - in_proj_qkv
+  - in_proj_z
+  - out_proj
+
+chat_template: tokenizer_default
+chat_template_kwargs:
+  enable_thinking: false
+
+datasets:
+  - path: /home/unstable/datasets/love/love_accepted.jsonl
+    type: chat_template
+    field_messages: messages
+    roles_to_train: ["assistant"]
+    train_on_eos: turn
+test_datasets:
+  - path: /home/unstable/datasets/love/love_test.jsonl
+    type: chat_template
+    field_messages: messages
+    roles_to_train: ["assistant"]
+    train_on_eos: turn
+    split: train
+
+sequence_len: 512
+sample_packing: false
+eval_sample_packing: false
+train_on_inputs: false
+shuffle_merged_datasets: true
+seed: 0
+
+micro_batch_size: 8
+gradient_accumulation_steps: 1
+eval_batch_size: 1
+num_epochs: 1
+learning_rate: 0.00009
+lr_scheduler: cosine
+warmup_steps: 0
+optimizer: adamw_torch
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+bf16: true
+tf32: false
+attn_implementation: sdpa
+gradient_checkpointing: true
+
+eval_steps: 2
+save_steps: 2
+save_total_limit: 10
+logging_steps: 1
+include_tokens_per_second: true
+use_tensorboard: true
