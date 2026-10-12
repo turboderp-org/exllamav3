@@ -556,6 +556,19 @@ __device__ __forceinline__ void scan_body
     __shared__ float sh_dot1[SUBK][MAX_HEAD_DIM];
     __shared__ float sh_dot2[SUBK][MAX_HEAD_DIM];
 
+    // The thread's state slice (one v column, bts k rows) in registers across tokens, as in
+    // scan_body_128; static indexing up to MAX_HEAD_DIM / SUBK keeps it out of scratch
+    constexpr int MAX_BTS = MAX_HEAD_DIM / SUBK;
+    float st[MAX_BTS];
+    const size_t st_offset = head * (k_head_dim * v_head_dim) + v_start + t + bt * bts * v_head_dim;
+    if (t < v_chunk_dim)
+    {
+        const float* rs = op.read_state + st_offset;
+        #pragma unroll
+        for (int e = 0; e < MAX_BTS; ++e)
+            if (e < bts) st[e] = rs[e * v_head_dim];
+    }
+
     // Iterate over sequence dim
     for (int s = 0; s < op.steps; ++s)
     {
@@ -575,9 +588,6 @@ __device__ __forceinline__ void scan_body
             gl_k = mixed_qkv + (num_k_heads + k_head) * k_head_dim;
             gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim + v_start;
         }
-
-        float* gl_rs_r = (s == 0 ? op.read_state : op.final_state) + head * (k_head_dim * v_head_dim);
-        float* gl_rs_w = op.final_state + head * (k_head_dim * v_head_dim);
 
         // Read q/k heads and apply L2 norm
         float q, k;
@@ -642,14 +652,10 @@ __device__ __forceinline__ void scan_body
                 // Dot products with last state, one partial per k-slice
                 float sum = 0.0f;
                 float* sh_k_rd = sh_k + bt * bts;
-                float* rs_rd = gl_rs_r + v_start + t + bt * bts * v_head_dim;
 
-                for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
-                {
-                    #pragma unroll
-                    for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
-                        sum = sum + *sh_k_rd * *rs_rd;
-                }
+                #pragma unroll
+                for (int e = 0; e < MAX_BTS; ++e)
+                    if (e < bts) sum = sum + sh_k_rd[e] * st[e];
                 sh_dot1[bt][t] = sum;
             }
             __syncthreads();
@@ -674,21 +680,19 @@ __device__ __forceinline__ void scan_body
             float v_out = 0.0f;
             float* sh_k_rd = sh_k + bt * bts;
             float* sh_q_rd = sh_q + bt * bts;
-            float* rs_r = gl_rs_r + v_start + t + bt * bts * v_head_dim;
-            float* rs_w = gl_rs_w + v_start + t + bt * bts * v_head_dim;
 
-            for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
+            #pragma unroll
+            for (int e = 0; e < MAX_BTS; ++e)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += v_head_dim, rs_w += v_head_dim, sh_k_rd++, sh_q_rd++)
+                if (e < bts)
                 {
                     // State update step, k x v
-                    float state = *rs_r;
-                    state = state * g_h + *sh_k_rd * v * beta_h;
-                    *rs_w = state;
+                    float state = st[e];
+                    state = state * g_h + sh_k_rd[e] * v * beta_h;
+                    st[e] = state;
 
                     // Accumulate attn output
-                    v_out = v_out + *sh_q_rd * state;
+                    v_out = v_out + sh_q_rd[e] * state;
                 }
             }
             sh_dot2[bt][t] = v_out;
@@ -714,6 +718,14 @@ __device__ __forceinline__ void scan_body
         g +=                (size_t) op.tstride * num_v_heads;
         beta +=             (size_t) op.tstride * num_v_heads;
         if (core_attn_out) core_attn_out += num_v_heads * v_head_dim;
+    }
+
+    if (t < v_chunk_dim && op.steps > 0)
+    {
+        float* rs = op.final_state + st_offset;
+        #pragma unroll
+        for (int e = 0; e < MAX_BTS; ++e)
+            if (e < bts) rs[e * v_head_dim] = st[e];
     }
 }
 
@@ -754,14 +766,23 @@ __device__ __forceinline__ void scan_body_128
     __shared__ float sh_dot2[SUBK][HEAD_DIM];
     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
 
+    // Each thread owns one v column over BTS k rows of its head's state and nothing else reads them
+    // during the scan, so the slice stays in registers across tokens: read once from read_state,
+    // written once to final_state
+    float st[BTS];
+    const size_t st_offset = head * HEAD_STATE_SIZE + v_start + t + bt * BTS * HEAD_DIM;
+    if (t < V_CHUNK_DIM)
+    {
+        const float* rs = op.read_state + st_offset;
+        #pragma unroll
+        for (int e = 0; e < BTS; ++e) st[e] = rs[e * HEAD_DIM];
+    }
+
     for (int s = 0; s < op.steps; ++s)
     {
         const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
         const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
         const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
-
-        float* gl_rs_r = (s == 0 ? op.read_state : op.final_state) + head * HEAD_STATE_SIZE;
-        float* gl_rs_w = op.final_state + head * HEAD_STATE_SIZE;
 
         float q = __bfloat162float(gl_q[t]);
         float k = __bfloat162float(gl_k[t]);
@@ -804,20 +825,15 @@ __device__ __forceinline__ void scan_body_128
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
-            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int e = 0; e < BTS; ++e)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
-                {
-                    if constexpr (CHANNELWISE)
-                        // Decay folded per k-channel: kv_mem reads the decayed state
-                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
-                    else
-                        sum = sum + *sh_k_rd * *rs_rd;
-                }
+                if constexpr (CHANNELWISE)
+                    // Decay folded per k-channel: kv_mem reads the decayed state
+                    sum = sum + sh_k_rd[e] * sh_g_rd[e] * st[e];
+                else
+                    sum = sum + sh_k_rd[e] * st[e];
             }
             sh_dot1[bt][t] = sum;
         }
@@ -836,20 +852,14 @@ __device__ __forceinline__ void scan_body_128
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
             float* sh_q_rd = sh_q + bt * BTS;
-            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
-            float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int e = 0; e < BTS; ++e)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
-                {
-                    float state = *rs_r;
-                    state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
-                    *rs_w = state;
-                    v_out = v_out + *sh_q_rd * state;
-                }
+                float state = st[e];
+                state = state * (CHANNELWISE ? sh_g_rd[e] : g_h) + sh_k_rd[e] * v * beta_h;
+                st[e] = state;
+                v_out = v_out + sh_q_rd[e] * state;
             }
             sh_dot2[bt][t] = v_out;
         }
@@ -868,6 +878,13 @@ __device__ __forceinline__ void scan_body_128
         g +=                (size_t) op.tstride * num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);
         beta +=             (size_t) op.tstride * num_v_heads;
         if (core_attn_out) core_attn_out += num_v_heads * HEAD_DIM;
+    }
+
+    if (t < V_CHUNK_DIM && op.steps > 0)
+    {
+        float* rs = op.final_state + st_offset;
+        #pragma unroll
+        for (int e = 0; e < BTS; ++e) rs[e * HEAD_DIM] = st[e];
     }
 }
 
@@ -2221,7 +2238,7 @@ void batched_scan_replay
     float scale = 1.0f / sqrtf(k_head_dim);
     // One job per block.x; the batch rows of a single sequence replay serially per layer, so the
     // v-split that keeps bsz = 1 passes occupied applies here as well
-    int v_split = (k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    int v_split = (!mamba2 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
     dim3 threads(MAX(k_head_dim, v_head_dim / v_split), SUBK);
 
     for (size_t base = 0; base < jobs.size(); base += REPLAY_MAX_JOBS)

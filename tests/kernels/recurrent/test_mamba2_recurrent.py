@@ -249,12 +249,14 @@ def test_recurrent_mamba2_deterministic(device, history):
         assert torch.equal(o, results[0][0]) and torch.equal(s, results[0][1])
 
 
+@pytest.mark.parametrize("dv", [64, 128])
 @torch.inference_mode()
-def test_recurrent_mamba2_replay_matches_steps(device):
+def test_recurrent_mamba2_replay_matches_steps(device, dv):
     # A speculative pass over seqlen tokens from base rows, then batched_scan_replay (kind 1, Mamba2) over the
     # first n staged tokens of each batch row: the replayed scratch row is bit-identical to the final state of
-    # a pass over only those n tokens, whose outputs also match the full pass position by position
-    nk, nv, dk, dv, bsz, seqlen = 2, 8, 128, 64, 2, 6
+    # a pass over only those n tokens, whose outputs also match the full pass position by position. dv 128 is
+    # the head width where the GDN replay takes its v split, which the Mamba2 kernels do not have
+    nk, nv, dk, bsz, seqlen = 2, 8, 128, 2, 6
     xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, 2 * bsz, seqlen, seed = 3)
     slots = (2 * torch.arange(bsz)).to(torch.int32).to(device)
     full = state0.clone()
