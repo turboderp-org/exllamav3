@@ -1,9 +1,24 @@
 #pragma once
 
+// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) and the shape table
+// (exl3_kernel_map.cuh) are shared; the backend supplies the tile inner: tensor-core MMA with cp.async
+// pipelines (CUDA) or WMMA on RDNA (rocm/quant)
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
-#include "exl3_gemm_inner.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
+#else
+    #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
+
+// Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
+// through a device counter; every block is resident (the grid is at most one block per multiprocessor)
+#if defined(USE_ROCM)
+    #define EXL3_GRID_SYNC() group_barrier(0, gridDim.x * gridDim.y * gridDim.z, locks + EXL3_GRID_BARRIER_OFFSET)
+#else
+    #define EXL3_GRID_SYNC() grid.sync()
+#endif
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -26,7 +41,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        grid.sync();
+        EXL3_GRID_SYNC();
         A = A_had;
     }
 
@@ -46,7 +61,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         size_m_ -= TILESIZE_M;
 
         if (size_m_ > 0 || svh)
-            grid.sync();
+            EXL3_GRID_SYNC();
     }
 
     // if (svh)
@@ -92,7 +107,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
 
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+    #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
         int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
     #endif
 
@@ -138,7 +153,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
         __threadfence();
-        grid.sync();
+        EXL3_GRID_SYNC();
         B_indices = v_indices;
         if (B_weights) B_weights = v_weights;
         bszm = bszm_sync;
@@ -164,7 +179,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
         }
-        grid.sync();
+        EXL3_GRID_SYNC();
     }
 
     for (int i = 0; i < bszm; i += gridDim.z)
@@ -204,10 +219,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 );
         }
 
-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+        #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
             group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
         #else
-            grid.sync();
+            EXL3_GRID_SYNC();
         #endif
 
         // Matmul. Per-matrix output width/pointer when the caller supplies the lists
@@ -218,7 +233,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         // Column slices write into a wider row (their source matrix's full width)
         int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
         int size_m_ = size_m;
-        half* A_ = A_had + (had_src_list ? had_src_list[mat_index] : j) * size_m * size_k;
+        // Idle z-slots past bszm carry mat_index -1 and never touch A_; guard the table read anyway
+        half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
         if (C_list && mat_index >= 0) C_ = C_list[mat_index];
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
@@ -241,10 +257,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             else                  C_ = (void*) (((half*) C_) + TILESIZE_M * n_stride_j);
             size_m_ -= TILESIZE_M;
 
-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+            #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
                 group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
             #else
-                grid.sync();
+                EXL3_GRID_SYNC();
             #endif
         }
 
@@ -289,7 +305,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     }
 
     if (B_weights)
-        grid.sync();
+        EXL3_GRID_SYNC();
 
     // Final reduction: each of the num_tokens groups of (bszm / num_tokens) contiguous slots is
     // summed into its own output row (row t for group t), instead of always collapsing into row

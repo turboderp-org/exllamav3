@@ -33,7 +33,13 @@ allocation on the host-bound decode path); larger calls allocate per call.
 #define RG_BM 128
 #define RG_BN 64
 #define RG_THREADS 512
-#define RG_STAGES 2
+// One stage on ROCm: its copies are synchronous (rocm/det_gemm_rocm.cuh), so a second stage would overlap
+// nothing, and two do not fit RDNA's 64 KB of LDS per workgroup
+#if defined(USE_ROCM)
+    #define RG_STAGES 1
+#else
+    #define RG_STAGES 2
+#endif
 #define RG_KCH 128
 #define RG_A_BYTES (2 * RG_BM * RG_KCH)
 #define RG_B_BYTES (2 * RG_BN * RG_KCH)
@@ -136,6 +142,10 @@ void routing_gemm_i8_kernel
         }
     };
 
+#if defined(USE_ROCM)
+    DetWmmaTile<2, 1> wt;
+    wt.clear();
+#else
     float facc[2][2][4];
     #pragma unroll
     for (int i = 0; i < 2; ++i)
@@ -143,19 +153,23 @@ void routing_gemm_i8_kernel
         for (int j = 0; j < 2; ++j)
             #pragma unroll
             for (int q = 0; q < 4; ++q) facc[i][j][q] = 0.0f;
+#endif
 
     issue(0, 0); det_cp_async_commit();
     for (int chunk = 0; chunk < n_chunks; ++chunk)
     {
         det_cp_async_wait<0>();
         __syncthreads();
-        if (chunk + 1 < n_chunks) issue(chunk + 1, (chunk + 1) % RG_STAGES);
+        if (RG_STAGES > 1 && chunk + 1 < n_chunks) issue(chunk + 1, (chunk + 1) % RG_STAGES);
         det_cp_async_commit();
         const int st = chunk % RG_STAGES;
         const unsigned a_hi = det_smem_u32(st_ahi(st)), a_lo = det_smem_u32(st_alo(st));
         const unsigned b_hi = det_smem_u32(st_bhi(st)), b_lo = det_smem_u32(st_blo(st));
         const float* sa_st = st_sa(st);
 
+#if defined(USE_ROCM)
+        wt.chunk<128, RG_KCH>(a_hi, a_lo, wm * 32, b_hi, b_lo, wn * 16, sa_st, lane);
+#else
         int acc_hh[2][2][4], acc_x[2][2][4];
         #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -194,10 +208,24 @@ void routing_gemm_i8_kernel
                 for (int q = 0; q < 4; ++q)
                     facc[i][j][q] = det_flush(acc_hh[i][j][q], acc_x[i][j][q], q >= 2 ? s1 : s0, facc[i][j][q]);
         }
+#endif
+        // Single buffer: the next chunk can only land once everyone is done with this one
+        if (RG_STAGES == 1 && chunk + 1 < n_chunks)
+        {
+            __syncthreads();
+            issue(chunk + 1, 0);
+        }
     }
     det_cp_async_wait<0>();
     __syncthreads();
     float (*cs_)[RG_BN + 4] = (float (*)[RG_BN + 4]) dsm;
+#if defined(USE_ROCM)
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int v = 0; v < 8; ++v)
+            cs_[wm * 32 + i * 16 + det_wmma_row(v, lane)][wn * 16 + (lane & 15)] = wt.acc[i][0][v];
+#else
     #pragma unroll
     for (int i = 0; i < 2; ++i)
         #pragma unroll
@@ -205,6 +233,7 @@ void routing_gemm_i8_kernel
             #pragma unroll
             for (int q = 0; q < 4; ++q)
                 cs_[wm * 32 + i * 16 + g + (q >= 2 ? 8 : 0)][wn * 16 + j * 8 + tg * 2 + (q & 1)] = facc[i][j][q];
+#endif
     __syncthreads();
     if (part) part += (size_t) blockIdx.z * R * E;
     #pragma unroll
@@ -247,6 +276,8 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 {
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
+    // int4 activation loads and 16-byte cp.async weight copies
+    if (((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_i8.data_ptr()) & 15) return false;
     const int K = hidden.size(-1);
     // The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 (both sm_80+) and
     // 97 KB of dynamic smem, over the pre-Ampere ceiling; cuBLAS serves the other arches
@@ -260,10 +291,13 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor& scores, cudaStream_t stream)
 {
     const int K = hidden.size(-1);
-    const int R = hidden.numel() / K;
+    int R = 1;
+    for (int i = 0; i < hidden.dim() - 1; ++i) R *= (int) hidden.size(i);
     const int E = gate_i8.size(1);
     const int KC = CEIL_DIVIDE(K, RG_KCH);
     TORCH_CHECK(scores.numel() == (int64_t) R * E, "routing_gemm_det: scores shape");
+    if (R == 0 || E == 0) return;
+    if (K == 0) { scores.zero_(); return; }     // empty sum
     const int S = rg_slices(R, E, KC);
     const int kslice = CEIL_DIVIDE(KC, S) * RG_KCH;
     const int S_eff = CEIL_DIVIDE(K, kslice);
@@ -330,7 +364,7 @@ void routing_gemm_det
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(routing_gemm_det_fits(hidden, gate_i8, gate_sb, scores), "routing_gemm_det: half activations, (2, E, K) int8 gate, fp32 scales, contiguous, K % 16 == 0");
+    TORCH_CHECK(routing_gemm_det_fits(hidden, gate_i8, gate_sb, scores), "routing_gemm_det: half activations, (2, E, K) int8 gate, fp32 scales, contiguous and 16-byte aligned, K % 16 == 0");
     routing_gemm_det_(hidden, gate_i8, gate_sb, scores, stream);
 }
 
@@ -374,6 +408,8 @@ void det_quant_weight
     TORCH_CHECK(w.dim() == 2 && w.is_contiguous() && w_i8.is_contiguous() && w_s.is_contiguous(), "det_quant_weight: layout");
     const int N = w.size(0), K = w.size(1);
     TORCH_CHECK(w_i8.size(0) == 2 && w_i8.size(1) == N && w_i8.size(2) == K && w_s.numel() == N, "det_quant_weight: shapes");
+    // K = 0 quantizes empty rows: the scale takes the all-zero-row convention (it multiplies nothing)
+    if (N == 0) return;
     signed char* hi = (signed char*) w_i8.data_ptr();
     quant_gate_kernel<<<N, 256, 0, stream>>>((const half*) w.data_ptr(), hi, hi + (size_t) N * K, (float*) w_s.data_ptr(), N, K);
     cuda_check(cudaPeekAtLastError());
@@ -392,6 +428,7 @@ void det_math_test(const at::Tensor& x, at::Tensor y)
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int n = x.numel();
     TORCH_CHECK(y.numel() == 3 * n, "det_math_test: y must hold 3 x n");
+    if (n == 0) return;
     det_math_kernel<<<CEIL_DIVIDE(n, 256), 256, 0, stream>>>((const float*) x.data_ptr(), (float*) y.data_ptr(), n);
     cuda_check(cudaPeekAtLastError());
 }

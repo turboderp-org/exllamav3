@@ -58,12 +58,20 @@ int64_t ngram_hash_cpu
 {
     TORCH_CHECK(ids.device().is_cpu() && ids.dtype() == at::kLong && ids.is_contiguous(),
                 "ngram_hash_cpu: ids must be contiguous int64 CPU");
+    TORCH_CHECK(ids.dim() == 2, "ngram_hash_cpu: ids must be (bsz, ctx + seq)");
+    // Host code reads and writes these through raw pointers
+    for (const at::Tensor* t : std::initializer_list<const at::Tensor*> { &multipliers, &offsets, &sizes, &uids, &inverse })
+        TORCH_CHECK(t->device().is_cpu() && t->dtype() == at::kLong && t->is_contiguous(),
+                    "ngram_hash_cpu: multipliers, offsets, sizes, uids and inverse must be contiguous int64 CPU");
+    TORCH_CHECK(heads.device().is_cpu() && heads.dtype() == at::kInt && heads.is_contiguous(),
+                "ngram_hash_cpu: heads must be contiguous int32 CPU");
     int64_t bsz = ids.size(0);
     int64_t T = ids.size(1);
     int64_t ctx = T - seq_len;
     int64_t ngram_size = multipliers.numel();
     int64_t H = offsets.numel();
-    TORCH_CHECK(ctx >= 0 && H == (ngram_size - 1) * heads_per_ngram, "ngram_hash_cpu: dims");
+    TORCH_CHECK(seq_len >= 0 && ctx >= 0 && H == (ngram_size - 1) * heads_per_ngram, "ngram_hash_cpu: dims");
+    TORCH_CHECK(sizes.numel() == H, "ngram_hash_cpu: sizes must have one entry per head");
     int64_t n = bsz * seq_len * H;
     TORCH_CHECK(uids.numel() >= n && inverse.numel() >= n && heads.numel() >= n,
                 "ngram_hash_cpu: output buffers too small");
@@ -75,6 +83,9 @@ int64_t ngram_hash_cpu
     int64_t* uids_p = (int64_t*) uids.data_ptr();
     int64_t* inv_p = (int64_t*) inverse.data_ptr();
     int32_t* heads_p = (int32_t*) heads.data_ptr();
+    for (int64_t h = 0; h < H; ++h)
+        TORCH_CHECK(szs[h] > 0, "ngram_hash_cpu: empty hash table for head ", h);
+    if (!n) return 0;
 
     py::gil_scoped_release release;
 
@@ -262,7 +273,7 @@ void ngram_gather_cpu
     int64_t U = uids.numel();
     TORCH_CHECK(out.size(0) >= U && out.size(1) * out.element_size() == row_bytes,
                 "ngram_gather_cpu: out shape");
-    if (!U) return;
+    if (!U || !row_bytes) return;
     const int64_t* up = (const int64_t*) uids.data_ptr();
     uint8_t* op = (uint8_t*) out.data_ptr();
 
@@ -410,8 +421,9 @@ void ngram_dequant
     {
         TORCH_CHECK_DTYPE((*aux), kHalf);
         TORCH_CHECK(aux->is_contiguous() && aux->dim() == 2 && aux->size(1) == dim, "ngram_dequant: aux shape");
+        TORCH_CHECK(!U || aux->size(0) > 0, "ngram_dequant: aux is empty");
     }
-    if (!U) return;
+    if (!U || !dim) return;
 
     size_t smem = dim * sizeof(float) + ((words + 1) & ~1) * sizeof(uint16_t);
     ngram_dequant_kernel<<<(unsigned int) U, dim, smem, stream>>>

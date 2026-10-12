@@ -37,6 +37,19 @@ def _decoder_layout(model):
     before the first block (MuseGlimmer's unweighted
     ``embed_tokens.embed_norm``; see ``embed_norm``).
 
+    The second layout understood is the Qwen3.8-Flash-Next (``qwen4_exp``)
+    stream-stack decoder::
+
+        Embedding  ExpandStreams  TransformerBlock ... [PLELayer] ... TransformerBlock
+                   GatedResidual(use_combine=False)  Linear
+
+    where ``ExpandStreams`` broadcasts the embedding into ``hc_mult`` fp32
+    residual streams, every block mixes them through its ``attn_hc`` /
+    ``mlp_hc`` ``GatedResidual`` sites (see ``block_hc_sites``), a ``PLELayer``
+    may sit between two blocks (``ple_layout``), and the final combine-less
+    ``GatedResidual`` mixer stands in the final-norm slot (there is no final
+    RMSNorm; ``is_gated_residual`` tells the two apart).
+
     Everything else is rejected HERE rather than dropped. This selection used to
     be by TYPE alone (``[m for m in mods if isinstance(m, TransformerBlock)]``,
     plus positional picks for the embedding / final norm / head), so any module
@@ -49,23 +62,32 @@ def _decoder_layout(model):
     mods = list(model.modules)
     assert isinstance(mods[0], Embedding), \
         f"expected Embedding as first module, got {type(mods[0]).__name__}"
-    assert isinstance(mods[-2], RMSNorm), \
-        f"expected final RMSNorm as penultimate module, got {type(mods[-2]).__name__}"
+    hc = _is_expand_streams(mods[1]) if len(mods) > 1 else False
+    if hc:
+        assert _is_gated_residual(mods[-2]) and not mods[-2].use_combine, \
+            f"stream-stack decoder (ExpandStreams) without a final combine-less " \
+            f"GatedResidual mixer as penultimate module: got {type(mods[-2]).__name__}"
+    else:
+        assert isinstance(mods[-2], RMSNorm), \
+            f"expected final RMSNorm as penultimate module, got {type(mods[-2]).__name__}"
     assert isinstance(mods[-1], Linear), \
         f"expected Linear LM head as last module, got {type(mods[-1]).__name__}"
     idxs = [i for i, m in enumerate(mods) if isinstance(m, TransformerBlock)]
     assert idxs, "no TransformerBlock modules found; unsupported architecture"
     first, last = idxs[0], idxs[-1]
-    # The ONE non-block module allowed between decoder blocks: Qwen-VL's
+    # The non-block modules allowed between decoder blocks: Qwen-VL's
     # DeepstackEmbed (Qwen3-VL / Qwen3.5-VL text towers build one after each of
     # the first N blocks). It holds no weights and is a pure no-op on text-only
     # input; under image input it adds the vision tower's intermediate-layer
     # ("deepstack") features onto the image positions of the residual stream.
     # The native forward reproduces it (see ``deepstack_layout``), so it is
-    # accepted here rather than rejected -- everything else stays rejected.
+    # accepted here rather than rejected. And, on a stream-stack decoder only,
+    # the PLELayer (Qwen3.8-Flash-Next's hashed n-gram injection; see
+    # ``ple_layout``). Everything else stays rejected.
     between = [i for i in range(first, last + 1)
                if not isinstance(mods[i], TransformerBlock)]
-    bad = [i for i in between if not _is_deepstack_embed(mods[i])]
+    bad = [i for i in between if not (_is_deepstack_embed(mods[i])
+                                      or (hc and _is_ple_layer(mods[i])))]
     assert not bad, \
         f"non-TransformerBlock module(s) interleaved between the decoder " \
         f"blocks: {[type(mods[i]).__name__ for i in bad]}; unsupported architecture"
@@ -73,10 +95,15 @@ def _decoder_layout(model):
         f"unexpected module(s) between the last decoder block and the final " \
         f"norm: {[type(m).__name__ for m in mods[last + 1:-2]]}"
     pre = mods[1:first]
-    assert len(pre) <= 1 and all(isinstance(m, RMSNorm) for m in pre), \
-        f"unexpected module(s) between the embedding and the first decoder " \
-        f"block: {[type(m).__name__ for m in pre]} (only a single RMSNorm on " \
-        f"the embeddings is understood -- see backbone.embed_norm)"
+    if hc:
+        assert len(pre) == 1, \
+            f"unexpected module(s) between ExpandStreams and the first decoder " \
+            f"block: {[type(m).__name__ for m in pre[1:]]}"
+    else:
+        assert len(pre) <= 1 and all(isinstance(m, RMSNorm) for m in pre), \
+            f"unexpected module(s) between the embedding and the first decoder " \
+            f"block: {[type(m).__name__ for m in pre]} (only a single RMSNorm on " \
+            f"the embeddings is understood -- see backbone.embed_norm)"
     return mods, first, last
 
 
@@ -90,12 +117,55 @@ def _is_deepstack_embed(module) -> bool:
     return isinstance(module, DeepstackEmbed)
 
 
+def _is_expand_streams(module) -> bool:
+    """True for the hyper-connection ``ExpandStreams`` module (the embedding ->
+    stream-stack broadcast of mHC / Qwen3.8-Flash-Next decoders)."""
+    try:
+        from ..modules.hyperconnections import ExpandStreams
+    except ImportError:            # pragma: no cover - library without HC support
+        return False
+    return isinstance(module, ExpandStreams)
+
+
+def is_gated_residual(module) -> bool:
+    """True for the Qwen3.8-Flash-Next ``GatedResidual`` (low-rank gated
+    hyper-connection site, or the final combine-less mixer)."""
+    try:
+        from ..modules.hyperconnections import GatedResidual
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(module, GatedResidual)
+
+
+def _is_gated_residual(module) -> bool:
+    return is_gated_residual(module)
+
+
+def _is_ple_layer(module) -> bool:
+    """True for the Qwen3.8-Flash-Next ``PLELayer`` (hashed n-gram injection)."""
+    try:
+        from ..modules.ple import PLELayer
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(module, PLELayer)
+
+
+def hc_mult(model) -> int:
+    """Number of parallel residual streams of a stream-stack decoder
+    (``ExpandStreams.hc_mult``; Qwen3.8-Flash-Next: 4), or 0 for an ordinary
+    ``[b, t, d]`` residual."""
+    mods, first, _ = _decoder_layout(model)
+    return int(mods[1].hc_mult) if first > 1 and _is_expand_streams(mods[1]) else 0
+
+
 def split_decoder(model):
     """
     Return ``(embed, blocks, final_norm, lm_head)`` from a loaded exllamav3
     ``Model``, validating the overall module layout. ``blocks`` is the list of
-    ``TransformerBlock`` modules, in order (any interleaved ``DeepstackEmbed``
-    modules are skipped here; see ``deepstack_layout``).
+    ``TransformerBlock`` modules, in order (any interleaved ``DeepstackEmbed`` /
+    ``PLELayer`` modules are skipped here; see ``deepstack_layout`` /
+    ``ple_layout``). On a stream-stack decoder ``final_norm`` is the final
+    ``GatedResidual`` mixer, not an ``RMSNorm`` (``is_gated_residual``).
 
     NOTE: an architecture may also carry a norm on the token embeddings, which
     this tuple does NOT include -- get it from ``embed_norm(model)``.
@@ -127,6 +197,30 @@ def deepstack_layout(model) -> dict:
             assert bi >= 0, "DeepstackEmbed before the first decoder block"
             assert bi not in layout, f"two DeepstackEmbed modules after block {bi}"
             layout[bi] = int(m.deepstack_index)
+    return layout
+
+
+def ple_layout(model) -> dict:
+    """
+    ``{block_index: PLELayer}`` for every ``PLELayer`` module that runs BEFORE
+    decoder block ``block_index`` (0-based over the TransformerBlocks); empty
+    on every architecture without one. Qwen3.8-Flash-Next builds the layer in
+    front of the block whose 1-based index is in ``ple_layer_ids`` (``[2]``:
+    between blocks 0 and 1). The inference module adds its delta into the
+    stream stack in place (``streams <- streams + ple(streams, ids)``); the
+    native forward mirrors that add (``training.ple``).
+    """
+    from ..modules import TransformerBlock
+    mods, first, last = _decoder_layout(model)
+    layout, bi = {}, 0
+    for m in mods[first:last + 1]:
+        if isinstance(m, TransformerBlock):
+            bi += 1
+        elif _is_ple_layer(m):
+            assert bi not in layout, f"two PLELayer modules before block {bi}"
+            assert not getattr(m, "stub", False), \
+                "tensor-parallel PLE stub in the module list; load the model layer-split"
+            layout[bi] = m
     return layout
 
 
@@ -162,8 +256,131 @@ def embed_norm(model):
     adapter, mirroring the module order).
     """
     mods, first, _ = _decoder_layout(model)
-    pre = mods[1:first]
+    pre = [m for m in mods[1:first] if not _is_expand_streams(m)]
     return pre[0] if pre else None
+
+
+def output_device(final_norm):
+    """The device of the final-norm slot's weights (= the output device under a
+    layer-autosplit load): an ``RMSNorm``'s weight, or a stream-stack decoder's
+    final ``GatedResidual`` mixer (its ``norm_w`` table)."""
+    if is_gated_residual(final_norm):
+        return final_norm.norm_w.device
+    return final_norm.weight.device
+
+
+# --- gated-residual hyper-connections (Qwen3.8-Flash-Next) -----------------
+
+def block_hc_sites(block):
+    """The ``(attn_hc, mlp_hc)`` hyper-connection site modules of one block, or
+    ``(None, None)`` on an ordinary pre-norm block. Both are ``GatedResidual``
+    sites when present (``assert_block_supported`` rejects the mHC
+    ``HyperConnection`` kind)."""
+    return getattr(block, "attn_hc", None), getattr(block, "mlp_hc", None)
+
+
+def gated_residual_spec(module) -> dict:
+    """
+    Plain-data description of one ``GatedResidual`` (a block's site, or the
+    final mixer) for ``training.hyperconnections.gated_residual_mix``:
+    ``hc_mult``, ``hidden_size``, ``rank``, ``eps``, and the frozen tables
+    ``norm_w`` ``[H, d]`` fp32 (the module's ``1 + w``), ``down`` ``[rank,
+    H*d]`` and ``up`` ``[H*d, rank]`` (fp16, the checkpoint orientation) and,
+    for a site, ``inject`` ``[H, H*d]`` fp16 (``None`` on the final mixer).
+
+    Read from the loaded module's RESIDENT tables, not the source weights:
+    ``down`` / ``inject`` live as views of ``proj_h`` and ``up`` is recovered
+    from the always-kept fused-kernel repack ``upx_h`` (``[H, d/4, rank, 4]``,
+    a pure permutation of ``up``; ``_tiled_tables`` restores it the same way),
+    so the model needs no ``keep_source_weights`` load -- inference releases
+    the checkpoint-layout ``up_h`` when its tiled kernel is active. Laundered
+    out of inference mode (``_frozen_normal``) since they reach autograd ops raw.
+    """
+    assert is_gated_residual(module), \
+        f"expected a GatedResidual, got {type(module).__name__}"
+    assert module.norm_w is not None and module.proj_h is not None, \
+        f"GatedResidual {module.key}: not loaded (load the model first)"
+    H, d, rank = module.hc_mult, module.hidden_size, module.rank
+    if module.up_h is not None:
+        up = module.up_h
+    else:
+        up = module.upx_h.permute(0, 1, 3, 2).reshape(H * d, rank)
+    inject = module.inject_h if module.use_combine else None
+    assert (inject is not None) == bool(module.use_combine)
+    return {
+        "key": module.key,
+        "hc_mult": H,
+        "hidden_size": d,
+        "rank": rank,
+        "eps": float(module.rms_eps),
+        "norm_w": _frozen_normal(module.norm_w),                 # [H, d] fp32, 1 + w
+        "down": _frozen_normal(module.down_h),                   # [rank, H*d] half
+        "up": _frozen_normal(up.contiguous()),                   # [H*d, rank] half
+        "inject": _frozen_normal(inject.contiguous()) if inject is not None else None,
+    }
+
+
+# --- PLE layer (Qwen3.8-Flash-Next hashed n-gram injection) ----------------
+
+def ple_projections(module):
+    """The ``(key_proj, value_proj)`` native ``Linear``s of a ``PLELayer``
+    (``[ple_embed_dim, hc_mult*hidden]`` and ``[ple_embed_dim, hidden]``).
+    Frozen by the training forward: they project a frozen hashed lookup."""
+    return module.key_proj, module.value_proj
+
+
+def ple_spec(module) -> dict:
+    """
+    Plain-data description of a ``PLELayer`` for ``training.ple.ple_delta``:
+    ``hc_mult``, ``hidden_size``, ``gate_scale`` (``hidden**-0.5``),
+    ``dilation`` (= ``ngram_size``), ``kernel``, the frozen depthwise conv
+    weight ``conv_w`` ``[H*d, 1, kernel]`` (half), and the three grouped
+    ``norm_spec``s ``norm_key`` / ``norm_query`` / ``norm_conv`` (weight
+    viewed ``[H, d]``, bias 1.0 -- the module's ``1 + w``).
+    """
+    assert _is_ple_layer(module), f"expected a PLELayer, got {type(module).__name__}"
+    assert not getattr(module, "stub", False), "PLE stub (TP) has no weights"
+    assert module.conv_w is not None, \
+        f"PLELayer {module.key}: not loaded (load the model first)"
+    w = module.conv_w
+    if w.dim() == 2:
+        w = w.unsqueeze(1)
+    H, d = module.hc_mult, module.hidden_size
+    assert tuple(w.shape) == (H * d, 1, module.conv_kernel_size), \
+        f"PLELayer {module.key}: conv weight shape {tuple(w.shape)} != " \
+        f"({H * d}, 1, {module.conv_kernel_size})"
+    return {
+        "key": module.key,
+        "hc_mult": H,
+        "hidden_size": d,
+        "gate_scale": float(module.gate_scale),
+        "dilation": int(module.conv_dilation),
+        "kernel": int(module.conv_kernel_size),
+        "state_len": int(module.conv_state_len),
+        "conv_w": _frozen_normal(w),
+        "norm_key": norm_spec(module.norm_key),
+        "norm_query": norm_spec(module.norm_query),
+        "norm_conv": norm_spec(module.norm_conv),
+    }
+
+
+def ple_ngram_embed(module, input_ids: torch.Tensor) -> torch.Tensor:
+    """
+    The frozen n-gram embedding ``[b, t, ple_embed_dim]`` (half, on the PLE
+    layer's device) for whole sequences starting at position 0 -- the
+    inference layer's stateless path: ids prepared as ``PLELayer._prepare_ids``
+    (CPU int64; multimodal alias ids -> the placeholder token), the hashing
+    history eos-padded by ``ngram_size - 1`` in front (``_history``, the
+    fresh-sequence convention ``PLELayerState.clear`` restores), then
+    ``NGramEmbedding.forward`` (host-side hashing + row gather from RAM /
+    disk, GPU dequant). No gradient: the table is frozen and the gather is
+    not differentiable anyway.
+    """
+    with torch.no_grad():
+        ids = module._prepare_ids(input_ids)
+        history = module._history(ids)
+        emb = module.ple_embedding.forward(history, {})
+    return emb
 
 
 # --- MTP (multi-token prediction) head ---------------------------------------
@@ -269,6 +486,20 @@ def _assert_moe_supported(key: str, mlp) -> None:
         f"supported, got router_type {mlp.router_type!r} (grouped ds3 MoE " \
         f"routing not wired up)"
     assert mlp.routing_gate is not None, f"{key}: MoE block has no routing gate"
+    # The inference side's CPU expert offload (EXL3_MOE_CPU_OFFLOAD: whole
+    # layers registered with the CPU MoE worker, their Linears never loaded;
+    # EXL3_MOE_CPU_SPLIT: the tail experts removed from the module tree) runs
+    # the experts as fp16 GEMMs in a worker process -- not differentiable, and
+    # the weights are not on the GPU for the training forward to read. The
+    # training path's own offload is ``--stream-experts`` (expert_stream.py),
+    # offline trainer only; the realtime (tabbyAPI) path needs resident experts.
+    assert not getattr(mlp, "cpu_offload", False) and \
+        getattr(mlp, "cpu_split_first", None) is None, \
+        f"{key}: the inference CPU expert offload (EXL3_MOE_CPU_OFFLOAD / " \
+        f"EXL3_MOE_CPU_SPLIT) is not supported for training: the offloaded " \
+        f"experts run in the CPU worker and are not differentiable. Unset it; " \
+        f"to train with experts in host RAM use the offline trainer's " \
+        f"--stream-experts (not available on the realtime path)"
     assert mlp.num_local_experts == mlp.num_experts, \
         f"{key}: expert/tensor-parallel MoE split ({mlp.num_local_experts} of " \
         f"{mlp.num_experts} experts local) is not supported for training"
@@ -325,11 +556,18 @@ def assert_block_supported(block):
     Gemma4 MoE layout (alt residual channel + router/routed/shared extra
     norms), and the HEADWISE sigmoid attention output gate (Spark-X2.5: a
     per-head scalar ``g_proj`` ``[hidden, nq]`` broadcast over head_dim).
+    Qwen3.8-Flash-Next blocks are accepted too: GatedResidual hyper-connection
+    sites in place of the pre-norms (the residual is the fp32 stream stack --
+    ``block_hc_sites`` / ``gated_residual_spec``), the sigmoid-gated GDN
+    output norm (``gdn_norm_spec``) and QSA full attention, trained as dense
+    attention up to the indexer's sparse threshold (``block_metadata``'s
+    ``qsa_threshold``).
     What it still cannot do is rejected here: fused-qkvz GatedDeltaNet (the
     Qwen3-Next layout), grouped ds3-router MoE, the softplus headwise gate
-    (Laguna), and non-NeoX RoPE. mRoPE and partial rotary (Qwen-VL text
-    towers, Spark-X2.5 full-attention layers) are ACCEPTED for text-only
-    training -- see the notes at the assertions below.
+    (Laguna), mHC (Sinkhorn) hyper-connections, and non-NeoX RoPE. mRoPE and
+    partial rotary (Qwen-VL text towers, Spark-X2.5 full-attention layers)
+    are ACCEPTED for text-only training -- see the notes at the assertions
+    below.
     """
     from ..modules import GatedMLP, Attention, SlidingAttention
     key = getattr(block, "key", "?")
@@ -337,6 +575,33 @@ def assert_block_supported(block):
     mlp = getattr(block, "mlp", None)
     assert attn is not None and mlp is not None, \
         f"{key}: block must have both attention and MLP (parallel/no-op blocks unsupported)"
+    # Hyper-connection sites (Qwen3.8-Flash-Next): the block's residual is the
+    # fp32 stream stack and each sublayer site is a GatedResidual mix / inject
+    # in place of the pre-norm / residual add (training.hyperconnections). The
+    # mHC HyperConnection kind (DeepSeek-V4 / GLM5.3: Sinkhorn combine matrix)
+    # is a different computation and is rejected here.
+    attn_hc, mlp_hc = block_hc_sites(block)
+    if attn_hc is not None or mlp_hc is not None:
+        assert attn_hc is not None and mlp_hc is not None, \
+            f"{key}: hyper-connection site on one sublayer only"
+        for site in (attn_hc, mlp_hc):
+            assert is_gated_residual(site), \
+                f"{key}: only the GatedResidual hyper-connection (Qwen3.8-Flash-Next) " \
+                f"is supported, got {type(site).__name__} (mHC is not wired up)"
+            assert site.use_combine, f"{key}: site-form GatedResidual expected"
+            assert site.norm_w is not None, \
+                f"{key}: GatedResidual {site.key} not loaded (load the model first)"
+        assert attn_hc.hc_mult == mlp_hc.hc_mult, f"{key}: hc_mult differs between sites"
+        assert getattr(block, "attn_norm", None) is None \
+            and getattr(block, "mlp_norm", None) is None, \
+            f"{key}: pre-norms alongside hyper-connection sites are not supported"
+        assert getattr(block, "attn_post_norm", None) is None \
+            and getattr(block, "mlp_post_norm", None) is None \
+            and getattr(block, "layer_scalar_f", None) is None, \
+            f"{key}: post-norms / layer scalars alongside hyper-connection sites " \
+            f"are not supported"
+        assert not (is_block_sparse_mlp(mlp) and getattr(mlp, "alt_residual_channel", False)), \
+            f"{key}: alt_residual_channel MoE on a stream-stack residual is not supported"
     if is_block_sparse_mlp(mlp):
         _assert_moe_supported(key, mlp)
     else:
@@ -401,6 +666,22 @@ def assert_block_supported(block):
         assert not getattr(attn, "gate_softplus", False), \
             f"{key}: softplus headwise attention gating is not supported; " \
             f"only the sigmoid gates (headwise / full-width / interleaved) are"
+    # QSA (Qwen3.8-Flash-Next sparse full attention): the indexer selects
+    # 4-token key blocks for query positions ABOVE its sparse threshold
+    # (``4 * block_topk + 3``; 2051 on the released model); at or below it the
+    # inference forward attends densely and exactly (``Attention.forward``:
+    # ``if seqlen > sparse_threshold()``). The native forward does dense
+    # attention only, so it is exact for sequences up to the threshold and
+    # must REFUSE longer ones (block_metadata carries the threshold; the
+    # trainer checks every batch against it). The indexer's own projections
+    # are then dead weight: never targets, never run.
+    qsa = getattr(attn, "qsa_indexer", None)
+    if qsa is not None:
+        assert callable(getattr(qsa, "sparse_threshold", None)), \
+            f"{key}: QSA indexer without a sparse_threshold(); unsupported"
+        assert int(qsa.sparse_threshold()) > 0, \
+            f"{key}: QSA indexer with a zero sparse threshold (sparse from " \
+            f"position 0) cannot be trained as dense attention"
     # NoPE layers (AFMoE full-attention layers) are built with no rope_settings
     # and skip RoPE entirely -- accepted (block_metadata carries inv_freq=None
     # and the native forward skips the rotation, mirroring the inference
@@ -622,6 +903,12 @@ def block_metadata(block) -> dict:
         # Gemma applies a learned per-layer scalar to the whole residual stream at
         # block end (TransformerBlock.forward: x *= layer_scalar_f). None elsewhere.
         "layer_scalar": getattr(block, "layer_scalar_f", None),
+        # QSA sparse-attention threshold (Qwen3.8-Flash-Next): the longest
+        # sequence this layer attends to DENSELY at inference. The native
+        # forward is exact up to it and refuses anything longer. None on every
+        # layer without an indexer.
+        "qsa_threshold": (int(attn.qsa_indexer.sparse_threshold())
+                          if getattr(attn, "qsa_indexer", None) is not None else None),
     }
 
 
@@ -633,16 +920,25 @@ def norm_spec(norm) -> Optional[dict]:
     ``y = (x / rms(x)) * scale * (weight + bias)`` -- so Gemma's ``(1 + weight)``
     convention and unweighted v-norm are handled by reading the module's own
     ``constant_bias`` / ``constant_scale`` / ``unweighted`` rather than hardcoding.
-    Returns ``None`` for a missing norm.
+    A GROUPED norm (``groups > 1``: the PLE layer's per-stream norms over a
+    ``[..., groups, dim]`` input, weight row selected per stream) gets its
+    weight viewed ``[groups, dim]`` so the same ``x * (w + bias)`` broadcasts
+    per stream, exactly as ``forward_torch`` views it. Returns ``None`` for a
+    missing norm.
     """
     if norm is None:
         return None
     from ..modules import RMSNorm
     assert isinstance(norm, RMSNorm), \
         f"native forward only supports RMSNorm, got {type(norm).__name__}"
+    w = None if getattr(norm, "unweighted", False) else _frozen_normal(norm.weight)
+    groups = int(getattr(norm, "groups", 1) or 1)
+    if w is not None and groups > 1:
+        assert w.numel() % groups == 0, \
+            f"{norm.key}: grouped norm weight ({w.numel()}) not divisible by groups ({groups})"
+        w = w.view(groups, -1)
     return {
-        "weight": None if getattr(norm, "unweighted", False)
-                  else _frozen_normal(norm.weight),
+        "weight": w,
         "eps": norm.rms_norm_eps,
         "bias": float(getattr(norm, "constant_bias", 0.0)),
         "scale": float(getattr(norm, "constant_scale", 1.0)),
@@ -772,16 +1068,27 @@ def short_conv_projections(block):
 def gdn_norm_spec(block) -> dict:
     """``norm_spec``-shaped description of a GatedDeltaNet block's gated
     RMSNorm (applied per value head over ``v_head_dim``, then multiplied by
-    ``silu(z)`` -- see ``training.gdn.gdn_gated_rmsnorm``)."""
+    ``act(z)`` -- see ``training.gdn.gdn_gated_rmsnorm``), plus
+    ``gate_activation``: the module's ``"silu"`` (Qwen3.5/3.6) or
+    ``"sigmoid"`` (Qwen3.8-Flash-Next ``output_gate_type``). Read from the
+    module, never assumed -- the two differ at every token, silently."""
     from ..modules import GatedRMSNorm
     norm = block.attn.norm
     assert isinstance(norm, GatedRMSNorm), \
         f"expected GatedRMSNorm on GatedDeltaNet, got {type(norm).__name__}"
+    act = str(getattr(norm, "gate_activation", "silu"))
+    assert act in ("silu", "sigmoid"), \
+        f"{norm.key}: unsupported GatedRMSNorm gate activation {act!r}"
+    assert not getattr(norm, "gate_first", False), \
+        f"{norm.key}: gate-first (Mamba2 group norm) GatedRMSNorm is not supported"
+    assert int(getattr(norm, "groups", 1) or 1) == 1, \
+        f"{norm.key}: grouped GatedRMSNorm is not supported"
     return {
         "weight": _frozen_normal(norm.weight),
         "eps": norm.rms_norm_eps,
         "bias": float(getattr(norm, "constant_bias", 0.0)),
         "scale": 1.0,
+        "gate_activation": act,
     }
 
 

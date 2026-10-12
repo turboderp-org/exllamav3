@@ -50,14 +50,24 @@ gate, and the Gemma4 MoE layout: routing + routed experts fed from the raw
 post-attention residual through their own pre-norms, routed/shared post
 norms, per-expert scale) or the "dots" sigmoid router (AFMoE: selection
 bias, normalize-over-selected weights, routed scaling factor, ungated
-shared expert) -- see ``_moe_out``. It reduces bit-identically to
+shared expert) -- see ``_moe_out``, and Qwen3.8-Flash-Next (``qwen4_exp``):
+the residual is a stack of 4 fp32 streams (``ExpandStreams``) that every
+sublayer site mixes and injects through a differentiable gated-residual
+hyper-connection in place of its pre-norm and residual add
+(``training.hyperconnections``; ``_site_in`` / ``_site_out``), a final
+combine-less mixer collapses the stack before the head (no final norm), the
+GDN output norm is sigmoid-gated, the QSA sparse-attention layers are run as
+dense attention (exact up to the indexer's threshold; longer sequences are
+refused), and the PLE hashed n-gram layer between two early blocks is
+reproduced on top of the inference loader's frozen table lookup
+(``training.ple``; ``_run_ple``). It reduces bit-identically to
 the original Llama
 path when those features are absent. Still rejected loudly
 (``assert_block_supported``): fused-qkvz GatedDeltaNet (Qwen3-Next layout),
-grouped ds3-router MoE, the softplus headwise gate (Laguna),
-and non-NeoX RoPE (mRoPE and partial
+grouped ds3-router MoE, the softplus headwise gate (Laguna), mHC
+(Sinkhorn) hyper-connections, and non-NeoX RoPE (mRoPE and partial
 rotary are accepted for text-only training). Sample packing is not
-supported on GatedDeltaNet
+supported on GatedDeltaNet / ShortConv / PLE
 models (the recurrence would carry state across packed document boundaries);
 train them unpacked.
 
@@ -104,6 +114,10 @@ from .gdn import (
     gdn_beta_g,
 )
 from .short_conv import shortconv_mix
+from .hyperconnections import (
+    expand_streams, gated_residual_mix, gated_residual_apply, streams_mean,
+)
+from .ple import ple_delta
 
 
 # FlashAttention-2 fast path. exllamav3's own FA2 usage is inference-only
@@ -544,6 +558,13 @@ class NativeLlamaQLoRA(nn.Module):
     # or None) while active, else None. Class default so older pickles/subclasses
     # without the attribute still run the forward untapped.
     _collect_spec = None
+    # Stream-stack residual (Qwen3.8-Flash-Next gated-residual hyper-
+    # connections): hc_mult parallel fp32 streams, 0 = the ordinary [b, t, d]
+    # residual. Class defaults so headless test nets take the plain path.
+    hc_mult = 0
+    final_mixer_spec = None     # the final GatedResidual mixer's spec, or None
+    _ple = {}                   # {block index: PLE entry} -- runs BEFORE that block
+    qsa_threshold = None        # longest sequence the QSA layers attend densely
 
     def __init__(
         self,
@@ -657,6 +678,12 @@ class NativeLlamaQLoRA(nn.Module):
         self.has_gdn = False
         self.has_shortconv = False
         self.has_moe = False
+        # Stream-stack residual (Qwen3.8-Flash-Next): ExpandStreams broadcasts
+        # the embedding into hc_mult fp32 streams, every block's sublayer
+        # sites mix / inject them (entry.attn_hc_spec / mlp_hc_spec), and the
+        # final GatedResidual mixer collapses them before the head. 0 = the
+        # ordinary [b, t, d] residual on every other architecture.
+        self.hc_mult = backbone.hc_mult(model)
 
         def make_wrap(targets, satisfied_targets):
             def wrap(linear, leaf, aliases=None, r_override=None):
@@ -770,6 +797,19 @@ class NativeLlamaQLoRA(nn.Module):
             entry.mlp_norm_spec = backbone.norm_spec(mlp_norm)
             entry.attn_post_spec = backbone.norm_spec(attn_post)
             entry.mlp_post_spec = backbone.norm_spec(mlp_post)
+            # Hyper-connection sites (Qwen3.8-Flash-Next): replace the pre-norm
+            # and the residual add at each sublayer (see _site_in / _site_out).
+            # Frozen tables, never targets. None on a pre-norm block.
+            attn_hc, mlp_hc = backbone.block_hc_sites(blk)
+            entry.attn_hc_spec = backbone.gated_residual_spec(attn_hc) if attn_hc is not None else None
+            entry.mlp_hc_spec = backbone.gated_residual_spec(mlp_hc) if mlp_hc is not None else None
+            assert (entry.attn_hc_spec is not None) == (self.hc_mult > 0), \
+                f"{getattr(blk, 'key', '?')}: hyper-connection sites and the " \
+                f"stream-stack layout (ExpandStreams) must come together"
+            if entry.attn_hc_spec is not None:
+                assert entry.attn_hc_spec["hc_mult"] == self.hc_mult, \
+                    f"{getattr(blk, 'key', '?')}: site hc_mult " \
+                    f"{entry.attn_hc_spec['hc_mult']} != model hc_mult {self.hc_mult}"
             if meta["kind"] == "gdn":
                 # GatedDeltaNet layer (Qwen3.5/3.6 linear attention). The five
                 # split projections are all native Linears, so LoRA / pissa /
@@ -876,6 +916,37 @@ class NativeLlamaQLoRA(nn.Module):
                     f"{sorted({w.key.split('.')[-1] for w in self._mtp_wrappers})})")
             self.mtp_target_modules = sorted(mtargets)
 
+        # PLE layers (Qwen3.8-Flash-Next hashed n-gram injection), keyed by the
+        # trunk block they run BEFORE. The key/value projections are native
+        # Linears wrapped frozen (aliases=() so no target name can select them:
+        # they project a frozen hashed lookup); the n-gram table itself is read
+        # through the inference module at forward time (backbone.ple_ngram_embed).
+        self._ple_modules = {}          # {block index: inference PLELayer}
+        self._ple = nn.ModuleDict()     # {str(block index): entry}
+        ple_wrap = make_wrap(targets, satisfied_targets)   # trunk-side (never the MTP wrap)
+        for bi, ple_mod in backbone.ple_layout(model).items():
+            kp, vp = backbone.ple_projections(ple_mod)
+            pe = nn.Module()
+            pe.key_proj = ple_wrap(kp, "ple_key_proj", ())
+            pe.value_proj = ple_wrap(vp, "ple_value_proj", ())
+            pe.spec = backbone.ple_spec(ple_mod)
+            pe.device = backbone.linear_device(kp)
+            self._ple[str(bi)] = pe
+            self._ple_modules[bi] = ple_mod
+        assert not self._ple or self.hc_mult > 0, "PLE layer on a non-stream-stack decoder"
+        self.has_ple = bool(self._ple)
+        # QSA (Qwen3.8-Flash-Next sparse attention): the native forward is
+        # dense, exact up to the smallest indexer threshold over the layers;
+        # _forward_trunk refuses longer sequences.
+        qsa = [m["qsa_threshold"] for m in self._block_meta
+               if m.get("qsa_threshold") is not None]
+        self.qsa_threshold = min(qsa) if qsa else None
+        if self.qsa_threshold is not None:
+            print(f" -- note: QSA sparse-attention layers present; the native forward "
+                  f"attends densely, which is exact for sequences up to "
+                  f"{self.qsa_threshold} tokens. Longer batches are refused "
+                  f"(keep --seq-len <= {self.qsa_threshold}).")
+
         self._wrappers = wrappers
         if self.has_moe:
             expert_targets = targets.intersection(
@@ -914,7 +985,18 @@ class NativeLlamaQLoRA(nn.Module):
                   "will run the sequential torch reference -- correct but slow "
                   "and memory-heavy at long seq-len. pip install "
                   "flash-linear-attention for the chunked Triton kernel.")
-        self.final_norm_spec = backbone.norm_spec(self.final_norm)
+        # Final norm slot: an RMSNorm (every ordinary arch) or, on a stream-
+        # stack decoder, the combine-less GatedResidual mixer that collapses
+        # the streams into the head's [b, t, d] input (no final RMSNorm at all
+        # on Qwen3.8-Flash-Next).
+        if backbone.is_gated_residual(self.final_norm):
+            assert self.hc_mult > 0
+            self.final_norm_spec = None
+            self.final_mixer_spec = backbone.gated_residual_spec(self.final_norm)
+            assert self.final_mixer_spec["inject"] is None, "final mixer with an inject table"
+        else:
+            self.final_norm_spec = backbone.norm_spec(self.final_norm)
+            self.final_mixer_spec = None
         # Final-logit tanh softcapping (Gemma2; 0 = none). Applied by logits(),
         # by the materialized supervised-position loss, and by both fused-CE
         # heads (softcap arg -- the cap is elementwise, so it chunks cleanly).
@@ -927,7 +1009,7 @@ class NativeLlamaQLoRA(nn.Module):
         # load this is the one decoder device; under layer-autosplit it is the
         # last device in the split (modules[-1].device). The embedding is loaded
         # on CPU (prefer_cpu) regardless.
-        self.device = self.final_norm.weight.device
+        self.device = backbone.output_device(self.final_norm)
         self._head_device = backbone.linear_device(self.lm_head)
 
         # Optional chunked-vocab head loss: reconstruct + matmul the head in
@@ -1244,11 +1326,51 @@ class NativeLlamaQLoRA(nn.Module):
         if attention_mask is not None:
             key_pad = (attention_mask == 0)[:, None, None, :]    # [b,1,1,t]
             bias = bias.masked_fill(key_pad, neg)
+            # A sliding window plus right-padding CAN fully mask a row: a pad
+            # query more than `window` past its row's last real token sees only
+            # pad keys, all masked. Its softmax is NaN, and on the next layer
+            # that NaN pad key/value poisons every real query in the row
+            # (probs 0 * v NaN = NaN in the matmul) -- the DPO/KTO NaN on
+            # Spark-X2.5 (window 512) whenever chosen/rejected lengths differ
+            # by more than the window. Let such rows attend to themselves:
+            # real queries never see pad keys, so loss-bearing outputs are
+            # unchanged.
+            dead = torch.isinf(bias).all(dim=-1, keepdim=True)  # [b,1,t,1]
+            if bool(dead.any()):
+                eye = torch.eye(t, dtype=torch.bool, device=device)
+                bias = bias.masked_fill(dead & eye, 0.0)
         return bias
+
+    # --- sublayer sites: pre-norm + residual add, or hyper-connection mix + inject
+
+    def _site_in(self, hidden, entry, site: str):
+        """The sublayer's input at ``site`` (``"attn"`` / ``"mlp"``) and the
+        site's inject gate. Pre-norm block: ``(norm(hidden), None)``.
+        Hyper-connection block (Qwen3.8-Flash-Next; ``hidden`` is the fp32
+        ``[b, t, H, d]`` stream stack): the GatedResidual mix -- its
+        ``mixed`` output cast to the compute dtype (inference hands the
+        sublayer a half copy) and the ``[b, t, H]`` ``post`` gate for
+        ``_site_out``."""
+        hc = getattr(entry, f"{site}_hc_spec", None)
+        if hc is not None:
+            post, mixed = gated_residual_mix(hidden, hc)
+            return mixed.to(self.compute_dtype), post
+        return self._norm(hidden, getattr(entry, f"{site}_norm_spec")), None
+
+    def _site_out(self, hidden, out, entry, site: str, post):
+        """The residual update at ``site`` for the sublayer output ``out``:
+        the plain add, the Gemma sandwich ``hidden + post_norm(out)``, or the
+        hyper-connection inject ``streams + post (x) out``."""
+        if getattr(entry, f"{site}_hc_spec", None) is not None:
+            return gated_residual_apply(hidden, out, post)
+        post_spec = getattr(entry, f"{site}_post_spec", None)
+        if post_spec is not None:
+            return hidden + self._norm(out, post_spec)
+        return hidden + out
 
     def _block_forward(self, meta, entry, hidden, position_ids, attn_bias,
                        attn_mode="eager", pack=None):
-        bsz, t, _ = hidden.shape
+        bsz, t = hidden.shape[:2]
         nq, nkv, hd = meta["num_q_heads"], meta["num_kv_heads"], meta["head_dim"]
 
         # --- attention ---
@@ -1257,7 +1379,7 @@ class NativeLlamaQLoRA(nn.Module):
         # a training run / fp32 in the validate path -- DON'T upcast them to fp32 here
         # (that is what doubled the activation footprint). Per-head norm and RoPE
         # below keep their internals in fp32 but return in this dtype.
-        normed = self._norm(hidden, entry.attn_norm_spec)
+        normed, post = self._site_in(hidden, entry, "attn")
         if meta.get("interleaved_gate"):
             # Qwen3.5 gated attention: q_proj emits [q | gate] interleaved per
             # head ([..., nq, 2*hd]); the gate multiplies the attention output
@@ -1431,22 +1553,19 @@ class NativeLlamaQLoRA(nn.Module):
         # residual stream here (that is what the old `.float()` was costing).
         attn_out = entry.o_proj(ctx)
         # Sandwich post-norm (Gemma): x = x + post_norm(attn_out). Plain pre-norm
-        # archs have no post-norm -> straight residual add.
-        if entry.attn_post_spec is not None:
-            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
-        else:
-            hidden = hidden + attn_out
+        # archs have no post-norm -> straight residual add. Hyper-connection
+        # block: the per-stream inject (_site_out).
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
 
         # --- gated MLP (SwiGLU / GeGLU) / MoE ---
         # `hidden` here is the post-attention residual stream -- exactly what
         # the inference TransformerBlock stashes as params["residual"] for the
-        # Gemma4 MoE's alt residual channel.
-        normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
-        if entry.mlp_post_spec is not None:
-            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
-        else:
-            hidden = hidden + mlp_out
+        # Gemma4 MoE's alt residual channel (a [b, t, d] residual only; the
+        # stream-stack layout rejects that MoE flavour at construction).
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
 
         # Gemma's learned per-layer scalar on the whole residual stream (block end).
         # None for plain archs -> no-op. Compounds over layers, so omitting it on
@@ -1678,12 +1797,12 @@ class NativeLlamaQLoRA(nn.Module):
         exactly; no RoPE, no attention mask (the recurrence is causal by
         construction). Right-padding is safe: pad positions produce garbage that
         never feeds back into real positions and is masked from the loss."""
-        bsz, t, _ = hidden.shape
+        bsz, t = hidden.shape[:2]
         nk, nv = meta["num_k_heads"], meta["num_v_heads"]
         dk, dv = meta["k_head_dim"], meta["v_head_dim"]
         k_dim, v_dim = nk * dk, nv * dv
 
-        normed = self._norm(hidden, entry.attn_norm_spec)
+        normed, post = self._site_in(hidden, entry, "attn")
         qkv = entry.qkv_proj(normed)                       # [b, t, 2*k_dim + v_dim]
         z = entry.z_proj(normed).view(bsz, t, nv, dv)      # output gate
         beta, g = gdn_beta_g(
@@ -1706,17 +1825,12 @@ class NativeLlamaQLoRA(nn.Module):
         core = self._gdn_delta_rule(q, k, v, g, beta)      # [b, t, nv, dv]
         core = gdn_gated_rmsnorm(core, entry.gdn_norm_spec, z)
         attn_out = entry.o_proj(core.reshape(bsz, t, v_dim))
-        if entry.attn_post_spec is not None:
-            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
-        else:
-            hidden = hidden + attn_out
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
 
-        normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
-        if entry.mlp_post_spec is not None:
-            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
-        else:
-            hidden = hidden + mlp_out
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
 
         ls = meta.get("layer_scalar")
         if ls is not None:
@@ -1734,21 +1848,16 @@ class NativeLlamaQLoRA(nn.Module):
         ``kernel - 1`` zeros; no RoPE, no attention mask (the conv is causal
         by construction). Right-padding is safe: pad positions only ever feed
         later pad positions, which are masked from the loss."""
-        normed = self._norm(hidden, entry.attn_norm_spec)
+        normed, post = self._site_in(hidden, entry, "attn")
         bcx = entry.in_proj(normed)                        # [b, t, 3*hidden]
         y = shortconv_mix(bcx, meta["conv1d_weight"], meta["conv1d_bias"])
         attn_out = entry.out_proj(y)
-        if entry.attn_post_spec is not None:
-            hidden = hidden + self._norm(attn_out, entry.attn_post_spec)
-        else:
-            hidden = hidden + attn_out
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
 
-        normed2 = self._norm(hidden, entry.mlp_norm_spec)
-        mlp_out = self._mlp_out(meta, entry, normed2, residual=hidden)
-        if entry.mlp_post_spec is not None:
-            hidden = hidden + self._norm(mlp_out, entry.mlp_post_spec)
-        else:
-            hidden = hidden + mlp_out
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
 
         ls = meta.get("layer_scalar")
         if ls is not None:
@@ -1961,6 +2070,25 @@ class NativeLlamaQLoRA(nn.Module):
             )
         return self._block_forward(meta, entry, hidden, position_ids, attn_bias, mode, pack)
 
+    def _ple_forward(self, pe, streams, emb):
+        """The differentiable half of a PLE layer (``training.ple``) on the
+        stream stack, given the frozen n-gram embedding ``emb``."""
+        delta = ple_delta(streams, emb, pe.spec, pe.key_proj, pe.value_proj,
+                          self._norm, self.compute_dtype)
+        return streams + delta
+
+    def _run_ple(self, bi, pe, streams, input_ids, ckpt):
+        """One PLE layer: the frozen n-gram lookup OUTSIDE the checkpoint (host
+        hashing + table gather; no grad, and not worth redoing in the
+        recompute), then the differentiable projections / gate / conv under
+        the same checkpointing as a block."""
+        emb = backbone.ple_ngram_embed(self._ple_modules[bi], input_ids)
+        emb = emb.to(streams.device)
+        if ckpt:
+            return torch.utils.checkpoint.checkpoint(
+                self._ple_forward, pe, streams, emb, use_reentrant=False)
+        return self._ple_forward(pe, streams, emb)
+
     def _forward_trunk(
         self,
         input_ids: torch.Tensor,
@@ -1984,14 +2112,25 @@ class NativeLlamaQLoRA(nn.Module):
                 and not self._adapters_off):
             qa_state["tick"] += 1
         if seg_ids is not None and (getattr(self, "has_gdn", False)
-                                    or getattr(self, "has_shortconv", False)):
+                                    or getattr(self, "has_shortconv", False)
+                                    or getattr(self, "has_ple", False)):
             raise ValueError(
                 "sample packing (seg_ids) is not supported on GatedDeltaNet / "
-                "ShortConv models: the recurrence and causal conv would carry "
-                "state across packed document boundaries. Train unpacked "
-                "(drop --pack).")
+                "ShortConv / PLE models: the recurrence, causal conv and n-gram "
+                "history would carry state across packed document boundaries. "
+                "Train unpacked (drop --pack).")
         if mm is not None and seg_ids is not None:
             raise ValueError("image batches (mm) cannot be sample-packed (seg_ids)")
+        # QSA sparse attention (Qwen3.8-Flash-Next): the native forward attends
+        # densely, which the inference forward also does up to the indexer's
+        # sparse threshold; beyond it inference attends sparsely and the two
+        # diverge, so refuse rather than train a forward that doesn't reproduce.
+        if self.qsa_threshold is not None and input_ids.shape[1] > self.qsa_threshold:
+            raise ValueError(
+                f"sequence length {input_ids.shape[1]} exceeds the QSA dense "
+                f"threshold ({self.qsa_threshold}): the inference forward attends "
+                f"sparsely past it and the native forward (dense) would not "
+                f"reproduce. Use --seq-len <= {self.qsa_threshold}.")
         # Image batch: only counts when at least one image token is present.
         has_img = mm is not None and bool((mm["index"] >= 0).any())
         # Bidirectional image spans (Gemma4) need the explicit [t, t] mask, so
@@ -2020,6 +2159,14 @@ class NativeLlamaQLoRA(nn.Module):
         # whatever the Embedding emitted.
         if self.embed_norm_spec is not None:
             hidden = self._norm(hidden, self.embed_norm_spec)
+
+        # Stream-stack residual (Qwen3.8-Flash-Next): ExpandStreams broadcasts
+        # the embedding into hc_mult fp32 streams [b, t, H, d]; the blocks'
+        # hyper-connection sites mix / inject them from here on, and the
+        # final mixer collapses them below. Kept fp32 like inference (only
+        # the sublayer inputs/outputs are in the compute dtype).
+        if self.hc_mult:
+            hidden = expand_streams(hidden, self.hc_mult)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(first_device)
@@ -2110,6 +2257,17 @@ class NativeLlamaQLoRA(nn.Module):
         with save_ctx:
             for bi, (meta, entry, dev) in enumerate(
                     zip(self._block_meta, self.blocks, self._block_devices)):
+                # PLE layer (Qwen3.8-Flash-Next): the hashed n-gram injection
+                # that sits in front of this block in the inference module
+                # list -- streams <- streams + ple(streams, ids). Runs on the
+                # layer's own device (mirroring the module order under a
+                # layer-split load); the block below then migrates as usual.
+                if str(bi) in self._ple:
+                    pe = self._ple[str(bi)]
+                    if pe.device != cur_device:
+                        hidden = backbone.to_device(hidden, pe.device)
+                        cur_device = pe.device
+                    hidden = self._run_ple(bi, pe, hidden, input_ids, ckpt)
                 # Cross the device boundary if this block sits on another card. All
                 # no-ops under a single-device load (dev == cur_device throughout).
                 if dev != cur_device:
@@ -2131,7 +2289,11 @@ class NativeLlamaQLoRA(nn.Module):
                 if self._collect_spec is not None:
                     want, pos = self._collect_spec
                     if bi in want:
+                        # Stream stack: tap the stream MEAN, the collapsed
+                        # hidden state the inference block exports.
                         h = hidden.detach().float()
+                        if h.dim() == 4:
+                            h = streams_mean(h)
                         if pos is not None:
                             p = pos.to(h.device).unsqueeze(-1).expand(-1, -1, h.shape[-1])
                             h = h.gather(1, p)
@@ -2142,7 +2304,15 @@ class NativeLlamaQLoRA(nn.Module):
         # dtype contract (the per-block residual stream above is bf16, but this is a
         # single [b, t, d] tensor, so the fp32 cast here is negligible).
         hidden = backbone.to_device(hidden, self.device)
-        hidden = self._norm(hidden, self.final_norm_spec).float()
+        if self.final_mixer_spec is not None:
+            # Final GatedResidual mixer (no inject): collapse the stream stack
+            # into the head's [b, t, d] input, rounded to the compute dtype as
+            # the inference mixer's half output store is, then fp32 like the
+            # final-norm path below.
+            hidden = gated_residual_mix(hidden, self.final_mixer_spec)[1]
+            hidden = hidden.to(self.compute_dtype).float()
+        else:
+            hidden = self._norm(hidden, self.final_norm_spec).float()
         # The raw final-norm state is what the MTP head consumes (inference
         # exports exactly this module's output as target_hidden), BEFORE the
         # head pre-scale below.

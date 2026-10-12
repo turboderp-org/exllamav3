@@ -1,5 +1,9 @@
-#include "exl3_moe_instances.cuh"
-#include "../exl3_moe_kernel.cuh"
+#include "exl3_moe_inst_common.cuh"
 
 fp_exl3_moe_kernel exl3_moe_kernel_k2_n128_cb2() { return exl3_moe_kernel<2, 128, 2>; }
 fp_exl3_moe_kernel exl3_moe_kernel_k2_n256_cb2() { return exl3_moe_kernel<2, 256, 2>; }
+
+#if defined(USE_ROCM)
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n128_cb2_pipe() { return exl3_moe_kernel<2, 128, 2, MOE_TILESIZE_M, false, true>; }
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n256_cb2_pipe() { return exl3_moe_kernel<2, 256, 2, MOE_TILESIZE_M, false, true>; }
+#endif

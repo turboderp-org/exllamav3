@@ -1062,16 +1062,31 @@ def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope
     return out
 
 
+def mla_unfold_block_k(device, n_q_heads: int, D_c: int, v_head_dim: int, block_m: int) -> int:
+    """K tile of _mla_unfold_kernel: 128 where it fits the device's shared memory, halved until it does
+    otherwise (64 KB parts at D_v 256: the W_UV tile alone is BLOCK_K x D_v halves). A loop tile only: the
+    grid and output are unchanged"""
+    def probe(bk):
+        R = block_m
+        o_lat = torch.empty((n_q_heads, R, D_c), dtype = torch.half, device = device)
+        w = torch.empty((D_c, n_q_heads * v_head_dim), dtype = torch.half, device = device)
+        out = torch.empty((R, n_q_heads, v_head_dim), dtype = torch.half, device = device)
+        return shared_bytes(_mla_unfold_kernel, (o_lat, w, out, R, n_q_heads, D_c, v_head_dim, block_m, bk),
+                            num_warps = 4, num_stages = 2)
+    return pick_config(device, "mla_unfold", (n_q_heads, D_c, v_head_dim, block_m), halving_ladder(128), probe)
+
+
 def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
     """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major."""
     H, R, D_c = o_lat.shape
     out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
     with torch.cuda.device(o_lat.device):
+        block_k = mla_unfold_block_k(o_lat.device, H, D_c, v_head_dim, block_m)
         _mla_unfold_kernel[(triton.cdiv(R, block_m), H)](
             o_lat, w_uv_flat, out, R,
             H, D_c, v_head_dim,
-            block_m, 128,
+            block_m, block_k,
             num_warps = 4, num_stages = 2,
         )
     _dbg_sync("mla_unfold", o_lat.device)
@@ -1112,9 +1127,10 @@ def mla_attn_triton_prefill_mha(
     dev = q.device
 
     # 99KB-smem devices (SM120 / consumer Ampere+) cannot hold the default 128-row q tile at
-    # these head dims; probe once per (device, dims) and remember the largest tile that fits
-    fb_key = (dev.index, qk_dim, v_head_dim, block_m)
-    block_m = _mha_block_m.get(fb_key, block_m)
+    # these head dims, and 64 KB parts (RDNA, Turing) at head dims of 256 not even the kv tiles
+    # beside a 32-row one; probe once per (device, dims) and remember the largest tiles that fit
+    fb_key = (dev.index, qk_dim, v_head_dim, block_m, block_n, num_stages)
+    block_m, block_n, num_stages = _mha_block_m.get(fb_key, (block_m, block_n, num_stages))
 
     if qc is not None:
         from .triton_paged import _get_h32
@@ -1177,12 +1193,19 @@ def mla_attn_triton_prefill_mha(
                             block_m, block_n,
                             num_warps = num_warps, num_stages = num_stages,
                         )
-                        _mha_block_m[fb_key] = block_m
+                        _mha_block_m[fb_key] = (block_m, block_n, num_stages)
                         break
                     except triton.runtime.errors.OutOfResources:
-                        # Launch failed before running anything; a smaller q tile is safe
-                        assert block_m > 32, "MHA prefill kernel does not fit in shared memory"
-                        block_m //= 2
+                        # Launch failed before running anything, so smaller tiles are safe: the q tile
+                        # down to 32 rows first, then the kv tile and its pipeline depth
+                        if block_m > 32:
+                            block_m //= 2
+                        elif num_stages > 1:
+                            num_stages = 1
+                        elif block_n > 16:
+                            block_n //= 2
+                        else:
+                            raise AssertionError("MHA prefill kernel does not fit in shared memory")
     _dbg_sync("mla_prefill_mha", dev)
     return out
 

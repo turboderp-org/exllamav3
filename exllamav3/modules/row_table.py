@@ -45,10 +45,10 @@ class _PinSet:
     def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
         if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
                 or self.packed.dtype != row_dtype:
-            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
+            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
             self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
             self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
-            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
+            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
 
 
 class RowTable:
@@ -66,6 +66,7 @@ class RowTable:
         self.num_rows = 0
         self.row_words = None       # elements per stored row
         self.row_dtype = None
+        self._locked = []           # mlock()ed (address, size) ranges of the stores
         self._pins = []             # pinned staging sets (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
         self._executor = None
@@ -96,8 +97,16 @@ class RowTable:
         self.row_words = shapes[0][1]
         self.row_dtype = stores[0].dtype
 
-    def open(self, stc, stream_from_disk: bool, allow_bf16: bool = False, what: str | None = None):
+    def open(self, stc, stream_from_disk: bool, allow_bf16: bool = False, what: str | None = None,
+             lock: bool = False):
+        """lock: hold the table in RAM and mlock() it there (stream_from_disk must be False); the locked-memory
+        limit is checked before anything loads"""
         keys = self.keys
+        if lock:
+            assert not stream_from_disk
+            from ..util.memory import prepare_host_lock, lock_host_tensors
+            nbytes = sum(stc.get_tensor_meta(k)[k]["n_bytes"] for k in keys)
+            prepare_host_lock(nbytes, f"Locking {self.key} in RAM")
         handles = [stc.get_tensor_handle(k, optional = True) for k in keys] if stream_from_disk else [None]
         if all(h is not None for h in handles):
             # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
@@ -121,6 +130,11 @@ class RowTable:
                     stc.release_file(f)
             self._set_stores(handles)
         elif len(keys) == 1:
+            # no file entry: the tensor is already in host memory (conversion)
+            meta = stc.find_stc(keys[0]).get_tensor_meta(keys[0])
+            if what and meta is not None:
+                from ..util.memory import check_host_memory
+                check_host_memory(meta[keys[0]]["n_bytes"], what)
             self._set_stores([stc.get_tensor(keys[0], "cpu", allow_bf16 = allow_bf16, no_defer = True)])
         else:
             # Sharded table: one contiguous slab, each shard copied into its slice as it loads
@@ -137,9 +151,15 @@ class RowTable:
                 r0 += t.shape[0]
                 del t
             self._set_stores([slab])
+        if lock:
+            self._locked = lock_host_tensors(self.stores, f"Locking {self.key} in RAM")
 
     def close(self):
         self.drain_prefetch()       # queued workers still read the table; first
+        if self._locked:
+            from ..util.memory import unlock_host_ranges
+            unlock_host_ranges(self._locked)
+            self._locked = []
         self.stores = None
         self._pins = []
 
@@ -215,11 +235,11 @@ class RowTable:
     def _retire(self, entry: dict):
         # Drop a queued prefetch that no lookup will take. Its worker may still be writing the
         # staging set, so wait it out (a cold gather, at most) unless it hasn't started
-        self._forget(entry)
-        self.prefetch_stats["retired"] += 1
         f = entry["future"]
         if not f.cancel():
-            f.result()
+            f.exception()       # an error of its own belongs to no lookup
+        self._forget(entry)
+        self.prefetch_stats["retired"] += 1
         entry["pin"].held = False
 
     def _acquire_pin(self, n: int) -> _PinSet:
@@ -305,10 +325,10 @@ class RowTable:
         ids = ids.to("cpu", torch.int64).contiguous().clone()
         if self._match(ids) is not None:
             return
-        pin = self._acquire_pin(n)
         if self.on_disk:
             for h in self.stores:
                 h._ensure_open()    # lazy open isn't thread-safe; do it here, not on the worker
+        pin = self._acquire_pin(n)
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_prefetch")
         self._pending.append({
@@ -347,19 +367,22 @@ class RowTable:
             pin = self._acquire_pin(n)
         try:
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve)
+            out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
+            if not in_order:
+                out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
+            elif not out.is_cuda:
+                out = out.clone()       # the decoded rows may still be the staging buffer itself
+            if out.is_cuda and not synced:
+                if pin.event is None:
+                    pin.event = torch.cuda.Event()
+                pin.event.record(torch.cuda.current_stream(out.device))
         except BaseException:
-            # a failed gather must not keep its staging set
-            pin.held = False
+            # a failed gather, upload or decode must not keep its staging set; an interrupted wait
+            # leaves the set with its prefetch, whose worker may still be writing it
+            if entry is not None and not entry["future"].done():
+                self._pending.append(entry)
+            else:
+                pin.held = False
             raise
-
-        out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
-        if not in_order:
-            out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
-        elif not out.is_cuda:
-            out = out.clone()       # the decoded rows may still be the staging buffer itself
-        if out.is_cuda and not synced:
-            if pin.event is None:
-                pin.event = torch.cuda.Event()
-            pin.event.record(torch.cuda.current_stream(out.device))
         pin.held = False
         return out

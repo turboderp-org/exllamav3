@@ -25,7 +25,12 @@ static int exl3_gemv_int8_mode()
 {
     if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
     const char* e = getenv("EXL3_INT8_GEMV");
+#if defined(USE_ROCM)
+    // Off by default on ROCm: the RDNA fdot2 GEMVs (rocm/quant) are faster at these shapes
+    _exl3_gemv_int8_mode = e ? atoi(e) : 0;
+#else
     _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+#endif
     _exl3_gemv_int8_mode_chk = true;
     return _exl3_gemv_int8_mode;
 }

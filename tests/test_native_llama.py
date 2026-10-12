@@ -599,6 +599,37 @@ def test_packing_pad_no_nan():
     print("[packing] trailing pads produce no NaN at real positions PASSED")
 
 
+def test_sliding_window_right_pad_no_nan():
+    # DPO/KTO batches right-pad rows of different lengths. On a sliding layer
+    # a pad query more than `window` past its row's last real token sees only
+    # (masked) pad keys; the bias must not leave that row fully masked, or its
+    # NaN poisons the real tokens of the row on the NEXT layer. The padded
+    # row's real outputs must equal the same row run unpadded.
+    torch.manual_seed(8)
+    d, nq, nkv, hd, inter, w = 16, 4, 2, 8, 32, 4
+    entry, meta, _, _ = _build_block(d, nq, nkv, hd, inter, dtype=torch.float32,
+                                     r=0, activation="gelu", window=w,
+                                     headwise_gate=True)
+    net = _headless_net()
+    t, L = 12, 3                                    # pad gap 9 > window
+    am = torch.tensor([[1] * t, [1] * L + [0] * (t - L)])
+    pos = (am.cumsum(-1) - 1).clamp_min(0)
+    h = torch.randn(2, t, d, dtype=torch.float32)
+    bias = net._attn_bias(am, t, h.device, torch.float32, window=w)
+    assert not torch.isinf(bias).all(-1).any(), "fully-masked attention row"
+    out = net._block_forward(meta, entry, h, pos, bias)
+    out = net._block_forward(meta, entry, out, pos, bias)   # second layer
+    assert torch.isfinite(out).all(), "NaN/inf after a sliding layer with right-padding"
+
+    bias1 = net._attn_bias(None, L, h.device, torch.float32, window=w)
+    ref = net._block_forward(meta, entry, h[1:, :L], pos[1:, :L], bias1)
+    ref = net._block_forward(meta, entry, ref, pos[1:, :L], bias1)
+    err = (out[1:, :L] - ref).abs().max().item()
+    assert err < 1e-5, f"padded row differs from unpadded: max|Δ|={err}"
+    print(f"[sliding-pad] right-padding past the window: no NaN, real tokens "
+          f"match unpadded (max|Δ|={err:.2e}) PASSED")
+
+
 def test_modules_to_save_param_groups():
     # Full-trained embed/head (modules_to_save) must be optimized but excluded
     # from weight decay (decaying a whole embedding table is harmful), while LoRA
@@ -754,6 +785,7 @@ def main():
         test_block_backward_reaches_adapters_only,
         test_packing_block_isolation,
         test_packing_pad_no_nan,
+        test_sliding_window_right_pad_no_nan,
         test_modules_to_save_param_groups,
         test_mtp_head_matches_reference_and_trains_head_only,
     ], label="native-llama")

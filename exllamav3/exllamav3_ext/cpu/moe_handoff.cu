@@ -27,21 +27,29 @@
 //   GPU flag kernels
 // -------------------------------------------------------------------------------------------
 
-// No longer used
-__global__ void moe_flag_write_kernel(uint32_t* flag, uint32_t value)
+// Fallback for when the stream memory operations are unavailable or disabled
+__global__ void moe_flag_write_kernel(moe_flag_t* flag, moe_flag_t value)
 {
+#if MOE_FLAG_BITS == 64
+    stg_release_sys_u64(flag, value);
+#else
     stg_release_sys_u32(flag, value);
+#endif
 }
 
-// No longer used
-__global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* abort_flag)
+// Fallback for when the stream memory operations are unavailable or disabled
+__global__ void moe_flag_wait_kernel(moe_flag_t* flag, moe_flag_t value, uint32_t* abort_flag)
 {
     uint64_t sleep = MOE_SLEEP_MIN;
     uint64_t waited = 0;
     while (true)
     {
+#if MOE_FLAG_BITS == 64
+        if (ldg_acquire_sys_u64(flag) >= value) return;
+#else
         uint32_t v = (uint32_t) ldg_acquire_sys_u32(flag);
         if ((int32_t)(v - value) >= 0) return;
+#endif
         __nanosleep(sleep);
         waited += sleep;
         if (sleep < MOE_SLEEP_MAX) sleep <<= 1;
@@ -62,6 +70,19 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
 // writing satisfying values into the flags.
 namespace {
 
+#if defined(USE_ROCM)
+// HIP has the memops as runtime entry points in the library already linked. Its wait compares with a plain
+// unsigned >= rather than CUDA's cyclic one, hence the 64-bit flags (see moe_handoff.h)
+typedef hipError_t (*fn_stream_wait64)(hipStream_t, void*, uint64_t, unsigned int, uint64_t);
+typedef hipError_t (*fn_stream_write64)(hipStream_t, void*, uint64_t, unsigned int);
+
+struct MemOps
+{
+    fn_stream_wait64 wait = &hipStreamWaitValue64;
+    fn_stream_write64 write = &hipStreamWriteValue64;
+    bool resolved = true;
+};
+#else
 typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 
@@ -93,6 +114,7 @@ struct MemOps
         resolved = wait && write;
     }
 };
+#endif
 
 MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
@@ -112,11 +134,16 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
+#if defined(USE_ROCM)
+        hipError_t r = m.write(stream, (void*) flag, (uint64_t) value, 0);
+        if (r == hipSuccess) return;
+#else
         CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
-    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<uint32_t*>(flag), static_cast<uint32_t>(value));
+    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value));
 }
 
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
@@ -126,6 +153,10 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
+#if defined(USE_ROCM)
+        hipError_t r = m.wait(stream, (void*) flag, (uint64_t) value, hipStreamWaitValueGte, ~0ull);
+        if (r == hipSuccess) return;
+#else
         CUresult r = m.wait(
             (CUstream) stream,
             (CUdeviceptr) flag,
@@ -133,12 +164,13 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
             CU_STREAM_WAIT_VALUE_GEQ
         );
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>
     (
-        reinterpret_cast<uint32_t*>(flag),
-        static_cast<uint32_t>(value),
+        reinterpret_cast<moe_flag_t*>(flag),
+        static_cast<moe_flag_t>(value),
         reinterpret_cast<uint32_t*>(abort_flag)
     );
 }
@@ -175,6 +207,21 @@ inline void store_release_u32(uint32_t* p, uint32_t v)
     (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
 #else
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
+// Publish a job's full sequence number into a flag (only the 64-bit flags take the high half)
+inline void store_release_flag(uint32_t* p, const MoeJob& job)
+{
+#if MOE_FLAG_BITS == 64
+    uint64_t v = (uint64_t(job.seq_hi) << 32) | job.seq;
+#if defined(_MSC_VER) && !defined(__clang__)
+    (void)_InterlockedExchange64(reinterpret_cast<volatile long long*>(p), static_cast<long long>(v));
+#else
+    __atomic_store_n(reinterpret_cast<uint64_t*>(p), v, __ATOMIC_RELEASE);
+#endif
+#else
+    store_release_u32(p, job.seq);
 #endif
 }
 
@@ -242,7 +289,7 @@ void exl3_moe_cpu_worker_run
             shead++;
             store_release_u32(stage_head, shead);
 
-            // Wait until the slot's previous tenant has been DMA'd out
+            // Wait until the slot's previous tenant has been DMA'd out (low half of the flag, cyclically)
             uint32_t* pf = pinned_free + size_t(job.slot) * 16;
             while ((int32_t)(load_acquire_u32(pf) - job.prev_seq) < 0)
             {
@@ -256,7 +303,7 @@ void exl3_moe_cpu_worker_run
                 wstage + size_t(job.slot) * wslot_size,
                 stage_threads_
             );
-            store_release_u32(stage_done + size_t(job.slot) * 16, job.seq);
+            store_release_flag(stage_done + size_t(job.slot) * 16, job);
         }
     });
 
@@ -310,7 +357,7 @@ void exl3_moe_cpu_worker_run
 
         const auto hp_t0 = std::chrono::steady_clock::now();
 
-        // Wait for the GPU to publish the staged inputs for this seq
+        // Wait for the GPU to publish the staged inputs for this seq (low half of the flag, cyclically)
         uint32_t* drdy = data_ready + size_t(job.slot) * 16;
         while ((int32_t)(load_acquire_u32(drdy) - job.seq) < 0)
         {
@@ -360,7 +407,7 @@ void exl3_moe_cpu_worker_run
                 );
         }
 
-        store_release_u32(done + size_t(job.slot) * 16, job.seq);
+        store_release_flag(done + size_t(job.slot) * 16, job);
 
         if (hprof)
         {

@@ -70,8 +70,10 @@ void adaptivep_gumbel_noise_f32
 
     TORCH_CHECK_DTYPE(probs_in, kFloat);
     TORCH_CHECK_DTYPE(logits, kFloat);
+    TORCH_CHECK_SHAPES_FULL(probs_in, logits);
 
     int size = logits.numel();
+    if (!size) return;
     int blocks = CEIL_DIVIDE(size, NUM_THREADS);
 
     adaptivep_gumbel_noise_kernel_f32<<<blocks, NUM_THREADS, 0, stream>>>
@@ -85,4 +87,5 @@ void adaptivep_gumbel_noise_f32
         peak_logit_value,
         sharpness
     );
+    cuda_check(cudaPeekAtLastError());
 }

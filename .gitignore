@@ -23,3 +23,11 @@ qlora_runs.csv.*
 unsloth_compiled_cache/
 # wandb local run artifacts (wandb is now opt-in; the local run_report is default)
 wandb/
+
+# written next to the sources by torch's hipify during ROCm builds
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/hip_*
+
+# per-machine test model registry overrides (tests/testlib/models.py)
+tests/models.local.yaml

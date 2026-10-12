@@ -226,6 +226,7 @@ class BlockSparseMLP_CPU:
             if isinstance(asn, dict) and asn.get(comp, 0) > 0:
                 asn[comp] -= 1
         self.cpu_offload = False
+        self.cpu_host = None
 
     def cpu_split_submit(self, y, bsz, selected_experts, routing_weights):
         """Hand the tail experts' share of the routed sum to the worker. Returns

@@ -43,6 +43,9 @@ def smem_limit(device) -> int:
     if lim is None:
         props = torch.cuda.get_device_properties(idx)
         lim = getattr(props, "shared_memory_per_block_optin", 0)
+        if not lim and torch.version.hip:
+            # ROCm has no opt-in tier (the property is absent): the per-block LDS is the limit
+            lim = props.shared_memory_per_block
         if not lim:
             lim = 64 * 1024 if props.major < 8 else 96 * 1024
         if _env_limit:

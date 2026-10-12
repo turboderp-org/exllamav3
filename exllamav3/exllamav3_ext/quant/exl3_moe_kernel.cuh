@@ -10,7 +10,15 @@
 #include "../util.cuh"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
-#include "exl3_gemm_inner.cuh"
+#if defined(USE_ROCM)
+    // The RDNA inner (WMMA) and the pipelined mainloop the PIPE instances run (rocm/quant). With
+    // MOE_TILESIZE_K = 32 this kernel is the RDNA inner's only live caller of its split-K path (every RDNA
+    // GEMM shape has TILESIZE_K = 16), so a wrong fused-MoE output on RDNA points there first
+    #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
+    #include "../rocm/quant/exl3_moe_inner_rdna.cuh"
+#else
+    #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
 
@@ -18,8 +26,8 @@
 // B dequant over more rows and are launched separately over the experts whose token count
 // warrants them ([count_lo, count_hi], see exl3_moe). Separate instances rather than one
 // kernel with a runtime tier switch: the tiers' register frames would otherwise share one
-// 128-register budget and the 16-row path pays for tiles it never runs (measured +60-70% on
-// Ada/Ampere for that arrangement)
+// 128-register budget and the 16-row path pays for tiles it never runs. On RDNA the inner implements
+// the 16-row tile only; the wide tiles come from the pipelined mainloop below
 template<int t_bits, int cb, int MT, int N_TILE, bool t_half>
 __device__ __forceinline__
 void moe_gemm_tile
@@ -61,10 +69,81 @@ void moe_gemm_tile
     #undef SHAPE_ARGS
 }
 
-template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool t_half = false>
+#if defined(USE_ROCM)
+
+// Pipelined mainloop (rocm/quant/exl3_moe_inner_rdna.cuh): one expert GEMM of size_m rows in row tiles of
+// 64 / 48 / 32 / 16 (the smallest that covers the rest, capped at 64), sharing each dequantized B
+// fragment across the row blocks. Mixed-K kernels (t_bits == 0) keep the 16-row tile only, so the K
+// switch does not multiply into three row-tile copies. The mainloop takes half-integer rates as the
+// pseudo width EXL3_HALF_BITS(K) (exl3_gemv_tiles_rdna.cuh); mixed half-integer rates never reach it
+// (the host routes them to the non-pipelined kernel)
+template<int t_bits, int cb, int N_TILE, bool t_half>
+__device__ __forceinline__
+void moe_gemm_rows_pipe
+(
+    const half* in_addr,
+    const uint16_t* trellis,
+    half* out_addr,
+    int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const int K
+)
+{
+    constexpr int PB = t_half ? EXL3_HALF_BITS(t_bits) : t_bits;
+    #define PIPE_ARGS(MT) in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks
+    while (size_m > 0)
+    {
+        int tm;
+        if constexpr (t_bits)
+        {
+            if (size_m > 48)      { moe_pipe::moe_gemm_pipe<PB, cb, 4, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(64)); tm = 64; }
+            else if (size_m > 32) { moe_pipe::moe_gemm_pipe<PB, cb, 3, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(48)); tm = 48; }
+            else if (size_m > 16) { moe_pipe::moe_gemm_pipe<PB, cb, 2, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(32)); tm = 32; }
+            else                  { moe_pipe::moe_gemm_pipe<PB, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); tm = 16; }
+        }
+        else
+        {
+            // Runtime K in half-bit units, integer rates only (see above)
+            switch (K)
+            {
+                case 2:  moe_pipe::moe_gemm_pipe<1, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 4:  moe_pipe::moe_gemm_pipe<2, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 6:  moe_pipe::moe_gemm_pipe<3, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 8:  moe_pipe::moe_gemm_pipe<4, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 10: moe_pipe::moe_gemm_pipe<5, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 12: moe_pipe::moe_gemm_pipe<6, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 14: moe_pipe::moe_gemm_pipe<7, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 16: moe_pipe::moe_gemm_pipe<8, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+            }
+            tm = 16;
+        }
+        in_addr += tm * size_k;
+        out_addr += tm * size_n;
+        size_m -= tm;
+    }
+    #undef PIPE_ARGS
+}
+
+// The pipelined instances are built for EXL3_MOE_PIPE_WPE waves per SIMD, so two blocks fit one WGP; the
+// host launches that many only after the runtime occupancy query confirms it (exl3_moe.cu)
+#define EXL3_MOE_KERNEL_ATTR __attribute__((amdgpu_waves_per_eu(PIPE ? EXL3_MOE_PIPE_WPE : 1)))
+
+#else
+#define EXL3_MOE_KERNEL_ATTR
+#endif
+
+// PIPE (RDNA only): true = the g/u/d GEMMs run the pipelined mainloop (EXL3_ROCM_MOE_PIPE=1, default),
+// false = the shared inner through moe_gemm_tile (the CUDA path, EXL3_ROCM_MOE_PIPE=0 on RDNA)
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool t_half = false, bool PIPE = false>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+EXL3_MOE_KERNEL_ATTR
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
+#if !defined(USE_ROCM)
+    static_assert(!PIPE, "the pipelined mainloop exists for RDNA only");
+#endif
     const int group_idx = blockIdx.z;
     const int block_idx = blockIdx.x;
     const int group_size = gridDim.x;  // SMs per expert, set at launch
@@ -192,15 +271,6 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 size_m -= tm;
             }
         };
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
-        {
-            gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim);
-        };
-
-        if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
-        group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for g, u + activation+gate + input hadamard for d
         auto had_guad = [&]()
@@ -226,15 +296,47 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             group_barrier(group_idx, group_size, barrier_counters_sense);
         };
 
-        had_guad();
-
-        // d GEMM
+#if defined(USE_ROCM)
+        // g, u and d through ONE call site: with three, clang outlines the GEMM lambda (FLAT loads,
+        // callee-saved spills), and the outlined runtime-K instance hangs on gfx11 for half-integer rates at
+        // the N = 256 tile (every wave returns into the lambda's own epilogue: s[30:31] holds the epilogue
+        // address when s_setpc_b64 runs). Same order and barriers as the CUDA sequence below
+        #pragma nounroll
+        for (int p = gated ? 0 : 1; p < 3; ++p)
+        {
+            if (p == 2)
+            {
+                group_barrier(group_idx, group_size, barrier_counters_sense);
+                had_guad();
+            }
+            const half* in_addr     = p == 0 ? temp_state_g : (p == 1 ? temp_state_u : temp_intermediate_g);
+            half* out_addr          = p == 0 ? temp_intermediate_g : (p == 1 ? temp_intermediate_u : temp_state_g);
+            const uint16_t* trellis = p == 0 ? exp_gate_trellis : (p == 1 ? exp_up_trellis : exp_down_trellis);
+            const int K             = p == 0 ? K_gate : (p == 1 ? K_up : K_down);
+            const int size_k        = p == 2 ? intermediate_dim : hidden_dim;
+            const int size_n        = p == 2 ? hidden_dim : intermediate_dim;
+            if constexpr (PIPE)
+                moe_gemm_rows_pipe<t_bits, cb, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, token_count, size_k, size_n, locks, K);
+            else
+                gemm(in_addr, out_addr, trellis, K, size_k, size_n);
+        }
+#else
+        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        {
+            gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim);
+        };
         auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
         };
 
+        if (gated)
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+        group_barrier(group_idx, group_size, barrier_counters_sense);
+        had_guad();
         gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+#endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for d + scatter add

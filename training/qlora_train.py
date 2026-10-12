@@ -89,6 +89,9 @@ SINGLE_ONLY_KEYS = {
     "inspect", "lora_embed", "lora_head", "module_lora_lr_mul",
     "offload_embed_head_optim",
     "offload_activations", "offload_mode", "vram_spillover", "use_liger",
+    # Streamed routed experts (Session 59) and the PLE n-gram table in RAM
+    # (Session 58); the native single-device backend only.
+    "stream_experts", "stream_experts_slots", "ngram_ram",
     "quant_aware", "quant_aware_scale", "quant_aware_ref_model",
     "torch_profile",   # torch.profiler window; DDP backend has no such flag
     "wandb_project", "wandb_run_name", "wandb_entity",  # not mirrored to DDP yet

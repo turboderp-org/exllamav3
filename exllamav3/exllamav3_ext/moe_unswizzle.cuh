@@ -12,5 +12,7 @@ void moe_unswizzle_trellis
     int64_t tiles_k,
     int64_t tiles_n,
     double K,
-    bool swizzled               // false: plain copy (e.g. K8 matrices are never swizzled)
+    int64_t group = 0,            // packed tile group of these bytes (0/2/8, exl3_moe_cpu_swizzle_group);
+                                  // 0: plain copy (e.g. never-swizzled projections)
+    int64_t planar = 0            // 1: invert the planar dword order too (exl3_moe_cpu_planar_layout)
 );

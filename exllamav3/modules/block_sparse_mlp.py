@@ -4,10 +4,12 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
+from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .linear import has_runtime_lora
@@ -24,17 +26,18 @@ from .block_sparse_mlp_routing import (
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
-# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps
-TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 128))
+# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps (per-backend
+# defaults in util/backend.py)
+TEMP_ROWS_FUSED = MOE_FUSED_ROWS
 TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
-BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
+BATCH_RECON = MOE_BATCH_RECON
 # Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
 # instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
 # launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
 # launch
-MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
@@ -1253,7 +1256,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             for b, e in enumerate(grp):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
-                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                        tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):

@@ -9,6 +9,7 @@ from .linear import has_runtime_lora
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -16,7 +17,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = QKV_SLICE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -1073,16 +1076,18 @@ class Attention(Module):
         from ..cache.qsa import QSAPlanes
 
         # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
-        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
-        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
-        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
+        # as fp16 K/V in a per-call transient of one fixed size, the pool. The (1, chunk)-at-
+        # context-0 measuring pass runs that allocation like any other prefill chunk, but it
+        # lands here as the same two tensors anyway (K and V scratch of pool_pages pages) so
+        # the budget holds whichever chunk shape the loader measures with. QSA bounds its dense
         # prefill and stages a small window; MLA/DSA caches have their own measure
         if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
             from .attention_fn.triton_paged import _qc_staging
             if _qc_staging == 1:
-                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
-                t = torch.empty((n,), dtype = torch.half, device = self.device)
-                del t
+                shape = (layer.qk.shape[0], PAGE_SIZE, layer.token_dim)
+                kd = torch.empty(shape, dtype = torch.half, device = self.device)
+                vd = torch.empty(shape, dtype = torch.half, device = self.device)
+                del kd, vd
             return
 
         if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
@@ -1198,8 +1203,20 @@ class Attention(Module):
             o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
-            # quantized-cache prefill size its staging to the window instead of the job's pages
+            # quantized-cache prefill dequantize the window instead of the job's pages and size
+            # its fixed staging scratch to that bound instead of the pool
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            staging_pages = None
+            if self.qsa_indexer is not None:
+                staging_pages = -(-(self.qsa_indexer.sparse_threshold() + seqlen) // PAGE_SIZE)
+            # Prefill-sized chunks otherwise take the bound from the host copy of cache_seqlens when
+            # the caller has one (the generator builds it on the CPU, so no sync): the kernels' fallback
+            # bound is the block table's width plus the chunk, which counts the chunk twice once the
+            # table covers it and can push a short context into the kv-split regime
+            if max_kv_len is None and seqlen > 16:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             o = attn_dispatch(
                 q = q,
                 k = k,
@@ -1218,6 +1235,7 @@ class Attention(Module):
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
                 max_kv_len = max_kv_len,
+                staging_pages = staging_pages,
             )
 
         if self.headwise_gate:
