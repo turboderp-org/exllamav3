@@ -130,6 +130,22 @@ _FLASH_FN = None
 _FLASH_TRIED = False
 
 
+
+def init_lora_a_(t: torch.Tensor, fan_in: int) -> torch.Tensor:
+    """PEFT's LoRA-A init on an A stored as ``[in_features, r]``.
+
+    PEFT stores A as ``[r, in]`` and uses torch's kaiming-uniform init with
+    a=sqrt(5), whose bound is ``1/sqrt(fan_in)`` with fan_in read from dim 1 =
+    ``in``. Our A is transposed, so the same call read fan_in = r and
+    initialised A ``sqrt(in/r)`` too large (8.9x at r=32 on a 2560-wide input),
+    which made the effective update per Adam step that much larger than PEFT's
+    at the same lr (found 2026-10-11, doc/exl3_vs_bnb_qwen35_4b_2026-10-11.md).
+    Explicit bound, independent of storage layout.
+    """
+    bound = 1.0 / math.sqrt(fan_in)
+    with torch.no_grad():
+        return t.uniform_(-bound, bound)
+
 def _flash_attn_func():
     global _FLASH_FN, _FLASH_TRIED
     if not _FLASH_TRIED:
@@ -336,7 +352,7 @@ class DiffLinear(nn.Module):
             # (lora_init.apply_init_lora) may overwrite both afterwards.
             self.lora_a = nn.Parameter(torch.empty(self.in_features, r, dtype=torch.float32, device=dev))
             self.lora_b = nn.Parameter(torch.zeros(r, self.out_features, dtype=torch.float32, device=dev))
-            nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+            init_lora_a_(self.lora_a, self.in_features)
             # PEFT-style lora_dropout: dropout on the LoRA branch's input only,
             # the frozen base path always sees the undropped x. Train-time only
             # (nn.Dropout is identity in eval; forward also gates on training).
@@ -1115,13 +1131,13 @@ class NativeLlamaQLoRA(nn.Module):
             dev = self._block_devices[0]
             self.embed_lora_a = nn.Parameter(torch.empty(vocab, r, dtype=torch.float32, device=dev))
             self.embed_lora_b = nn.Parameter(torch.zeros(r, hid, dtype=torch.float32, device=dev))
-            nn.init.kaiming_uniform_(self.embed_lora_a, a=5 ** 0.5)
+            init_lora_a_(self.embed_lora_a, vocab)
         if self.lora_head:
             hid, vocab = self.lm_head.in_features, self.lm_head.out_features   # [d, V]
             dev = self._head_device
             self.head_lora_a = nn.Parameter(torch.empty(hid, r, dtype=torch.float32, device=dev))
             self.head_lora_b = nn.Parameter(torch.zeros(r, vocab, dtype=torch.float32, device=dev))
-            nn.init.kaiming_uniform_(self.head_lora_a, a=5 ** 0.5)
+            init_lora_a_(self.head_lora_a, hid)
 
         # --- freeze the trunk (MTP-only stage 2) ------------------------------
         # Every trunk-side trainable keeps its VALUE (a resumed trunk adapter
