@@ -130,7 +130,6 @@ class Gemma4Config(Config):
         )
 
         # Vision model settings
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
         self.boi_token_id = self.read_cfg(int, "boi_token_id", None)
         self.eoi_token_id = self.read_cfg(int, "eoi_token_id", None)
         self.vision_soft_tokens_per_image = self.read_cfg(

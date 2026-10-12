@@ -44,9 +44,13 @@ Shared-memory layout constants mirror cpu/moe_handoff.h.
 MOE_JOB_RING = 256
 MOE_MAX_SLOTS = 8
 MOE_JOB_MAX_EXPERTS = 256   # structural capacity of MoeJob.experts[]; see cpu/moe_handoff.h
-# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + one uint32 pad, all 4-byte
+# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + seq_hi, all 4-byte
 # fields so no compiler padding -- recompute this if the struct's fixed fields ever change
 MOE_JOB_BYTES = (7 + MOE_JOB_MAX_EXPERTS + 1) * 4
+MOE_JOB_SEQ_HI = 7 + MOE_JOB_MAX_EXPERTS   # u32 index of MoeJob.seq_hi
+# Flag width (MOE_FLAG_BITS in cpu/moe_handoff.h): ROCm's stream wait has no cyclic compare, so its
+# flags are 64-bit and never wrap; CUDA's are 32-bit and compared cyclically
+MOE_FLAG_BITS = 64 if torch.version.hip else 32
 MOE_CTRL_JOBS_OFFSET = 384
 MOE_SLOT_FLAGS_OFFSET = MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * MOE_JOB_BYTES
 MOE_MAX_WSLOTS = 8
@@ -56,6 +60,20 @@ MOE_STAGE_TAIL_OFFSET = MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE
 MOE_STAGE_HEAD_OFFSET = MOE_STAGE_TAIL_OFFSET + 64
 MOE_STAGE_JOBS_OFFSET = MOE_STAGE_TAIL_OFFSET + 128
 MOE_CTRL_SIZE = MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * MOE_JOB_BYTES
+
+
+def _set_job_seq(job, seq: int):
+    """Sequence number into a job descriptor (u32 view) as its two 32-bit halves"""
+    job[0] = seq & 0xFFFFFFFF
+    job[MOE_JOB_SEQ_HI] = seq >> 32
+
+
+def _write_flag(u32: np.ndarray, offset: int, value: int):
+    """Host-side write of a handoff flag at a byte offset into the region"""
+    if MOE_FLAG_BITS == 64:
+        u32[offset // 4 : offset // 4 + 2].view(np.uint64)[0] = value
+    else:
+        u32[offset // 4] = value & 0xFFFFFFFF
 
 
 def _align64(x):
@@ -80,14 +98,14 @@ class MoeCpuTuning:
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
         assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
-        # Physical cores kept free of pool workers for the host process when the pool pins its
-        # workers (EXL3_MOE_CPU_PIN); the host is confined to them once the worker has started,
-        # see moe_cpu_affinity.py. 0 disables the reservation and the pinning
+        # Physical cores kept free of pool workers for the host process, whether the pool pins
+        # its workers (EXL3_MOE_CPU_PIN) or lets them float; the host is confined to them once
+        # the worker has started, see moe_cpu_affinity.py. 0 disables the reservation
         self.host_cores = int(os.environ.get("EXL3_MOE_HOST_CORES", 1))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
-        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0, pinning
-        # is off or the topology is unreadable
+        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0 or the
+        # topology is unreadable
         _, n_phys = ext.exl3_moe_cpu_core_order()
         self.threads = int(os.environ.get(
             "EXL3_MOE_CPU_THREADS",
@@ -103,10 +121,11 @@ class MoeCpuTuning:
         # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
         # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
-        # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
-        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
-        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
+        # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
+        # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
+        # AVX-512 tiers, band-2 + planar dwords on AVX2, native on scalar).
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout everywhere.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
         # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
         # into loader tensors and then copied into the arena, so this bounds the transient host
@@ -371,6 +390,24 @@ def _win32_large_page_alloc(size: int, min_size: int):
     return buf
 
 
+def _copy_repacked(dst, tensor, group, planar):
+    """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
+    CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
+    to (nt/group, kt, nt%group), and with planar each tile's dwords are transposed -- dword w
+    to 8*(w%bits) + w/bits, i.e. the trailing (8, bits) dword dims swap (integer rates only,
+    where group is nonzero). One strided copy_; group 0 is a plain copy."""
+    tk, tn, ps = tensor.shape
+    if not group:
+        dst.copy_(tensor)
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
+            tensor.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tn // group, tk, group, ps).copy_(
+            tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
+
+
 class _HugeArena:
     """
     Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
@@ -545,15 +582,15 @@ class _HugeArena:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
                   f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
-    def rehome(self, tensor, band_swizzle = False):
+    def rehome(self, tensor, band_swizzle = 0, planar = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
         returned view stays valid.
 
-        band_swizzle: repack a [k/16, n/16, 16K] trellis tensor band-contiguous during the
-        copy -- physical order becomes (group n/128, k-tile, member, tile), one strided copy_.
-        The returned view keeps the original logical shape; only the byte order differs
-        (consumed by the swz-aware kernels in moe_mul1.cpp)."""
+        band_swizzle/planar: repack a [k/16, n/16, 16K] trellis tensor with the given packed
+        layout during the copy (see _copy_repacked). The returned view keeps the original
+        logical shape; only the byte order differs (consumed by the swz-aware kernels in
+        moe_mul1.cpp)."""
         import torch
         if tensor is None or tensor.numel() == 0:
             return tensor
@@ -571,10 +608,8 @@ class _HugeArena:
         self.cur_off += aligned
         buf = memoryview(self.cur)[off : off + nbytes]
         dst = torch.frombuffer(buf, dtype = torch.uint8)
-        if band_swizzle:
-            tk, tn, ps = tensor.shape
-            dst.view(tensor.dtype).view(tn // 8, tk, 8, ps) \
-               .copy_(tensor.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+        if band_swizzle or planar:
+            _copy_repacked(dst.view(tensor.dtype).view(tensor.shape), tensor, band_swizzle, planar)
         else:
             dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
         return dst.view(tensor.dtype).view(tensor.shape)
@@ -632,12 +667,15 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
-        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
+        # Repack the trellis copies into the packed layout the kernel tier wants for each
+        # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
+        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        swz = TUNING.swizzle
 
         def rehome_trellis(t):
-            return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
+            grp = cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
+            pln = grp and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0)
+            return arena.rehome(t, band_swizzle = grp, planar = pln)
 
         def nbytes(t):
             return t.numel() * t.element_size()
@@ -730,10 +768,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
                 new = stc.get_tensor(key + ".trellis", cpu)
                 assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
-                if swz and v_tr.shape[2] // 16 != 8:
-                    tk, tn, ps = new.shape
-                    v_tr.view(tn // 8, tk, 8, ps) \
-                        .copy_(new.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+                grp = cext.exl3_moe_cpu_swizzle_group(new.shape[2] / 16.0) if swz else 0
+                if grp:
+                    _copy_repacked(v_tr, new, grp, cext.exl3_moe_cpu_planar_layout(new.shape[2] / 16.0))
                 else:
                     v_tr.copy_(new)
                 v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
@@ -1134,12 +1171,12 @@ class MoeCpuHost:
                         done0 = MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS
                         cons0 = MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_SLOTS):
-                            u32[(done0 + s * 64) // 4] = seq
-                            u32[(cons0 + s * 64) // 4] = seq
+                            _write_flag(u32, done0 + s * 64, seq)
+                            _write_flag(u32, cons0 + s * 64, seq)
                         fl = MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_WSLOTS):
-                            u32[(fl + s * 64) // 4] = wseq                          # stage_done
-                            u32[(fl + 64 * MOE_MAX_WSLOTS + s * 64) // 4] = wseq    # pinned_free
+                            _write_flag(u32, fl + s * 64, wseq)                         # stage_done
+                            _write_flag(u32, fl + 64 * MOE_MAX_WSLOTS + s * 64, wseq)   # pinned_free
                         self.v_abort[0] = 1
                     except Exception:
                         pass
@@ -1256,7 +1293,7 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (ring stall)")
                     time.sleep(0.0002)
             job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
+            _set_job_seq(job, seq)
             job[1] = layer_idx
             job[2] = rows
             job[3] = spec["topk"]
@@ -1333,7 +1370,7 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (ring stall)")
                     time.sleep(0.0002)
             job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
+            _set_job_seq(job, seq)
             job[1] = layer_idx
             job[2] = n
             job[3] = spec["topk"]
@@ -1385,32 +1422,53 @@ class MoeCpuHost:
                         mx = max(mx, pd[k][0] * pd[k][1])
         return mx
 
-    def _device_buffers(self, device):
+    def _stream_layout(self, spec):
+        """Packed trellis layout of a layer's streamed projections as ((group, planar) for g, u,
+        d), plus whether any of them needs the GPU restore pass. The arena holds the bytes in
+        the layout the CPU kernel tier wants per bitrate (exl3_moe_cpu_swizzle_group /
+        exl3_moe_cpu_planar_layout, the same rule the child loader and expert replacement
+        apply), and the GPU kernels only read native order, so every packed projection is
+        restored after its DMA. Rates are fixed per layer, so the policy is cached on the spec;
+        a layer with nothing packed reads vram_slots directly (no ring, no copy pass)"""
+        lay = spec.get("stream_layout")
+        if lay is None:
+            pd = spec["proj_dims"]
+            lay = []
+            for nm in ("g", "u", "d"):
+                if pd.get(nm) and TUNING.swizzle:
+                    K = pd[nm][2]
+                    lay.append((int(ext.exl3_moe_cpu_swizzle_group(K)),
+                                int(ext.exl3_moe_cpu_planar_layout(K))))
+                else:
+                    lay.append((0, 0))
+            lay = spec["stream_layout"] = (tuple(lay), any(g or p for g, p in lay))
+        return lay
+
+    def _device_buffers(self, device, spec = None):
         """The persistent device-side buffers of the streamed-prefill path (VRAM weight ring,
-        native-order ring for swizzled experts, reconstruct scratch, fused-tier buffers, batched
+        native-order ring for restored experts, reconstruct scratch, fused-tier buffers, batched
         tier statics), created on first request per device. The autosplit loader requests them
         during a layer's measured load (prefill_worst_case_parts), before the worker starts, so
         they count as allocated when the split is planned instead of appearing on the first real
-        prefill; _ensure_stream_state adopts them"""
+        prefill; _ensure_stream_state adopts them. The native-order ring exists only once a
+        layer whose experts arrive packed asks for it (spec given), so hosts whose tier packs
+        nothing never allocate it; once allocated it stays for later layers to account for"""
         key = torch.device(device).index or 0
         d = self._dev_bufs.get(key)
         mx = self._max_proj_numel()
         if d is None:
-            # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the
-            # child's arena rehome, K8 excepted per matrix); the GPU restores the native tile
-            # order into a parallel ring after each DMA
-            swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
             d = dict(
                 vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                               for _ in range(self.num_wslots)],
-                native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                                for _ in range(self.num_wslots)] if swz else None,
-                swz = swz,
+                native_slots = None,
                 w_scratch = None,
                 fused_bufs = {},
                 recon = {},
             )
             self._dev_bufs[key] = d
+        if spec is not None and d["native_slots"] is None and self._stream_layout(spec)[1]:
+            d["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                                 for _ in range(self.num_wslots)]
         # Reconstruct scratch sized for the largest projection registered so far; grows if a
         # later layer is larger
         if mx and (d["w_scratch"] is None or d["w_scratch"].numel() < mx):
@@ -1427,7 +1485,6 @@ class MoeCpuHost:
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = bufs["vram_slots"],
             native_slots = bufs["native_slots"],
-            swz = bufs["swz"],
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
@@ -1456,6 +1513,11 @@ class MoeCpuHost:
             # streaming keeps the link awake, so the sustained awake rate is the one to use
             bw = probe_bandwidth(timed_copy)
         st["bw"] = bw
+        if st["native_slots"] is not None:
+            # The ring was carved on the compute stream during the measured load; the copy
+            # stream writes into it, so its first write is ordered after that stream (the
+            # allocator may have recycled a block whose last user is still queued there)
+            st["copy_stream"].wait_stream(torch.cuda.current_stream())
         if TUNING.stream_t_explicit:
             st["stream_t"] = self.stream_t
         else:
@@ -1622,7 +1684,7 @@ class MoeCpuHost:
         # its zero row, and the sorted assignment lists
         fixed += (rows + 1) * h * 4 + rows * h * 4 + (rows + 1) * hi * 2 + A * 32
         with torch.cuda.device(device):
-            bufs = self._device_buffers(device)
+            bufs = self._device_buffers(device, spec)
             if self._stream_fused_t(spec, aux, h):
                 self._stream_fused_bufs(bufs, spec, device)
             recon = self._stream_recon_layer(bufs, layer_idx, spec, aux, device)
@@ -1684,6 +1746,10 @@ class MoeCpuHost:
         # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path
         blocks = self.layer_blocks[layer_idx] if self.pinned else None
 
+        # Packed-layout policy of this layer's projections (see _stream_layout): packed bytes
+        # are restored to native order after the DMA, so the kernels below always see native
+        layout, restore = self._stream_layout(spec)
+
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
         # experts too hot for the temp buffers take the per-expert reconstruct path. Same
         # eligibility as support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2
@@ -1725,13 +1791,13 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (stage ring stall)")
                     time.sleep(0.0002)
                 job = self.v_stage_jobs[stail % MOE_STAGE_RING]
-                job[0] = seq
+                _set_job_seq(job, seq)
                 job[1] = layer_idx
                 job[2] = len(batch)
                 job[3] = 0
                 job[4] = ws
                 job[5] = 1    # MOE_JOB_KIND_STAGE
-                job[6] = self.wslot_prev_seq[ws]
+                job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
                 for bi, e in enumerate(batch):
                     job[7 + bi] = e
                 self.v_stage_tail[0] = stail + 1
@@ -1745,23 +1811,31 @@ class MoeCpuHost:
                     st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
+            if restore and st["native_slots"] is None:
+                # First batch on this device that needs native-order bytes: adopt the ring the
+                # measured load allocated, or allocate it now (manual loads) on the compute
+                # stream. The caching allocator ties the block to the stream it was carved on,
+                # so the copy stream's first write into it is ordered after that stream
+                st["native_slots"] = self._device_buffers(y.device, spec)["native_slots"]
+                copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
-                if st["swz"]:
-                    # Restore the native tile order on the copy stream, one launch per projection
-                    # over the whole batch (K8 matrices were never swizzled: plain copy)
-                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
+                if restore:
+                    # Restore the native tile order on the copy stream, one launch per
+                    # projection over the whole batch (group-0 projections in an otherwise
+                    # packed layer take the plain-copy path in the same kernel)
+                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
                         if not pd.get(name):
                             continue
                         k, n, K = pd[name]
                         ext.moe_unswizzle_trellis(
                             st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, K != 8)
+                            k // 16, n // 16, K, layout[pi][0], layout[pi][1])
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
+            vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
@@ -1940,6 +2014,10 @@ class MoeCpuHost:
         self.aux = {}
         self.acked = 0
         self.live_layers = 0
+        self.seq = self.wseq = 0
+        self.next_slot = self.next_wslot = 0
+        self.slot_last_seq = [0] * MOE_MAX_SLOTS
+        self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:

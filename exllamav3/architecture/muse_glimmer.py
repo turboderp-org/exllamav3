@@ -117,7 +117,6 @@ class MuseGlimmerConfig(Config):
         # Vision model settings
         read_vision_config = self.read_cfg(dict, "vision_config", no_default)
         self.vision = read_muse_glimmer_vision_config(read_vision_config)
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
 
         prep_path = os.path.join(self.directory, "processor_config.json")
         with open(prep_path, encoding = "utf8") as f:

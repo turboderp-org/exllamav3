@@ -149,6 +149,7 @@ void had_r_128
     if (input.dtype() == at::kHalf)
     {
         TORCH_CHECK_DTYPE(output, kHalf);
+        if (!rows || !blocks) return;
         if (pre_scale.has_value())
             had_hf_r_128_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             (
@@ -179,6 +180,7 @@ void had_r_128
     else if (input.dtype() == at::kFloat)
     {
         TORCH_CHECK_DTYPE(output, kFloat);
+        if (!rows || !blocks) return;
         if (pre_scale.has_value())
             had_ff_r_128_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             (
@@ -248,6 +250,7 @@ void had_r_128_dual
     if (input1.dtype() == at::kHalf)
     {
         TORCH_CHECK_DTYPE(output1, kHalf);
+        if (!rows || !blocks) return;
         if (pre_scale1.has_value())
             had_hf_r_128_dual_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             (
@@ -287,6 +290,7 @@ void had_r_128_dual
     else if (input1.dtype() == at::kFloat)
     {
         TORCH_CHECK_DTYPE(output1, kFloat);
+        if (!rows || !blocks) return;
         if (pre_scale1.has_value())
             had_ff_r_128_dual_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             (
@@ -360,7 +364,6 @@ void had_r_128_batch
     TORCH_CHECK_DTYPE(table, kHalf);
     TORCH_CHECK_DIM(table, 2);
     TORCH_CHECK(table.is_contiguous() && table.size(1) == cols, "scale table must be contiguous [E, cols]");
-    if (!rows) return;
 
     int blocks = cols / 128;
     float r_scale = scale * 0.088388347648f;
@@ -371,6 +374,7 @@ void had_r_128_batch
     if (input.dtype() == at::kHalf)
     {
         TORCH_CHECK_DTYPE(output, kHalf);
+        if (!rows || !blocks) return;
         if (pre)
             had_hf_r_128_batch_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             ((const half*) input.data_ptr(), (half*) output.data_ptr(), (const half*) table.data_ptr(),
@@ -383,6 +387,7 @@ void had_r_128_batch
     else if (input.dtype() == at::kFloat)
     {
         TORCH_CHECK_DTYPE(output, kFloat);
+        if (!rows || !blocks) return;
         if (pre)
             had_ff_r_128_batch_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
             ((const float*) input.data_ptr(), (float*) output.data_ptr(), (const half*) table.data_ptr(),

@@ -94,9 +94,12 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
     while (true)
     {
+        // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
+        // forward pass that feeds it
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
         // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
         // readback for the full sleep quantum (a 1 ms nap at this spot showed up as a slow first
@@ -557,6 +560,12 @@ void pg_all_reduce_cpu
     size_t device_data_size = tensor.numel() * tensor.element_size();
 
     TORCH_CHECK(cpu_data_size % 16 == 0, "data_size must be multiple of 16");
+    TORCH_CHECK(tensor.dtype() == at::kFloat || tensor.dtype() == at::kHalf || tensor.dtype() == at::kBFloat16,
+                "pg_all_reduce_cpu: Unknown dtype");
+
+    // Every rank reduces a tensor of the same shape, so an empty reduce is a no-op on all of them.
+    // It must not reach the job queue either: a zero-size job is the CPU helper's end-of-round marker
+    if (!tensor.numel()) return;
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
 

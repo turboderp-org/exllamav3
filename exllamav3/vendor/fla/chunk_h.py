@@ -12,9 +12,7 @@ import triton.language as tl
 from .index import prepare_chunk_offsets
 from .op import exp2
 from .utils import autotune_cache_kwargs
-from .utils import check_shared_mem
-
-BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
+from .utils import autotune
 
 
 @triton.heuristics({
@@ -22,11 +20,11 @@ BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
+@autotune(
+    configs=lambda dev: [
         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
+        for BK in ([32, 64] if dev.shared_mem() else [16, 32])
+        for BV in ([32, 64] if dev.shared_mem() else [16, 32])
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],

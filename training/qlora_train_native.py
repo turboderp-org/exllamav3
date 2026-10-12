@@ -1924,6 +1924,21 @@ def _run_main():
                          "VRAM reporting is unavailable in this mode, and --parallel "
                          "split is rejected (its capacity probing is meaningless "
                          "when allocations never fail). See training/uvm_allocator.py.")
+    ap.add_argument("--stream-experts", action="store_true",
+                    help="MoE models: keep the routed experts' packed EXL3 weights in "
+                         "page-locked host RAM and stream them into a small VRAM ring "
+                         "one layer at a time, prefetched one layer ahead, instead of "
+                         "holding them on the GPU (training.expert_stream; the 16 GB "
+                         "tier for Qwen3.8-Flash-Next, whose experts alone are ~31 GB "
+                         "at 2.05 bpw). Value-exact: same loss as the resident run. "
+                         "Host RAM must hold every expert (checked up front). Single "
+                         "device only; rejects --parallel split, --vram-spillover, "
+                         "--sample-every > 0 (the inference forward needs resident "
+                         "experts) and routed-expert adapter targets.")
+    ap.add_argument("--stream-experts-slots", type=int, default=2,
+                    help="VRAM ring slots for --stream-experts (default 2 = current + "
+                         "one prefetched layer; each slot is one layer's experts, "
+                         "~0.65 GB at 2.05 bpw). More slots prefetch further ahead.")
     ap.add_argument("--use-liger", action="store_true",
                     help="Route RMSNorm (2D/3D norms) and SwiGLU (silu only) through "
                          "Liger Triton kernels for lower activation memory + speed. "
@@ -2066,6 +2081,11 @@ def _run_main():
                          "HF/Unsloth GA fix). mean: the pre-Session-11 mean-of-"
                          "means (over-weights tokens in short micro-batches), "
                          "kept for reproducing old runs. No-op at --grad-accum 1.")
+    ap.add_argument("--ngram-ram", action="store_true",
+                    help="PLE models (Qwen3.8-Flash-Next): hold the hashed n-gram "
+                         "embedding table fully in system RAM instead of streaming "
+                         "rows from disk per forward (tens of GB of RAM; the "
+                         "inference loader's --ngram_ram).")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
                     help="Frozen-weight dequant path (audit A1). fast (default): "
                          "reconstruct only the inner trellis weight and apply the "
@@ -2125,6 +2145,17 @@ def _run_main():
     # in this process (dataset build, eval build, --sample-every prompts) agrees.
     from chat_jinja import set_strip_sys_prompt_extras
     set_strip_sys_prompt_extras(args.strip_sys_prompt_extras)
+
+    # Expert streaming is single-device by design and cannot serve the
+    # inference forward (live samples); refuse the combinations up front.
+    if args.stream_experts:
+        from exllamav3.training import expert_stream as _es
+        problems = _es.incompatible_flags(
+            args.parallel, args.vram_spillover, args.sample_every, args.targets,
+            args.expert_r)
+        if problems:
+            raise SystemExit("--stream-experts cannot be combined with:\n  - "
+                             + "\n  - ".join(problems))
 
     # UVM spillover must be installed before the first CUDA tensor exists, so
     # this runs before anything touches a device (model load is the first).
@@ -2208,6 +2239,9 @@ def _run_main():
     # 1. Load native model + tokenizer (the forward that's correct on EXL3).
     _FAIL_CTX["phase"] = "load_model"
     config = Config.from_directory(args.model)
+    if args.ngram_ram:
+        # Read by NGramEmbedding.load(); the default streams rows from disk.
+        config.infer_params.ngram_stream_from_disk = False
     model = Model.from_config(config)
 
     # The KV cache must be created BEFORE model.load() so each attention layer
@@ -2239,6 +2273,18 @@ def _run_main():
         active_devices = list(model.active_devices)
         print(f" -- layer-autosplit: active devices {active_devices}, "
               f"output device {model.output_device}")
+    elif args.stream_experts:
+        # Single-device load that parks each MoE block's routed experts in
+        # host RAM as the block lands (peak VRAM: dense trunk + one layer's
+        # experts), then streams them per layer during training.
+        from exllamav3.training import expert_stream as _es
+        streamer = _es.load_streaming(model, args.device, slots=args.stream_experts_slots,
+                                      progressbar=True)
+        active_devices = [torch.device(args.device).index]
+        if not streamer.layers:
+            raise SystemExit("--stream-experts: this model has no block-sparse MoE "
+                             "layers to stream; drop the flag.")
+        print(f" -- {streamer.describe()}")
     else:
         model.load(device=args.device, progressbar=True)
         active_devices = [torch.device(args.device).index]
@@ -2312,11 +2358,19 @@ def _run_main():
                  if not net.trunk_trainable() else
                  f"trained jointly (loss = trunk + {args.mtp_loss_weight:g} * mtp)"))
     if args.pack and (getattr(net, "has_gdn", False)
-                      or getattr(net, "has_shortconv", False)):
+                      or getattr(net, "has_shortconv", False)
+                      or getattr(net, "has_ple", False)):
         raise SystemExit(
-            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6) or ShortConv "
-            "(LFM2) models: the recurrence / causal conv would carry state "
-            "across packed document boundaries. Drop --pack and train unpacked.")
+            "--pack is not supported on GatedDeltaNet (Qwen3.5/3.6), ShortConv "
+            "(LFM2) or PLE (Qwen3.8-Flash-Next) models: the recurrence / causal "
+            "conv / n-gram history would carry state across packed document "
+            "boundaries. Drop --pack and train unpacked.")
+    if net.qsa_threshold is not None and args.seq_len > net.qsa_threshold:
+        raise SystemExit(
+            f"--seq-len {args.seq_len} exceeds this model's QSA dense-attention "
+            f"threshold ({net.qsa_threshold}): the native forward attends densely "
+            f"and only reproduces inference up to that length. Use --seq-len <= "
+            f"{net.qsa_threshold}.")
     if args.head_vocab_chunk and net._head_slice is None:
         print(" -- note: --head-vocab-chunk set but this head can't slice; using "
               "the single-shot fused head.")
@@ -3315,6 +3369,8 @@ def _run_main():
           f"{tot_seen / dt if dt else 0:,.0f} tot tok/s | "
           f"peak VRAM {peak_str} | {dt:.0f}s for {step} steps | "
           f"step time: {timer.summary()}")
+    if args.stream_experts:
+        print(f"[STREAM] {streamer.stats_line()}")
     log_run("completed", dt, val_loss, final_eval2)
     final_summary = {k: v for k, v in {
         "end_loss": end_loss, "final_val": val_loss,

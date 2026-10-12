@@ -239,6 +239,8 @@ def mp_model_forward(
         "positions",
         "position_ids",
         "recurrent_slots",
+        "recurrent_slots_scan",
+        "recurrent_slots_scan_in",
         "inv_freq",
         "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
     ]:

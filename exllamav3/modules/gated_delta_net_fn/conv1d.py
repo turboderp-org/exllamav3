@@ -402,10 +402,13 @@ def causal_conv1d_update(
     history: bool = False,
     params: dict = None,
     token_major: bool = False,
+    incremental: bool = False,
 ):
     """
     token_major: mixed_qkv is the (bsz, seqlen, dim) projection output (fp16/bf16/fp32) read
-    in place by the Triton kernel; output is (bsz, seqlen, dim) bf16 either way
+    in place by the Triton kernel; output is (bsz, seqlen, dim) bf16 either way.
+    incremental: a later step of a history pass fed one step at a time (the window is the tail of
+    the ring, see conv1d_update_kernel); CUDA path only
     """
     if token_major:
         bsz, seqlen, dim = mixed_qkv.shape
@@ -442,9 +445,11 @@ def causal_conv1d_update(
             out,
             True,
             history,
+            incremental,
         )
         return out
 
+    assert not incremental, "incremental conv steps need the CUDA conv kernel (bf16, channel-major, short)"
     if dummy_slots:
         recurrent_slots = buffered_arange(bsz, mixed_qkv.device)
     mixed_qkv = causal_conv1d_update_slotted_triton(

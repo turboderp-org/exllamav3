@@ -1,12 +1,12 @@
 """
 Host-side CPU placement for the CPU MoE offload path.
 
-The worker pool (cpu/moe_mul1.cpp Pool) pins one compute thread per physical core, in
-physical_core_order(): one LP per core first, then every SMT sibling. The parent process (the
-thread driving the forward pass, CUDA's driver threads, an API server's executor threads) is
-not pinned, so the scheduler can drop it on a worker's LP. A pinned worker cannot move away,
-so it becomes the straggler at every per-phase barrier of the job. This module plans and applies
-that placement.
+The worker pool (cpu/moe_mul1.cpp Pool) runs one compute thread per physical core, pinned by
+default in physical_core_order(): one LP per core first, then every SMT sibling. The parent
+process (the thread driving the forward pass, CUDA's driver threads, an API server's executor
+threads) is not pinned, so the scheduler can drop it on a worker's LP, where the worker becomes
+the straggler at every per-phase barrier of the job. This module plans and applies the host
+placement, with the workers pinned or floating alike (the pool reports its topology either way).
 """
 import os
 import sys

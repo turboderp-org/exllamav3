@@ -810,6 +810,10 @@ def main():
     ap.add_argument("--skip-head-slice-check", action="store_true",
                     help="skip the chunked-vocab head equality check (it gates "
                          "--head-vocab-chunk; runs by default when the head can slice)")
+    ap.add_argument("--ngram-ram", action="store_true",
+                    help="PLE models (Qwen3.8-Flash-Next): hold the n-gram table in "
+                         "system RAM instead of streaming rows from disk (see the "
+                         "trainer's --ngram-ram).")
     ap.add_argument("--dequant-mode", choices=["fast", "legacy"], default="fast",
                     help="Dequant path for the main forward compare (matches the "
                          "trainer flag). The fast-vs-legacy parity gate below runs "
@@ -826,6 +830,8 @@ def main():
     prompts = args.prompts or DEFAULT_PROMPTS
 
     config = Config.from_directory(args.model)
+    if args.ngram_ram:
+        config.infer_params.ngram_stream_from_disk = False
     model = Model.from_config(config)
     if args.parallel == "split":
         load_kwargs = {}

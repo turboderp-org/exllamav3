@@ -121,6 +121,7 @@ def add_args(
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
         parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
+        parser.add_argument("-hdt", "--hybrid_draft_tokens", type = int, help = "Hybrid drafting: when a job's current suffix matches at least this many tokens of its earlier context, draft that many tokens of the continuation (on top of any other drafting mode)", default = 0)
         parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
@@ -279,6 +280,7 @@ def init(
         draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
         vars(args).get("num_draft_tokens") or 0,
         4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
+        vars(args).get("hybrid_draft_tokens") or 0,
     )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
@@ -299,12 +301,16 @@ def init(
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
+            # The draft cache gets the same speculative headroom and slot count: a recurrent drafter
+            # keeps its own state pool and checkpoints alongside the target's
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             ) if draft_model_dir else None
         else:
             cache = Cache(
@@ -317,7 +323,9 @@ def init(
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             ) if draft_model_dir else None
     else:
         cache = None

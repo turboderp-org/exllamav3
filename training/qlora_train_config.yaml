@@ -335,6 +335,17 @@ vram_spillover: false     # single only, Linux only: allocate CUDA tensors as un
                           #   levers above and keep this as the safety net. A few % over VRAM is
                           #   usable; heavy oversubscription crawls. Peak-VRAM stats read n/a.
                           #   Builds a tiny allocator with nvcc on first use (training/uvm_allocator.py)
+stream_experts: false     # single only, MoE models: keep the routed experts' packed EXL3 weights in
+                          #   pinned host RAM and stream them into a small VRAM ring one layer at a
+                          #   time, prefetched a layer ahead (the 16 GB tier for Qwen3.8-Flash-Next,
+                          #   whose experts alone are ~31 GB). Value-exact. Host RAM must hold every
+                          #   expert (checked up front). Rejects parallel: split, vram_spillover,
+                          #   sample_every > 0 (live samples are an inference forward) and expert_*
+                          #   targets / expert_r. See README "Streaming routed experts from host RAM"
+stream_experts_slots: 2   # VRAM ring slots for stream_experts: 2 = current + one prefetched layer
+                          #   (~0.65 GB each at 2.05 bpw on Qwen3.8-Flash-Next); more = further ahead
+ngram_ram: false          # PLE models (Qwen3.8-Flash-Next): hold the hashed n-gram table fully in
+                          #   system RAM (tens of GB) instead of streaming rows from disk per forward
 use_liger: false          # single/split only: RMSNorm + SwiGLU through Liger Triton kernels (lower
                           #   activation memory, faster; slightly different numerics -- gate with
                           #   qlora_validate_native.py --use-liger first)

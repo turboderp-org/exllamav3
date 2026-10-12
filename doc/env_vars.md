@@ -182,21 +182,42 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
-  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
-  pass, so the space is reserved at load time rather than discovered at the first long prefill.
-  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  a per-call transient of one fixed size, the full cache at batch size 1
+  (`2 * max_num_tokens * num_kv_heads * head_dim` fp16 elements; QSA layers use their bounded
+  dense window instead), so the allocator sees the same request on every prefill chunk rather
+  than a size that grows with the context. The autosplit measuring pass budgets it, so the
+  space is accounted for at load time; loads with an explicit split map it at the first long
+  prefill. For very large caches this is the tradeoff to weigh against `0` (e.g. ~4 GB at
   1M tokens with 8 kv heads of dim 128).
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
-### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`, `9` on Turing)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
-over long contexts at low cache bitrates). Tuning/testing knob.
+over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
+below) every prefill chunk stages. Tuning/testing knob.
+
+### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+
+Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
+dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
+dequantization of a quantized cache, or the fp16 cache's own pages, viewed where they are
+consecutive and gathered otherwise, then PyTorch's memory-efficient SDPA per KV group (its
+cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions for sm_75, so the
+Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
+kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
+`1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
+off on Turing.
+
+### `EXL3_FA75` (default: on for sm_75, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
+`mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
+its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
@@ -295,6 +316,24 @@ pipeline everywhere, for A/B testing.
 
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
+
+### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
+
+Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels
+use a plain launch with a software device barrier, so every block of a grid must be resident at
+once; the autotuner sizes its candidate grids from `hipOccupancyMaxActiveBlocksPerMultiprocessor`,
+whose per-target resource accounting is not reliable (gfx1150 reports more blocks per WGP than its
+LDS holds for these kernels, and the barrier then deadlocks with the GPU at 100%). The default
+clamps grids to one block per WGP, which is what the API returns anyway for the regular shapes on
+gfx1100 and gfx1201. Set higher to allow more blocks per WGP, or `0` to trust the API. The fused
+MoE kernel has its own bound (`EXL3_ROCM_MOE_BPS=1` forces one block per WGP there).
+
+### `EXL3_DEBUG_AUTOTUNE` (default: unset)
+
+Print every GEMM autotune candidate (shape, LDS, blocks per WGP before and after the clamp, grid)
+and synchronize after each probe and measurement launch, naming it first, so a launch that never
+completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
+launches.
 
 ## Sampling
 
@@ -427,17 +466,20 @@ testing. Read once per process (parent and worker independently).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
-Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
-load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
-(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
-leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
-(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
-and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+Repack the CPU worker's expert trellis copies into a packed layout at load, so each GEMV band
+streams sequentially from DRAM instead of in short strided runs. The layout is per kernel tier
+(rule: `exl3_moe_cpu_swizzle_group`): the AVX-512 tiers (`vbmi`, `bw`, `vnni`) band output tiles
+in groups of 8, except K8 tensors, which route to the dword kernel and stay native (+45-75%
+cold decode GEMV throughput on a 7960X, reaching the sequential-read roofline). The `avx2` tier
+bands integer rates in groups of 2 and additionally repacks each tile's 32-bit words into the
+"planar" order (dword `w` moves to `8 * (w % bits) + w / bits`): under the tensor-core tile
+permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
+collapses to a single `vpermd` instead of walking the tile's registers, which removes the
+rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
+tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
+tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -688,28 +730,28 @@ Seconds the parent waits for the CPU worker to signal ready after every offloade
 been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
 so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
-### `EXL3_MOE_CPU_PIN` (default: `1` on Windows, `0` on Linux)
+### `EXL3_MOE_CPU_PIN` (default: `1`)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
-SMT siblings last, instead of leaving placement to the OS scheduler, and reserve cores for the
-host process (`EXL3_MOE_HOST_CORES`). Two workers sharing a physical core, or a worker sharing
-one with the host's spin-waiting threads, becomes the straggler at every per-phase barrier of a
-job. Which side of that trade-off wins depends on the scheduler. On Windows the pinned layout
-with a reserved host core is faster and far steadier than floating threads. On Linux the
-opposite was measured end to end: CFS keeps the workers and the host's spin-waits on distinct
-cores by itself, while a pinned layout cannot adapt to whatever else lands on its cores and so
-settles on a different throughput level each run; unpinned runs are faster and repeatable.
-Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
-pinning if the CPU topology can't be read.
+SMT siblings last, instead of leaving placement to the OS scheduler. Two workers sharing a
+physical core, or a worker sharing one with the host's threads, becomes the straggler at every
+per-phase barrier of a job. A floating pool depends on the scheduler keeping that layout apart
+on its own; that works on some hosts and loses a large share of decode throughput on others
+(hosts with small L3 domains, VM guests), while the pinned layout can only lose to whatever
+else lands on its cores, so pinning is the default on every platform. `0` lets the workers
+float, which can be worth testing on a host that also runs other work; the reserved host core
+(`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
+topology can't be read.
 
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
-Physical cores kept free of worker threads and reserved for the host process. Only in effect with
-`EXL3_MOE_CPU_PIN` on (the Windows default): the pool then pins one compute thread per physical core; the parent process (the thread driving the
-forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
-worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
-every per-phase barrier. The default worker count leaves this many cores free, and once the worker
-has started the host process is confined to them (both SMT siblings). If an explicit thread count
+Physical cores kept free of worker threads and reserved for the host process. The pool runs one
+compute thread per physical core; the parent process (the thread driving the forward, CUDA's
+driver threads, an API server's executor threads) is otherwise free to land on a worker's logical
+processor, where a pinned worker cannot move away and a floating one is only moved after the
+damage, so it becomes the straggler at every per-phase barrier. The default worker count leaves
+this many cores free, and once the worker has started the host process is confined to them (both
+SMT siblings), whether or not the workers are pinned. If an explicit thread count
 covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
 shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
 (Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host

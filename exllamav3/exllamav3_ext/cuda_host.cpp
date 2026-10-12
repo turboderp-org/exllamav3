@@ -3,19 +3,22 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 
+// The runtime records a failed call's error as the last error as well. Errors these functions report (or deliberately
+// ignore) must be consumed, or the next cudaGetLastError() elsewhere (torch's launch checks) attributes them to
+// something unrelated
+static void consume_error(cudaError_t cr)
+{
+    if (cr != cudaSuccess) cudaGetLastError();
+}
+
 void cuda_host_register(uintptr_t ptr, size_t nbytes, unsigned int flags)
 {
     cudaError_t cr = cudaHostRegister(reinterpret_cast<void*>(ptr), nbytes, flags);
 
     // A region can only be pinned once per process, but ranks sharing an arena may each try to
-    // register it. The runtime also records the returned error as the last error, so clear it or
-    // the next cudaGetLastError() elsewhere (torch's launch checks) attributes it to something
-    // unrelated
-    if (cr == cudaErrorHostMemoryAlreadyRegistered)
-    {
-        cudaGetLastError();
-        return;
-    }
+    // register it
+    consume_error(cr);
+    if (cr == cudaErrorHostMemoryAlreadyRegistered) return;
 
     TORCH_CHECK(
         cr == cudaSuccess,
@@ -30,11 +33,8 @@ void cuda_host_unregister(uintptr_t ptr)
 
     // Teardown is racy by nature: the region may already have been released, or the runtime may
     // be unloading while shared segments are still being torn down. Both are benign here
-    if (cr == cudaErrorHostMemoryNotRegistered || cr == cudaErrorCudartUnloading)
-    {
-        cudaGetLastError();
-        return;
-    }
+    consume_error(cr);
+    if (cr == cudaErrorHostMemoryNotRegistered || cr == cudaErrorCudartUnloading) return;
 
     TORCH_CHECK(
         cr == cudaSuccess,
@@ -49,6 +49,7 @@ uintptr_t cuda_host_get_device_pointer(uintptr_t ptr)
     // WSL2), where the host pointer is not usable in kernels and this alias must be passed instead
     void* dev_ptr = nullptr;
     cudaError_t cr = cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void*>(ptr), 0);
+    consume_error(cr);
 
     TORCH_CHECK(
         cr == cudaSuccess,
@@ -70,6 +71,7 @@ int cuda_device_get_attribute(int attr, int device)
 #else
     cudaError_t cr = cudaDeviceGetAttribute(&value, static_cast<cudaDeviceAttr>(attr), device);
 #endif
+    consume_error(cr);
 
     TORCH_CHECK(
         cr == cudaSuccess,
@@ -90,6 +92,7 @@ at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device)
     TORCH_CHECK(t.is_pinned(), "pinned_cuda_view: tensor must be pinned");
     void* dev_ptr = nullptr;
     cudaError_t cr = cudaHostGetDevicePointer(&dev_ptr, t.data_ptr(), 0);
+    consume_error(cr);
     TORCH_CHECK(
         cr == cudaSuccess,
         "cudaHostGetDevicePointer(", t.data_ptr(), ") failed: ", cudaGetErrorString(cr)

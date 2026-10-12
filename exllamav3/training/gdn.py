@@ -38,7 +38,9 @@ Semantics (matching the inference module + its CUDA fused op, gdn.cu):
       S_t = exp(g_t) * S_{t-1} + k_t ⊗ (beta_t * (v_t - (exp(g_t)*S_{t-1})^T k_t))
       o_t = (S_t^T q_t) * dk^-0.5
 
-* output norm: ``rmsnorm(o) * (w + bias) * silu(z)`` (``GatedRMSNorm``)
+* output norm: ``rmsnorm(o) * (w + bias) * silu(z)`` (``GatedRMSNorm``), or
+  ``* sigmoid(z)`` on a ``gate_activation = "sigmoid"`` norm
+  (Qwen3.8-Flash-Next's ``output_gate_type``)
 """
 
 from __future__ import annotations
@@ -125,9 +127,15 @@ def gdn_causal_conv1d_silu(
 
 def gdn_gated_rmsnorm(x: torch.Tensor, spec: dict, gate: torch.Tensor) -> torch.Tensor:
     """Gated RMSNorm over the value-head dim: ``rmsnorm(x) * (w + bias) *
-    silu(gate)``, fp32 internals, returned in ``x``'s dtype. ``spec`` is a
-    ``backbone.norm_spec``-shaped dict (weight/eps/bias); ``x``/``gate`` are
-    ``[b, t, nv, dv]``. Matches ``GatedRMSNorm.forward_torch``."""
+    act(gate)``, fp32 internals, returned in ``x``'s dtype. ``spec`` is a
+    ``backbone.gdn_norm_spec`` dict (weight/eps/bias + ``gate_activation``);
+    ``x``/``gate`` are ``[b, t, nv, dv]``. ``gate_activation`` is ``"silu"``
+    (Qwen3.5/3.6 -- ``GatedRMSNorm.forward_torch``) or ``"sigmoid"``
+    (Qwen3.8-Flash-Next's ``output_gate_type``, KDA -- the module's sigmoid
+    path: weighted norm, then ``* sigmoid(gate)``, all fp32). Anything else
+    is rejected by ``gdn_norm_spec`` at construction, never guessed here."""
+    act = spec.get("gate_activation", "silu")
+    assert act in ("silu", "sigmoid"), f"unknown GDN gate activation {act!r}"
     xf = x.float()
     var = xf.pow(2).mean(dim=-1, keepdim=True) + spec["eps"]
     xn = xf * torch.rsqrt(var)
@@ -136,7 +144,8 @@ def gdn_gated_rmsnorm(x: torch.Tensor, spec: dict, gate: torch.Tensor) -> torch.
         w = w.float()
         b = spec["bias"]
         xn = xn * (w + b) if b != 0.0 else xn * w
-    xn = xn * F.silu(gate.float())
+    g = gate.float()
+    xn = xn * (torch.sigmoid(g) if act == "sigmoid" else F.silu(g))
     return xn.to(x.dtype)
 
 

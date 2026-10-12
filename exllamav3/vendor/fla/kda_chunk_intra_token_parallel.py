@@ -11,12 +11,13 @@ import triton
 import triton.language as tl
 from .op import exp2
 from .utils import autotune_cache_kwargs
+from .utils import autotune
 
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({'BH': BH}, num_warps=num_warps)
         for BH in [1, 2, 4, 8]
