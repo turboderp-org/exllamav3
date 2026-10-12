@@ -152,7 +152,15 @@ __device__ __forceinline__ void sincos_accurate(float x, float* s, float* c)
     const float k = rintf(x * 0.15915494309189535f);
     float r = fmaf(-k, 6.28318548202514648f, x);
     r = fmaf(-k, -1.74845553e-7f, r);
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     __sincosf(r, s, c);
+#else
+    // Host pass of a .cpp that includes this header: the body is parsed, never run, and the
+    // intrinsic is only declared under the device compilers (glibc declares a __sincosf of its
+    // own, MSVC's CRT does not)
+    *s = sinf(r);
+    *c = cosf(r);
+#endif
 }
 
 #define NEG_INF_F16 __ushort_as_half(0xFC00)

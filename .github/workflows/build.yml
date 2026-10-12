@@ -102,10 +102,25 @@ jobs:
           elif target == "rocm":
               combos = [c for c in combos if c["rocm"]]
 
+          # One job per OS, backend and torch saves the compiler cache (Python 3.12 where present);
+          # the other Python versions of the same torch only restore it, their compiles being
+          # identical (see the cache steps). One cache per torch rather than per job keeps the
+          # repository's cache storage to a generation or two of full builds. The smoke build
+          # never saves: its single-arch entries would seed the real builds with a near-empty cache
+          for c in combos:
+              c["save_cache"] = False
+          if target != "windows_smoke":
+              groups = {}
+              for c in combos:
+                  groups.setdefault((c["os"], c["cuda"], c["rocm"], c["torch"]), []).append(c)
+              for group in groups.values():
+                  saver = max(group, key = lambda c: (c["pyver"] == "3.12", c["pyver"]))
+                  saver["save_cache"] = True
+
           print(f"{len(combos)} jobs:")
           for c in combos:
               backend = f"CUDA {c['cuda']}" if c["cuda"] else f"ROCm {c['rocm']}"
-              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}")
+              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}" + (" (saves the compiler cache)" if c["save_cache"] else ""))
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": combos}) + "\n")
@@ -165,44 +180,75 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
-      # Compiler cache for the Linux builds: ccache in front of nvcc / hipcc and the host compiler
-      # (torch's BuildExtension does this itself for CUDA when ccache is on PATH; the HIP compiler is
-      # named through PYTORCH_NVCC below), with the cache directory carried between runs through the
-      # Actions cache. Keys end in the commit so every run saves its own state; the restore prefixes
-      # fall back to the latest cache for the same backend/torch and, failing that, any Python version
-      # of it. The kernel translation units include no Python headers, so their compiles are identical
-      # across Python versions once the torch include path is too: the venv's site-packages (whose
-      # path carries the Python version) is reached through a fixed symlink on PYTHONPATH (next step),
-      # and that is the path ccache sees in the preprocessed source
+      # Compiler cache: on Linux ccache in front of nvcc / hipcc (named through PYTORCH_NVCC in the
+      # build steps: torch only wraps the compilers by itself from 2.13 on) and the host compiler
+      # (ccache's masquerade directory ahead on PATH, which torch 2.13's own "ccache c++" also
+      # resolves through, ccache skipping itself), on Windows sccache in front of nvcc (torch never
+      # wraps the compilers there, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
+      # compiler stays uncached since older torch versions name cl directly in the ninja rule, and
+      # the .cpp units are a small share of the build). The cache directory is carried between runs
+      # through the Actions cache: one cache per OS, backend and torch, saved by one job of the
+      # matrix (save_cache, see the matrix step) and restored by every job of that torch through
+      # the key prefix, falling back to any torch of the same backend (the kernel units that include
+      # no torch headers, most of the build, compile identically under every torch). Keys end in the
+      # commit so every save is a new entry and the restore takes the latest. The kernel
+      # translation units include no Python headers, so their compiles are
+      # identical across Python versions once the torch include path is too: the site-packages
+      # (whose path carries the Python version) is reached through a fixed link on PYTHONPATH
+      # (next step), and that is the path the cache sees in the preprocessed source
       - name: Set up ccache
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y ccache
+          Write-Output "/usr/lib/ccache" >> "$env:GITHUB_PATH"
           $dir = Join-Path $env:RUNNER_TEMP 'ccache'
           Write-Output "CCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_BASEDIR=${{ github.workspace }}" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_NOHASHDIR=1" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines,locale" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_COMPRESS=1" >> "$env:GITHUB_ENV"
-          Write-Output "CCACHE_MAXSIZE=3G" >> "$env:GITHUB_ENV"
+          # zstd level: the default fast level leaves a good share of the object size on the table
+          # and compression only runs on a miss, so a mid level is a cheap way to keep the caches small
+          Write-Output "CCACHE_COMPRESSLEVEL=10" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_MAXSIZE=2G" >> "$env:GITHUB_ENV"
+
+      - name: Set up sccache
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "v0.18.0"
+          $name = "sccache-$ver-x86_64-pc-windows-msvc"
+          curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$name.zip" "https://github.com/mozilla/sccache/releases/download/$ver/$name.zip"
+          if ($LASTEXITCODE -ne 0) { throw "sccache download failed with exit code $LASTEXITCODE" }
+          $dest = Join-Path $env:RUNNER_TEMP 'sccache'
+          Expand-Archive -Path "$name.zip" -DestinationPath $dest -Force
+          $bin = Join-Path $dest $name
+          & (Join-Path $bin 'sccache.exe') --version
+          Write-Output $bin >> "$env:GITHUB_PATH"
+          $dir = Join-Path $env:RUNNER_TEMP 'ccache'
+          Write-Output "SCCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_CACHE_SIZE=2G" >> "$env:GITHUB_ENV"
+          # sccache already stores entries zstd-compressed (hence the Actions cache's own zstd gains
+          # nothing on top); a mid level shrinks them further at a cost paid only on misses
+          Write-Output "SCCACHE_CACHE_ZSTD_LEVEL=10" >> "$env:GITHUB_ENV"
 
       - name: Stable site-packages path for the compiler cache
-        if: runner.os == 'Linux'
         run: |
           $site = python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
           $link = Join-Path $env:RUNNER_TEMP 'site'
-          New-Item -ItemType SymbolicLink -Path $link -Target $site | Out-Null
+          # A junction needs no privilege on Windows and is transparent to the file APIs
+          $kind = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+          New-Item -ItemType $kind -Path $link -Target $site | Out-Null
           Write-Output "PYTHONPATH=$link" >> "$env:GITHUB_ENV"
 
       - name: Restore compiler cache
-        if: runner.os == 'Linux'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-
             ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-
 
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
@@ -226,11 +272,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -255,6 +308,7 @@ jobs:
           Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip" "libcufft.zip"
 
           unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cudart-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvcc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
@@ -307,11 +361,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -347,6 +408,7 @@ jobs:
           }
 
           unzip '*.zip' -d $cudaRoot
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
             xcopy "$($archiveDir.FullName)\*" "$cudaRoot" /E /I /H /Y
@@ -471,6 +533,11 @@ jobs:
             Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
+            # torch takes this command verbatim for the ninja nvcc rule (nvcc is on PATH from the
+            # CUDA install step; the host compiler from the VS shell)
+            $env:PYTORCH_NVCC = "sccache nvcc"
+          } else {
+            $env:PYTORCH_NVCC = "ccache ${{ steps.cuda-toolkit-Linux.outputs.CUDA_PATH }}/bin/nvcc"
           }
 
           # --- Build wheel
@@ -500,17 +567,24 @@ jobs:
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
       - name: Compiler cache statistics
-        if: runner.os == 'Linux' && always()
+        if: (matrix.cuda != '' || matrix.rocm != '') && always()
         run: |
           python -c "import sys; print('python prefix:', sys.prefix)"
-          ccache -s
+          if ($IsWindows) {
+            sccache --show-adv-stats
+            # flush the server's pending writes before the cache directory is saved
+            sccache --stop-server
+            $global:LASTEXITCODE = 0
+          } else {
+            ccache -s -v
+          }
 
       - name: Save compiler cache
-        if: runner.os == 'Linux' && (matrix.cuda != '' || matrix.rocm != '')
+        if: matrix.save_cache
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-py${{ matrix.pyver }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
 
       - name: Verify extension size
         if: matrix.cuda != '' || matrix.rocm != ''
