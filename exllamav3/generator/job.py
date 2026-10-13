@@ -16,6 +16,18 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
+import os
+
+# EXL3_NAN_CHECK: fail fast when a decode step produces non-finite logits, instead of sampling
+# garbage (argmax over NaN returns token id 0, which e.g. decodes to '!' and loops). 0 = off,
+# 1 = the job's first sampled token (default, one extra sync per job), 2 = every token
+_nan_check_mode = {"0": 0, "1": 1, "2": 2}.get(os.environ.get("EXL3_NAN_CHECK", "1"), 1)
+
+
+class NonFiniteLogits(RuntimeError):
+    """A decode step produced NaN/Inf logits. Almost always a kernel bug (e.g. a miscompiled
+    Triton specialization) rather than bad inputs; the message lists the toggles that A/B the
+    fused decode paths to bisect with."""
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
@@ -727,6 +739,20 @@ class Job:
         # assert logits.shape[0] == len(self.sequences)
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
+
+        # Fail fast on NaN/Inf logits: sampling them yields a fixed garbage token (argmax over
+        # NaN is id 0) that can loop, which hides the fault. First-token mode pays one sync per
+        # job; every-token mode is for debugging
+        if _nan_check_mode == 2 or (_nan_check_mode == 1 and self.new_tokens < 1):
+            if not bool(torch.isfinite(logits).all()):
+                n_bad = int((~torch.isfinite(logits)).sum())
+                raise NonFiniteLogits(
+                    f"Job {self.identifier!r} (serial {self.serial_number}) produced {n_bad} non-finite "
+                    f"logits at step {self.new_tokens} (tensor {tuple(logits.shape)} on {logits.device}). "
+                    f"This is a kernel bug, not bad sampling settings. A/B the fused decode paths to "
+                    f"bisect: EXL3_BC_MLA=0, EXL3_BC_GDN=0, EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0, "
+                    f"or disable the check with EXL3_NAN_CHECK=0."
+                )
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first

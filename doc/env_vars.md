@@ -337,6 +337,17 @@ launches.
 
 ## Sampling
 
+### `EXL3_NAN_CHECK` (default: `1`)
+
+Fail fast when a decode step produces non-finite logits instead of sampling them. Argmax over an
+all-NaN distribution returns token id 0 (which decodes to `'!'` in some tokenizers), so a kernel
+that emits NaN shows up as an endless garbage-token loop rather than an error. Mode `1` checks the
+job's first sampled token (one extra device sync per job), mode `2` checks every token (debugging;
+one sync per token), mode `0` disables. On a hit, `NonFiniteLogits` is raised with the job, step
+and count; it is almost always a kernel bug, so the message also lists the env toggles that A/B the
+fused decode paths (`EXL3_BC_MLA`, `EXL3_BC_GDN`, `EXL3_BC_ATTN`, `EXL3_BC_DSA`, `EXL3_GRAPHS`) for
+bisection. Only catches the NaN/Inf flavor; a kernel that computes wrong-but-finite values passes.
+
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
 
 Collapse eligible sampler stacks into fused kernels at sampler construction. Stacks ending in
