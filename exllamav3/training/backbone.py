@@ -505,8 +505,14 @@ def _assert_moe_supported(key: str, mlp) -> None:
         f"{mlp.num_experts} experts local) is not supported for training"
     assert len(mlp.gates) == len(mlp.ups) == len(mlp.downs) == mlp.num_experts, \
         f"{key}: expected one gate/up/down linear per expert"
-    assert mlp.n_group is None and mlp.topk_group is None, \
-        f"{key}: grouped expert routing (n_group/topk_group) is not supported"
+    # n_group/topk_group = 1/1 is the trivial grouping (one group holding
+    # every expert, and it is always selected): GLM-4.5/4.7 (Glm4MoeForCausalLM)
+    # declares its "dots" router that way and the inference side runs the
+    # same ungrouped ext.routing_ds3_nogroup kernel for it. Real grouping
+    # (DeepSeek-V3's n_group > 1) is a different top-k and stays rejected.
+    assert mlp.n_group in (None, 1) and mlp.topk_group in (None, 1), \
+        f"{key}: grouped expert routing (n_group={mlp.n_group}, " \
+        f"topk_group={mlp.topk_group}) is not supported"
     if mlp.router_type == "std":
         assert mlp.routed_scaling_factor in (None, 1.0), \
             f"{key}: routed_scaling_factor is a sigmoid-router feature, " \
