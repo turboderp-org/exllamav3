@@ -37,3 +37,23 @@ def test_split_offload_rejected():
     m.num_local_experts = 117
     with pytest.raises(AssertionError, match="EXL3_MOE_CPU_SPLIT"):
         _assert_moe_supported("layers.0", m)
+
+
+def test_trivial_grouping_accepted():
+    # GLM-4.5/4.7 (Glm4MoeForCausalLM) builds its dots router with
+    # n_group = topk_group = 1: one group holding every expert, always
+    # selected, which the inference side runs through the ungrouped kernel.
+    m = _StubMoE()
+    m.router_type = "dots"
+    m.routed_scaling_factor = 2.5
+    m.n_group = m.topk_group = 1
+    _assert_moe_supported("layers.3", m)
+
+
+def test_real_grouping_rejected():
+    m = _StubMoE()
+    m.router_type = "dots"
+    m.routed_scaling_factor = 2.5
+    m.n_group, m.topk_group = 8, 4
+    with pytest.raises(AssertionError, match="n_group=8"):
+        _assert_moe_supported("layers.3", m)

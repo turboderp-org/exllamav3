@@ -727,7 +727,9 @@ def check_mtp(model, tokenizer, config, prompts, device, cdt, attn_impl="auto"):
             # The generator's prefill shift: position i sees the state that
             # produced token i (i-1), zero carry at the first position.
             shifted = torch.cat((torch.zeros_like(state[:, :1, :]), state[:, :-1, :]), dim=1)
-            mtp_state = draft.forward(ids, {"target_hidden": shifted})   # [1, t, d]
+            # The draft's embedding lives on the CPU; the generator feeds it
+            # ids from a pinned CPU buffer, so do the same here.
+            mtp_state = draft.forward(ids.cpu(), {"target_hidden": shifted})   # [1, t, d]
             logits_native = lm.forward(lm.prepare_for_device(mtp_state, {}), {}).float()
         with torch.no_grad():
             logits_diff = net.mtp_logits(ids).float()

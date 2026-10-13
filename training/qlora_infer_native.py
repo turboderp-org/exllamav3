@@ -125,12 +125,6 @@ def main():
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=4096)
-    if args.use_per_device:
-        model.load(use_per_device=args.use_per_device, progressbar=True)
-    else:
-        model.load(device="cuda:0", progressbar=True)
-    tokenizer = Tokenizer.from_config(config)
     # --mtp: the model's own draft head as a second component model on the
     # trunk's output device (it borrows the trunk's embedding + LM head via
     # attach_to, which the Generator performs). Same wiring as the realtime
@@ -140,6 +134,17 @@ def main():
         if "mtp" not in config.model_classes:
             raise SystemExit(f"--mtp: {config.architecture} defines no MTP head")
         draft_model = Model.from_config(config, component="mtp")
+    # A draft needs recurrent-state history on the trunk cache (GDN layers roll
+    # back rejected draft tokens from it), as examples/generator.py sets it.
+    max_history = ((args.num_draft_tokens or draft_model.caps.get("default_draft_size", 4))
+                   if draft_model is not None else 0)
+    cache = Cache(model, max_num_tokens=4096, max_history=max_history)
+    if args.use_per_device:
+        model.load(use_per_device=args.use_per_device, progressbar=True)
+    else:
+        model.load(device="cuda:0", progressbar=True)
+    tokenizer = Tokenizer.from_config(config)
+    if draft_model is not None:
         draft_cache = Cache(draft_model, max_num_tokens=4096)
         draft_model.load(device=str(model.output_device) if args.use_per_device
                          else "cuda:0", progressbar=True)
