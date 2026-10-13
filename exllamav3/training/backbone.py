@@ -50,6 +50,16 @@ def _decoder_layout(model):
     ``GatedResidual`` mixer stands in the final-norm slot (there is no final
     RMSNorm; ``is_gated_residual`` tells the two apart).
 
+    The third layout is the mHC stream-stack decoder (DeepSeek-V4,
+    GLM-5.3-Flash)::
+
+        Embedding  ExpandStreams  TransformerBlock ... TransformerBlock
+                   HyperHead  RMSNorm  Linear
+
+    where the blocks' sites are ``HyperConnection`` modules (Sinkhorn combine;
+    see ``mhc_spec``) next to ordinary pre-norms, and a ``HyperHead`` collapses
+    the stack (``hyper_head_spec``) in front of the usual final RMSNorm.
+
     Everything else is rejected HERE rather than dropped. This selection used to
     be by TYPE alone (``[m for m in mods if isinstance(m, TransformerBlock)]``,
     plus positional picks for the embedding / final norm / head), so any module
@@ -63,7 +73,10 @@ def _decoder_layout(model):
     assert isinstance(mods[0], Embedding), \
         f"expected Embedding as first module, got {type(mods[0]).__name__}"
     hc = _is_expand_streams(mods[1]) if len(mods) > 1 else False
-    if hc:
+    # mHC layout (DeepSeek-V4 / GLM-5.3-Flash): the stream stack is collapsed
+    # by a HyperHead module in front of an ordinary final RMSNorm + head.
+    mhc = hc and len(mods) > 3 and _is_hyper_head(mods[-3])
+    if hc and not mhc:
         assert _is_gated_residual(mods[-2]) and not mods[-2].use_combine, \
             f"stream-stack decoder (ExpandStreams) without a final combine-less " \
             f"GatedResidual mixer as penultimate module: got {type(mods[-2]).__name__}"
@@ -91,9 +104,10 @@ def _decoder_layout(model):
     assert not bad, \
         f"non-TransformerBlock module(s) interleaved between the decoder " \
         f"blocks: {[type(mods[i]).__name__ for i in bad]}; unsupported architecture"
-    assert last == len(mods) - 3, \
+    tail = 4 if mhc else 3
+    assert last == len(mods) - tail, \
         f"unexpected module(s) between the last decoder block and the final " \
-        f"norm: {[type(m).__name__ for m in mods[last + 1:-2]]}"
+        f"norm: {[type(m).__name__ for m in mods[last + 1:-(tail - 1)]]}"
     pre = mods[1:first]
     if hc:
         assert len(pre) == 1, \
@@ -139,6 +153,33 @@ def is_gated_residual(module) -> bool:
 
 def _is_gated_residual(module) -> bool:
     return is_gated_residual(module)
+
+
+def is_hyper_connection(module) -> bool:
+    """True for the mHC ``HyperConnection`` site (DeepSeek-V4 / GLM-5.3-Flash:
+    Sinkhorn-normalized combine matrix; see ``mhc_spec``)."""
+    try:
+        from ..modules.hyperconnections import HyperConnection
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(module, HyperConnection)
+
+
+def _is_hyper_head(module) -> bool:
+    """True for the mHC ``HyperHead`` (final stream collapse before the model norm)."""
+    try:
+        from ..modules.hyperconnections import HyperHead
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(module, HyperHead)
+
+
+def hyper_head(model):
+    """The mHC ``HyperHead`` module of a stream-stack decoder (the module in
+    front of the final RMSNorm), or ``None`` on every other layout."""
+    mods, _, last = _decoder_layout(model)
+    m = mods[last + 1]
+    return m if _is_hyper_head(m) else None
 
 
 def _is_ple_layer(module) -> bool:
@@ -274,9 +315,75 @@ def output_device(final_norm):
 def block_hc_sites(block):
     """The ``(attn_hc, mlp_hc)`` hyper-connection site modules of one block, or
     ``(None, None)`` on an ordinary pre-norm block. Both are ``GatedResidual``
-    sites when present (``assert_block_supported`` rejects the mHC
-    ``HyperConnection`` kind)."""
+    sites (Qwen3.8-Flash-Next) or both ``HyperConnection`` sites (mHC:
+    DeepSeek-V4 / GLM-5.3-Flash) when present; ``hc_site_spec`` builds the
+    matching spec."""
     return getattr(block, "attn_hc", None), getattr(block, "mlp_hc", None)
+
+
+def hc_site_spec(module) -> dict:
+    """The spec of one hyper-connection site of either kind, tagged with
+    ``kind``: ``"gated"`` (``gated_residual_spec``) or ``"mhc"`` (``mhc_spec``)."""
+    if is_gated_residual(module):
+        return {"kind": "gated", **gated_residual_spec(module)}
+    assert is_hyper_connection(module), \
+        f"expected a GatedResidual or HyperConnection site, got {type(module).__name__}"
+    return mhc_spec(module)
+
+
+def mhc_spec(module) -> dict:
+    """
+    Plain-data description of one mHC ``HyperConnection`` site for
+    ``training.hyperconnections.mhc_mix`` / ``mhc_apply``: ``hc_mult``,
+    ``hidden_size``, ``eps`` (the site's unweighted RMSNorm, = the model's
+    rms_norm_eps), ``hc_eps``, ``sinkhorn_iters`` and the frozen fp32 tables
+    ``fn`` ``[2H + H*H, H*d]``, ``base`` ``[2H + H*H]``, ``scale`` ``[3]``
+    (the checkpoint's ``{key}_fn`` / ``_base`` / ``_scale``), laundered out of
+    inference mode (``_frozen_normal``).
+    """
+    assert is_hyper_connection(module), \
+        f"expected a HyperConnection, got {type(module).__name__}"
+    assert module.fn is not None and module.base is not None and module.scale is not None, \
+        f"HyperConnection {module.key}: not loaded (load the model first)"
+    H = int(module.hc_mult)
+    assert tuple(module.fn.shape) == (2 * H + H * H, H * module.hidden_size), \
+        f"HyperConnection {module.key}: fn shape {tuple(module.fn.shape)} != " \
+        f"{(2 * H + H * H, H * module.hidden_size)}"
+    assert module.base.numel() == 2 * H + H * H and module.scale.numel() == 3, \
+        f"HyperConnection {module.key}: base/scale shape mismatch"
+    return {
+        "kind": "mhc",
+        "key": module.key,
+        "hc_mult": H,
+        "hidden_size": int(module.hidden_size),
+        "eps": float(module.rms_eps),
+        "hc_eps": float(module.hc_eps),
+        "sinkhorn_iters": int(module.sinkhorn_iters),
+        "fn": _frozen_normal(module.fn),
+        "base": _frozen_normal(module.base),
+        "scale": _frozen_normal(module.scale),
+    }
+
+
+def hyper_head_spec(module) -> dict:
+    """Spec of the mHC ``HyperHead`` for ``training.hyperconnections.mhc_head``:
+    ``mean`` (GLM-5.3-Flash: parameterless mean, no tables) or the DeepSeek-V4
+    gate tables ``fn`` ``[H, H*d]``, ``base`` ``[H]``, ``scale`` ``[1]`` fp32
+    with the norm ``eps`` and ``hc_eps``."""
+    assert _is_hyper_head(module), f"expected a HyperHead, got {type(module).__name__}"
+    spec = {"mean": bool(module.mean), "hc_mult": int(module.hc_mult),
+            "eps": float(module.rms_eps), "hc_eps": float(module.hc_eps)}
+    if not module.mean:
+        assert module.fn is not None and module.base is not None and module.scale is not None, \
+            f"HyperHead {module.key}: not loaded (load the model first)"
+        H = int(module.hc_mult)
+        assert module.fn.shape[0] == H and module.base.numel() == H \
+            and module.scale.numel() == 1, \
+            f"HyperHead {module.key}: table shapes {tuple(module.fn.shape)} / " \
+            f"{module.base.numel()} / {module.scale.numel()}"
+        spec.update({"fn": _frozen_normal(module.fn), "base": _frozen_normal(module.base),
+                     "scale": _frozen_normal(module.scale)})
+    return spec
 
 
 def gated_residual_spec(module) -> dict:
@@ -443,6 +550,19 @@ def is_gated_delta_net(attn) -> bool:
     return isinstance(attn, GatedDeltaNet)
 
 
+def is_mla(attn) -> bool:
+    """True for exllamav3's ``MLAttention`` (multi-head latent attention:
+    DeepSeek-V2/V3 family, GLM-5.x; the latent ``kv_a`` path with the
+    ``kv_b`` up-projection held as the module's ``w_uk_flat`` / ``w_uv_flat``
+    tables). ``mla_spec`` reads it; the native forward attends densely over
+    the up-projected per-head K/V."""
+    try:
+        from ..modules import MLAttention
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(attn, MLAttention)
+
+
 def is_short_conv(attn) -> bool:
     """True when a block's ``attn`` slot holds a ``ShortConv`` (LFM2 /
     LFM2-MoE gated short causal convolution -- the ``conv`` layers of
@@ -529,8 +649,8 @@ def _assert_moe_supported(key: str, mlp) -> None:
         assert mlp.shared_experts.activation_fn in ("silu", "gelu"), \
             f"{key}: unsupported shared-expert activation " \
             f"{mlp.shared_experts.activation_fn!r}"
-        assert getattr(mlp.shared_experts, "act_limit", 0.0) in (0.0, None), \
-            f"{key}: shared-expert act_limit is not supported"
+        assert float(getattr(mlp.shared_experts, "act_limit", 0.0) or 0.0) >= 0.0, \
+            f"{key}: negative shared-expert act_limit"
     if mlp.shared_gate is not None:
         assert mlp.shared_experts is not None, \
             f"{key}: shared gate without shared experts"
@@ -590,17 +710,33 @@ def assert_block_supported(block):
     if attn_hc is not None or mlp_hc is not None:
         assert attn_hc is not None and mlp_hc is not None, \
             f"{key}: hyper-connection site on one sublayer only"
+        mhc = is_hyper_connection(attn_hc)
         for site in (attn_hc, mlp_hc):
-            assert is_gated_residual(site), \
-                f"{key}: only the GatedResidual hyper-connection (Qwen3.8-Flash-Next) " \
-                f"is supported, got {type(site).__name__} (mHC is not wired up)"
-            assert site.use_combine, f"{key}: site-form GatedResidual expected"
-            assert site.norm_w is not None, \
-                f"{key}: GatedResidual {site.key} not loaded (load the model first)"
+            if mhc:
+                # mHC (DeepSeek-V4 / GLM-5.3-Flash): the Sinkhorn mix feeds the
+                # block's ordinary pre-norm (mix_norm), so the pre-norms MUST
+                # be present here; the site tables are checked by mhc_spec.
+                assert is_hyper_connection(site), \
+                    f"{key}: mixed hyper-connection kinds on one block"
+                assert site.fn is not None, \
+                    f"{key}: HyperConnection {site.key} not loaded (load the model first)"
+            else:
+                assert is_gated_residual(site), \
+                    f"{key}: only the GatedResidual (Qwen3.8-Flash-Next) and mHC " \
+                    f"HyperConnection (DeepSeek-V4 / GLM-5.3-Flash) hyper-connections " \
+                    f"are supported, got {type(site).__name__}"
+                assert site.use_combine, f"{key}: site-form GatedResidual expected"
+                assert site.norm_w is not None, \
+                    f"{key}: GatedResidual {site.key} not loaded (load the model first)"
         assert attn_hc.hc_mult == mlp_hc.hc_mult, f"{key}: hc_mult differs between sites"
-        assert getattr(block, "attn_norm", None) is None \
-            and getattr(block, "mlp_norm", None) is None, \
-            f"{key}: pre-norms alongside hyper-connection sites are not supported"
+        if mhc:
+            assert getattr(block, "attn_norm", None) is not None \
+                and getattr(block, "mlp_norm", None) is not None, \
+                f"{key}: mHC sites without the block pre-norms are not supported"
+        else:
+            assert getattr(block, "attn_norm", None) is None \
+                and getattr(block, "mlp_norm", None) is None, \
+                f"{key}: pre-norms alongside GatedResidual sites are not supported"
         assert getattr(block, "attn_post_norm", None) is None \
             and getattr(block, "mlp_post_norm", None) is None \
             and getattr(block, "layer_scalar_f", None) is None, \
@@ -615,25 +751,75 @@ def assert_block_supported(block):
             f"{key}: only GatedMLP or BlockSparseMLP is supported, got {type(mlp).__name__}"
     assert mlp.activation_fn in ("silu", "gelu"), \
         f"{key}: only SiLU/GeLU gated MLP is supported, got activation {mlp.activation_fn!r}"
-    assert getattr(mlp, "act_limit", 0.0) in (0.0, None), \
-        f"{key}: gated-MLP act_limit is not supported"
+    # act_limit (DeepSeek-V4 / GLM-5.3-Flash swiglu_limit): the clamped gated
+    # activation min(act(g), L) * clamp(u, -L, L) -- reproduced by the native
+    # forward exactly as the inference act_mul kernel orders it (activation
+    # first, then the clamp on its output; see native_llama._gated_act).
+    assert float(getattr(mlp, "act_limit", 0.0) or 0.0) >= 0.0, \
+        f"{key}: negative act_limit"
     if is_gated_delta_net(attn):
         # Differentiable GatedDeltaNet: supported for the SPLIT projection
         # layout (Qwen3.5/3.6: in_proj_qkv / in_proj_z / in_proj_b /
-        # in_proj_a). The fused qkvz/ba layout (Qwen3-Next) interleaves heads
-        # inside one tensor and is not wired up.
+        # in_proj_a) and the KDA layout (GLM-5.3-Flash: qkv_proj + b_proj +
+        # the low-rank f_a/f_b forget gate and g_a/g_b output gate; see
+        # training.gdn's KDA section). The fused qkvz/ba layout (Qwen3-Next)
+        # interleaves heads inside one tensor and is not wired up.
         assert attn.num_k_heads > 0, \
             f"{key}: GatedDeltaNet with no local K heads (TP shard?) unsupported"
         assert attn.qkvz_proj is None and attn.ba_proj is None, \
             f"{key}: fused qkvz/ba GatedDeltaNet projections (Qwen3-Next " \
             f"layout) are not supported; only the split in_proj_qkv/z/b/a " \
-            f"layout (Qwen3.5/3.6) is"
-        for name in ("qkv_proj", "z_proj", "b_proj", "a_proj", "o_proj"):
-            assert getattr(attn, name, None) is not None, \
-                f"{key}: GatedDeltaNet missing {name}"
+            f"layout (Qwen3.5/3.6) and the KDA layout (GLM-5.3-Flash) are"
+        if getattr(attn, "kda", False):
+            for name in ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj",
+                         "g_a_proj", "g_b_proj", "o_proj"):
+                assert getattr(attn, name, None) is not None, \
+                    f"{key}: KDA GatedDeltaNet missing {name}"
+            assert attn.z_proj is None and attn.a_proj is None, \
+                f"{key}: KDA layer with z/a projections (unexpected layout)"
+            assert attn.num_k_heads == attn.num_v_heads and attn.k_head_dim == attn.v_head_dim, \
+                f"{key}: KDA requires uniform head geometry"
+            assert str(getattr(attn.norm, "gate_activation", "silu")) == "sigmoid", \
+                f"{key}: KDA gated norm must use the sigmoid output gate"
+        else:
+            for name in ("qkv_proj", "z_proj", "b_proj", "a_proj", "o_proj"):
+                assert getattr(attn, name, None) is not None, \
+                    f"{key}: GatedDeltaNet missing {name}"
         assert attn.norm is not None, f"{key}: GatedDeltaNet missing gated norm"
         assert attn.a_log is not None and attn.dt_bias is not None, \
             f"{key}: GatedDeltaNet a_log/dt_bias not loaded (load the model first)"
+        return
+    if is_mla(attn):
+        # Multi-head latent attention (GLM-5.3-Flash NoPE MLA): the native
+        # forward up-projects the normalized latent to per-head K/V through
+        # the module's w_uk/w_uv tables and attends densely. Only the NoPE
+        # form is wired up (qk_rope_head_dim == 0); the interleaved-RoPE MLA
+        # of DeepSeek-V3 / GLM-5.x-big stays rejected here. DSA indexer
+        # layers are exact up to index_topk tokens (the inference forward
+        # itself attends densely below the selection budget -- MLAttention.
+        # _attend: ``sparse = ... > index_topk``); block_metadata exposes the
+        # budget as ``qsa_threshold`` and the trunk refuses longer batches.
+        assert attn.num_q_heads > 0, f"{key}: MLA layer with no local heads (TP shard?)"
+        assert int(attn.qk_rope_head_dim) == 0 and attn.rope_settings is None, \
+            f"{key}: only NoPE MLA (qk_rope_head_dim == 0) is supported; this layer " \
+            f"carries a {attn.qk_rope_head_dim}-dim RoPE slice (DeepSeek-V3 / GLM " \
+            f"MLA with interleaved RoPE is not wired up)"
+        assert attn.kv_a_proj_with_mqa is not None and attn.kv_a_layernorm is not None \
+            and attn.o_proj is not None, f"{key}: MLA layer missing kv_a / o projections"
+        assert attn.q_proj is not None, f"{key}: MLA layer missing the q projection"
+        assert (attn.q_a_proj is None) == (attn.q_a_layernorm is None), \
+            f"{key}: q_a_proj / q_a_layernorm must come together"
+        assert attn.w_uk_flat is not None and attn.w_uv_flat is not None, \
+            f"{key}: MLA kv_b tables not loaded (load the model first)"
+        assert not float(getattr(attn, "l4_beta", 0.0) or 0.0), \
+            f"{key}: Llama-4 position scaling on MLA is not supported"
+        assert attn.indexer_mode in (None, "full", "shared"), \
+            f"{key}: unknown DSA indexer mode {attn.indexer_mode!r}"
+        if attn.indexer_mode is not None:
+            assert int(attn.index_topk) > 0, \
+                f"{key}: DSA indexer with a zero selection budget cannot be trained densely"
+        assert not getattr(attn, "tp_reduce", False), \
+            f"{key}: tensor-parallel MLA is not supported for training"
         return
     if is_short_conv(attn):
         # Differentiable ShortConv (LFM2 / LFM2-MoE): in_proj -> b|c|x split ->
@@ -742,6 +928,9 @@ def _mlp_metadata(block) -> dict:
         # gated-MLP activation ("silu" or "gelu"/GeGLU) -- routed experts and
         # dense MLP alike; the shared expert's own activation is read below.
         "activation": mlp.activation_fn,
+        # Clamped gated activation (DeepSeek-V4 / GLM-5.3-Flash swiglu_limit):
+        # min(act(g), L) * clamp(u, -L, L); 0.0 = unclamped.
+        "act_limit": float(getattr(mlp, "act_limit", 0.0) or 0.0),
     }
     if not is_block_sparse_mlp(mlp):
         meta["mlp_kind"] = "dense"
@@ -765,6 +954,8 @@ def _mlp_metadata(block) -> dict:
         "e_score_bias": _frozen_normal(mlp.e_score_correction_bias),
         "shared_activation": (mlp.shared_experts.activation_fn
                               if mlp.shared_experts is not None else None),
+        "shared_act_limit": (float(getattr(mlp.shared_experts, "act_limit", 0.0) or 0.0)
+                             if mlp.shared_experts is not None else 0.0),
         # Gemma4 layout: routing and the routed experts read the RAW
         # post-attention residual (params["residual"] in the inference
         # forward) through their own pre-norms, NOT the block's normed MLP
@@ -835,6 +1026,13 @@ def block_metadata(block) -> dict:
         _normal = _frozen_normal
         return {
             "kind": "gdn",
+            # KDA (GLM-5.3-Flash): per-k-channel decay from the low-rank
+            # forget gate, "safe gate" lower bound, low-rank sigmoid output
+            # gate -- see training.gdn.kda_beta_g. False on Qwen3.5/3.6.
+            "kda": bool(getattr(attn, "kda", False)),
+            "gate_lower_bound": (float(attn.gate_lower_bound)
+                                 if getattr(attn, "gate_lower_bound", None) is not None
+                                 else None),
             "num_k_heads": attn.num_k_heads,
             "num_v_heads": attn.num_v_heads,
             "k_head_dim": attn.k_head_dim,
@@ -842,12 +1040,46 @@ def block_metadata(block) -> dict:
             "conv_kernel_size": attn.conv_kernel_size,
             "beta_scale": float(attn.beta_scale),
             "a_log": _normal(attn.a_log),        # [nv]
-            "dt_bias": _normal(attn.dt_bias),    # [nv]
+            "dt_bias": _normal(attn.dt_bias),    # [nv] (KDA: [nv*dk])
             "conv1d_weight": _normal(w),         # [2*k_dim + v_dim, kernel]
             "conv1d_bias": _normal(attn.conv1d_bias),  # [2*k_dim + v_dim] or None
             # MLP half (activation + dense/moe description).
             **_mlp_metadata(block),
             "layer_scalar": getattr(block, "layer_scalar_f", None),
+        }
+    if is_mla(attn):
+        H = attn.num_q_heads
+        return {
+            "kind": "mla",
+            "num_q_heads": H,
+            # K/V are up-projected per q head from the shared latent: no GQA.
+            "num_kv_heads": H,
+            "head_dim": attn.qk_head_dim,
+            "v_head_dim": attn.v_head_dim,
+            "kv_lora_rank": attn.kv_lora_rank,
+            "qk_nope_head_dim": attn.qk_nope_head_dim,
+            "qk_rope_head_dim": attn.qk_rope_head_dim,
+            "sm_scale": attn.sm_scale,
+            # The kv_b up-projection, in the module's flat layout: [D_c, H*nope]
+            # and [D_c, H*v] fp16 (frozen; never a LoRA target -- it is not a
+            # Linear on the inference side).
+            "w_uk": _frozen_normal(attn.w_uk_flat),
+            "w_uv": _frozen_normal(attn.w_uv_flat),
+            "inv_freq": None,            # NoPE only (asserted above)
+            "attn_factor": 1.0,
+            "mrope_section": None,
+            "sliding_window": -1,
+            "softcap": 0.0,
+            **_mlp_metadata(block),
+            "use_k_as_v": False,
+            "interleaved_gate": False,
+            "full_gate": False,
+            "headwise_gate": False,
+            "layer_scalar": getattr(block, "layer_scalar_f", None),
+            # DSA indexer layers: dense attention is exact up to index_topk
+            # visible tokens (MLAttention._attend's sparse switch); the trunk
+            # refuses longer sequences through the same guard as QSA.
+            "qsa_threshold": (int(attn.index_topk) if attn.indexer_mode is not None else None),
         }
     sw = getattr(attn, "sliding_window", -1)
     return {
@@ -1061,6 +1293,29 @@ def gdn_projections(block):
     GatedDeltaNet block (split projection layout -- Qwen3.5/3.6)."""
     a = block.attn
     return a.qkv_proj, a.z_proj, a.b_proj, a.a_proj, a.o_proj
+
+
+def kda_projections(block):
+    """Return the ``(qkv_proj, b_proj, f_a_proj, f_b_proj, g_a_proj, g_b_proj,
+    o_proj)`` linears of a KDA GatedDeltaNet block (GLM-5.3-Flash)."""
+    a = block.attn
+    return a.qkv_proj, a.b_proj, a.f_a_proj, a.f_b_proj, a.g_a_proj, a.g_b_proj, a.o_proj
+
+
+def mla_projections(block):
+    """Return the ``(q_a_proj, q_b_proj, kv_a_proj_with_mqa, o_proj)`` linears
+    of an MLA block. ``q_a_proj`` is ``None`` on a direct-q layout, in which
+    case ``q_b_proj`` IS the direct ``q_proj`` (the inference module aliases
+    ``q_proj = q_b_proj`` on the low-rank layout)."""
+    a = block.attn
+    return a.q_a_proj, a.q_proj, a.kv_a_proj_with_mqa, a.o_proj
+
+
+def mla_norms(block):
+    """The ``(q_a_layernorm, kv_a_layernorm)`` RMSNorms of an MLA block
+    (``q_a_layernorm`` is ``None`` on a direct-q layout)."""
+    a = block.attn
+    return a.q_a_layernorm, a.kv_a_layernorm
 
 
 def short_conv_projections(block):
