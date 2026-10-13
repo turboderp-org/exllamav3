@@ -613,7 +613,11 @@ preallocated with `fallocate` and then page-locked by the parent, so neither the
 nor the later collapse pass can convert them (on the default `never` the CPU kernels run on 4K
 pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
 pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
-when it is created, or the load fails naming the chunk.
+when it is created, or the load fails naming the chunk. Page-locked memory is budgeted by the
+driver on some platforms (WDDM and WSL2 allow about half of RAM per process, shared with the
+pinned KV tiers): when registering a chunk fails for lack of it, the chunks already registered
+keep the DMA path and the experts in the rest of the arena stream through the staged path, with
+one notice at load.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 

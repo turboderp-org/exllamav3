@@ -846,6 +846,12 @@ def probe_bandwidth(timed_copy, floor_s = 0.5, cap_s = 2.0, asleep_gbs = 5.0):
             return sorted(tail)[len(tail) // 2]
 
 
+def _pinning_exhausted(e: Exception) -> bool:
+    """Whether a cudaHostRegister failure means the process has no page-locked memory left
+    (cudaErrorMemoryAllocation, reported as "out of memory"), as opposed to a bad mapping"""
+    return "out of memory" in str(e).lower()
+
+
 class MoeCpuHost:
 
     def __init__(self, config):
@@ -890,6 +896,10 @@ class MoeCpuHost:
         self.pinned = TUNING.pinned_arena
         self.arena_maps = []
         self.arena_views = []
+        # Chunks are registered in order; the first one the driver refuses for lack of page-locked
+        # memory (WDDM and WSL2 budget the pinnable memory at about half of RAM) ends the pinning,
+        # and experts in it and every later chunk stream through the staged path instead
+        self.arena_registered = None
         self.layer_blocks = []
         self.batch_recon = TUNING.stream_batch_recon
 
@@ -928,6 +938,29 @@ class MoeCpuHost:
             raise RuntimeError("CPU MoE worker process died")
         return False
 
+    def _register_handoff(self, size):
+        """Page-lock the handoff segment. It is registered after the arena chunks (its size depends
+        on the layers), so when the pinned budget ran out on them it can run out here too; the
+        segment is what the staged path runs on, so arena chunks are given back, last first, until
+        it fits"""
+        while True:
+            try:
+                cuda_host_register(self.base_ptr, size,
+                                   flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+                return
+            except Exception as e:
+                last = max((i for i, v in enumerate(self.arena_views) if v is not None), default = None)
+                if not _pinning_exhausted(e) or last is None:
+                    raise
+                cuda_host_unregister(self.arena_views[last].data_ptr())
+                self.arena_views[last] = None
+                self.arena_maps[last].close()
+                self.arena_maps[last] = None
+                self.arena_registered = last
+                print(f" !! CPU MoE pinned arena: chunk {last} released to page-lock the handoff "
+                      f"segment; experts in it and the remaining chunks use the staged path", flush = True)
+
+
     def _attach_chunk(self, index, size, name):
         """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
         ("chunk", ...) message; Windows: section `name`) and page-lock it for DMA. Registration
@@ -949,6 +982,13 @@ class MoeCpuHost:
                 m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
             finally:
                 os.close(fd)
+        if self.arena_registered is not None:
+            # Page-locked memory ran out at an earlier chunk: nothing past it is pinned, and the
+            # mapping is not needed either (the staged path reads the arena in the worker)
+            m.close()
+            self.arena_maps.append(None)
+            self.arena_views.append(None)
+            return
         view = None
         try:
             # count = size // 2: a section opened by name reports its page-rounded size, and
@@ -959,6 +999,17 @@ class MoeCpuHost:
         except Exception as e:
             view = None   # no tensor over an unmapped region may survive in the traceback's frame
             m.close()
+            if _pinning_exhausted(e):
+                # The driver has no page-locked memory left for this process (WDDM and WSL2 cap
+                # it at about half of RAM; the KV tiers and other processes share the budget).
+                # Not a fault: keep what is pinned, stage the rest
+                self.arena_registered = index
+                self.arena_maps.append(None)
+                self.arena_views.append(None)
+                print(f" !! CPU MoE pinned arena: no page-locked memory left for chunk {index} "
+                      f"({index * (size >> 20)} MiB registered); experts in the remaining chunks "
+                      f"use the staged path", flush = True)
+                return
             raise RuntimeError(
                 f"CPU MoE pinned arena: chunk {index} ({size >> 20} MiB) could not be attached "
                 f"({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
@@ -1063,8 +1114,7 @@ class MoeCpuHost:
         buf = np.frombuffer(self.shm.buf, dtype = np.uint8)
         buf[:MOE_CTRL_SIZE] = 0
         self.base_ptr = buf.ctypes.data
-        cuda_host_register(self.base_ptr, size,
-                           flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+        self._register_handoff(size)
         # GPU-visible alias of the registered buffer: equal to base_ptr under UVA (Linux
         # desktop), but a distinct address under WDDM (Windows), where the host VA is not a
         # valid device pointer
@@ -1743,8 +1793,11 @@ class MoeCpuHost:
         gated = pd.get("g") is not None
         abort = self.gpu_base_ptr + 128
         copy_stream = st["copy_stream"]
-        # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path
+        # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path. Experts
+        # in chunks past the registered ones (see _attach_chunk) go through the staged path too,
+        # decided per batch below
         blocks = self.layer_blocks[layer_idx] if self.pinned else None
+        pinned_chunks = self.arena_registered
 
         # Packed-layout policy of this layer's projections (see _stream_layout): packed bytes
         # are restored to native order after the DMA, so the kernels below always see native
@@ -1768,7 +1821,7 @@ class MoeCpuHost:
             self.wseq += 1
             seq = self.wseq
 
-            if blocks is not None:
+            if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
                 # Pinned arena: DMA each expert's contiguous block straight out of the
                 # registered arena mapping on the copy stream (no worker involvement, the
                 # stager thread stays idle)
@@ -2044,6 +2097,8 @@ class MoeCpuHost:
         # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
         # the worker (memfd, no name to unlink; a Windows section goes with its last handle)
         for view in self.arena_views:
+            if view is None:
+                continue
             try:
                 cuda_host_unregister(view.data_ptr())
             except Exception:
@@ -2055,6 +2110,8 @@ class MoeCpuHost:
             import gc
             gc.collect()
             for m in maps:
+                if m is None:
+                    continue
                 try:
                     m.close()
                 except Exception:
