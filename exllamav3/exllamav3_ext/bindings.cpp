@@ -102,6 +102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_register", &cuda_host_register, py::arg("ptr"), py::arg("nbytes"), py::arg("flags"));
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
+    m.def("cuda_memcpy_async", &cuda_memcpy_async, py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("kind"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
