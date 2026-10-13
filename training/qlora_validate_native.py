@@ -820,6 +820,19 @@ def main():
                     help="Dequant path for the main forward compare (matches the "
                          "trainer flag). The fast-vs-legacy parity gate below runs "
                          "regardless (skip with --skip-dequant-parity).")
+    ap.add_argument("--stream-experts", action="store_true",
+                    help="Load with the trainer's expert streaming (routed experts parked in "
+                         "host RAM, --parallel single): the forward of a model whose experts "
+                         "do not fit VRAM. The inference oracle cannot run in this process "
+                         "then: produce it first in a separate run with --save-ref (e.g. under "
+                         "EXL3_MOE_CPU_OFFLOAD + --parallel split) and pass --load-ref here.")
+    ap.add_argument("--stream-experts-slots", type=int, default=2)
+    ap.add_argument("--save-ref", default=None, metavar="PATH",
+                    help="Run ONLY the native inference forward on the prompts, save the "
+                         "logits to PATH (torch.save) and exit.")
+    ap.add_argument("--load-ref", default=None, metavar="PATH",
+                    help="Take the native-inference logits from PATH (--save-ref output) "
+                         "instead of running the inference forward in this process.")
     ap.add_argument("--skip-dequant-parity", action="store_true",
                     help="skip the fast-vs-legacy dequant parity gate (forward + "
                          "adapter-grad compare under both modes)")
@@ -835,6 +848,8 @@ def main():
     if args.ngram_ram:
         config.infer_params.ngram_stream_from_disk = False
     model = Model.from_config(config)
+    if args.stream_experts and args.parallel != "single":
+        raise SystemExit("--stream-experts is single-device (--parallel single)")
     if args.parallel == "split":
         load_kwargs = {}
         if args.reserve_per_device is not None:
@@ -844,9 +859,39 @@ def main():
         model.load(progressbar=True, **load_kwargs)
         print(f" -- layer-autosplit: active devices {model.active_devices}, "
               f"output device {model.output_device}")
+    elif args.stream_experts:
+        from exllamav3.training import expert_stream as _es
+        streamer = _es.load_streaming(model, args.device, slots=args.stream_experts_slots,
+                                      progressbar=True)
+        if not streamer.layers:
+            raise SystemExit("--stream-experts: this model has no block-sparse MoE layers")
+        print(f" -- {streamer.describe()}")
     else:
         model.load(device=args.device, progressbar=True)
     tokenizer = Tokenizer.from_config(config)
+
+    if args.save_ref:
+        # Reference-only run: the native inference forward on every prompt,
+        # saved for a later --load-ref compare (two-process validation of a
+        # model whose experts must be streamed for the training forward).
+        ref = {}
+        for prompt in prompts:
+            ids = tokenizer.encode(prompt, add_bos=True).to(args.device)
+            with torch.inference_mode():
+                ref[prompt] = model.forward(ids).float().cpu()
+            print(f" -- saved native logits for {prompt!r}: {tuple(ref[prompt].shape)}")
+        torch.save({"model": args.model, "logits": ref}, args.save_ref)
+        print(f" -- reference logits written to {args.save_ref}")
+        return 0
+    ref_logits = None
+    if args.load_ref:
+        blob = torch.load(args.load_ref, map_location="cpu")
+        ref_logits = blob["logits"]
+        missing = [p for p in prompts if p not in ref_logits]
+        if missing:
+            raise SystemExit(f"--load-ref {args.load_ref} has no logits for {missing!r}")
+        print(f" -- native-inference logits taken from {args.load_ref} "
+              f"(saved from {blob.get('model')!r})")
 
     # No adapters: a pure frozen forward, directly comparable to native inference.
     net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
@@ -867,9 +912,13 @@ def main():
     for prompt in prompts:
         ids = tokenizer.encode(prompt, add_bos=True).to(args.device)
 
-        # Native (correct) forward -- runs under inference_mode, fp16 kernels.
-        with torch.inference_mode():
-            logits_native = model.forward(ids).float()       # [1, t, V]
+        # Native (correct) forward -- runs under inference_mode, fp16 kernels
+        # (or the logits a --save-ref run produced, for streamed-expert loads).
+        if ref_logits is not None:
+            logits_native = ref_logits[prompt].to(args.device)
+        else:
+            with torch.inference_mode():
+                logits_native = model.forward(ids).float()       # [1, t, V]
 
         # Differentiable forward.
         with torch.no_grad():
@@ -923,7 +972,10 @@ def main():
     if not args.skip_head_slice_check:
         all_ok &= check_head_slice(net)
 
-    if not args.skip_dequant_parity:
+    if not args.skip_dequant_parity and args.stream_experts:
+        print("\n -- skipping dequant-parity check under --stream-experts (its fast-vs-"
+              "legacy nets would both stream; MoE routing ties make it FAIL anyway).")
+    elif not args.skip_dequant_parity:
         all_ok &= check_dequant_parity(model, tokenizer, " ".join(prompts),
                                        args.device, cdt,
                                        attn_impl=args.attn_impl)

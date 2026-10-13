@@ -563,6 +563,18 @@ def is_mla(attn) -> bool:
     return isinstance(attn, MLAttention)
 
 
+def is_dsv4_attention(attn) -> bool:
+    """True for exllamav3's ``DSV4Attention`` (DeepSeek-V4 hybrid sparse
+    attention: sliding / CSA / HCA layers with gated-pool compressors, sinks,
+    MQA with V == K, grouped low-rank output projection). ``dsv4_spec`` reads
+    it; ``native_llama._dsv4_forward`` is the differentiable transcription."""
+    try:
+        from ..modules.dsv4 import DSV4Attention
+    except ImportError:            # pragma: no cover
+        return False
+    return isinstance(attn, DSV4Attention)
+
+
 def is_short_conv(attn) -> bool:
     """True when a block's ``attn`` slot holds a ``ShortConv`` (LFM2 /
     LFM2-MoE gated short causal convolution -- the ``conv`` layers of
@@ -601,10 +613,18 @@ def _assert_moe_supported(key: str, mlp) -> None:
     -- is rejected loudly here.
     """
     from ..modules import GatedMLP
-    assert mlp.router_type in ("std", "dots"), \
-        f"{key}: only the 'std' softmax and 'dots' sigmoid top-k routers are " \
-        f"supported, got router_type {mlp.router_type!r} (grouped ds3 MoE " \
-        f"routing not wired up)"
+    assert mlp.router_type in ("std", "dots", "sqrtsp", "sqrtsp_hash"), \
+        f"{key}: only the 'std' softmax, 'dots' sigmoid and DeepSeek-V4 'sqrtsp' / " \
+        f"'sqrtsp_hash' top-k routers are supported, got router_type " \
+        f"{mlp.router_type!r} (grouped ds3 MoE routing not wired up)"
+    if mlp.router_type == "sqrtsp_hash":
+        # DeepSeek-V4 hash-MoE bootstrap layers: expert ids come from the
+        # frozen tid2eid table indexed by the input token ids (the trunk
+        # forward hands input_ids down to the block for this).
+        assert getattr(mlp, "tid2eid", None) is not None, \
+            f"{key}: sqrtsp_hash router without a loaded tid2eid table"
+        assert mlp.tid2eid.shape[-1] == mlp.num_experts_per_tok, \
+            f"{key}: tid2eid width {mlp.tid2eid.shape[-1]} != top-k {mlp.num_experts_per_tok}"
     assert mlp.routing_gate is not None, f"{key}: MoE block has no routing gate"
     # The inference side's CPU expert offload (EXL3_MOE_CPU_OFFLOAD: whole
     # layers registered with the CPU MoE worker, their Linears never loaded;
@@ -789,6 +809,39 @@ def assert_block_supported(block):
         assert attn.a_log is not None and attn.dt_bias is not None, \
             f"{key}: GatedDeltaNet a_log/dt_bias not loaded (load the model first)"
         return
+    if is_dsv4_attention(attn):
+        # DeepSeek-V4 attention (training.native_llama._dsv4_forward): sliding
+        # window + compressed-window entries + sink column, exactly as the
+        # stateless inference forward (_forward_nc) up to the CSA indexer's
+        # selection budget: a CSA layer's top-k over its T = S // 4 compressed
+        # entries is a no-op while T <= index_topk, i.e. S <= 4*index_topk+3
+        # (2051 on V4-Flash); block_metadata exposes that as the sparse
+        # threshold and the trunk refuses longer batches. HCA / sliding
+        # layers have no indexer and are exact at any length.
+        assert attn.num_q_heads > 0, f"{key}: DSV4 layer with no local heads (TP shard?)"
+        assert attn.layer_type in ("sliding", "csa", "hca"), \
+            f"{key}: unknown DSV4 layer type {attn.layer_type!r}"
+        assert not getattr(attn, "tp_reduce", False) and not getattr(attn, "tp_mode", False), \
+            f"{key}: tensor-parallel DSV4 attention is not supported for training"
+        for name in ("q_a", "q_norm", "q_b", "wkv", "kv_norm", "wo_b"):
+            assert getattr(attn, name, None) is not None, f"{key}: DSV4 layer missing {name}"
+        assert len(attn.wo_a) == attn.o_groups and attn.num_q_heads % attn.o_groups == 0, \
+            f"{key}: o_groups {attn.o_groups} vs {len(attn.wo_a)} wo_a slices / " \
+            f"{attn.num_q_heads} heads"
+        assert attn.sinks is not None and attn.inv_freq_main is not None \
+            and attn.inv_freq_compress is not None, \
+            f"{key}: DSV4 sinks / rope tables not loaded (load the model first)"
+        if attn.layer_type in ("csa", "hca"):
+            comp = attn.compressor
+            assert comp is not None and comp.ape is not None, \
+                f"{key}: DSV4 {attn.layer_type} layer without a loaded compressor"
+            assert comp.overlapping == (attn.layer_type == "csa"), \
+                f"{key}: compressor overlap flag disagrees with the layer type"
+            assert int(comp.compress_rate) > 0
+        if attn.layer_type == "csa":
+            assert int(attn.index_topk) > 0, f"{key}: CSA layer with a zero index_topk"
+        assert int(attn.sliding_window) > 0, f"{key}: DSV4 layer without a sliding window"
+        return
     if is_mla(attn):
         # Multi-head latent attention (GLM-5.3-Flash NoPE MLA): the native
         # forward up-projects the normalized latent to per-head K/V through
@@ -952,6 +1005,8 @@ def _mlp_metadata(block) -> dict:
         "routed_scaling_factor": (float(mlp.routed_scaling_factor)
                                   if mlp.routed_scaling_factor is not None else 1.0),
         "e_score_bias": _frozen_normal(mlp.e_score_correction_bias),
+        # DeepSeek-V4 hash layers: [vocab, top_k] expert-id table (CPU/long).
+        "tid2eid": (_frozen_normal(mlp.tid2eid) if mlp.router_type == "sqrtsp_hash" else None),
         "shared_activation": (mlp.shared_experts.activation_fn
                               if mlp.shared_experts is not None else None),
         "shared_act_limit": (float(getattr(mlp.shared_experts, "act_limit", 0.0) or 0.0)
@@ -1046,6 +1101,50 @@ def block_metadata(block) -> dict:
             # MLP half (activation + dense/moe description).
             **_mlp_metadata(block),
             "layer_scalar": getattr(block, "layer_scalar_f", None),
+        }
+    if is_dsv4_attention(attn):
+        lt = attn.layer_type
+        comp = attn.compressor if lt in ("csa", "hca") else None
+        m = int(comp.compress_rate) if comp is not None else 1
+        return {
+            "kind": "dsv4",
+            "layer_type": lt,
+            "num_q_heads": attn.num_q_heads,
+            "num_kv_heads": 1,
+            "head_dim": attn.head_dim,
+            "v_head_dim": attn.head_dim,
+            "rope_head_dim": attn.rope_head_dim,
+            "o_groups": attn.o_groups,
+            "sm_scale": attn.sm_scale,
+            "sliding_window": int(attn.sliding_window),
+            "sinks": _frozen_normal(attn.sinks),                   # [H] fp32
+            # This layer's rope table (main theta on sliding layers, the
+            # yarn-ramped compress theta on CSA/HCA) and the compressor's.
+            "inv_freq": _frozen_normal(attn.inv_freq_main if lt == "sliding"
+                                       else attn.inv_freq_compress),
+            "inv_freq_compress": _frozen_normal(attn.inv_freq_compress),
+            "compress_rate": m,
+            "compressor": (None if comp is None else {
+                "overlapping": bool(comp.overlapping),
+                "head_dim": int(comp.head_dim),
+                "rope_dim": int(comp.rope_dim),
+                "ape": _frozen_normal(comp.ape),                   # [m, W] fp32
+                "norm": norm_spec(comp.norm),
+            }),
+            "index_topk": int(attn.index_topk or 0),
+            "attn_factor": 1.0,
+            "mrope_section": None,
+            "softcap": 0.0,
+            **_mlp_metadata(block),
+            "use_k_as_v": False,
+            "interleaved_gate": False,
+            "full_gate": False,
+            "headwise_gate": False,
+            "layer_scalar": getattr(block, "layer_scalar_f", None),
+            # CSA: dense over all visible compressed entries is exact while
+            # T = S // m <= index_topk (DSV4Attention._forward_nc: the top-k
+            # only runs past it) -> S <= m * index_topk + m - 1.
+            "qsa_threshold": (m * int(attn.index_topk) + m - 1) if lt == "csa" else None,
         }
     if is_mla(attn):
         H = attn.num_q_heads
@@ -1309,6 +1408,31 @@ def mla_projections(block):
     ``q_proj = q_b_proj`` on the low-rank layout)."""
     a = block.attn
     return a.q_a_proj, a.q_proj, a.kv_a_proj_with_mqa, a.o_proj
+
+
+def dsv4_projections(block):
+    """The ``(q_a, q_b, wkv, wo_a_slices, wo_b)`` linears of a DSV4 block
+    (``wo_a_slices`` is the list of ``o_groups`` group slices)."""
+    a = block.attn
+    return a.q_a, a.q_b, a.wkv, list(a.wo_a), a.wo_b
+
+
+def dsv4_norms(block):
+    """The ``(q_norm, kv_norm)`` weighted RMSNorms of a DSV4 block (on the
+    q_a latent and the shared kv row). The per-head q norm after q_b is
+    unweighted (spec ``weight: None``, eps = rms_norm_eps)."""
+    a = block.attn
+    return a.q_norm, a.kv_norm
+
+
+def dsv4_compressor_projections(block):
+    """The ``(wkv, wgate)`` linears of a CSA/HCA layer's compressor, or
+    ``(None, None)`` on a sliding layer. The CSA indexer's own compressor and
+    projections are dead weight for training (dense-exact below the budget)."""
+    comp = getattr(block.attn, "compressor", None)
+    if comp is None:
+        return None, None
+    return comp.wkv, comp.wgate
 
 
 def mla_norms(block):

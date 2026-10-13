@@ -266,6 +266,19 @@ _MLA_TARGET_ALIASES = {
     "o_proj": ("o_proj",),
 }
 
+# DeepSeek-V4 attention leaf -> target names (checkpoint namespace attn.wq_a /
+# wq_b / wkv / wo_a / wo_b). The q pair answers to q_proj, the single shared
+# kv row to k_proj / v_proj, both halves of the grouped low-rank output
+# projection to o_proj. The compressor projections (compressor.wkv / wgate)
+# are frozen (never targets): they feed the compressed-window keys.
+_DSV4_TARGET_ALIASES = {
+    "wq_a": ("wq_a", "q_a_proj", "q_proj"),
+    "wq_b": ("wq_b", "q_b_proj", "q_proj"),
+    "wkv": ("wkv", "kv_proj", "k_proj", "v_proj"),
+    "wo_a": ("wo_a", "o_a_proj", "o_proj"),
+    "wo_b": ("wo_b", "o_b_proj", "o_proj"),
+}
+
 # ShortConv leaf -> the target names that select it (LFM2 / LFM2-MoE conv
 # layers). Same idea as the GDN aliases: the fused in_proj ([hidden, 3*hidden]
 # emitting b|c|x) plays the q/k/v role, out_proj plays o, so the familiar
@@ -740,6 +753,7 @@ class NativeLlamaQLoRA(nn.Module):
         satisfied_targets: set[str] = set()   # requested names that matched a linear
         self.has_gdn = False
         self.has_shortconv = False
+        self.has_dsv4 = False
         self.has_moe = False
         # Stream-stack residual (Qwen3.8-Flash-Next): ExpandStreams broadcasts
         # the embedding into hc_mult fp32 streams, every block's sublayer
@@ -905,6 +919,27 @@ class NativeLlamaQLoRA(nn.Module):
                                     _GDN_TARGET_ALIASES["in_proj_a"])
                 entry.o_proj = wrap(o_l, "out_proj",
                                     _GDN_TARGET_ALIASES["out_proj"])
+            elif meta["kind"] == "dsv4":
+                # DeepSeek-V4 attention: q_a -> q_norm -> q_b (+ unweighted
+                # per-head norm), the shared kv row (wkv -> kv_norm), the
+                # grouped low-rank output projection (o_groups wo_a slices ->
+                # wo_b), and on CSA/HCA layers the frozen compressor
+                # projections. See _dsv4_forward.
+                self.has_dsv4 = True
+                qa_l, qb_l, wkv_l, woa_ls, wob_l = backbone.dsv4_projections(blk)
+                qn, kvn = backbone.dsv4_norms(blk)
+                entry.q_a_proj = wrap(qa_l, "wq_a", _DSV4_TARGET_ALIASES["wq_a"])
+                entry.q_b_proj = wrap(qb_l, "wq_b", _DSV4_TARGET_ALIASES["wq_b"])
+                entry.wkv = wrap(wkv_l, "wkv", _DSV4_TARGET_ALIASES["wkv"])
+                entry.wo_a = nn.ModuleList(
+                    [wrap(l, "wo_a", _DSV4_TARGET_ALIASES["wo_a"]) for l in woa_ls])
+                entry.wo_b = wrap(wob_l, "wo_b", _DSV4_TARGET_ALIASES["wo_b"])
+                entry.q_a_norm_spec = backbone.norm_spec(qn)
+                entry.kv_norm_spec = backbone.norm_spec(kvn)
+                cwkv, cwg = backbone.dsv4_compressor_projections(blk)
+                entry.comp_wkv = wrap(cwkv, "compressor_wkv", ()) if cwkv is not None else None
+                entry.comp_wgate = wrap(cwg, "compressor_wgate", ()) if cwg is not None else None
+                entry.g_proj = None
             elif meta["kind"] == "mla":
                 # MLA layer (GLM-5.3-Flash NoPE MLA): low-rank q path (q_a ->
                 # norm -> q_b, or a direct q_proj), the latent kv_a projection
@@ -1721,14 +1756,15 @@ class NativeLlamaQLoRA(nn.Module):
         v = (c @ w_uv).view(bsz, t, H, hd_v)
         return q, k, v
 
-    def _mlp_out(self, meta, entry, normed2, residual=None):
+    def _mlp_out(self, meta, entry, normed2, residual=None, input_ids=None):
         # MLP half of a block, shared by the softmax-attention and
         # GatedDeltaNet block forwards: dense gated MLP, or the block-sparse
         # mixture of experts (meta["mlp_kind"] == "moe"). ``residual`` is the
         # RAW post-attention residual stream, needed only by the Gemma4 MoE
         # layout (alt_residual_channel routes from it); dense MLPs ignore it.
+        # ``input_ids`` feed the DeepSeek-V4 hash-MoE router only.
         if meta.get("mlp_kind", "dense") == "moe":
-            return self._moe_out(meta, entry, normed2, residual)
+            return self._moe_out(meta, entry, normed2, residual, input_ids=input_ids)
         return self._gated_mlp(entry.gates, entry.ups, entry.downs,
                                meta["activation"], normed2,
                                act_limit=meta.get("act_limit", 0.0))
@@ -1777,7 +1813,7 @@ class NativeLlamaQLoRA(nn.Module):
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
 
-    def _moe_out(self, meta, entry, normed2, residual=None):
+    def _moe_out(self, meta, entry, normed2, residual=None, input_ids=None):
         """Block-sparse mixture of experts (BlockSparseMLP -- Qwen3-MoE /
         Qwen3.5-MoE / Gemma4 MoE / AFMoE) over the already-normed input.
 
@@ -1847,7 +1883,34 @@ class NativeLlamaQLoRA(nn.Module):
         ye = self._norm(yr, routed_pre) if routed_pre is not None else yr
 
         logits = entry.router(z).to(acc)                        # [nt, E]
-        if meta.get("router_type", "std") == "dots":
+        rtype = meta.get("router_type", "std")
+        if rtype in ("sqrtsp", "sqrtsp_hash"):
+            # DeepSeek-V4 router (inference routing_sqrtsp / routing_sqrtsp_hash):
+            # affinity sqrt(softplus(logits)); selection by top-k over
+            # affinity + e_score_correction_bias ("sqrtsp"), or from the frozen
+            # tid2eid table indexed by the token ids (hash-MoE bootstrap
+            # layers, "sqrtsp_hash"); the selected experts weighted by their
+            # raw affinities normalized over the selected set (+1e-20) and
+            # scaled by routed_scaling_factor. Differentiable through the
+            # affinities; the selection is piecewise-constant / fixed.
+            scores = F.softplus(logits).sqrt()                  # [nt, E] >=fp32
+            if rtype == "sqrtsp_hash":
+                assert input_ids is not None, \
+                    "sqrtsp_hash (DeepSeek-V4 hash-MoE) routing needs the input ids"
+                table = meta["tid2eid"]
+                ids = input_ids.reshape(-1).to(table.device)
+                assert ids.shape[0] == nt, \
+                    f"hash routing: {nt} hidden rows but {ids.shape[0]} input ids"
+                top_idx = table[ids].to(device=y.device, dtype=torch.long)   # [nt, k]
+            else:
+                e_bias = meta.get("e_score_bias")
+                sel_scores = scores if e_bias is None \
+                    else scores + e_bias.to(acc).to(scores.device)
+                _, top_idx = torch.topk(sel_scores, top_k, dim=-1)
+            weights = scores.gather(1, top_idx)                 # [nt, k]
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            weights = weights * meta.get("routed_scaling_factor", 1.0)
+        elif rtype == "dots":
             # Ungrouped sigmoid router (AFMoE / dots.llm1), mirroring the
             # inference routing_dots / ext.routing_ds3_nogroup: sigmoid
             # scores; e_score_correction_bias added for the top-k SELECTION
@@ -2029,6 +2092,134 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
+    # --- DeepSeek-V4 attention block forward -------------------------------
+
+    @staticmethod
+    def _rope_gptj_trailing(x, inv_freq, positions, rope_dim, sign=1.0):
+        """GPT-J (interleaved-pair) rotation of the TRAILING ``rope_dim`` dims
+        of ``x`` ``[b, t, h, D]`` at per-token ``positions`` ``[b, t]`` (the
+        inference ``ext.rope`` with ``RopeStyle.GPTJ`` and ``rotate_offset =
+        D - rope_dim``; ``sign = -1`` is the eq. 26 de-rotation). fp32 math,
+        returned in ``x``'s dtype."""
+        D = x.shape[-1]
+        if rope_dim <= 0:
+            return x
+        head, tail = x[..., :D - rope_dim], x[..., D - rope_dim:].float()
+        freqs = positions.float().unsqueeze(-1) * inv_freq.float().view(1, 1, -1)   # [b,t,rd/2]
+        cos = freqs.cos().repeat_interleave(2, dim=-1).unsqueeze(2)                # [b,t,1,rd]
+        sin = (sign * freqs.sin()).repeat_interleave(2, dim=-1).unsqueeze(2)
+        x1, x2 = tail[..., 0::2], tail[..., 1::2]
+        rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        out = (tail * cos + rot * sin).to(x.dtype)
+        return torch.cat((head, out), dim=-1)
+
+    def _dsv4_compress(self, meta, entry, normed, bsz, t):
+        """The stateless compressor (``DSV4Compressor.forward`` with no state;
+        ``_forward_nc``): complete windows of ``m`` tokens only (remainder
+        dropped), per-channel softmax over the window of ``gate + ape``
+        weighting the window's kv rows, the compressor norm, then the rope
+        slice rotated at the window's first-token position ``w * m`` with the
+        compress table. CSA (overlapping): each entry pools the previous
+        window's Ca half (zero rows, -inf gates at w = 0) and this window's Cb
+        half. Returns ``[b, nw, hd]`` or None (no complete window)."""
+        comp = meta["compressor"]
+        m, hd = meta["compress_rate"], comp["head_dim"]
+        nw = t // m
+        if nw == 0:
+            return None
+        kv = entry.comp_wkv(normed).float()[:, :nw * m]            # [b, nw*m, W]
+        gate = entry.comp_wgate(normed).float()[:, :nw * m]
+        kv = kv.view(bsz, nw, m, -1)
+        gate = gate.view(bsz, nw, m, -1) + comp["ape"].to(gate.dtype).to(gate.device)
+        if comp["overlapping"]:
+            ca_kv, cb_kv = kv[..., :hd], kv[..., hd:]
+            ca_g, cb_g = gate[..., :hd], gate[..., hd:]
+            prev_kv = torch.cat((ca_kv.new_zeros(bsz, 1, m, hd), ca_kv[:, :-1]), dim=1)
+            prev_g = torch.cat((ca_g.new_full((bsz, 1, m, hd), -float("inf")), ca_g[:, :-1]), dim=1)
+            kv = torch.cat((prev_kv, cb_kv), dim=2)                # [b, nw, 2m, hd]
+            gate = torch.cat((prev_g, cb_g), dim=2)
+        pooled = (kv * torch.softmax(gate, dim=2)).sum(dim=2)      # [b, nw, hd] fp32
+        pooled = self._norm(pooled.to(self.compute_dtype), comp["norm"])
+        wpos = (torch.arange(nw, device=pooled.device) * m).unsqueeze(0).expand(bsz, nw)
+        pooled = self._rope_gptj_trailing(pooled.unsqueeze(2), meta["inv_freq_compress"],
+                                          wpos, comp["rope_dim"]).squeeze(2)
+        return pooled
+
+    def _dsv4_forward(self, meta, entry, hidden, position_ids, attention_mask, input_ids):
+        """One DeepSeek-V4 decoder block (``DSV4Attention._forward_nc`` +
+        the hc / MoE half). Attention per head over ``[this chunk's kv rows
+        (sliding) ++ compressed entries]`` with V == K (one shared kv row),
+        an extra sink logit per head in the softmax denominator, the output's
+        rope slice de-rotated at the query position, then the grouped
+        low-rank output projection. Masks: sliding key j visible to query i
+        iff j <= i and i - j < window (and j not a pad key); compressed entry
+        w visible iff w < (i + 1) // m. Eager fp32 scores (no flash kernel
+        for this form). Right-padding only; no packing (rejected up front)."""
+        bsz, t = hidden.shape[:2]
+        H, D, rd = meta["num_q_heads"], meta["head_dim"], meta["rope_head_dim"]
+        G = meta["o_groups"]
+        m, lt = meta["compress_rate"], meta["layer_type"]
+        cd = self.compute_dtype
+        dev = hidden.device
+        pos = position_ids if position_ids.dim() == 2 else position_ids[0]
+
+        normed, post = self._site_in(hidden, entry, "attn")
+        # Queries: q_a -> q_norm -> q_b -> unweighted per-head norm -> rope slice
+        q = entry.q_b_proj(self._norm(entry.q_a_proj(normed), entry.q_a_norm_spec))
+        q = q.view(bsz, t, H, D)
+        q = self._norm(q, {"weight": None, "eps": entry.kv_norm_spec["eps"],
+                           "bias": 0.0, "scale": 1.0})
+        q = self._rope_gptj_trailing(q, meta["inv_freq"], pos, rd)
+        # The shared kv row: wkv -> kv_norm -> rope slice
+        kv = self._norm(entry.wkv(normed), entry.kv_norm_spec).view(bsz, t, 1, D)
+        kv = self._rope_gptj_trailing(kv, meta["inv_freq"], pos, rd).squeeze(2)   # [b, t, D]
+
+        comp = self._dsv4_compress(meta, entry, normed, bsz, t) if lt in ("csa", "hca") else None
+        nw = 0 if comp is None else comp.shape[1]
+        keys = kv if comp is None else torch.cat((kv, comp.to(kv.dtype)), dim=1)   # [b, t+nw, D]
+
+        # Additive mask [b, 1, t, t + nw]: sliding window on the raw keys,
+        # the causal complete-window bound on the compressed entries.
+        i = torch.arange(t, device=dev).unsqueeze(1)
+        j = torch.arange(t, device=dev).unsqueeze(0)
+        win = (j <= i) & ((i - j) < meta["sliding_window"])        # [t, t]
+        win = win.unsqueeze(0).expand(bsz, t, t)
+        if attention_mask is not None:
+            win = win & attention_mask.to(dev).bool().unsqueeze(1)   # pad keys hidden
+        if nw:
+            w = torch.arange(nw, device=dev).view(1, 1, nw)
+            vis = w < ((pos.to(dev) + 1) // m).unsqueeze(-1)          # [b, t, nw]
+            allow = torch.cat((win, vis), dim=-1)
+        else:
+            allow = win
+        mask = torch.zeros(allow.shape, dtype=torch.float32, device=dev)
+        mask = mask.masked_fill(~allow, float("-inf")).unsqueeze(1)   # [b, 1, t, t+nw]
+
+        qf = q.transpose(1, 2).float()                               # [b, H, t, D]
+        kf = keys.float().unsqueeze(1)                               # [b, 1, t+nw, D]
+        scores = torch.matmul(qf, kf.transpose(-1, -2)) * meta["sm_scale"] + mask
+        sink = meta["sinks"].to(device=dev, dtype=scores.dtype).view(1, H, 1, 1).expand(bsz, H, t, 1)
+        probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
+        o = torch.matmul(probs, kf)                                  # [b, H, t, D]
+        o = o.transpose(1, 2)                                        # [b, t, H, D]
+        o = self._rope_gptj_trailing(o, meta["inv_freq"], pos, rd, sign=-1.0).to(cd)
+        # Grouped low-rank output projection: heads [g*hpg, (g+1)*hpg) -> wo_a[g] -> cat -> wo_b
+        hpg = H // G
+        og = o.reshape(bsz, t, G, hpg * D)
+        o_lat = torch.cat([entry.wo_a[g](og[:, :, g]) for g in range(G)], dim=-1)
+        attn_out = entry.wo_b(o_lat)
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
+
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None,
+                                input_ids=input_ids)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            hidden = (hidden * ls).to(hidden.dtype)
+        return hidden
+
     # --- ShortConv (LFM2 gated causal conv) block forward ------------------
 
     def _shortconv_forward(self, meta, entry, hidden):
@@ -2118,11 +2309,11 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(
-            m["kind"] if m.get("kind", "attn") in ("gdn", "shortconv")
+            m["kind"] if m.get("kind", "attn") in ("gdn", "shortconv", "dsv4")
             else self._attn_mode_for(m, mem_eff)
             for m in self._block_meta)
         plan = ", ".join(f"{counts[k]}×{k}" for k in
-                         ("flash", "sdpa", "eager", "gdn", "shortconv")
+                         ("flash", "sdpa", "eager", "gdn", "shortconv", "dsv4")
                          if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
@@ -2245,6 +2436,17 @@ class NativeLlamaQLoRA(nn.Module):
                     use_reentrant=False,
                 )
             return self._gdn_forward(meta, entry, hidden)
+        if meta.get("kind", "attn") == "dsv4":
+            # DeepSeek-V4 block: its own sliding / compressed / sink attention
+            # (eager; no flash kernel for this form), hash-MoE by token id.
+            am = ctx.get("attention_mask")
+            ids = ctx.get("input_ids")
+            if ckpt:
+                return torch.utils.checkpoint.checkpoint(
+                    self._dsv4_forward, meta, entry, hidden, position_ids, am, ids,
+                    use_reentrant=False,
+                )
+            return self._dsv4_forward(meta, entry, hidden, position_ids, am, ids)
         if meta.get("kind", "attn") == "shortconv":
             # ShortConv block (LFM2): causal conv, no RoPE, no
             # attention bias, no packing (rejected up front).
@@ -2312,12 +2514,13 @@ class NativeLlamaQLoRA(nn.Module):
             qa_state["tick"] += 1
         if seg_ids is not None and (getattr(self, "has_gdn", False)
                                     or getattr(self, "has_shortconv", False)
-                                    or getattr(self, "has_ple", False)):
+                                    or getattr(self, "has_ple", False)
+                                    or getattr(self, "has_dsv4", False)):
             raise ValueError(
                 "sample packing (seg_ids) is not supported on GatedDeltaNet / "
-                "ShortConv / PLE models: the recurrence, causal conv and n-gram "
-                "history would carry state across packed document boundaries. "
-                "Train unpacked (drop --pack).")
+                "ShortConv / PLE / DeepSeek-V4 models: the recurrence, causal conv, "
+                "n-gram history and compressed-window entries would carry state "
+                "across packed document boundaries. Train unpacked (drop --pack).")
         if mm is not None and seg_ids is not None:
             raise ValueError("image batches (mm) cannot be sample-packed (seg_ids)")
         # QSA sparse attention (Qwen3.8-Flash-Next): the native forward attends
@@ -2434,7 +2637,10 @@ class NativeLlamaQLoRA(nn.Module):
         # The per-forward attention context, shared with the MTP head's blocks
         # (same mask, positions, packing and backend selection as the trunk's).
         ctx = {"mem_eff": mem_eff, "get_bias": get_bias, "pack_ctx": pack_ctx,
-               "attention_mask": attention_mask, "seg_ids": seg_ids}
+               "attention_mask": attention_mask, "seg_ids": seg_ids,
+               # DeepSeek-V4: hash-MoE layers route by token id; the DSV4
+               # block forward also builds its own window masks.
+               "input_ids": input_ids}
 
         # Activation offload: park the (grad-checkpointed) block-boundary activations
         # saved for backward in CPU RAM, trading CPU<->GPU copies for GPU memory.
