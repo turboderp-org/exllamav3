@@ -408,6 +408,21 @@ def _copy_repacked(dst, tensor, group, planar):
             tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
 
 
+def _copy_unpacked(dst, packed, group, planar):
+    """The inverse of _copy_repacked: a packed-layout [k/16, n/16, 16K] view back to native
+    tile order (and dword order) in `dst`"""
+    tk, tn, ps = dst.shape
+    if not group:
+        dst.copy_(packed)
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).copy_(
+            packed.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tk, tn // group, group, ps).copy_(
+            packed.view(tn // group, tk, group, ps).permute(1, 0, 2, 3))
+
+
 class _HugeArena:
     """
     Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
@@ -685,19 +700,32 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             expert block in (g, u, d) order, the layout the stager produces and the DMA unit
             of the pinned-arena streamed path), then the small aux tensors. Returns the
             per-projection lists and the per-expert (chunk, byte offset) of each block."""
-            gs, us, ds, blocks = [], [], [], []
+            gs, us, ds, blocks, auxlocs = [], [], [], [], []
             for e in range(len(u)):
                 projs = ([g[e]] if g else []) + [u[e], d[e]]
                 total = sum(nbytes(t[0]) for t in projs)
                 assert all(nbytes(t[0]) % 64 == 0 for t in projs), "trellis size not 64-byte aligned"
                 blocks.append(arena.reserve(total))
                 trellis = [rehome_trellis(t[0]) for t in projs]
-                aux = [(arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3])) for t in projs]
+                # The aux tensors' (chunk, offset, bytes) go to the parent with the block: a demotion
+                # (promote-on-miss) writes an expert's suh/svh/bias into the arena from the GPU
+                aux, locs = [], []
+                for t in projs:
+                    pa, pl = [], []
+                    for a in (t[1], t[2], t[3]):
+                        if a is None or a.numel() == 0:
+                            pl.append(None)
+                        else:
+                            pl.append(arena.reserve(nbytes(a)) + (nbytes(a),))
+                        pa.append(arena.rehome(a))
+                    aux.append(tuple(pa))
+                    locs.append(pl)
+                auxlocs.append(locs)
                 if g:
                     gs.append((trellis[0],) + aux[0])
                 us.append((trellis[-2],) + aux[-2])
                 ds.append((trellis[-1],) + aux[-1])
-            return gs, us, ds, blocks
+            return gs, us, ds, blocks, auxlocs
 
         def biases(ts):
             return [t[3] for t in ts] if ts and ts[0][3] is not None else []
@@ -715,7 +743,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 spec = msg[1]
                 num_experts = len(spec["up_keys"])
                 batch = TUNING.load_batch_experts or num_experts
-                g, u, d, blocks = [], [], [], []
+                g, u, d, blocks, auxlocs = [], [], [], [], []
                 for e0 in range(0, num_experts, batch):
                     sl = slice(e0, e0 + batch)
                     stc.begin_deferred_load()
@@ -725,11 +753,12 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     stc.end_deferred_load()
                     # Copy into the hugepage-backed arena now that the deferred reads have
                     # actually populated these tensors; the loader tensors die with this batch
-                    bg, bu, bd, bb = rehome_experts(bg, bu, bd)
+                    bg, bu, bd, bb, ba = rehome_experts(bg, bu, bd)
                     g += bg
                     u += bu
                     d += bd
                     blocks += bb
+                    auxlocs += ba
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -747,7 +776,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     pass
                 # The ack carries the expert block locations (only meaningful to a parent that
                 # maps the arena)
-                conn.send(("ok", blocks if pinned else None))
+                conn.send(("ok", blocks if pinned else None, auxlocs if pinned else None))
             elif msg[0] == "start":
                 shm_name, layout = msg[1], msg[2]
                 break
@@ -901,6 +930,10 @@ class MoeCpuHost:
         # and experts in it and every later chunk stream through the staged path instead
         self.arena_registered = None
         self.layer_blocks = []
+        self.layer_auxloc = []
+        # Promote-on-miss transfers (see BlockSparseMLP_CPU._split_promote_step): per device a
+        # stream of its own and two expert-sized staging buffers (packed and native order)
+        self._promo = {}
         self.batch_recon = TUNING.stream_batch_recon
 
     def _spawn(self):
@@ -930,6 +963,7 @@ class MoeCpuHost:
             if msg[0] == "ok":
                 # Layer acks arrive in registration order: entry i describes specs[i]
                 self.layer_blocks.append(msg[1] if len(msg) > 1 else None)
+                self.layer_auxloc.append(msg[2] if len(msg) > 2 else None)
                 self.acked += 1
             elif msg[0] == "chunk":
                 self._attach_chunk(msg[1], msg[2], msg[3])
@@ -1621,6 +1655,145 @@ class MoeCpuHost:
         uf = torch.nn.functional.relu(u.float())
         return (uf * uf).half()
 
+    # -- promote-on-miss transfers ---------------------------------------------------------------
+    #
+    # With the pinned arena the parent maps the worker's expert memory, so an expert moves between
+    # the GPU slot tensors and its arena block by DMA on a side stream: no checkpoint read, no
+    # worker message, no quiesce. The arena holds the bytes in the CPU tier's packed layout
+    # (_stream_layout), the GPU slots in native order, so a transfer repacks through the staging
+    # buffers with the same strided copies the child loader uses. The caller orders the transfers
+    # against the compute streams (BlockSparseMLP_CPU._split_promote_step).
+
+    def promote_ready(self, layer_idx, cpu_local):
+        """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
+        mapped here and the expert's chunks were page-locked (the pinning may have stopped short)"""
+        if not self.pinned or layer_idx >= len(self.layer_blocks) or self.layer_blocks[layer_idx] is None:
+            return False
+        if layer_idx not in self.aux or self.specs[layer_idx].get("expert_bytes") is None:
+            return False
+        chunks = {self.layer_blocks[layer_idx][cpu_local][0]}
+        for proj in self.layer_auxloc[layer_idx][cpu_local]:
+            chunks |= {loc[0] for loc in proj if loc is not None}
+        return all(c < len(self.arena_views) and self.arena_views[c] is not None for c in chunks)
+
+
+    def _promo_state(self, device):
+        key = torch.device(device).index or 0
+        P = self._promo.get(key)
+        if P is None:
+            eb = max(sp.get("expert_bytes") or 0 for sp in self.specs)
+            P = self._promo[key] = dict(
+                stream = torch.cuda.Stream(device = device),
+                raw = torch.empty(eb // 2, dtype = torch.int16, device = device),
+            )
+        return P
+
+
+    def promo_stream(self, device):
+        return self._promo_state(device)["stream"]
+
+
+    def _promo_parts(self, layer_idx, linears):
+        """(projection index in the worker's (g, u, d) order, name, Linear, byte offset, bytes) of
+        the expert's projections; `linears` is (gate or None, up, down)"""
+        spec = self.specs[layer_idx]
+        gb, ub, db = spec["proj_bytes"]
+        parts, li, off = [], 0, 0
+        for name, lin, nb in zip(("g", "u", "d"), linears, (gb, ub, db)):
+            if lin is None:
+                continue
+            parts.append((li, name, lin, off, nb))
+            li += 1
+            off += nb
+        return parts
+
+
+    def promote_expert(self, layer_idx, cpu_local, linears):
+        """Copy worker expert `cpu_local` into the GPU slot `linears` (gate or None, up, down):
+        the trellis block by DMA from the arena, repacked to native order, the aux tensors from
+        their GPU copies. Enqueued on the device's promotion stream; returns the event after it"""
+        spec = self.specs[layer_idx]
+        eb = spec["expert_bytes"]
+        ci, off = self.layer_blocks[layer_idx][cpu_local]
+        src = self.arena_views[ci][off // 2 : (off + eb) // 2]
+        layout, _ = self._stream_layout(spec)
+        aux = self.aux[layer_idx]
+        up = linears[1]
+        P = self._promo_state(up.trellis.device)
+        stream = P["stream"]
+        with torch.cuda.stream(stream):
+            raw = P["raw"][:eb // 2]
+            # Raw memcpy: torch's copy_ does not take the registered arena for pinned memory and would
+            # copy synchronously (the same for the device-to-host copies of demote_expert)
+            ext.cuda_memcpy_async(raw.data_ptr(), src.data_ptr(), eb, 1)
+            for li, name, lin, o, nb in self._promo_parts(layer_idx, linears):
+                dst = lin.trellis.view(torch.int16)
+                piece = raw[o // 2 : (o + nb) // 2]
+                group, planar = layout[("g", "u", "d").index(name)]
+                if group:
+                    _copy_unpacked(dst, piece.view(dst.shape), group, planar)
+                else:
+                    dst.view(-1).copy_(piece)
+                for an, attr in (("suh", "suh"), ("svh", "svh"), ("bias", "bias")):
+                    lst = aux.get(f"{an}_{name}")
+                    t = getattr(lin, attr, None)
+                    if lst is None or lst[cpu_local] is None or t is None:
+                        continue
+                    t.copy_(lst[cpu_local], non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+        return ev
+
+
+    def demote_expert(self, layer_idx, cpu_local, linears):
+        """Copy the GPU slot `linears` into worker expert `cpu_local`: the trellis block repacked
+        and DMA'd into the arena, the aux tensors into both their GPU copies (the streamed
+        prefill's) and the arena (the CPU kernel's). The worker slot must be unused (unmapped)
+        until the returned event has landed"""
+        spec = self.specs[layer_idx]
+        eb = spec["expert_bytes"]
+        ci, off = self.layer_blocks[layer_idx][cpu_local]
+        dst_block = self.arena_views[ci][off // 2 : (off + eb) // 2]
+        layout, _ = self._stream_layout(spec)
+        aux = self.aux[layer_idx]
+        locs = self.layer_auxloc[layer_idx][cpu_local]
+        up = linears[1]
+        P = self._promo_state(up.trellis.device)
+        stream = P["stream"]
+        hold = []
+        with torch.cuda.stream(stream):
+            raw = P["raw"][:eb // 2]
+            for li, name, lin, o, nb in self._promo_parts(layer_idx, linears):
+                srct = lin.trellis.view(torch.int16)
+                piece = raw[o // 2 : (o + nb) // 2]
+                group, planar = layout[("g", "u", "d").index(name)]
+                if group:
+                    _copy_repacked(piece.view(srct.shape), srct, group, planar)
+                else:
+                    piece.copy_(srct.view(-1))
+                for j, (an, attr) in enumerate((("suh", "suh"), ("svh", "svh"), ("bias", "bias"))):
+                    lst = aux.get(f"{an}_{name}")
+                    t = getattr(lin, attr, None)
+                    if lst is None or lst[cpu_local] is None or t is None:
+                        continue
+                    lst[cpu_local].copy_(t, non_blocking = True)
+                    loc = locs[li][j]
+                    if loc is not None:
+                        lc, lo, ln = loc
+                        tc = t.contiguous()
+                        if tc is not t:
+                            hold.append(tc)      # a temporary: kept alive until the copy has landed
+                        ext.cuda_memcpy_async(self.arena_views[lc].data_ptr() + lo, tc.data_ptr(), ln, 2)
+            ext.cuda_memcpy_async(dst_block.data_ptr(), raw.data_ptr(), eb, 2)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            if hold:
+                # Temporaries live until their copies have landed; landed entries are dropped on the
+                # next call (no synchronization on the transfer stream)
+                P["hold"] = [(e, ts) for e, ts in P.get("hold", ()) if not e.query()] + [(ev, hold)]
+        return ev
+
+
     def install_expert(self, layer_idx, local_idx, keys):
         """Dynamic placement: replace worker expert `local_idx` of `layer_idx` with the
         checkpoint tensors at `keys` (per-projection prefixes, gate first when gated). The
@@ -2105,6 +2278,8 @@ class MoeCpuHost:
                 pass
         self.arena_views = []
         self.layer_blocks = []
+        self.layer_auxloc = []
+        self._promo = {}
         maps, self.arena_maps = self.arena_maps, []
         if maps:
             import gc

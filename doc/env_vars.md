@@ -619,6 +619,26 @@ pinned KV tiers): when registering a chunk fails for lack of it, the chunks alre
 keep the DMA path and the experts in the rest of the arena stream through the staged path, with
 one notice at load.
 
+### `EXL3_MOE_CPU_PROMOTE` (default: `4`)
+
+Spare GPU expert slots per layer for promote-on-miss in `--moe_cpu_split` mode with the pinned
+arena (`EXL3_MOE_PINNED_ARENA=1`); `0` keeps the periodic swap sweep instead. Each decode step, a
+routed expert the CPU worker had to compute is copied from the arena into a free spare slot on a
+side stream, and once the copy has landed the placement map sends later routes to the GPU; the
+least-used resident that was not routed goes the other way into the worker slot the promotion
+freed, so the resident set follows the conversation token by token instead of once per sweep, and
+no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
+promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
+start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
+step's bookkeeping cost every 128 steps.
+
+### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
+
+Debug: after every landed transfer, read the expert back and compare it with the checkpoint (a
+promotion's GPU slot tensors; a demotion's packed arena bytes and aux copies). Synchronizes and
+reads the checkpoint per transfer, so it is for short runs.
+
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
 Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
