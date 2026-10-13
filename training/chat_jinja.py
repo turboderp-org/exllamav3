@@ -378,7 +378,19 @@ def make_jinja_segment_builder(render, default_vars=None):
 
         segs, prev, pending = [], "", ""
         for i, t in enumerate(turns):
-            cur = r(turns[:i + 1])
+            if t.get("role") != "assistant" and i + 1 < len(turns):
+                # Some templates refuse a prefix with no user turn yet
+                # (Qwen3.6/3.8: raise_exception('No user query found') on a
+                # lone system message). Such a prefix is masked context
+                # either way, so defer it: the next turn's render covers
+                # both and the diff lands in one masked segment. Only the
+                # LAST turn's render has to succeed on its own.
+                try:
+                    cur = r(turns[:i + 1])
+                except ValueError:
+                    continue
+            else:
+                cur = r(turns[:i + 1])
             if not cur.startswith(prev):
                 raise ValueError(
                     f"template re-renders earlier turns at turn {i} "

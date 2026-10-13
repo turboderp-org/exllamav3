@@ -301,6 +301,36 @@ def test_unrenderable():
     print("unrenderable shapes: OK")
 
 
+def test_deferred_prefix():
+    # Qwen3.6/3.8 templates raise_exception when the prefix has no user turn
+    # yet, so messages[:1] (system only) can't render. The builder defers
+    # that prefix into the next turn's masked segment; the result still
+    # concatenates to the full render with only the assistant body
+    # supervised. A conversation whose LAST turn can't render still raises.
+    guard = ("{%- set ns = namespace(user=false) %}"
+             "{%- for m in messages %}{%- if m.role == 'user' %}"
+             "{%- set ns.user = true %}{%- endif %}{%- endfor %}"
+             "{%- if not ns.user %}"
+             "{{ raise_exception('No user query found in messages.') }}"
+             "{%- endif %}")
+    tpl = guard + CHATML_TPL
+    build = make_build(tpl=tpl)
+    render = cj.compile_chat_template(tpl)
+    turns = [s("S"), u("Q"), a("R")]
+    segs = build(turns)
+    assert cat(segs) == render(turns), f"{cat(segs)!r}"
+    assert sup(segs) == ["R<|im_end|>"], f"{segs!r}"
+    assert segs[0] == ("<|im_start|>system\nS<|im_end|>\n"
+                       "<|im_start|>user\nQ<|im_end|>\n", False), segs[0]
+    try:
+        build([s("S")])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+    print("deferred prefix: OK")
+
+
 def test_prefix_violation():
     # A template that keeps reasoning only on the LAST message re-renders
     # history: turns[:2] shows the think span, turns[:3] drops it. That must
@@ -465,6 +495,7 @@ if __name__ == "__main__":
     test_template_vars_layering()
     test_special_tokens_in_context()
     test_unrenderable()
+    test_deferred_prefix()
     test_prefix_violation()
     test_multimodal_content_parts()
     test_extract_rich_turns()
