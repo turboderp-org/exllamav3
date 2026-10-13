@@ -163,3 +163,82 @@ def gdn_beta_g(
     beta = torch.sigmoid(b_raw.float()) * float(beta_scale)
     g = -a_log.float().exp() * F.softplus(a_raw.float() + dt_bias.float())
     return beta, g
+
+
+# ---------------------------------------------------------------------------
+# KDA (Kimi Delta Attention; GLM-5.3-Flash linear-attention layers).
+# ---------------------------------------------------------------------------
+# Same conv -> delta rule -> gated norm -> o_proj skeleton as the Qwen GDN
+# above, with three differences read from the inference module
+# (``GatedDeltaNet`` in ``kda`` mode, ``torch_recurrent_kda``):
+#
+# * the decay is PER K-CHANNEL: ``g`` is ``[b, t, nv, dk]`` from a low-rank
+#   forget gate ``f = f_b_proj(f_a_proj(x)) + dt_bias`` (``dt_bias`` is
+#   ``[nv*dk]``), ``g = lower_bound * sigmoid(exp(A_log) * f)`` ("safe gate",
+#   ``gate_lower_bound`` set; GLM-5.3-Flash: -5) or ``-exp(A_log) *
+#   softplus(f)`` without a bound;
+# * ``beta = sigmoid(b_proj(x)) * beta_scale`` (no a_proj);
+# * the output gate is low-rank, ``z = g_b_proj(g_a_proj(x))`` (no activation
+#   in between), applied by the gated norm as ``sigmoid(z)``.
+#
+# Recurrence per value head with state ``S`` ``[dk, dv]``, q/k L2-normalized
+# and ``q`` scaled by ``dk^-0.5``::
+#
+#     S_t = diag(exp(g_t)) S_{t-1}
+#     S_t = S_t + k_t (x) (beta_t * (v_t - S_t^T k_t))
+#     o_t = S_t^T q_t
+
+
+def kda_beta_g(
+    b_raw: torch.Tensor,            # [b, t, nv]      b_proj output
+    f_raw: torch.Tensor,            # [b, t, nv*dk]   f_b_proj(f_a_proj(x))
+    a_log: torch.Tensor,            # [nv]
+    dt_bias: torch.Tensor,          # [nv*dk]
+    gate_lower_bound: Optional[float],
+    beta_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(beta [b, t, nv], g [b, t, nv, dk])`` of a KDA layer, fp32 (the
+    inference module's own expression, ``GatedDeltaNet.forward`` kda branch)."""
+    b, t, _ = b_raw.shape
+    nv = a_log.numel()
+    beta = torch.sigmoid(b_raw.float()) * float(beta_scale)
+    gf = (f_raw.float() + dt_bias.float().view(1, 1, -1)).view(b, t, nv, -1)
+    decay = a_log.float().exp().view(1, 1, nv, 1)
+    if gate_lower_bound is not None:
+        g = torch.sigmoid(gf * decay) * float(gate_lower_bound)
+    else:
+        g = -decay * F.softplus(gf, threshold=20.0)
+    return beta, g
+
+
+def kda_delta_rule_reference(
+    q: torch.Tensor,        # [b, t, nv, dk]  raw (pre-L2-norm)
+    k: torch.Tensor,        # [b, t, nv, dk]  raw (pre-L2-norm)
+    v: torch.Tensor,        # [b, t, nv, dv]
+    g: torch.Tensor,        # [b, t, nv, dk]  log decay per k-channel, fp32
+    beta: torch.Tensor,     # [b, t, nv]
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Sequential differentiable KDA delta rule, fp32 ``[b, t, nv, dv]``.
+    Transcribes the inference reference ``torch_recurrent_kda`` (which the
+    CUDA/Triton kernels are validated against), made autograd-safe. The
+    correctness / CPU / gradcheck path; CUDA training uses fla's chunked
+    ``chunk_kda`` (``NativeLlamaQLoRA._gdn_delta_rule``)."""
+    b, t, nv, dk = k.shape
+    dv = v.shape[-1]
+    assert q.shape == k.shape and v.shape[:3] == (b, t, nv) and g.shape == (b, t, nv, dk)
+
+    def up(x):
+        return x.to(torch.promote_types(x.dtype, torch.float32))
+    q = gdn_l2norm(up(q), eps) * (dk ** -0.5)
+    k = gdn_l2norm(up(k), eps)
+    v, g, beta = up(v), up(g), up(beta)
+    state = v.new_zeros(b, nv, dk, dv)
+    outs = []
+    for i in range(t):
+        state = state * g[:, i].exp().unsqueeze(-1)                       # [b, nv, dk, dv]
+        kv_mem = (state * k[:, i].unsqueeze(-1)).sum(dim=-2)              # [b, nv, dv]
+        delta = (v[:, i] - kv_mem) * beta[:, i].unsqueeze(-1)
+        state = state + k[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+        outs.append((state * q[:, i].unsqueeze(-1)).sum(dim=-2))
+    return torch.stack(outs, dim=1)

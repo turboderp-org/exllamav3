@@ -111,11 +111,12 @@ from .fused_ce import (
 )
 from .gdn import (
     gdn_delta_rule_reference, gdn_causal_conv1d_silu, gdn_gated_rmsnorm,
-    gdn_beta_g,
+    gdn_beta_g, kda_beta_g, kda_delta_rule_reference,
 )
 from .short_conv import shortconv_mix
 from .hyperconnections import (
     expand_streams, gated_residual_mix, gated_residual_apply, streams_mean,
+    mhc_mix, mhc_apply, mhc_head,
 )
 from .ple import ple_delta
 
@@ -239,6 +240,45 @@ _GDN_TARGET_ALIASES = {
     "out_proj": ("out_proj", "o_proj"),
 }
 
+# KDA (GLM-5.3-Flash linear attention) leaf -> target names. qkv/o ride the
+# Llama-style names like the Qwen GDN layout; beta and the low-rank forget /
+# output gate projections (fp16, tiny: 128-wide bottlenecks) are adapted only
+# when named explicitly.
+_KDA_TARGET_ALIASES = {
+    "qkv_proj": ("in_proj_qkv", "qkv_proj", "q_proj", "k_proj", "v_proj"),
+    "b_proj": ("in_proj_b", "b_proj"),
+    "f_a_proj": ("f_a_proj",),
+    "f_b_proj": ("f_b_proj",),
+    "g_a_proj": ("g_a_proj",),
+    "g_b_proj": ("g_b_proj",),
+    "o_proj": ("out_proj", "o_proj"),
+}
+
+# MLA (multi-head latent attention) leaf -> target names. The low-rank query
+# pair answers to q_proj (both halves, PEFT-style "all the q path"), the
+# latent kv_a projection to k_proj / v_proj (it is the only K/V linear: the
+# kv_b up-projection is held as frozen tables on the inference side and is
+# not adaptable), o_proj to itself.
+_MLA_TARGET_ALIASES = {
+    "q_a_proj": ("q_a_proj", "q_proj"),
+    "q_b_proj": ("q_b_proj", "q_proj"),
+    "kv_a_proj_with_mqa": ("kv_a_proj_with_mqa", "kv_a_proj", "k_proj", "v_proj"),
+    "o_proj": ("o_proj",),
+}
+
+# DeepSeek-V4 attention leaf -> target names (checkpoint namespace attn.wq_a /
+# wq_b / wkv / wo_a / wo_b). The q pair answers to q_proj, the single shared
+# kv row to k_proj / v_proj, both halves of the grouped low-rank output
+# projection to o_proj. The compressor projections (compressor.wkv / wgate)
+# are frozen (never targets): they feed the compressed-window keys.
+_DSV4_TARGET_ALIASES = {
+    "wq_a": ("wq_a", "q_a_proj", "q_proj"),
+    "wq_b": ("wq_b", "q_b_proj", "q_proj"),
+    "wkv": ("wkv", "kv_proj", "k_proj", "v_proj"),
+    "wo_a": ("wo_a", "o_a_proj", "o_proj"),
+    "wo_b": ("wo_b", "o_b_proj", "o_proj"),
+}
+
 # ShortConv leaf -> the target names that select it (LFM2 / LFM2-MoE conv
 # layers). Same idea as the GDN aliases: the fused in_proj ([hidden, 3*hidden]
 # emitting b|c|x) plays the q/k/v role, out_proj plays o, so the familiar
@@ -267,6 +307,26 @@ _MOE_EXPERT_TARGET_ALIASES = {
     "up_proj": ("expert_up_proj",),
     "down_proj": ("expert_down_proj",),
 }
+
+
+_FLA_KDA_FN = None
+_FLA_KDA_TRIED = False
+
+
+def _fla_kda_fn():
+    """fla's autograd-capable chunked KDA kernel (``fla.ops.kda.chunk_kda``),
+    or None. The vendored copy in ``exllamav3.vendor.fla`` is forward-only
+    (inference prefill), so training needs the installed package."""
+    global _FLA_KDA_FN, _FLA_KDA_TRIED
+    if _FLA_KDA_TRIED:
+        return _FLA_KDA_FN
+    _FLA_KDA_TRIED = True
+    try:
+        from fla.ops.kda import chunk_kda
+        _FLA_KDA_FN = chunk_kda
+    except Exception:
+        _FLA_KDA_FN = None
+    return _FLA_KDA_FN
 
 
 def _rotate_half_neox(x: torch.Tensor) -> torch.Tensor:
@@ -322,6 +382,14 @@ class DiffLinear(nn.Module):
     # instances and pre-feature checkpoints behave exactly as before.
     lora_drop = None
 
+    # Whether the frozen Linear's bias enters the forward. Class default so
+    # headless instances behave as before. False on MoE ROUTERS: the inference
+    # routing kernels multiply by the raw gate weight (HF's bias-free
+    # F.linear), and a checkpoint "gate.bias" tensor (DeepSeek-V4) is the
+    # selection bias -- loaded by the Linear as an ordinary bias it would
+    # otherwise reach the logits twice over (see _moe_out).
+    use_bias = True
+
     def __init__(
         self,
         linear: nn.Module,
@@ -330,11 +398,13 @@ class DiffLinear(nn.Module):
         use_rslora: bool = False,
         compute_dtype: torch.dtype = torch.bfloat16,
         dropout: float = 0.0,
+        use_bias: bool = True,
     ):
         super().__init__()
         assert backbone.is_loaded(linear), \
             "native Linear must be loaded (have .inner) before wrapping"
         self.linear = linear                 # frozen; holds trellis / fp16 weight
+        self.use_bias = bool(use_bias)
         self.key = linear.key
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -470,7 +540,7 @@ class DiffLinear(nn.Module):
             inner_fn, suh, svh = parts
             had = self._had if self._had is not None \
                 else backbone.hadamard_128(suh.device, suh.dtype)
-            bias = backbone.frozen_bias(self.linear, self.compute_dtype)
+            bias = self._bias()
             if not self.adapter_enabled:
                 # Reference view: pure frozen base -- no LoRA, no pissa offset.
                 return EXL3LoRAHadFunction.apply(
@@ -494,7 +564,7 @@ class DiffLinear(nn.Module):
             # (backbone.frozen_weight_closure directly, bypassing the residual).
             return EXL3LoRAFunction.apply(
                 xc, None, None,
-                backbone.frozen_bias(self.linear, self.compute_dtype),
+                self._bias(),
                 1.0,
                 backbone.frozen_weight_closure(self.linear, self.compute_dtype),
             )
@@ -503,17 +573,22 @@ class DiffLinear(nn.Module):
             # perturbation; only the trainable low-rank term moves outside.
             y = EXL3LoRAFunction.apply(
                 xc, None, None,
-                backbone.frozen_bias(self.linear, self.compute_dtype),
+                self._bias(),
                 1.0,
                 self._weight_closure_qa(),
             )
             return y + self._lora_drop_term(xc)
         return EXL3LoRAFunction.apply(
             xc, self.lora_a, self.lora_b,
-            backbone.frozen_bias(self.linear, self.compute_dtype),
+            self._bias(),
             self.scale,
             self._weight_closure_qa(),
         )
+
+    def _bias(self):
+        if not self.use_bias:
+            return None
+        return backbone.frozen_bias(self.linear, self.compute_dtype)
 
     def extra_repr(self) -> str:
         return (f"key={self.key}, in={self.in_features}, out={self.out_features}, "
@@ -693,6 +768,7 @@ class NativeLlamaQLoRA(nn.Module):
         satisfied_targets: set[str] = set()   # requested names that matched a linear
         self.has_gdn = False
         self.has_shortconv = False
+        self.has_dsv4 = False
         self.has_moe = False
         # Stream-stack residual (Qwen3.8-Flash-Next): ExpandStreams broadcasts
         # the embedding into hc_mult fp32 streams, every block's sublayer
@@ -702,7 +778,7 @@ class NativeLlamaQLoRA(nn.Module):
         self.hc_mult = backbone.hc_mult(model)
 
         def make_wrap(targets, satisfied_targets):
-            def wrap(linear, leaf, aliases=None, r_override=None):
+            def wrap(linear, leaf, aliases=None, r_override=None, use_bias=True):
                 # `aliases` (GDN / MoE-expert layers) lets several requested
                 # target names select one physical linear (see
                 # _GDN_TARGET_ALIASES / _MOE_EXPERT_TARGET_ALIASES; an empty
@@ -721,6 +797,7 @@ class NativeLlamaQLoRA(nn.Module):
                     use_rslora=use_rslora,
                     compute_dtype=compute_dtype,
                     dropout=lora_dropout,
+                    use_bias=use_bias,
                 )
                 wrappers.append(w)
                 return w
@@ -795,7 +872,11 @@ class NativeLlamaQLoRA(nn.Module):
                 # Router + shared-expert gate: frozen projections (aliases=() so
                 # no target name can select them), still DiffLinears so the
                 # routing weights stay differentiable w.r.t. the hidden state.
-                entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", ())
+                # The router multiplies by the RAW gate weight: every supported
+                # routing kernel ignores a Linear bias (DeepSeek-V4's
+                # "gate.bias" is the selection bias, read via meta e_score_bias).
+                entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", (),
+                                    use_bias=False)
                 sh_gate = backbone.moe_shared_gate_linear(blk)
                 entry.shared_gate = wrap(sh_gate, "shared_gate", ()) if sh_gate is not None else None
                 # Gemma4-layout extra norms (None on Qwen-family MoE): router
@@ -817,8 +898,8 @@ class NativeLlamaQLoRA(nn.Module):
             # and the residual add at each sublayer (see _site_in / _site_out).
             # Frozen tables, never targets. None on a pre-norm block.
             attn_hc, mlp_hc = backbone.block_hc_sites(blk)
-            entry.attn_hc_spec = backbone.gated_residual_spec(attn_hc) if attn_hc is not None else None
-            entry.mlp_hc_spec = backbone.gated_residual_spec(mlp_hc) if mlp_hc is not None else None
+            entry.attn_hc_spec = backbone.hc_site_spec(attn_hc) if attn_hc is not None else None
+            entry.mlp_hc_spec = backbone.hc_site_spec(mlp_hc) if mlp_hc is not None else None
             assert (entry.attn_hc_spec is not None) == (self.hc_mult > 0), \
                 f"{getattr(blk, 'key', '?')}: hyper-connection sites and the " \
                 f"stream-stack layout (ExpandStreams) must come together"
@@ -826,7 +907,22 @@ class NativeLlamaQLoRA(nn.Module):
                 assert entry.attn_hc_spec["hc_mult"] == self.hc_mult, \
                     f"{getattr(blk, 'key', '?')}: site hc_mult " \
                     f"{entry.attn_hc_spec['hc_mult']} != model hc_mult {self.hc_mult}"
-            if meta["kind"] == "gdn":
+            if meta["kind"] == "gdn" and meta.get("kda"):
+                # KDA layer (GLM-5.3-Flash linear attention): qkv + beta +
+                # the low-rank forget gate (f_a/f_b) and output gate (g_a/g_b)
+                # + o_proj, all native Linears (see training.gdn, KDA).
+                self.has_gdn = True
+                qkv_l, b_l, fa_l, fb_l, ga_l, gb_l, o_l = backbone.kda_projections(blk)
+                entry.gdn_norm_spec = backbone.gdn_norm_spec(blk)
+                entry.qkv_proj = wrap(qkv_l, "qkv_proj", _KDA_TARGET_ALIASES["qkv_proj"])
+                entry.b_proj = wrap(b_l, "b_proj", _KDA_TARGET_ALIASES["b_proj"])
+                entry.f_a_proj = wrap(fa_l, "f_a_proj", _KDA_TARGET_ALIASES["f_a_proj"])
+                entry.f_b_proj = wrap(fb_l, "f_b_proj", _KDA_TARGET_ALIASES["f_b_proj"])
+                entry.g_a_proj = wrap(ga_l, "g_a_proj", _KDA_TARGET_ALIASES["g_a_proj"])
+                entry.g_b_proj = wrap(gb_l, "g_b_proj", _KDA_TARGET_ALIASES["g_b_proj"])
+                entry.o_proj = wrap(o_l, "o_proj", _KDA_TARGET_ALIASES["o_proj"])
+                entry.z_proj = entry.a_proj = None
+            elif meta["kind"] == "gdn":
                 # GatedDeltaNet layer (Qwen3.5/3.6 linear attention). The five
                 # split projections are all native Linears, so LoRA / pissa /
                 # quant-aware compose exactly as on softmax layers.
@@ -843,6 +939,45 @@ class NativeLlamaQLoRA(nn.Module):
                                     _GDN_TARGET_ALIASES["in_proj_a"])
                 entry.o_proj = wrap(o_l, "out_proj",
                                     _GDN_TARGET_ALIASES["out_proj"])
+            elif meta["kind"] == "dsv4":
+                # DeepSeek-V4 attention: q_a -> q_norm -> q_b (+ unweighted
+                # per-head norm), the shared kv row (wkv -> kv_norm), the
+                # grouped low-rank output projection (o_groups wo_a slices ->
+                # wo_b), and on CSA/HCA layers the frozen compressor
+                # projections. See _dsv4_forward.
+                self.has_dsv4 = True
+                qa_l, qb_l, wkv_l, woa_ls, wob_l = backbone.dsv4_projections(blk)
+                qn, kvn = backbone.dsv4_norms(blk)
+                entry.q_a_proj = wrap(qa_l, "wq_a", _DSV4_TARGET_ALIASES["wq_a"])
+                entry.q_b_proj = wrap(qb_l, "wq_b", _DSV4_TARGET_ALIASES["wq_b"])
+                entry.wkv = wrap(wkv_l, "wkv", _DSV4_TARGET_ALIASES["wkv"])
+                entry.wo_a = nn.ModuleList(
+                    [wrap(l, "wo_a", _DSV4_TARGET_ALIASES["wo_a"]) for l in woa_ls])
+                entry.wo_b = wrap(wob_l, "wo_b", _DSV4_TARGET_ALIASES["wo_b"])
+                entry.q_a_norm_spec = backbone.norm_spec(qn)
+                entry.kv_norm_spec = backbone.norm_spec(kvn)
+                cwkv, cwg = backbone.dsv4_compressor_projections(blk)
+                entry.comp_wkv = wrap(cwkv, "compressor_wkv", ()) if cwkv is not None else None
+                entry.comp_wgate = wrap(cwg, "compressor_wgate", ()) if cwg is not None else None
+                entry.g_proj = None
+            elif meta["kind"] == "mla":
+                # MLA layer (GLM-5.3-Flash NoPE MLA): low-rank q path (q_a ->
+                # norm -> q_b, or a direct q_proj), the latent kv_a projection
+                # + its norm, and o_proj as native Linears; K/V come from the
+                # frozen kv_b tables in meta (w_uk / w_uv). See _mla_qkv.
+                qa_l, qb_l, kva_l, o_l = backbone.mla_projections(blk)
+                qa_n, kva_n = backbone.mla_norms(blk)
+                entry.q_a_proj = (wrap(qa_l, "q_a_proj", _MLA_TARGET_ALIASES["q_a_proj"])
+                                  if qa_l is not None else None)
+                entry.q_b_proj = wrap(qb_l, "q_b_proj", _MLA_TARGET_ALIASES["q_b_proj"]
+                                      if qa_l is not None else ("q_proj",))
+                entry.kv_a_proj = wrap(kva_l, "kv_a_proj_with_mqa",
+                                       _MLA_TARGET_ALIASES["kv_a_proj_with_mqa"])
+                entry.o_proj = wrap(o_l, "o_proj", _MLA_TARGET_ALIASES["o_proj"])
+                entry.q_a_norm_spec = backbone.norm_spec(qa_n)
+                entry.kv_a_norm_spec = backbone.norm_spec(kva_n)
+                entry.q_norm_spec = entry.k_norm_spec = entry.v_norm_spec = None
+                entry.g_proj = None
             elif meta["kind"] == "shortconv":
                 # ShortConv layer (LFM2 / LFM2-MoE gated causal conv). Two
                 # native Linears (in_proj / out_proj), so LoRA / pissa /
@@ -958,8 +1093,8 @@ class NativeLlamaQLoRA(nn.Module):
                if m.get("qsa_threshold") is not None]
         self.qsa_threshold = min(qsa) if qsa else None
         if self.qsa_threshold is not None:
-            print(f" -- note: QSA sparse-attention layers present; the native forward "
-                  f"attends densely, which is exact for sequences up to "
+            print(f" -- note: sparse-attention (QSA / DSA indexer) layers present; the "
+                  f"native forward attends densely, which is exact for sequences up to "
                   f"{self.qsa_threshold} tokens. Longer batches are refused "
                   f"(keep --seq-len <= {self.qsa_threshold}).")
 
@@ -995,7 +1130,8 @@ class NativeLlamaQLoRA(nn.Module):
             print(" -- note: mRoPE detected (Qwen-VL text tower). Text-only "
                   "batches reduce exactly to 1D NeoX RoPE; image batches "
                   "(--vision) rotate the 3D [t, h, w] positions per band.")
-        if self.has_gdn and _fla_chunk_fn() is None:
+        has_kda = any(m.get("kda") for m in self._block_meta if m.get("kind") == "gdn")
+        if self.has_gdn and (_fla_kda_fn() if has_kda else _fla_chunk_fn()) is None:
             print(" -- note: GatedDeltaNet layers present but the fla package "
                   "(flash-linear-attention) is not importable; the delta rule "
                   "will run the sequential torch reference -- correct but slow "
@@ -1013,6 +1149,12 @@ class NativeLlamaQLoRA(nn.Module):
         else:
             self.final_norm_spec = backbone.norm_spec(self.final_norm)
             self.final_mixer_spec = None
+        # mHC decoders (DeepSeek-V4 / GLM-5.3-Flash): a HyperHead collapses the
+        # stream stack (weighted gate, or GLM's plain mean) in front of the
+        # final RMSNorm above. None on every other layout.
+        hh = backbone.hyper_head(model)
+        self.hyper_head_spec = backbone.hyper_head_spec(hh) if hh is not None else None
+        assert (self.hyper_head_spec is None) or (self.hc_mult > 0 and self.final_mixer_spec is None)
         # Final-logit tanh softcapping (Gemma2; 0 = none). Applied by logits(),
         # by the materialized supervised-position loss, and by both fused-CE
         # heads (softcap arg -- the cap is elementwise, so it chunks cleanly).
@@ -1369,6 +1511,15 @@ class NativeLlamaQLoRA(nn.Module):
         ``_site_out``."""
         hc = getattr(entry, f"{site}_hc_spec", None)
         if hc is not None:
+            if hc.get("kind", "gated") == "mhc":
+                # mHC: the Sinkhorn mix collapses the streams, then the
+                # block's own pre-norm runs on the collapsed rows (inference
+                # mix_norm: collapsed stored half, normed half). post/comb
+                # drive the inject in _site_out.
+                post, comb, collapsed = mhc_mix(hidden, hc)
+                normed = self._norm(collapsed.to(self.compute_dtype),
+                                    getattr(entry, f"{site}_norm_spec"))
+                return normed, (post, comb)
             post, mixed = gated_residual_mix(hidden, hc)
             return mixed.to(self.compute_dtype), post
         return self._norm(hidden, getattr(entry, f"{site}_norm_spec")), None
@@ -1377,7 +1528,10 @@ class NativeLlamaQLoRA(nn.Module):
         """The residual update at ``site`` for the sublayer output ``out``:
         the plain add, the Gemma sandwich ``hidden + post_norm(out)``, or the
         hyper-connection inject ``streams + post (x) out``."""
-        if getattr(entry, f"{site}_hc_spec", None) is not None:
+        hc = getattr(entry, f"{site}_hc_spec", None)
+        if hc is not None:
+            if hc.get("kind", "gated") == "mhc":
+                return mhc_apply(hidden, out, post[0], post[1])
             return gated_residual_apply(hidden, out, post)
         post_spec = getattr(entry, f"{site}_post_spec", None)
         if post_spec is not None:
@@ -1395,8 +1549,12 @@ class NativeLlamaQLoRA(nn.Module):
         # a training run / fp32 in the validate path -- DON'T upcast them to fp32 here
         # (that is what doubled the activation footprint). Per-head norm and RoPE
         # below keep their internals in fp32 but return in this dtype.
+        hd_v = meta.get("v_head_dim", hd)   # MLA: value head dim may differ from q/k
         normed, post = self._site_in(hidden, entry, "attn")
-        if meta.get("interleaved_gate"):
+        if meta.get("kind") == "mla":
+            q, k, v = self._mla_qkv(meta, entry, normed, bsz, t)
+            out_gate = head_gate = None
+        elif meta.get("interleaved_gate"):
             # Qwen3.5 gated attention: q_proj emits [q | gate] interleaved per
             # head ([..., nq, 2*hd]); the gate multiplies the attention output
             # (sigmoid) before o_proj. Split exactly as the inference
@@ -1414,23 +1572,24 @@ class NativeLlamaQLoRA(nn.Module):
         else:
             q = entry.q_proj(normed).view(bsz, t, nq, hd)
             out_gate = None
-        # Spark-X2.5 headwise gate: one scalar per q head from its own linear
-        # on the block input; applied per head to the context below (inference:
-        # g = g_proj(x), then ext.mul_sigmoid_broadcast_(o, g) on the
-        # [b, t, nq, hd] context before the flatten + o_proj).
-        head_gate = entry.g_proj(normed) if meta.get("headwise_gate") else None  # [b,t,nq]
-        k = entry.k_proj(normed).view(bsz, t, nkv, hd)
-        # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
-        v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd)
+        if meta.get("kind") != "mla":
+            # Spark-X2.5 headwise gate: one scalar per q head from its own linear
+            # on the block input; applied per head to the context below (inference:
+            # g = g_proj(x), then ext.mul_sigmoid_broadcast_(o, g) on the
+            # [b, t, nq, hd] context before the flatten + o_proj).
+            head_gate = entry.g_proj(normed) if meta.get("headwise_gate") else None  # [b,t,nq]
+            k = entry.k_proj(normed).view(bsz, t, nkv, hd)
+            # use_k_as_v: V is the raw K projection (taken before k-norm/RoPE).
+            v = k if entry.v_proj is None else entry.v_proj(normed).view(bsz, t, nkv, hd)
 
-        # Per-head q/k/v RMSNorm, applied to the raw projections before RoPE
-        # (Qwen3: q/k; Gemma: q/k/v unweighted). No-ops when the spec is None.
-        if entry.q_norm_spec is not None:
-            q = self._norm(q, entry.q_norm_spec)
-        if entry.k_norm_spec is not None:
-            k = self._norm(k, entry.k_norm_spec)
-        if entry.v_norm_spec is not None:
-            v = self._norm(v, entry.v_norm_spec)
+            # Per-head q/k/v RMSNorm, applied to the raw projections before RoPE
+            # (Qwen3: q/k; Gemma: q/k/v unweighted). No-ops when the spec is None.
+            if entry.q_norm_spec is not None:
+                q = self._norm(q, entry.q_norm_spec)
+            if entry.k_norm_spec is not None:
+                k = self._norm(k, entry.k_norm_spec)
+            if entry.v_norm_spec is not None:
+                v = self._norm(v, entry.v_norm_spec)
 
         # NoPE layers (AFMoE full-attention layers) carry no RoPE table at all
         # -- skip the rotation exactly as the inference forward's `if self.rope:`.
@@ -1466,9 +1625,9 @@ class NativeLlamaQLoRA(nn.Module):
                     meta["sm_scale"], window=meta["sliding_window"],
                     softcap=float(meta["softcap"] or 0.0),
                 )                                               # [total, nq, hd]
-                o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
+                o = q.new_zeros(bsz, t, nq, hd_v, dtype=of.dtype)
                 o[keep] = of
-                ctx = o.reshape(bsz, t, nq * hd)
+                ctx = o.reshape(bsz, t, nq * hd_v)
             else:
                 window = meta["sliding_window"]
                 ws = (window - 1, 0) if window and window > 0 else (-1, -1)
@@ -1476,8 +1635,8 @@ class NativeLlamaQLoRA(nn.Module):
                     q.to(self.compute_dtype), k.to(self.compute_dtype), v.to(self.compute_dtype),
                     softmax_scale=meta["sm_scale"], causal=True,
                     window_size=ws, softcap=float(meta["softcap"] or 0.0),
-                )                                               # [b, t, nq, hd]
-                ctx = o.reshape(bsz, t, nq * hd)
+                )                                               # [b, t, nq, hd_v]
+                ctx = o.reshape(bsz, t, nq * hd_v)
         elif attn_mode == "sdpa":
             # head_dim > 256 (Gemma global layers): FA2 can't (caps at 256), and
             # torch's mem-efficient / flash SDPA backends ALSO cap at head_dim 256 --
@@ -1506,7 +1665,7 @@ class NativeLlamaQLoRA(nn.Module):
                 if rep > 1:                                     # expand GQA -> nq heads
                     kf = kf.repeat_interleave(rep, dim=1)
                     vf = vf.repeat_interleave(rep, dim=1)
-                of = qf.new_zeros(qf.shape[0], nq, hd)
+                of = qf.new_zeros(qf.shape[0], nq, hd_v)
                 cul = cu.tolist()
                 for s, e in zip(cul[:-1], cul[1:]):
                     # [1, nq, L, hd] for SDPA; isolate this document.
@@ -1517,9 +1676,9 @@ class NativeLlamaQLoRA(nn.Module):
                         is_causal=True, scale=meta["sm_scale"],
                     )                                           # [1, nq, L, hd]
                     of[s:e] = od.squeeze(0).transpose(0, 1)
-                o = q.new_zeros(bsz, t, nq, hd, dtype=of.dtype)
+                o = q.new_zeros(bsz, t, nq, hd_v, dtype=of.dtype)
                 o[keep] = of
-                ctx = o.reshape(bsz, t, nq * hd)
+                ctx = o.reshape(bsz, t, nq * hd_v)
             else:
                 qh = q.transpose(1, 2).to(cd)
                 kh = k.transpose(1, 2).to(cd)
@@ -1529,8 +1688,8 @@ class NativeLlamaQLoRA(nn.Module):
                     vh = vh.repeat_interleave(rep, dim=1)
                 o = F.scaled_dot_product_attention(
                     qh, kh, vh, is_causal=True, scale=meta["sm_scale"],
-                )                                               # [b, nq, t, hd]
-                ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd)
+                )                                               # [b, nq, t, hd_v]
+                ctx = o.transpose(1, 2).reshape(bsz, t, nq * hd_v)
         else:
             # Eager reference (validate / CPU / fp32 / gradcheck): materializes the
             # [b, nq, t, t] scores. Keep the score+softmax math in fp32 for fidelity
@@ -1549,8 +1708,8 @@ class NativeLlamaQLoRA(nn.Module):
                 scores = softcap * torch.tanh(scores / softcap)
             scores = scores + attn_bias.to(scores.dtype)
             probs = torch.softmax(scores, dim=-1)
-            ctx = torch.matmul(probs, v)                        # [b,nq,t,hd]
-            ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd)  # fp32 reference result
+            ctx = torch.matmul(probs, v)                        # [b,nq,t,hd_v]
+            ctx = ctx.transpose(1, 2).reshape(bsz, t, nq * hd_v)  # fp32 reference result
         # Output gate (Qwen3.5 interleaved / AFMoE full-width g_proj):
         # o *= sigmoid(gate), applied to the flattened context exactly as the
         # inference mul_sigmoid_ does, before o_proj. sigmoid in fp32 for
@@ -1563,7 +1722,7 @@ class NativeLlamaQLoRA(nn.Module):
         # ctx dtype.
         if head_gate is not None:
             hg = torch.sigmoid(head_gate.float()).to(ctx.dtype)      # [b,t,nq]
-            ctx = (ctx.reshape(bsz, t, nq, hd) * hg.unsqueeze(-1)).reshape(bsz, t, nq * hd)
+            ctx = (ctx.reshape(bsz, t, nq, hd_v) * hg.unsqueeze(-1)).reshape(bsz, t, nq * hd_v)
         # o_proj re-casts its input to compute_dtype and outputs in it, so attn_out is
         # bf16 in a training run regardless of ctx's dtype -- no fp32 upcast of the
         # residual stream here (that is what the old `.float()` was costing).
@@ -1593,28 +1752,70 @@ class NativeLlamaQLoRA(nn.Module):
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
 
-    def _mlp_out(self, meta, entry, normed2, residual=None):
+    def _mla_qkv(self, meta, entry, normed, bsz, t):
+        """MLA projections (GLM-5.3-Flash NoPE MLA) in the UNABSORBED form:
+        q = q_b(norm(q_a(x))) (or a direct q_proj); the normalized latent
+        c = kv_a_layernorm(kv_a(x)[:, :D_c]); K = c @ W_UK, V = c @ W_UV per
+        head from the module's flat kv_b tables. Returns q [b,t,H,qk_hd],
+        k [b,t,H,nope], v [b,t,H,v_hd] in the activation dtype. Inference
+        attends in absorbed form (scores through W_UK folded into q); the
+        scores and output are the same quantity, computed here explicitly.
+        NoPE only: no rope slice, no rotation (asserted at construction)."""
+        H, D_c = meta["num_q_heads"], meta["kv_lora_rank"]
+        nope, hd_v = meta["qk_nope_head_dim"], meta["v_head_dim"]
+        if entry.q_a_proj is not None:
+            q = entry.q_b_proj(self._norm(entry.q_a_proj(normed), entry.q_a_norm_spec))
+        else:
+            q = entry.q_b_proj(normed)
+        q = q.view(bsz, t, H, meta["head_dim"])
+        ckv = entry.kv_a_proj(normed)                       # [b, t, D_c (+ rope)]
+        c = self._norm(ckv[..., :D_c], entry.kv_a_norm_spec)
+        w_uk = meta["w_uk"].to(device=c.device, dtype=c.dtype)   # [D_c, H*nope]
+        w_uv = meta["w_uv"].to(device=c.device, dtype=c.dtype)   # [D_c, H*v]
+        k = (c @ w_uk).view(bsz, t, H, nope)
+        v = (c @ w_uv).view(bsz, t, H, hd_v)
+        return q, k, v
+
+    def _mlp_out(self, meta, entry, normed2, residual=None, input_ids=None):
         # MLP half of a block, shared by the softmax-attention and
         # GatedDeltaNet block forwards: dense gated MLP, or the block-sparse
         # mixture of experts (meta["mlp_kind"] == "moe"). ``residual`` is the
         # RAW post-attention residual stream, needed only by the Gemma4 MoE
         # layout (alt_residual_channel routes from it); dense MLPs ignore it.
+        # ``input_ids`` feed the DeepSeek-V4 hash-MoE router only.
         if meta.get("mlp_kind", "dense") == "moe":
-            return self._moe_out(meta, entry, normed2, residual)
+            return self._moe_out(meta, entry, normed2, residual, input_ids=input_ids)
         return self._gated_mlp(entry.gates, entry.ups, entry.downs,
-                               meta["activation"], normed2)
+                               meta["activation"], normed2,
+                               act_limit=meta.get("act_limit", 0.0))
 
-    def _gated_mlp(self, gates, ups, downs, activation, x):
+    @staticmethod
+    def _gated_act(act, g, u, act_limit):
+        """``act(g) * u``, with the clamped form ``min(act(g), L) * clamp(u, -L,
+        L)`` when ``act_limit`` L > 0 (DeepSeek-V4 / GLM-5.3-Flash
+        swiglu_limit). The clamp order follows exllamav3's inference
+        ``act_mul`` kernel (activation first, then ``min`` on its output; the
+        HF reference clamps the gate before SiLU, which differs by < 5e-4 only
+        where g > L -- the inference kernel is the oracle the validate gate
+        compares against)."""
+        a = act(g)
+        if act_limit:
+            a = a.clamp(max=act_limit)
+            u = u.clamp(-act_limit, act_limit)
+        return a * u
+
+    def _gated_mlp(self, gates, ups, downs, activation, x, act_limit=0.0):
         # Gated MLP (SwiGLU / GeGLU) over the already-normed input. The MLP may
         # be sliced across the intermediate dim (very wide models) -- sum the
         # downs. Also runs a MoE block's shared expert (its slices, its
-        # activation).
+        # activation). act_limit: the clamped gated activation (see _gated_act).
         is_silu = activation == "silu"
         act = F.silu if is_silu else (lambda z: F.gelu(z, approximate="tanh"))
         # Liger fused SiLU*mul (CUDA, silu only -- GeGLU stays torch): fuses the
         # activation+multiply into one kernel, saving an intermediate. fp32 is
-        # allowed for the parity gate's math tier (see _norm).
-        liger_silu = (self.use_liger and is_silu and x.is_cuda
+        # allowed for the parity gate's math tier (see _norm). Not with a
+        # clamp (act_limit): that path is the plain torch one below.
+        liger_silu = (self.use_liger and is_silu and x.is_cuda and not act_limit
                       and self.compute_dtype in (torch.float16, torch.bfloat16,
                                                  torch.float32))
         liger_ops = _liger_ops() if liger_silu else None
@@ -1627,12 +1828,12 @@ class NativeLlamaQLoRA(nn.Module):
                 with torch.cuda.device(x.device):
                     a = liger_ops[1].apply(gate(x), up(x))       # silu(gate)*up
             else:
-                a = act(gate(x)) * up(x)
+                a = self._gated_act(act, gate(x), up(x), act_limit)
             d = down(a)                                          # compute_dtype (no fp32 upcast)
             mlp_out = d if mlp_out is None else mlp_out + d
         return mlp_out
 
-    def _moe_out(self, meta, entry, normed2, residual=None):
+    def _moe_out(self, meta, entry, normed2, residual=None, input_ids=None):
         """Block-sparse mixture of experts (BlockSparseMLP -- Qwen3-MoE /
         Qwen3.5-MoE / Gemma4 MoE / AFMoE) over the already-normed input.
 
@@ -1702,7 +1903,34 @@ class NativeLlamaQLoRA(nn.Module):
         ye = self._norm(yr, routed_pre) if routed_pre is not None else yr
 
         logits = entry.router(z).to(acc)                        # [nt, E]
-        if meta.get("router_type", "std") == "dots":
+        rtype = meta.get("router_type", "std")
+        if rtype in ("sqrtsp", "sqrtsp_hash"):
+            # DeepSeek-V4 router (inference routing_sqrtsp / routing_sqrtsp_hash):
+            # affinity sqrt(softplus(logits)); selection by top-k over
+            # affinity + e_score_correction_bias ("sqrtsp"), or from the frozen
+            # tid2eid table indexed by the token ids (hash-MoE bootstrap
+            # layers, "sqrtsp_hash"); the selected experts weighted by their
+            # raw affinities normalized over the selected set (+1e-20) and
+            # scaled by routed_scaling_factor. Differentiable through the
+            # affinities; the selection is piecewise-constant / fixed.
+            scores = F.softplus(logits).sqrt()                  # [nt, E] >=fp32
+            if rtype == "sqrtsp_hash":
+                assert input_ids is not None, \
+                    "sqrtsp_hash (DeepSeek-V4 hash-MoE) routing needs the input ids"
+                table = meta["tid2eid"]
+                ids = input_ids.reshape(-1).to(table.device)
+                assert ids.shape[0] == nt, \
+                    f"hash routing: {nt} hidden rows but {ids.shape[0]} input ids"
+                top_idx = table[ids].to(device=y.device, dtype=torch.long)   # [nt, k]
+            else:
+                e_bias = meta.get("e_score_bias")
+                sel_scores = scores if e_bias is None \
+                    else scores + e_bias.to(acc).to(scores.device)
+                _, top_idx = torch.topk(sel_scores, top_k, dim=-1)
+            weights = scores.gather(1, top_idx)                 # [nt, k]
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            weights = weights * meta.get("routed_scaling_factor", 1.0)
+        elif rtype == "dots":
             # Ungrouped sigmoid router (AFMoE / dots.llm1), mirroring the
             # inference routing_dots / ext.routing_ds3_nogroup: sigmoid
             # scores; e_score_correction_bias added for the top-k SELECTION
@@ -1753,7 +1981,8 @@ class NativeLlamaQLoRA(nn.Module):
             toks = tok_sorted[start:end]
             w = w_sorted[start:end].unsqueeze(1)                # [c, 1] >=fp32
             xe = ye.index_select(0, toks)                       # [c, d]
-            h = act(entry.expert_gates[e](xe)) * entry.expert_ups[e](xe)
+            h = self._gated_act(act, entry.expert_gates[e](xe), entry.expert_ups[e](xe),
+                                meta.get("act_limit", 0.0))
             de = entry.expert_downs[e](h)                       # [c, d] compute dtype
             out.index_add_(0, toks, de.to(acc) * w)
             start = end
@@ -1769,7 +1998,8 @@ class NativeLlamaQLoRA(nn.Module):
         # (post_feedforward_layernorm_1) before adding it to the routed sum.
         if len(entry.gates):
             sh = self._gated_mlp(entry.gates, entry.ups, entry.downs,
-                                 meta.get("shared_activation") or meta["activation"], y)
+                                 meta.get("shared_activation") or meta["activation"], y,
+                                 act_limit=meta.get("shared_act_limit", 0.0))
             shared_post = getattr(entry, "shared_post_spec", None)
             if shared_post is not None:
                 sh = self._norm(sh, shared_post)
@@ -1790,6 +2020,24 @@ class NativeLlamaQLoRA(nn.Module):
         validate / gradcheck). q/k arrive RAW; both paths L2-normalize per head
         internally. Shapes: q/k [b,t,nk,dk], v [b,t,nv,dv], g/beta [b,t,nv];
         returns [b,t,nv,dv]."""
+        if g.dim() == 4:
+            # KDA (per-k-channel decay, g [b,t,nv,dk]): fla's chunked KDA
+            # kernel (autograd-capable; the same math exllamav3's inference
+            # prefill runs through its vendored forward-only copy), else the
+            # sequential fp32 reference.
+            kda_fn = _fla_kda_fn()
+            use_kda = (kda_fn is not None and q.is_cuda and self.attn_impl != "eager"
+                       and self.compute_dtype in (torch.float16, torch.bfloat16))
+            if use_kda:
+                cd = self.compute_dtype
+                core, _ = kda_fn(
+                    q.to(cd), k.to(cd), v.to(cd),
+                    g=g.float(), beta=beta.to(cd),
+                    initial_state=None, output_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                return core
+            return kda_delta_rule_reference(q, k, v, g, beta)
         fla_fn = _fla_chunk_fn()
         use_fla = (fla_fn is not None and q.is_cuda and self.attn_impl != "eager"
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
@@ -1820,11 +2068,22 @@ class NativeLlamaQLoRA(nn.Module):
 
         normed, post = self._site_in(hidden, entry, "attn")
         qkv = entry.qkv_proj(normed)                       # [b, t, 2*k_dim + v_dim]
-        z = entry.z_proj(normed).view(bsz, t, nv, dv)      # output gate
-        beta, g = gdn_beta_g(
-            entry.b_proj(normed), entry.a_proj(normed),
-            meta["a_log"], meta["dt_bias"], meta["beta_scale"],
-        )                                                  # [b, t, nv] fp32 each
+        if meta.get("kda"):
+            # KDA: low-rank output gate (no activation between the halves;
+            # the gated norm applies sigmoid), beta from b_proj, per-channel
+            # decay from the low-rank forget gate (training.gdn.kda_beta_g).
+            z = entry.g_b_proj(entry.g_a_proj(normed)).view(bsz, t, nv, dv)
+            beta, g = kda_beta_g(
+                entry.b_proj(normed), entry.f_b_proj(entry.f_a_proj(normed)),
+                meta["a_log"], meta["dt_bias"], meta.get("gate_lower_bound"),
+                meta["beta_scale"],
+            )                                              # [b,t,nv], [b,t,nv,dk] fp32
+        else:
+            z = entry.z_proj(normed).view(bsz, t, nv, dv)      # output gate
+            beta, g = gdn_beta_g(
+                entry.b_proj(normed), entry.a_proj(normed),
+                meta["a_log"], meta["dt_bias"], meta["beta_scale"],
+            )                                                  # [b, t, nv] fp32 each
 
         # Causal depthwise conv + SiLU over the packed q|k|v channels, in the
         # activation dtype (fp32 on the validate path, compute dtype in training;
@@ -1852,6 +2111,139 @@ class NativeLlamaQLoRA(nn.Module):
         if ls is not None:
             hidden = (hidden * ls).to(hidden.dtype)
         return hidden
+
+    # --- DeepSeek-V4 attention block forward -------------------------------
+
+    @staticmethod
+    def _rope_gptj_trailing(x, inv_freq, positions, rope_dim, sign=1.0):
+        """GPT-J (interleaved-pair) rotation of the TRAILING ``rope_dim`` dims
+        of ``x`` ``[b, t, h, D]`` at per-token ``positions`` ``[b, t]`` (the
+        inference ``ext.rope`` with ``RopeStyle.GPTJ`` and ``rotate_offset =
+        D - rope_dim``; ``sign = -1`` is the eq. 26 de-rotation). fp32 math,
+        returned in ``x``'s dtype."""
+        D = x.shape[-1]
+        if rope_dim <= 0:
+            return x
+        head, tail = x[..., :D - rope_dim], x[..., D - rope_dim:].float()
+        freqs = positions.float().unsqueeze(-1) * inv_freq.float().view(1, 1, -1)   # [b,t,rd/2]
+        cos = freqs.cos().repeat_interleave(2, dim=-1).unsqueeze(2)                # [b,t,1,rd]
+        sin = (sign * freqs.sin()).repeat_interleave(2, dim=-1).unsqueeze(2)
+        x1, x2 = tail[..., 0::2], tail[..., 1::2]
+        rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        out = (tail * cos + rot * sin).to(x.dtype)
+        return torch.cat((head, out), dim=-1)
+
+    def _dsv4_compress(self, meta, entry, normed, bsz, t):
+        """The stateless compressor (``DSV4Compressor.forward`` with no state;
+        ``_forward_nc``): complete windows of ``m`` tokens only (remainder
+        dropped), per-channel softmax over the window of ``gate + ape``
+        weighting the window's kv rows, the compressor norm, then the rope
+        slice rotated at the window's first-token position ``w * m`` with the
+        compress table. CSA (overlapping): each entry pools the previous
+        window's Ca half (zero rows, -inf gates at w = 0) and this window's Cb
+        half. Returns ``[b, nw, hd]`` or None (no complete window)."""
+        comp = meta["compressor"]
+        m, hd = meta["compress_rate"], comp["head_dim"]
+        nw = t // m
+        if nw == 0:
+            return None
+        kv = entry.comp_wkv(normed).float()[:, :nw * m]            # [b, nw*m, W]
+        gate = entry.comp_wgate(normed).float()[:, :nw * m]
+        kv = kv.view(bsz, nw, m, -1)
+        gate = gate.view(bsz, nw, m, -1) + comp["ape"].to(gate.dtype).to(gate.device)
+        if comp["overlapping"]:
+            ca_kv, cb_kv = kv[..., :hd], kv[..., hd:]
+            ca_g, cb_g = gate[..., :hd], gate[..., hd:]
+            prev_kv = torch.cat((ca_kv.new_zeros(bsz, 1, m, hd), ca_kv[:, :-1]), dim=1)
+            prev_g = torch.cat((ca_g.new_full((bsz, 1, m, hd), -float("inf")), ca_g[:, :-1]), dim=1)
+            kv = torch.cat((prev_kv, cb_kv), dim=2)                # [b, nw, 2m, hd]
+            gate = torch.cat((prev_g, cb_g), dim=2)
+        pooled = (kv * torch.softmax(gate, dim=2)).sum(dim=2)      # [b, nw, hd] fp32
+        pooled = self._norm(pooled.to(self.compute_dtype), comp["norm"])
+        wpos = (torch.arange(nw, device=pooled.device) * m).unsqueeze(0).expand(bsz, nw)
+        pooled = self._rope_gptj_trailing(pooled.unsqueeze(2), meta["inv_freq_compress"],
+                                          wpos, comp["rope_dim"]).squeeze(2)
+        return pooled
+
+    def _dsv4_forward(self, meta, entry, hidden, position_ids, attention_mask, input_ids):
+        """One DeepSeek-V4 decoder block (``DSV4Attention._forward_nc`` +
+        the hc / MoE half). Attention per head over ``[this chunk's kv rows
+        (sliding) ++ compressed entries]`` with V == K (one shared kv row),
+        an extra sink logit per head in the softmax denominator, the output's
+        rope slice de-rotated at the query position, then the grouped
+        low-rank output projection. Masks: sliding key j visible to query i
+        iff j <= i and i - j < window (and j not a pad key); compressed entry
+        w visible iff w < (i + 1) // m. Eager fp32 scores (no flash kernel
+        for this form). Right-padding only; no packing (rejected up front)."""
+        normed, post = self._site_in(hidden, entry, "attn")
+        attn_out = self._dsv4_attention(meta, entry, normed, position_ids, attention_mask)
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
+
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None,
+                                input_ids=input_ids)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            hidden = (hidden * ls).to(hidden.dtype)
+        return hidden
+
+    def _dsv4_attention(self, meta, entry, normed, position_ids, attention_mask=None):
+        """The attention sublayer of a DSV4 block on its normed input
+        ``[b, t, d]`` -> ``[b, t, d]`` (see ``_dsv4_forward``)."""
+        bsz, t = normed.shape[:2]
+        H, D, rd = meta["num_q_heads"], meta["head_dim"], meta["rope_head_dim"]
+        G = meta["o_groups"]
+        m, lt = meta["compress_rate"], meta["layer_type"]
+        cd = self.compute_dtype
+        dev = normed.device
+        pos = position_ids if position_ids.dim() == 2 else position_ids[0]
+
+        # Queries: q_a -> q_norm -> q_b -> unweighted per-head norm -> rope slice
+        q = entry.q_b_proj(self._norm(entry.q_a_proj(normed), entry.q_a_norm_spec))
+        q = q.view(bsz, t, H, D)
+        q = self._norm(q, {"weight": None, "eps": entry.kv_norm_spec["eps"],
+                           "bias": 0.0, "scale": 1.0})
+        q = self._rope_gptj_trailing(q, meta["inv_freq"], pos, rd)
+        # The shared kv row: wkv -> kv_norm -> rope slice
+        kv = self._norm(entry.wkv(normed), entry.kv_norm_spec).view(bsz, t, 1, D)
+        kv = self._rope_gptj_trailing(kv, meta["inv_freq"], pos, rd).squeeze(2)   # [b, t, D]
+
+        comp = self._dsv4_compress(meta, entry, normed, bsz, t) if lt in ("csa", "hca") else None
+        nw = 0 if comp is None else comp.shape[1]
+        keys = kv if comp is None else torch.cat((kv, comp.to(kv.dtype)), dim=1)   # [b, t+nw, D]
+
+        # Additive mask [b, 1, t, t + nw]: sliding window on the raw keys,
+        # the causal complete-window bound on the compressed entries.
+        i = torch.arange(t, device=dev).unsqueeze(1)
+        j = torch.arange(t, device=dev).unsqueeze(0)
+        win = (j <= i) & ((i - j) < meta["sliding_window"])        # [t, t]
+        win = win.unsqueeze(0).expand(bsz, t, t)
+        if attention_mask is not None:
+            win = win & attention_mask.to(dev).bool().unsqueeze(1)   # pad keys hidden
+        if nw:
+            w = torch.arange(nw, device=dev).view(1, 1, nw)
+            vis = w < ((pos.to(dev) + 1) // m).unsqueeze(-1)          # [b, t, nw]
+            allow = torch.cat((win, vis), dim=-1)
+        else:
+            allow = win
+        mask = torch.zeros(allow.shape, dtype=torch.float32, device=dev)
+        mask = mask.masked_fill(~allow, float("-inf")).unsqueeze(1)   # [b, 1, t, t+nw]
+
+        qf = q.transpose(1, 2).float()                               # [b, H, t, D]
+        kf = keys.float().unsqueeze(1)                               # [b, 1, t+nw, D]
+        scores = torch.matmul(qf, kf.transpose(-1, -2)) * meta["sm_scale"] + mask
+        sink = meta["sinks"].to(device=dev, dtype=scores.dtype).view(1, H, 1, 1).expand(bsz, H, t, 1)
+        probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
+        o = torch.matmul(probs, kf)                                  # [b, H, t, D]
+        o = o.transpose(1, 2)                                        # [b, t, H, D]
+        o = self._rope_gptj_trailing(o, meta["inv_freq"], pos, rd, sign=-1.0).to(cd)
+        # Grouped low-rank output projection: heads [g*hpg, (g+1)*hpg) -> wo_a[g] -> cat -> wo_b
+        hpg = H // G
+        og = o.reshape(bsz, t, G, hpg * D)
+        o_lat = torch.cat([entry.wo_a[g](og[:, :, g]) for g in range(G)], dim=-1)
+        return entry.wo_b(o_lat)
 
     # --- ShortConv (LFM2 gated causal conv) block forward ------------------
 
@@ -1890,6 +2282,10 @@ class NativeLlamaQLoRA(nn.Module):
         if not mem_eff:
             return "eager"
         hd = meta["head_dim"]
+        if meta.get("v_head_dim", hd) != hd:
+            # FA2 / the mem-efficient SDPA backend take one head dim for
+            # q/k/v; an MLA layer with v_head_dim != qk_head_dim is eager.
+            return "eager"
         if hd <= 256 and hd % 8 == 0:
             return "flash"
         # head_dim > 256 (Gemma global layers): FA2 unsupported, but torch's
@@ -1938,11 +2334,11 @@ class NativeLlamaQLoRA(nn.Module):
         mem_eff = (self._flash_ok and is_cuda
                    and self.compute_dtype in (torch.float16, torch.bfloat16))
         counts = Counter(
-            m["kind"] if m.get("kind", "attn") in ("gdn", "shortconv")
+            m["kind"] if m.get("kind", "attn") in ("gdn", "shortconv", "dsv4")
             else self._attn_mode_for(m, mem_eff)
             for m in self._block_meta)
         plan = ", ".join(f"{counts[k]}×{k}" for k in
-                         ("flash", "sdpa", "eager", "gdn", "shortconv")
+                         ("flash", "sdpa", "eager", "gdn", "shortconv", "dsv4")
                          if counts[k])
         avail = "available" if _flash_attn_func() is not None else "NOT importable"
         why = "" if mem_eff else "  (eager: needs CUDA + fp16/bf16" + \
@@ -1953,11 +2349,14 @@ class NativeLlamaQLoRA(nn.Module):
             line += (f"  [moe: {len(moe)} layers x {moe[0]['num_experts']} experts, "
                      f"top-{moe[0]['num_experts_per_tok']}]")
         if counts["gdn"]:
+            kda = any(m.get("kda") for m in self._block_meta if m.get("kind") == "gdn")
+            fn_ok = (_fla_kda_fn() if kda else _fla_chunk_fn()) is not None
             gdn_fast = (is_cuda and self.attn_impl != "eager"
                         and self.compute_dtype in (torch.float16, torch.bfloat16)
-                        and _fla_chunk_fn() is not None)
-            line += ("  [gdn: fla chunked kernel]" if gdn_fast
-                     else "  [gdn: torch reference -- SLOW, install "
+                        and fn_ok)
+            tag = "kda" if kda else "gdn"
+            line += (f"  [{tag}: fla chunked kernel]" if gdn_fast
+                     else f"  [{tag}: torch reference -- SLOW, install "
                           "flash-linear-attention + use bf16/fp16 CUDA]")
         vl = []
         if getattr(self, "has_mrope", False):
@@ -2062,6 +2461,17 @@ class NativeLlamaQLoRA(nn.Module):
                     use_reentrant=False,
                 )
             return self._gdn_forward(meta, entry, hidden)
+        if meta.get("kind", "attn") == "dsv4":
+            # DeepSeek-V4 block: its own sliding / compressed / sink attention
+            # (eager; no flash kernel for this form), hash-MoE by token id.
+            am = ctx.get("attention_mask")
+            ids = ctx.get("input_ids")
+            if ckpt:
+                return torch.utils.checkpoint.checkpoint(
+                    self._dsv4_forward, meta, entry, hidden, position_ids, am, ids,
+                    use_reentrant=False,
+                )
+            return self._dsv4_forward(meta, entry, hidden, position_ids, am, ids)
         if meta.get("kind", "attn") == "shortconv":
             # ShortConv block (LFM2): causal conv, no RoPE, no
             # attention bias, no packing (rejected up front).
@@ -2129,12 +2539,13 @@ class NativeLlamaQLoRA(nn.Module):
             qa_state["tick"] += 1
         if seg_ids is not None and (getattr(self, "has_gdn", False)
                                     or getattr(self, "has_shortconv", False)
-                                    or getattr(self, "has_ple", False)):
+                                    or getattr(self, "has_ple", False)
+                                    or getattr(self, "has_dsv4", False)):
             raise ValueError(
                 "sample packing (seg_ids) is not supported on GatedDeltaNet / "
-                "ShortConv / PLE models: the recurrence, causal conv and n-gram "
-                "history would carry state across packed document boundaries. "
-                "Train unpacked (drop --pack).")
+                "ShortConv / PLE / DeepSeek-V4 models: the recurrence, causal conv, "
+                "n-gram history and compressed-window entries would carry state "
+                "across packed document boundaries. Train unpacked (drop --pack).")
         if mm is not None and seg_ids is not None:
             raise ValueError("image batches (mm) cannot be sample-packed (seg_ids)")
         # QSA sparse attention (Qwen3.8-Flash-Next): the native forward attends
@@ -2251,7 +2662,10 @@ class NativeLlamaQLoRA(nn.Module):
         # The per-forward attention context, shared with the MTP head's blocks
         # (same mask, positions, packing and backend selection as the trunk's).
         ctx = {"mem_eff": mem_eff, "get_bias": get_bias, "pack_ctx": pack_ctx,
-               "attention_mask": attention_mask, "seg_ids": seg_ids}
+               "attention_mask": attention_mask, "seg_ids": seg_ids,
+               # DeepSeek-V4: hash-MoE layers route by token id; the DSV4
+               # block forward also builds its own window masks.
+               "input_ids": input_ids}
 
         # Activation offload: park the (grad-checkpointed) block-boundary activations
         # saved for backward in CPU RAM, trading CPU<->GPU copies for GPU memory.
@@ -2320,6 +2734,11 @@ class NativeLlamaQLoRA(nn.Module):
         # dtype contract (the per-block residual stream above is bf16, but this is a
         # single [b, t, d] tensor, so the fp32 cast here is negligible).
         hidden = backbone.to_device(hidden, self.device)
+        hh_spec = getattr(self, "hyper_head_spec", None)   # getattr: headless test nets
+        if hh_spec is not None:
+            # mHC HyperHead: collapse the stream stack (fp32, as the inference
+            # module emits it) into the final norm's input.
+            hidden = mhc_head(hidden, hh_spec)
         if self.final_mixer_spec is not None:
             # Final GatedResidual mixer (no inject): collapse the stream stack
             # into the head's [b, t, d] input, rounded to the compute dtype as
