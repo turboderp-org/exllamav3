@@ -874,19 +874,27 @@ def main():
         # Reference-only run: the native inference forward on every prompt,
         # saved for a later --load-ref compare (two-process validation of a
         # model whose experts must be streamed for the training forward).
-        ref = {}
+        ref, states = {}, {}
+        n_layers = len([m for m in model.modules if type(m).__name__ == "TransformerBlock"])
         for prompt in prompts:
             ids = tokenizer.encode(prompt, add_bos=True).to(args.device)
+            # Per-block residual states (the stream mean on hc decoders), the
+            # inference block's own export, for a per-layer --load-ref compare.
+            params = {"export_state_layers": set(range(n_layers)), "export_states": []}
             with torch.inference_mode():
-                ref[prompt] = model.forward(ids).float().cpu()
-            print(f" -- saved native logits for {prompt!r}: {tuple(ref[prompt].shape)}")
-        torch.save({"model": args.model, "logits": ref}, args.save_ref)
+                ref[prompt] = model.forward(ids, params).float().cpu()
+            st = params.get("export_states") or []
+            states[prompt] = [t.float().cpu() for t in st]
+            print(f" -- saved native logits for {prompt!r}: {tuple(ref[prompt].shape)}, "
+                  f"{len(states[prompt])} block states")
+        torch.save({"model": args.model, "logits": ref, "states": states}, args.save_ref)
         print(f" -- reference logits written to {args.save_ref}")
         return 0
     ref_logits = None
     if args.load_ref:
         blob = torch.load(args.load_ref, map_location="cpu")
         ref_logits = blob["logits"]
+        ref_states = blob.get("states") or {}
         missing = [p for p in prompts if p not in ref_logits]
         if missing:
             raise SystemExit(f"--load-ref {args.load_ref} has no logits for {missing!r}")
@@ -920,9 +928,28 @@ def main():
             with torch.inference_mode():
                 logits_native = model.forward(ids).float()       # [1, t, V]
 
-        # Differentiable forward.
-        with torch.no_grad():
-            logits_diff = net.logits(ids).float()            # [1, t, V]
+        # Differentiable forward (+ per-block state taps when the reference
+        # carries the inference block exports: first divergent layer finder).
+        taps = ref_states.get(prompt) if ref_logits is not None else None
+        if taps:
+            with net.collect_hidden(range(len(net.blocks))):
+                with torch.no_grad():
+                    logits_diff = net.logits(ids).float()
+                mine = dict(net.collected)
+            print(f"\nprompt: {prompt!r}  per-block state cos (diff vs native export):")
+            worst = []
+            for bi, t_ref in enumerate(taps):
+                if bi not in mine:
+                    continue
+                a = mine[bi].reshape(-1).to(t_ref.device)
+                b = t_ref.reshape(-1)
+                c = torch.cosine_similarity(a, b, dim=0).item()
+                worst.append((c, bi))
+            line = " ".join(f"{bi}:{c:.4f}" for c, bi in sorted(worst, key=lambda x: x[1]))
+            print("  " + line)
+        else:
+            with torch.no_grad():
+                logits_diff = net.logits(ids).float()            # [1, t, V]
 
         # Native output lands on the model's output device; co-locate for compare.
         logits_diff = logits_diff.to(logits_native.device)

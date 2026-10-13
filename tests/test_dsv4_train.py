@@ -370,6 +370,26 @@ def test_sqrtsp_and_hash_routers_match_hf():
     print("[dsv4] sqrtsp + hash routers with clamped experts match HF PASSED")
 
 
+def test_router_linear_bias_is_ignored():
+    """DeepSeek-V4 stores the selection bias as ``gate.bias``, which the inference
+    Linear loads as an ordinary bias; the routing kernels multiply by the raw
+    gate weight. The router wrapper must drop the Linear bias (use_bias=False)
+    or the logits would carry it (and sqrt(softplus) of biased logits zeroes
+    experts the kernel keeps)."""
+    torch.manual_seed(6)
+    d, E = 8, 6
+    lin = MockLinear(d, E, "blk.ffn.gate", scale=1.0)
+    bias = torch.randn(E) * 50.0
+    lin.inner.bias = bias
+    lin.inner.get_bias_tensor = lambda: bias
+    x = torch.randn(3, d)
+    with_bias = DiffLinear(lin, r=0, compute_dtype=torch.float32)(x)
+    no_bias = DiffLinear(lin, r=0, compute_dtype=torch.float32, use_bias=False)(x)
+    assert (with_bias - (x @ lin.frozen_weight + bias)).abs().max() < 1e-5
+    assert (no_bias - x @ lin.frozen_weight).abs().max() < 1e-5
+    print("[dsv4] router wrapper drops the Linear bias (use_bias=False) PASSED")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -379,6 +399,7 @@ def main():
         test_dsv4_right_padding_hides_pad_keys,
         test_dsv4_backward_reaches_adapters,
         test_sqrtsp_and_hash_routers_match_hf,
+        test_router_linear_bias_is_ignored,
     ], label="dsv4-train")
     print("\nAll DeepSeek-V4 training checks passed.")
 

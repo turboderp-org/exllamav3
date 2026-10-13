@@ -382,6 +382,14 @@ class DiffLinear(nn.Module):
     # instances and pre-feature checkpoints behave exactly as before.
     lora_drop = None
 
+    # Whether the frozen Linear's bias enters the forward. Class default so
+    # headless instances behave as before. False on MoE ROUTERS: the inference
+    # routing kernels multiply by the raw gate weight (HF's bias-free
+    # F.linear), and a checkpoint "gate.bias" tensor (DeepSeek-V4) is the
+    # selection bias -- loaded by the Linear as an ordinary bias it would
+    # otherwise reach the logits twice over (see _moe_out).
+    use_bias = True
+
     def __init__(
         self,
         linear: nn.Module,
@@ -390,11 +398,13 @@ class DiffLinear(nn.Module):
         use_rslora: bool = False,
         compute_dtype: torch.dtype = torch.bfloat16,
         dropout: float = 0.0,
+        use_bias: bool = True,
     ):
         super().__init__()
         assert backbone.is_loaded(linear), \
             "native Linear must be loaded (have .inner) before wrapping"
         self.linear = linear                 # frozen; holds trellis / fp16 weight
+        self.use_bias = bool(use_bias)
         self.key = linear.key
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -530,7 +540,7 @@ class DiffLinear(nn.Module):
             inner_fn, suh, svh = parts
             had = self._had if self._had is not None \
                 else backbone.hadamard_128(suh.device, suh.dtype)
-            bias = backbone.frozen_bias(self.linear, self.compute_dtype)
+            bias = self._bias()
             if not self.adapter_enabled:
                 # Reference view: pure frozen base -- no LoRA, no pissa offset.
                 return EXL3LoRAHadFunction.apply(
@@ -554,7 +564,7 @@ class DiffLinear(nn.Module):
             # (backbone.frozen_weight_closure directly, bypassing the residual).
             return EXL3LoRAFunction.apply(
                 xc, None, None,
-                backbone.frozen_bias(self.linear, self.compute_dtype),
+                self._bias(),
                 1.0,
                 backbone.frozen_weight_closure(self.linear, self.compute_dtype),
             )
@@ -563,17 +573,22 @@ class DiffLinear(nn.Module):
             # perturbation; only the trainable low-rank term moves outside.
             y = EXL3LoRAFunction.apply(
                 xc, None, None,
-                backbone.frozen_bias(self.linear, self.compute_dtype),
+                self._bias(),
                 1.0,
                 self._weight_closure_qa(),
             )
             return y + self._lora_drop_term(xc)
         return EXL3LoRAFunction.apply(
             xc, self.lora_a, self.lora_b,
-            backbone.frozen_bias(self.linear, self.compute_dtype),
+            self._bias(),
             self.scale,
             self._weight_closure_qa(),
         )
+
+    def _bias(self):
+        if not self.use_bias:
+            return None
+        return backbone.frozen_bias(self.linear, self.compute_dtype)
 
     def extra_repr(self) -> str:
         return (f"key={self.key}, in={self.in_features}, out={self.out_features}, "
@@ -763,7 +778,7 @@ class NativeLlamaQLoRA(nn.Module):
         self.hc_mult = backbone.hc_mult(model)
 
         def make_wrap(targets, satisfied_targets):
-            def wrap(linear, leaf, aliases=None, r_override=None):
+            def wrap(linear, leaf, aliases=None, r_override=None, use_bias=True):
                 # `aliases` (GDN / MoE-expert layers) lets several requested
                 # target names select one physical linear (see
                 # _GDN_TARGET_ALIASES / _MOE_EXPERT_TARGET_ALIASES; an empty
@@ -782,6 +797,7 @@ class NativeLlamaQLoRA(nn.Module):
                     use_rslora=use_rslora,
                     compute_dtype=compute_dtype,
                     dropout=lora_dropout,
+                    use_bias=use_bias,
                 )
                 wrappers.append(w)
                 return w
@@ -856,7 +872,11 @@ class NativeLlamaQLoRA(nn.Module):
                 # Router + shared-expert gate: frozen projections (aliases=() so
                 # no target name can select them), still DiffLinears so the
                 # routing weights stay differentiable w.r.t. the hidden state.
-                entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", ())
+                # The router multiplies by the RAW gate weight: every supported
+                # routing kernel ignores a Linear bias (DeepSeek-V4's
+                # "gate.bias" is the selection bias, read via meta e_score_bias).
+                entry.router = wrap(backbone.moe_router_linear(blk), "router_gate", (),
+                                    use_bias=False)
                 sh_gate = backbone.moe_shared_gate_linear(blk)
                 entry.shared_gate = wrap(sh_gate, "shared_gate", ()) if sh_gate is not None else None
                 # Gemma4-layout extra norms (None on Qwen-family MoE): router
@@ -2155,15 +2175,31 @@ class NativeLlamaQLoRA(nn.Module):
         iff j <= i and i - j < window (and j not a pad key); compressed entry
         w visible iff w < (i + 1) // m. Eager fp32 scores (no flash kernel
         for this form). Right-padding only; no packing (rejected up front)."""
-        bsz, t = hidden.shape[:2]
+        normed, post = self._site_in(hidden, entry, "attn")
+        attn_out = self._dsv4_attention(meta, entry, normed, position_ids, attention_mask)
+        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
+
+        normed2, post2 = self._site_in(hidden, entry, "mlp")
+        mlp_out = self._mlp_out(meta, entry, normed2,
+                                residual=hidden if hidden.dim() == 3 else None,
+                                input_ids=input_ids)
+        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
+        ls = meta.get("layer_scalar")
+        if ls is not None:
+            hidden = (hidden * ls).to(hidden.dtype)
+        return hidden
+
+    def _dsv4_attention(self, meta, entry, normed, position_ids, attention_mask=None):
+        """The attention sublayer of a DSV4 block on its normed input
+        ``[b, t, d]`` -> ``[b, t, d]`` (see ``_dsv4_forward``)."""
+        bsz, t = normed.shape[:2]
         H, D, rd = meta["num_q_heads"], meta["head_dim"], meta["rope_head_dim"]
         G = meta["o_groups"]
         m, lt = meta["compress_rate"], meta["layer_type"]
         cd = self.compute_dtype
-        dev = hidden.device
+        dev = normed.device
         pos = position_ids if position_ids.dim() == 2 else position_ids[0]
 
-        normed, post = self._site_in(hidden, entry, "attn")
         # Queries: q_a -> q_norm -> q_b -> unweighted per-head norm -> rope slice
         q = entry.q_b_proj(self._norm(entry.q_a_proj(normed), entry.q_a_norm_spec))
         q = q.view(bsz, t, H, D)
@@ -2207,18 +2243,7 @@ class NativeLlamaQLoRA(nn.Module):
         hpg = H // G
         og = o.reshape(bsz, t, G, hpg * D)
         o_lat = torch.cat([entry.wo_a[g](og[:, :, g]) for g in range(G)], dim=-1)
-        attn_out = entry.wo_b(o_lat)
-        hidden = self._site_out(hidden, attn_out, entry, "attn", post)
-
-        normed2, post2 = self._site_in(hidden, entry, "mlp")
-        mlp_out = self._mlp_out(meta, entry, normed2,
-                                residual=hidden if hidden.dim() == 3 else None,
-                                input_ids=input_ids)
-        hidden = self._site_out(hidden, mlp_out, entry, "mlp", post2)
-        ls = meta.get("layer_scalar")
-        if ls is not None:
-            hidden = (hidden * ls).to(hidden.dtype)
-        return hidden
+        return entry.wo_b(o_lat)
 
     # --- ShortConv (LFM2 gated causal conv) block forward ------------------
 

@@ -92,4 +92,47 @@ Backward smoke PASS (loss 5.4718), RESULT PASS. The quant was deleted after
 these runs to make room for the DeepSeek download (disk: 19 GB free on /home
 with it present).
 
-DeepSeek-V4-Flash: see below.
+## DeepSeek-V4-Flash box validation
+
+turboderp/DeepSeek-V4-Flash-Vision-Exp-exl3 @ 2.04bpw (75 GB on disk, text
+trunk only; `rms_norm_eps` 1e-20 in this config), same two-process recipe,
+fp32 compute, eager attention (the only DSV4 path). Streaming parked 43 MoE
+layers, 64.5 GiB pinned (1536 MiB/layer).
+
+First attempt FAILED (cos 0.94-0.99, one next-token flip). The per-block
+export (added to `--save-ref` / `--load-ref` for this) put the divergence in
+blocks 0-2, the hash-MoE layers; a real-token diagnostic against the
+inference modules showed attention and the shared expert at cos 1.0000 and
+the routed hash output at 0.6-0.7; a second diagnostic inside layer 0 showed
+identical expert selections and expert linears but different routing
+WEIGHTS. Cause: DeepSeek-V4 stores its selection bias as `gate.bias`, which
+exllamav3's router `Linear` loads as an ordinary bias. The inference routing
+kernels multiply by the raw gate weight (HF's bias-free `F.linear`) and use
+that tensor only for selection; the training router wrapper went through the
+Linear and added it to the logits (|logit| ~80), so `sqrt(softplus)` zeroed
+half the hash-selected experts. Fix: `DiffLinear(use_bias=False)` on every MoE
+router (no supported routing kernel reads a Linear bias; the other archs keep
+the selection bias under its own key, so they were unaffected). Regression
+test in `tests/test_dsv4_train.py`.
+
+The CPU expert-offload reference and a reference with the hash layers kept on
+the GPU (monkeypatched offload eligibility) gave the same per-block picture,
+so the inference CPU worker is not implicated.
+
+After the fix:
+
+| prompt | native | diff | argmax agree | last-token cos | max abs diff | per-block cos |
+|---|---|---|---|---|---|---|
+| The capital of France is | Paris | Paris | 100% | 0.999514 | 0.93 | 1.0000 x 43 |
+| Once upon a time, there was a | little | little | 88.9% | 0.999730 | 0.64 | 1.0000 x 43 |
+| Water is made of hydrogen and | oxygen | oxygen | 100% | 0.999766 | 0.74 | 1.0000 x 43 |
+
+Head-slice PASS, backward smoke PASS (loss 4.1428), RESULT PASS. The quant is
+still on disk (`models/DeepSeek-V4-Flash-Vision-Exp-exl3-2.04bpw`; 23 GB free on
+/home with it).
+
+## Not done
+
+No training run on either model. Candidates: a short love-set SFT with
+`--stream-experts` on either quant (the Flash-Next v1 recipe: attention +
+dense/shared targets, routed experts frozen).
