@@ -538,7 +538,7 @@ class Mamba2(Module):
         rows_in = rows_in.tolist() if rows_in is not None else rows_out
         core_attn_out = []
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-            state = recurrent_state[si, 0].unsqueeze(0) if recurrent_state is not None else None
+            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = chunk_simple_gla(
                 q[i:i + 1], k[i:i + 1], v[i:i + 1].contiguous(),
                 g = g[i:i + 1],

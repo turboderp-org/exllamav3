@@ -42,7 +42,7 @@ _TOUCH_INTERVAL = 60
 # Bump when a change to the code alters the bytes of a page image or a checkpoint (a kernel or module computing
 # K/V differently, a new checkpoint layout). Part of the fingerprint, so existing caches are left alone until
 # then; the version string and the model/cache identity cover the rest
-DISK_CACHE_FORMAT_VERSION = 1
+DISK_CACHE_FORMAT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
                 for key, layer in cache.layers.items()
             ],
             "recurrent": [
-                [str(k), type(l).__name__, l.get_checkpoint_size()]
+                [str(k), type(l).__name__, l.get_checkpoint_size(), str(getattr(getattr(l, "recurrent_state", None), "dtype", None))]
                 for k, l in (cache.get_all_recurrent_layers() if hasattr(cache, "get_all_recurrent_layers") else {}).items()
             ],
         }

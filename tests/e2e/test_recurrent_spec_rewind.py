@@ -36,22 +36,28 @@ def loaded(model_id, model_registry, request):
     if not entry.available:
         pytest.skip(f"test model '{model_id}' not available")
     device = torch.device(request.config.getoption("--device"))
-    _, model, (cache,), tok = load_with_caches(entry.path, device, [{"max_history": MAX_HISTORY}])
+    # Two caches: the default fp16-stored recurrent state (rounds on each store) and the fp32 one
+    _, model, caches, tok = load_with_caches(entry.path, device, [
+        {"max_history": MAX_HISTORY},
+        {"max_history": MAX_HISTORY, "recurrent_dtype": torch.float},
+    ])
     ids = tok.encode(PROMPT, add_bos = True)
     gen = torch.Generator().manual_seed(1)
     cont = torch.randint(100, 2000, (1, MAX_HISTORY + 2), generator = gen)
-    yield model, cache, ids, cont
+    yield model, dict(zip(("fp16_state", "fp32_state"), caches)), ids, cont
     unload_model(model)
 
 
 @pytest.mark.models("recurrent")
 @torch.inference_mode()
+@pytest.mark.parametrize("state", ["fp16_state", "fp32_state"])
 @pytest.mark.parametrize("pass_len, rejected", [
     (5, 0), (5, 1), (5, 4),
     (MAX_HISTORY + 1, 0), (MAX_HISTORY + 1, 1), (MAX_HISTORY + 1, 30), (MAX_HISTORY + 1, MAX_HISTORY),
 ])
-def test_spec_pass_rewind_matches_plain(model_id, loaded, pass_len, rejected):
-    model, cache, ids, cont = loaded
+def test_spec_pass_rewind_matches_plain(model_id, loaded, pass_len, rejected, state):
+    model, caches, ids, cont = loaded
+    cache = caches[state]
     spec = cont[:, :pass_len]
     accepted = pass_len - rejected
     probe = cont[:, pass_len : pass_len + 1]
@@ -101,7 +107,8 @@ def test_spec_pass_rewind_matches_plain(model_id, loaded, pass_len, rejected):
 @pytest.mark.models("recurrent")
 @torch.inference_mode()
 def test_rewind_without_history_is_position_only(model_id, loaded):
-    model, cache, ids, cont = loaded
+    model, caches, ids, cont = loaded
+    cache = caches["fp32_state"]
     n = ids.shape[1]
     s = cache.get_new_state()
     model.forward(ids, {"attn_mode": "flash_attn", "cache": cache, "batch_shape": (1, 4096), "past_len": 0,

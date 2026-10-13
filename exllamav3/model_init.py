@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
+import torch
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
@@ -116,6 +117,7 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-rs32", "--recurrent_state_fp32", action = "store_true", help = "Store the recurrent state of GatedDeltaNet/KDA layers in fp32 instead of the default fp16 (twice the state pool and checkpoints; the scans compute in fp32 either way). Mamba2 layers always use fp32")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
         parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
         parser.add_argument("-dcd", "--disk_cache_dir", type = str, help = "Directory for a persistent third-tier page/checkpoint cache behind the CPU tier (needs -ccs > 0), default: disabled", default = None)
@@ -306,6 +308,7 @@ def init(
                 compand_a = args.cache_compand_a,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             )
             # The draft cache gets the same speculative headroom and slot count: a recurrent drafter
             # keeps its own state pool and checkpoints alongside the target's
@@ -317,6 +320,7 @@ def init(
                 v_bits = v_bits,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             ) if draft_model_dir else None
         else:
             cache = Cache(
@@ -325,6 +329,7 @@ def init(
                 layer_type = CacheLayer_fp16,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             )
             draft_cache = Cache(
                 draft_model,
@@ -332,6 +337,7 @@ def init(
                 layer_type = CacheLayer_fp16,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             ) if draft_model_dir else None
     else:
         cache = None

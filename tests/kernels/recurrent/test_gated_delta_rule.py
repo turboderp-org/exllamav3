@@ -157,6 +157,7 @@ def _recurrent_param(shape, history):
     return pytest.param(history, *shape)
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float, torch.half], ids = ["fp32_state", "fp16_state"])
 @pytest.mark.parametrize(
     "history,bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
     [_recurrent_param(shape, history) for history in (False, True) for shape in RECURRENT_SHAPES],
@@ -164,6 +165,7 @@ def _recurrent_param(shape, history):
 @torch.inference_mode()
 def test_cuda_recurrent_gated_delta_rule_matches_torch(
     device,
+    state_dtype,
     history,
     bsz,
     seqlen,
@@ -181,11 +183,13 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
     g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
     beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
-    recurrent_state = torch.randn(
+    # fp16-representable initial values, so the fp32 reference and an fp16 pool start from the same state
+    recurrent_state = (torch.randn(
         (num_slots, 1, num_v_heads, k_head_dim, v_head_dim),
         dtype = torch.float,
         device = device,
-    ) * 0.05
+    ) * 0.05).half().float()
+    pool_in = recurrent_state.to(state_dtype)
     slots = 2 * torch.arange(bsz, dtype = torch.int32, device = device) + 1
 
     ref_out, ref_state = _torch_gated_delta_rule(
@@ -204,7 +208,7 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         mixed_qkv,
         g,
         beta,
-        recurrent_state,
+        pool_in,
         slots,
         history,
         num_k_heads,
@@ -213,8 +217,13 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         v_head_dim,
     )
 
+    assert cuda_state.dtype == state_dtype
+    cuda_state = cuda_state.float()
     torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
     torch.testing.assert_close(cuda_state, ref_state, rtol = 5e-2, atol = 5e-2)
+    if state_dtype == torch.half:
+        # One rounding of the final state: within fp16 precision of the fp32 scan
+        torch.testing.assert_close(cuda_state[slots.long()], ref_state[slots.long()], rtol = 2e-3, atol = 1e-4)
     if history:
         # The base rows are left exactly as they were
         assert torch.equal(cuda_state[slots.long() + 1], recurrent_state[slots.long() + 1])

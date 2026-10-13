@@ -80,8 +80,8 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
             l.rewind(slot, last_history, num_tokens)
     for device_index, jobs in conv_by_device.items():
         ext.batched_conv_rewind(jobs, device_index)
-    for (device_index, kind, nk, nv, dk, dv), jobs in replay_by_key.items():
-        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv)
+    for (device_index, kind, nk, nv, dk, dv, state_half), jobs in replay_by_key.items():
+        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv, state_half)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens,
@@ -271,6 +271,7 @@ class GDNLayerState:
         max_batch_size: int,
         max_history: int,
         cache_id: int,
+        state_dtype: torch.dtype = torch.float,
     ):
         self.module = module
         self.conv_state = torch.empty(
@@ -278,9 +279,14 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        # The recurrent state is stored in fp16 (the cache's default for GDN and KDA layers) or in
+        # fp32 (Cache(recurrent_dtype = torch.float); Mamba2 layers always). The scan kernels
+        # compute in fp32 either way and round once per pass on the store; the chunked prefill
+        # kernels take and return fp32
+        assert state_dtype in (torch.float, torch.half), "recurrent state dtype must be float32 or float16"
         self.recurrent_state = torch.empty(
             (2 * max_batch_size, 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = torch.float,
+            dtype = state_dtype,
             device = "meta"
         )
         # Staged scan inputs, flat rows. A pass of (bsz, seqlen) stages row-major: the first
@@ -303,10 +309,17 @@ class GDNLayerState:
         self.cache_id = cache_id
 
 
+    def set_state_dtype(self, dtype: torch.dtype):
+        """Storage dtype of the recurrent-state pool, settable until the state is allocated"""
+        assert self.device is None, "recurrent state dtype must be set before the state is allocated"
+        assert dtype in (torch.float, torch.half), "recurrent state dtype must be float32 or float16"
+        self.recurrent_state = torch.empty_like(self.recurrent_state, dtype = dtype)
+
+
     def get_checkpoint_size(self):
         return (
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
-            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * 4
+            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * self.recurrent_state.element_size()
         )
 
 
@@ -388,11 +401,11 @@ class GDNLayerState:
 
 
     def scan_geometry(self):
-        """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim): the replay kernel's
-        selection; every job of one batched_scan_replay launch shares it"""
+        """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half): the replay
+        kernel's selection; every job of one batched_scan_replay launch shares it"""
         m = self.module
         kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
-        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim
+        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, self.recurrent_state.dtype == torch.half
 
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
@@ -494,6 +507,7 @@ class GDNLayerState:
                 "cache_id": self.cache_id,
                 "max_history": self.max_history,
                 "max_batch_size": self.max_batch_size,
+                "state_dtype": self.recurrent_state.dtype,
             }
         }
 
