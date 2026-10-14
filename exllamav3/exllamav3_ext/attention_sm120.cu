@@ -1,3 +1,5 @@
+#if !defined(USE_ROCM)
+
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <mutex>
@@ -389,3 +391,5 @@ at::Tensor sm120_tma_attn_paged(
     TORCH_CHECK(false, "sm120_tma_attn requires CUDA toolkit 12.8 or newer");
 #endif
 }
+
+#endif
