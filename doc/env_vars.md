@@ -776,6 +776,21 @@ float, which can be worth testing on a host that also runs other work; the reser
 (`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
 topology can't be read.
 
+### `EXL3_MOE_CPU_SPREAD` (default: `0`)
+
+Linux only. Set to `1` to order physical worker cores round-robin across L3 cache domains
+before assigning SMT siblings. With fewer workers than physical cores, this avoids placing
+the whole pool on the first one or two CCDs. It works with `-mct` / `EXL3_MOE_CPU_THREADS`
+and the existing worker pinning; the reserved host cores follow the same ordering. The
+default retains CPU-ID order. Unreadable L3 topology falls back to that default order.
+
+On a 24-core Threadripper 7960X, LFM2.5-8B split decode (`-mcs 16 -mcpa`) measured about
+240 tok/s with `EXL3_MOE_CPU_SPREAD=1 -mct 12`, versus 222–225 tok/s with the default 23
+workers and 232 tok/s with 12 workers in the default order. Full offload was approximately
+unchanged with the spread 12-worker pool. These are workload-specific measurements, not an
+automatic thread-count recommendation. This changes CPU affinity only, not NUMA memory
+placement; benchmark it with the actual model and allocation policy on multi-socket hosts.
+
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
 Physical cores kept free of worker threads and reserved for the host process. The pool runs one
