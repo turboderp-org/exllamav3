@@ -6,7 +6,22 @@ from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
 from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, BCKernelTooLarge, \
-    MAX_BSZ, MAX_QLEN
+    signature_to_ast, MAX_BSZ, MAX_QLEN
+
+
+def mla_absorb_signature() -> tuple[dict, bool]:
+    """Signature and pointer_range_32 flag for the AOT compile of _mla_absorb_kernel. On HIP every pointer
+    is tagged ":16" AND pointer_range_32 is set (all the kernel's allocations are MB-scale
+    statics). The specializations compile to three different binaries on gfx1100/triton 3.7.1:
+    bare is a 64 KB-LDS 277-spill variant that emits NaN/garbage (surfaced downstream as
+    all-NaN logits and a "!!!!!" generation loop), divisibility-only is finite-but-wrong by
+    up to ~0.4 in rare elements, and both attrs together are exact (32 KB, 41 spills).
+    test_mla.py's wide-NoPE graph-vs-dispatch case covers the shape."""
+    sig = {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+    if torch.version.hip:
+        sig = {k: (v + ":16" if v.startswith("*") else v) for k, v in sig.items()}
+        return sig, True
+    return sig, False
 
 """
 Graph-captured decode attention for MLA (BC_MLAttention): the whole decode block -- q
@@ -196,14 +211,17 @@ class BCMLA:
             4, 2)
 
         absorb_bm = min(64, triton.next_power_of_2(max(R, 16)))
+        _absorb_sig, _absorb_range = mla_absorb_signature()
+        # pointer_range_32 is part of the compile contract -- see mla_absorb_signature()
         k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
-            {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+            _absorb_sig
             | {n: "constexpr" for n in (
                 "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
             dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
                  NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
                  BLOCK_M = absorb_bm, BLOCK_N = 128),
-            4, 2)
+            4, 2,
+            pointer_range_32 = _absorb_range)
 
         if self.quant:
             groups = D_c // 32
