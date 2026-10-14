@@ -84,8 +84,21 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        layers_per_device: list[int] | None,
     ):
         current_device_i = 0
+        layers_left = None
+        if layers_per_device is not None:
+            if not isinstance(layers_per_device, list) or \
+                    not all(isinstance(n, int) and n >= 0 for n in layers_per_device):
+                raise ValueError("layers_per_device must be list[int], with no negative values")
+            num_layers = sum(1 for m in modules if m.layer_idx is not None and m.layer_idx >= 0)
+            layers_left = [n for i, n in enumerate(layers_per_device) if i in active_devices]
+            if not sum(layers_left) == sum(layers_per_device) == num_layers:
+                raise ValueError(
+                    f"layers_per_device {layers_per_device} must add up to the model's {num_layers} layers "
+                    f"on the devices in the split {active_devices}"
+                )
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
         dummy_state = None
         prev_load_device = None
@@ -147,6 +160,14 @@ class Model_LSMixin(ABC):
                     else:
                         b, c, *rest = backup_shape
                         backup_shape = (b, min(max_output_size, c), *rest)
+
+                # Given layer counts: a device is left once it has its layers, so other modules
+                # load with the next layer
+                if layers_left is not None:
+                    while any(layers_left) and not layers_left[current_device_i]:
+                        current_device_i += 1
+                    if module.layer_idx is not None and module.layer_idx >= 0:
+                        layers_left[current_device_i] -= 1
 
                 while True:
                     try:
@@ -282,6 +303,8 @@ class Model_LSMixin(ABC):
                             "HIP out of memory" in str(e):
                             # Exception object will hold references to tensors so we can't free them here
                             fail = True
+                            if layers_left is not None:
+                                reason = str(e).partition("\n")[0][:200]
                             if verbose:
                                 print(f" -- autosplit: {module.key} does not fit on {load_device}: {str(e).splitlines()[0][:200]}")
                         else:
@@ -296,6 +319,10 @@ class Model_LSMixin(ABC):
                                 rs.reset()
 
                         free_mem()
+                        if layers_left is not None:
+                            raise RuntimeError(
+                                f"Insufficient VRAM in split: {module.key} does not fit on {load_device}: {reason}"
+                            )
                         current_device_i += 1
                         if current_device_i >= len(active_devices):
                             raise RuntimeError("Insufficient VRAM in split for model and cache")
