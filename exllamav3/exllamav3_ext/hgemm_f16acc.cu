@@ -71,32 +71,64 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p)
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     int src_size = pred ? 16 : 0;    // 0 -> zero-fill, no global read
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                  :: "r"(smem_u32(smem)), "l"(gmem), "r"(src_size));
+#else
+    (void) smem; (void) gmem; (void) pred;
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ void cp_async_commit()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_async_wait()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#else
+    (void) N;
+#endif
+}
 __device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const void* p)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+#else
+    (void) r; (void) p;
+#endif
 }
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+#else
+    (void) r; (void) p;
+#endif
 }
 __device__ __forceinline__ void mma_f16(uint32_t* c, const uint32_t* a, const uint32_t* b)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void) c; (void) a; (void) b;
+#endif
 }
 __device__ __forceinline__ void mma_f32(float* c, const uint32_t* a, const uint32_t* b)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void) c; (void) a; (void) b;
+#endif
 }
 
 template <bool OUT_F32, int TILE_N = 128, bool TUNED = false>
@@ -394,16 +426,25 @@ bool enabled(int device)
     return on == 1;
 }
 
-// Hard shape coverage of the kernel (independent of the device decision).
-static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+// Devices, dtypes, ranks, matching shapes and the tile multiples of K and N
+static bool covered_shapes(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
 {
     if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
     if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
     if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
     if (a.dim() != b.dim() || a.dim() != c.dim() || (a.dim() != 2 && a.dim() != 3)) return false;
+    if (a.dim() == 3 && (a.size(0) != b.size(0) || a.size(0) != c.size(0))) return false;
     int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
     if (b.size(-2) != K || c.size(-2) != M || c.size(-1) != N) return false;
-    if (K < 1 || N < 1 || M < 1 || K % BK != 0 || N % BN != 0) return false;
+    return K % BK == 0 && N % BN == 0;
+}
+
+// Hard shape coverage of the kernel (independent of the device decision).
+static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+{
+    if (!covered_shapes(a, b, c)) return false;
+    int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
+    if (K < 1 || N < 1 || M < 1) return false;
     if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
         K > std::numeric_limits<int>::max()) return false;
     // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
@@ -488,7 +529,11 @@ static void launch_config(const at::Tensor& a, const at::Tensor& b, const at::Te
 template <bool OUT_F32>
 static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream)
 {
-    if (!tuned_device(a.device().index())) launch_config<OUT_F32, 128, false>(a, b, c, stream);
+    // Ada (sm_89) runs the narrow tuned layout for every shape: its smaller L2 favours the
+    // 128x64 tile with the wider raster group, while Ampere loses with it (issue #384)
+    const auto* props = at::cuda::getDeviceProperties(a.device().index());
+    if (props->major == 8 && props->minor == 9) launch_config<OUT_F32, 64, true>(a, b, c, stream);
+    else if (!tuned_device(a.device().index())) launch_config<OUT_F32, 128, false>(a, b, c, stream);
     else if (narrow_tile(a, b)) launch_config<OUT_F32, 64, true>(a, b, c, stream);
     else launch_config<OUT_F32, 128, true>(a, b, c, stream);
 }
@@ -510,6 +555,13 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 // Force the kernel (tests / benchmarks): errors if the shape is not covered
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
 {
+    // Empty batch, rows or columns: nothing to compute. Empty reduction (K = 0): the product is zero
+    if (a.numel() == 0 || b.numel() == 0 || c.numel() == 0)
+    {
+        TORCH_CHECK(f16acc::covered_shapes(a, b, c), "hgemm_f16acc: unsupported device, dtype or shape (K % 64, N % 128)");
+        if (c.numel()) c.zero_();
+        return;
+    }
     TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: unsupported device, shape, strides or alignment (Ampere+, K % 64, N % 128; 16-byte input and vector-aligned output)");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

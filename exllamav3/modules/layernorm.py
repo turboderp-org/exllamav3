@@ -144,9 +144,9 @@ class LayerNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w)
+        module.weight = nn.Parameter(w, requires_grad = False)
         b = consumer.recv(exported.get("bias"), cuda = True)
-        module.bias = nn.Parameter(b) if b is not None else None
+        module.bias = nn.Parameter(b, requires_grad = False) if b is not None else None
         return module
 
     @staticmethod
@@ -163,12 +163,12 @@ class LayerNorm(Module):
         w = consumer.recv(exported["weight"], cuda = True)
         if w.dim() == 2 and w.shape[0] > 1:
             w = w[first : last, :]
-        module.weight = nn.Parameter(w.contiguous())
+        module.weight = nn.Parameter(w.contiguous(), requires_grad = False)
 
         b = consumer.recv(exported["bias"], cuda = True)
         if b is not None:
             if b.dim() == 2 and b.shape[0] > 1:
                 b = b[first : last, :]
-            module.bias = nn.Parameter(b.contiguous())
+            module.bias = nn.Parameter(b.contiguous(), requires_grad = False)
 
         return module

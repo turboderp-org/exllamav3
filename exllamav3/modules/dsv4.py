@@ -422,6 +422,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -583,6 +585,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
 
@@ -612,7 +616,7 @@ class DSV4Attention(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True).float().contiguous()
+        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True, arena = False).float().contiguous()
 
         self.inv_freq_main = yarn_inv_freq(self.rope_head_dim, self.rope_theta, device)
         self.inv_freq_compress = yarn_inv_freq(
@@ -626,11 +630,11 @@ class DSV4Attention(Module):
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
 
         if self.compressor is not None:
-            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True).float().contiguous()
+            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True, arena = False).float().contiguous()
             self.compressor.make_bc(self.inv_freq_compress)
         if self.indexer is not None:
             self.indexer.make_bc(self.inv_freq_compress)
-            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True).float().contiguous()
+            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True, arena = False).float().contiguous()
         for rl in self.recurrent_layers:
             rl.alloc(device)
         for cl in self.cache_layers:
@@ -657,6 +661,8 @@ class DSV4Attention(Module):
         self.x_fan = None
         self.q_fan = None
         self.x_fan_ready = False
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
         self._fan_scratch = {}
         self._bgraph_state = {}
         self._bc_dsa_batch = {}
@@ -963,8 +969,6 @@ class DSV4Attention(Module):
         self._fan_scratch = {}
 
         from .multilinear import MultiLinear
-        self.qb_multi = self.wob_multi = None
-        self._one_idx = None
         try:
             if self.q_fan is None and self.q_b.quant_type == "exl3":
                 self.qb_multi = MultiLinear(self.device, [self.q_b])
@@ -1317,7 +1321,9 @@ class DSV4Attention(Module):
                 bcd = build_bc_dsa_batch(self, rsl, kl)
                 self._bc_dsa_batch[id(rsl)] = bcd if bcd is not None else False
             if bcd:
-                return bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
+                y = bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
+                if y is not None:   # None: the graph kernels do not fit this device's shared memory
+                    return y
 
         # Eager batched body (capture reference / fallback): per-job state in a device
         # array, same kernels as the graphs
@@ -1400,20 +1406,29 @@ class DSV4Attention(Module):
                     int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
                 wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
                 self.idx_weights.inner.bc.run(x.view(R, -1), wts)
-                s_max = -(-kl.capacity // 128) * 128
-                scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
-                with torch.cuda.device(device):
-                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, 128))](
-                        qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
-                        scores, a_ec, R, a_pos, a_ec, bt_st,
-                        bt_st.stride(0),
+                # The score stride and the tile alignment both follow the kv tile, which the
+                # ladder may shrink on small-smem devices (smem.py)
+                from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
+                def i_args(bn):
+                    s_max = -(-kl.capacity // bn) * bn
+                    scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
+                    args = (qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
+                            scores, a_ec, R, a_pos, a_ec, bt_st, bt_st.stride(0))
+                    consts = dict(
                         H_i = Hi, H_pad = max(triton.next_power_of_2(Hi), 16), D_i = Di,
                         S_stride = s_max, compress_rate = m,
-                        scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
+                        scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = bn,
                         SEQ = S, MULTIROW = 1, EPP = kl.epp,
                         DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
-                        DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0,
-                        num_warps = 8, num_stages = 2)
+                        DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0)
+                    return s_max, scores, args, consts
+                with torch.cuda.device(device):
+                    def probe(bn):
+                        _, _, args, consts = i_args(bn)
+                        return shared_bytes(_dsa_indexer_fewq_kernel, args, **consts, num_warps = 8, num_stages = 2)
+                    idx_bn = pick_config(device, "dsv4_indexer_fewq", (Hi, Di, m, S, kl.epp, kl.capacity), halving_ladder(128), probe)
+                    s_max, scores, args, consts = i_args(idx_bn)
+                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, idx_bn))](*args, **consts, num_warps = 8, num_stages = 2)
                 indices = g_tensor_cache.get(device, (R, kp), torch.int32, "dsv4_b_idx")
                 # Per-row scan bound from the state array: each row reads only its own
                 # causal region, so the score buffer needs no -inf backfill
@@ -1522,6 +1537,10 @@ class DSV4Attention(Module):
             q_idx = o2[1].view(1, rows, -1)
         elif self.qb_multi is not None and rows <= 32:
             q = self._mgemm1(self.qb_multi, q_res, torch.half, "dsv4_qb1_ah")
+            # qb_multi stands in when q_b and idx_wq_b can't share a fan, so the indexer query
+            # still needs its own projection
+            if need_q_idx:
+                q_idx = self.idx_wq_b.forward(q_res, params)
         else:
             q = self.q_b.forward(q_res, params)
             if need_q_idx:

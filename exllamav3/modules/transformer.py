@@ -4,7 +4,7 @@ import torch
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from .hyperconnections import HyperConnection
+from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -134,6 +134,13 @@ class TransformerBlock(Module):
         )
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply_ (hyperconnections.hc_flush) lands before its streams move to another device
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -148,9 +155,9 @@ class TransformerBlock(Module):
 
         if self.attn:
             if self.attn_hc:
-                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
                 y = y.half()
-                if self.attn_norm:
+                if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
@@ -172,9 +179,9 @@ class TransformerBlock(Module):
 
         if self.mlp:
             if self.mlp_hc:
-                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
                 y = y.half()
-                if self.mlp_norm:
+                if self.mlp_norm and not normed:
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x

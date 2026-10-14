@@ -183,6 +183,8 @@ def print_stats(stats_sink):
 
 @torch.inference_mode()
 def main(args):
+    if args.ngram_corpus and args.s_ngram_match_min <= 0:
+        raise ValueError("-ngram_corpus requires -ngram_min > 0")
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
         min_draft_len = args.s_ngram_draft_length
@@ -219,7 +221,9 @@ def main(args):
             cache = cache,
             tokenizer = tokenizer,
             ngram_match_min = args.s_ngram_match_min,
+            ngram_corpus = args.ngram_corpus,
             num_draft_tokens = args.s_ngram_draft_length,
+            hybrid_draft_tokens = args.hybrid_draft_tokens,
             dynamic_draft_tokens = args.dynamic_draft,
             draft_confidence = args.draft_confidence,
             record_draft_stats = stats_sink is not None,
@@ -239,7 +243,8 @@ def main(args):
             draft_model = draft_model,
             draft_cache = draft_cache,
             tokenizer = tokenizer,
-        num_draft_tokens = args.num_draft_tokens,
+            num_draft_tokens = args.num_draft_tokens,
+            hybrid_draft_tokens = args.hybrid_draft_tokens,
             draft_confidence = args.draft_confidence,
             dynamic_draft_tokens = args.dynamic_draft,
             record_draft_stats = stats_sink is not None,
@@ -255,6 +260,8 @@ def main(args):
         draft_mode = "DFlash"
     if args.draft_model_dir and draft_model.caps.get("mtp_draft"):
         draft_mode = "MTP"
+    if args.hybrid_draft_tokens:
+        draft_mode += f" + hybrid {args.hybrid_draft_tokens}"
     r = {
         "Baseline": result_baseline,
         "N-gram (greedy)": result_ngram,

@@ -178,6 +178,7 @@ class DeepseekV4MTPModel(Model):
             key = f"{last}.markov_head.markov_w1",
             vocab_size = config.vocab_size,
             hidden_size = config.dspark_markov_rank,
+            allow_table = False,
         )
         # Device-resident (~63 MB): the sampling loop stays on-stream with no host syncs
         self.markov_w1.caps["prefer_cpu"] = False
@@ -265,6 +266,7 @@ class DeepseekV4MTPModel(Model):
 
 
     @override
+    @torch.inference_mode
     def forward(self, input_ids: torch.Tensor, params: dict, **kwargs) -> torch.Tensor:
         """Draft-block forward: seed token per row -> [seed, noise x (block-1)] -> input
         layer (embed + stream expand) -> blocks -> hc_head collapse -> norm. Returns the

@@ -42,7 +42,7 @@ def _sprof_wrap(kind, layer, fn):
     return r
 
 """
-Forward-path hooks are cpu_split_submit / cpu_offload_forward / cpu_split_combine, the
+Forward-path hooks are cpu_split_submit / cpu_offload_issue / cpu_split_combine, the
 load-path hooks cpu_maybe_offload_load / cpu_maybe_split_load / cpu_post_load, plus
 cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 """
@@ -85,6 +85,17 @@ def run_pending_swap_sweeps(infer_params):
         total += n
     if total and os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
+
+
+def trellis_rate(tile_width: int):
+    """Bitrate of an EXL3 trellis from its tile width (last dim): an integer 1..8 for 16 * K, a
+    half-integer 1.5 / 2.5 / 3.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
+    K, rem = divmod(tile_width, 16)
+    if rem == 0 and 1 <= K <= 8:
+        return K
+    if rem == 8 and 1 <= K <= 3:
+        return K + 0.5
+    return None
 
 
 class BlockSparseMLP_CPU:
@@ -215,6 +226,7 @@ class BlockSparseMLP_CPU:
             if isinstance(asn, dict) and asn.get(comp, 0) > 0:
                 asn[comp] -= 1
         self.cpu_offload = False
+        self.cpu_host = None
 
     def cpu_split_submit(self, y, bsz, selected_experts, routing_weights):
         """Hand the tail experts' share of the routed sum to the worker. Returns
@@ -265,16 +277,28 @@ class BlockSparseMLP_CPU:
             buf[:n], self.cpu_split_first)
         return sel_cpu
 
-    def cpu_offload_forward(self, shape, y, selected_experts, routing_weights, params):
+    def cpu_offload_issue(self, shape, y, selected_experts, routing_weights, params):
         """Whole-layer offload: the routed sum (of the given shape) comes entirely from the
-        worker. The autosplit measuring forward only observes VRAM allocation, which the CPU
-        compute cannot affect, so it skips the (slow, full-chunk) host pass and just allocates
-        the output."""
+        worker. Returns (final_hidden_states, cpu_pending) like cpu_split_submit: decode-size
+        batches are issued only, and cpu_split_combine collects them, so GPU work the caller
+        enqueues in between (the shared expert) runs while the worker computes instead of
+        behind the flag wait. Prefill-size batches take the streamed path, which overlaps
+        internally. The autosplit measuring forward only observes VRAM allocation, which the
+        CPU compute cannot affect, so it skips the (slow, full-chunk) host pass and just
+        allocates the output."""
         if params.get("autosplit_measure"):
-            return torch.zeros_like(y, dtype = torch.float).reshape(shape)
+            return torch.zeros_like(y, dtype = torch.float).reshape(shape), None
+        if y.shape[0] < self.cpu_host.stream_min_rows:
+            return None, self.cpu_host.submit_issue(
+                self.cpu_layer_idx, y, selected_experts, routing_weights)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, selected_experts, routing_weights
-        ).reshape(shape)
+        ).reshape(shape), None
+
+    def cpu_offload_forward(self, shape, y, selected_experts, routing_weights, params):
+        """Single-phase form of cpu_offload_issue (issue and collect back to back)"""
+        final_hidden_states, cpu_pending = self.cpu_offload_issue(shape, y, selected_experts, routing_weights, params)
+        return self.cpu_split_combine(final_hidden_states, None, cpu_pending, shape)
 
     def cpu_split_combine(self, final_hidden_states, cpu_partial, cpu_pending, shape):
         """Fold the CPU tail partial into the routed sum (stream-ordered: the collect
@@ -292,7 +316,9 @@ class BlockSparseMLP_CPU:
                 return final_hidden_states
             cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:
-            final_hidden_states = final_hidden_states + cpu_partial.view(shape)
+            # Whole-layer offload: the worker's output is the routed sum
+            final_hidden_states = cpu_partial.view(shape) if final_hidden_states is None \
+                else final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
 
     @override
@@ -315,7 +341,7 @@ class BlockSparseMLP_CPU:
         (which loads the expert weights itself, concurrently with GPU loading) and load
         everything else (router, norms, shared experts) on the GPU as usual. Eligibility here
         uses header metadata only; the parent never fetches expert data. Returns False without
-        side effects when the layer is ineligible (non-mul1 codebook, K > 8, or mixed per-expert
+        side effects when the layer is ineligible (non-mul1 codebook, unsupported K, or mixed per-expert
         biases), in which case the caller falls back to the normal path.
         """
         stc = self.config.stc
@@ -332,8 +358,8 @@ class BlockSparseMLP_CPU:
         def hdr_shape(l):
             return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
         for l in probe:
-            if hdr_shape(l)[-1] // 16 > 8:
-                print(f" !! {self.key}: K > 8, CPU offload skipped")
+            if trellis_rate(hdr_shape(l)[-1]) is None:
+                print(f" !! {self.key}: unsupported bitrate, CPU offload skipped")
                 return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
@@ -366,6 +392,11 @@ class BlockSparseMLP_CPU:
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        if self.e_score_bias_vl_key:
+            esb_vl = self.config.stc.get_tensor(
+                f"{self.key}.{self.e_score_bias_vl_key}", self.device, optional = True, allow_bf16 = True,
+                no_defer = True)
+            self.e_score_bias_vl = esb_vl.float() if esb_vl is not None else None
         if self.tid2eid_key:
             self.tid2eid = self.config.stc.get_tensor(
                 f"{self.key}.{self.tid2eid_key}", self.device, no_defer = True)
@@ -388,7 +419,7 @@ class BlockSparseMLP_CPU:
         self.cpu_component = comp
         def dims_of(l):
             s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-            return (s[0] * 16, s[1] * 16, s[2] // 16)
+            return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
         gd = dims_of(self.gates[0]) if self.gated else None
         ud = dims_of(self.ups[0])
         dd = dims_of(self.downs[0])
@@ -421,6 +452,7 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            interm_fp32 = self.interm_dtype == torch.float,
         )
         self.cpu_offload = True
         print(f" -- CPU-offloaded experts (worker): {self.key}")
@@ -450,8 +482,8 @@ class BlockSparseMLP_CPU:
         def hdr_shape(l):
             return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
         for l in probe:
-            if hdr_shape(l)[-1] // 16 > 8:
-                print(f" !! {self.key}: K > 8, CPU split skipped")
+            if trellis_rate(hdr_shape(l)[-1]) is None:
+                print(f" !! {self.key}: unsupported bitrate, CPU split skipped")
                 return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
@@ -518,7 +550,7 @@ class BlockSparseMLP_CPU:
 
         def dims_of(l):
             s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-            return (s[0] * 16, s[1] * 16, s[2] // 16)
+            return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
         gd = dims_of(self.gates[first]) if self.gated else None
         ud = dims_of(self.ups[first])
         dd = dims_of(self.downs[first])
@@ -549,6 +581,7 @@ class BlockSparseMLP_CPU:
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
+            interm_fp32 = self.interm_dtype == torch.float,
         )
 
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never

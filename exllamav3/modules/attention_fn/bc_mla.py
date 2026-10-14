@@ -1,10 +1,11 @@
 import torch
+from ...util.backend import DSA_SPLIT_WARPS
 from ...util.device_copy import to_device
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
+from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, BCKernelTooLarge, \
     MAX_BSZ, MAX_QLEN
 
 """
@@ -176,6 +177,7 @@ class BCMLA:
             _mla_decode_split_kernel,
             _mla_decode_combine_kernel,
             _mla_unfold_kernel,
+            mla_unfold_block_k,
         )
 
         dev = self.device
@@ -271,7 +273,8 @@ class BCMLA:
         k_unfold = _compile_kernel(dev, _mla_unfold_kernel,
             {"o_lat": "*fp16", "w_uv_flat": "*fp16", "out": "*fp16", "R": "i32"}
             | {n: "constexpr" for n in ("n_q_heads", "D_c", "D_v", "BLOCK_M", "BLOCK_K")},
-            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm, BLOCK_K = 128),
+            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm,
+                 BLOCK_K = mla_unfold_block_k(dev, H, D_c, D_v, unfold_bm)),
             4, 2)
 
         # Static intermediates, shared between layers on the same device. Bucketed flat
@@ -478,7 +481,8 @@ class BCMLA:
                 Q_SPLIT = 1, OUT_LATENT = 1,
                 QC = self.k_bits if self.quant else 0,
             )
-            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+            # ROCm: 8 warps spill far less to scratch on these parts
+            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
             sig_c = {
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
@@ -541,7 +545,10 @@ class BCMLA:
                     ext_indices = to_device(ext_indices, x.device)
 
         if (bsz, q_len, regime) not in self.configured:
-            self._configure(bsz, q_len, regime)
+            try:
+                self._configure(bsz, q_len, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
             self.configured.add((bsz, q_len, regime))
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,

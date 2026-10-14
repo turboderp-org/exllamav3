@@ -300,7 +300,7 @@ void ngram_gather_cpu
     int64_t U = uids.numel();
     TORCH_CHECK(out.size(0) >= U && out.size(1) * out.element_size() == row_bytes,
                 "ngram_gather_cpu: out shape");
-    if (!U) return;
+    if (!U || !row_bytes) return;
     const int64_t* up = (const int64_t*) uids.data_ptr();
     uint8_t* op = (uint8_t*) out.data_ptr();
 

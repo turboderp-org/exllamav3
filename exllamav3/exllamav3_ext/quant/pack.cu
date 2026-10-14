@@ -73,6 +73,10 @@ void pack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "pack_trellis: K must be 1..8");
+    TORCH_CHECK_DTYPE(packed, kShort);
+    TORCH_CHECK_DTYPE(unpacked, kShort);
+    TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "pack_trellis: packed and unpacked must be contiguous");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -80,11 +84,13 @@ void pack_trellis
 
     int rows = packed.size(0);
     int cols = packed.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(128);
     dim3 gridDim(rows, cols);
 
-    pack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    auto pack_trellis_fn = pack_trellis_kernel_instances[K - 1];
+    pack_trellis_fn<<<gridDim, blockDim, 0, stream>>>
     (
         (uint16_t*) packed.data_ptr(),
         (const uint16_t*) unpacked.data_ptr()
@@ -154,6 +160,10 @@ void unpack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "unpack_trellis: K must be 1..8");
+    TORCH_CHECK_DTYPE(packed, kShort);
+    TORCH_CHECK_DTYPE(unpacked, kShort);
+    TORCH_CHECK(packed.is_contiguous() && unpacked.is_contiguous(), "unpack_trellis: packed and unpacked must be contiguous");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -161,11 +171,13 @@ void unpack_trellis
 
     int rows = packed.size(0);
     int cols = packed.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(128);
     dim3 gridDim(cols, rows);
 
-    unpack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    auto unpack_trellis_fn = unpack_trellis_kernel_instances[K - 1];
+    unpack_trellis_fn<<<gridDim, blockDim, 0, stream>>>
     (
         (uint16_t*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr()
@@ -213,6 +225,7 @@ void pack_signs
     TORCH_CHECK_DTYPE(packed, kShort);
 
     int cols = packed.size(0);
+    if (!cols) return;
     dim3 blockDim(32);
     dim3 gridDim(CEIL_DIVIDE(cols, 32));
 

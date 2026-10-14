@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import cached_property
 from typing import Callable
+import gc
 import torch
 from .config import Config
 from ..util import parse_int_list
@@ -77,6 +78,18 @@ class Model(Model_TPMixin, Model_LSMixin):
         # modules that stage input-dependent data (PLE n-gram rows) on a worker thread before the
         # first layers are issued, so the gather overlaps block 0 instead of stalling at its layer
         return [m for m in self if m.caps.get("prefetch_ids")]
+
+
+    def prefetch_tokens(self, ids: list[int]):
+        """
+        Tokens the next forward pass will embed, known ahead of it (the generator has just
+        sampled them). An embedding table streamed from disk starts reading their rows, so the
+        read overlaps the host work before that forward instead of stalling it.
+        """
+        if not self.loaded_tp and self.modules:
+            prefetch = getattr(self.modules[0], "prefetch_tokens", None)
+            if prefetch is not None:
+                prefetch(ids)
 
 
     def get_layer_instances(self, layer_idx):
@@ -204,8 +217,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         of the graph-captured decode paths. Runs a short schedule of real forward passes through the loaded
         model (layer-split or tensor-parallel alike):
 
-          - single rows at 1, 2, 4, 8 and 16 tokens: the GEMM autotuner keys on the row count only up to the
-            16-row bucket, so these five passes cover every tuned shape of every quantized projection
+          - single rows at 1, 2, 4, 8, 16, 32, 48 and 64 tokens: the GEMM autotuner keys on the row count only up
+            to the 64-row bucket, so these passes cover every tuned shape of every quantized projection
           - one full chunk (prefill kernels, MoE prefill paths)
           - a batched family (max_batch_size rows): a short prefill, a one-token decode step and a multi-token
             step with recurrent history (draft/MTP verification shapes), then the same at batch size 1
@@ -262,14 +275,14 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Steps of a family share recurrent states and advance the position; each family starts at 0
         families = []
         if cache is None:
-            for n in (1, 2, 4, 8, 16, max_chunk_size):
+            for n in (1, 2, 4, 8, 16, 32, 48, 64, max_chunk_size):
                 families.append((f"rows {n}", 1, None, [(n, False)]))
         else:
             cap = cache.max_num_tokens
             def rup(n):
                 return -(-n // PAGE_SIZE) * PAGE_SIZE
             chunk = min(max_chunk_size, cap)
-            for n in (1, 2, 4, 8, 16):
+            for n in (1, 2, 4, 8, 16, 32, 48, 64):
                 if rup(n) <= cap:
                     families.append((f"rows {n}", 1, rup(n), [(n, False)]))
             if chunk > 16:
@@ -324,6 +337,12 @@ class Model(Model_TPMixin, Model_LSMixin):
                             params["recurrent_states"] = states
                         if history:
                             params["recurrent_history"] = True
+                    # Chunk-class steps stop the head at the last row, like prefill does (the
+                    # generator never takes logits for a whole chunk): full-chunk logits are the
+                    # single largest transient of the whole load (1.9 GiB fp16 at 4096 rows on a
+                    # 248k vocab) and would set the process's reserved high-water mark for nothing
+                    if q > 16:
+                        params["last_tokens_only"] = 1
                     step_label = f"{label}, {q} token(s) at {pos}" if cache is not None else label
                     try:
                         self.forward(ids(bsz, q), params)
@@ -368,6 +387,33 @@ class Model(Model_TPMixin, Model_LSMixin):
             y = self.prefill_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
+
+
+    @torch.inference_mode
+    def lm_head_argmax(self, state: torch.Tensor, params: dict) -> torch.Tensor:
+        """
+        Greedy token per position from a hidden state through this model's LM head, for drafters
+        that borrow the target's head (MTP, DFlash). Works in both layer-split and tensor-parallel
+        mode. With params["export_draft_conf"], also exports the winning logit per position as
+        params["draft_conf"], which the generator's confidence-calibrated draft sizing consumes.
+        The vocabulary is cropped to the unpadded size in both modes, so a zero-initialized
+        padding column can never win.
+        """
+        export = bool(params.get("export_draft_conf"))
+        if self.loaded_tp:
+            state = self.tp_producer.send(state)
+            ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
+            if export:
+                params["draft_conf"] = conf
+            return ids
+        lm = self.modules[self.logit_layer_idx]
+        logits = lm.forward(lm.prepare_for_device(state, params), params)
+        logits = logits[..., :self.config.vocab_size]
+        if export:
+            conf, ids = torch.max(logits, dim = -1)
+            params["draft_conf"] = conf
+            return ids
+        return torch.argmax(logits, dim = -1)
 
 
     @torch.inference_mode
@@ -520,129 +566,160 @@ class Model(Model_TPMixin, Model_LSMixin):
             For debug purposes, skip reference forward pass during autosplit load.
         """
 
-        free_mem()
+        # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
+        # allocated on any device yet (the usual first load) there is none, and a full collection
+        # walks every object imported so far
+        if any(torch.cuda.memory_allocated(i) for i in range(torch.cuda.device_count())):
+            free_mem()
 
-        # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
-        # shares the config but loads after the main model's worker has already started)
-        self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+        # Objects alive at this point (everything imported, any earlier model) are frozen for the
+        # duration of the load: they cannot become garbage because of it, and without the freeze
+        # every automatic collection during the load, and the collection in free_mem() below, walks
+        # them all over again. Skipped when the caller keeps its own frozen set
+        freeze = gc.get_freeze_count() == 0
+        if freeze:
+            gc.freeze()
+        try:
+            # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
+            # shares the config but loads after the main model's worker has already started)
+            self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
 
-        assert not (bool(reserve_per_device) and bool(use_per_device)), \
-            "Cannot specify both memory usage and memory reserve."
+            assert not (bool(reserve_per_device) and bool(use_per_device)), \
+                "Cannot specify both memory usage and memory reserve."
 
-        assert max_chunk_size >= 1, "max_chunk_size must be positive"
-        assert max_output_size >= 1, "max_output_size must be positive"
-        assert max_output_factor >= 1, "max_output_factor must be positive"
+            assert max_chunk_size >= 1, "max_chunk_size must be positive"
+            assert max_output_size >= 1, "max_output_size must be positive"
+            assert max_output_factor >= 1, "max_output_factor must be positive"
 
-        # Load to single device
-        if device is not None:
-            assert not bool(reserve_per_device) and not bool(use_per_device), \
-                "Cannot specify reserve_per_device or use_per_device when loading to single device."
-            assert not tensor_p, \
-                "Cannot use tensor_p when loading to single device."
-            self._load_single(progressbar, device, self.config, self.modules, verbose)
-            self.output_device = self.modules[-1].device
-
-        # Use/reserve
-        else:
-            rpd = reserve_per_device is not None
-            upd = use_per_device is not None
-            assert not (rpd and upd), \
-                "Cannot specify both reserve_per_device or use_per_device."
-            num_devices = torch.cuda.device_count()
-
-            if not upd:
-                if reserve_per_device is None:
-                    reserve_per_device = [0.5] * num_devices
-                elif any(isinstance(reserve_per_device, t) for t in [float, int]):
-                    reserve_per_device = [reserve_per_device] * num_devices
-                elif not isinstance(reserve_per_device, list):
-                    raise ValueError("reserve_per_device must be float or list[float]")
-                while len(reserve_per_device) < num_devices:
-                    reserve_per_device.append(0.5)
-                reserve_per_device = [int(x * 1024**3) for x in reserve_per_device]
-                active_devices = [
-                    i for i in range(num_devices)
-                    if i >= len(reserve_per_device) or reserve_per_device[i] >= 0
-                ]
-
-            if upd:
-                if any(isinstance(use_per_device, t) for t in [float, int]):
-                    use_per_device = [use_per_device] * num_devices
-                elif not isinstance(use_per_device, list):
-                    raise ValueError("use_per_device must be float or list[float]")
-                use_per_device = [int(x * 1024**3) for x in use_per_device]
-                active_devices = [
-                    i for i, x in enumerate(use_per_device)
-                    if x > 0
-                ]
-
-            # Split load
-            if not tensor_p:
-                yield from self._load_autosplit(
-                    progressbar,
-                    reserve_per_device,
-                    use_per_device,
-                    active_devices,
-                    max_chunk_size,
-                    max_output_size,
-                    max_output_factor,
-                    callback,
-                    generator,
-                    self.config,
-                    self.modules,
-                    verbose,
-                    max_batch_size,
-                    self.cache_weakrefs,
-                    autosplit_no_forward,
-                )
+            # Load to single device
+            if device is not None:
+                assert not bool(reserve_per_device) and not bool(use_per_device), \
+                    "Cannot specify reserve_per_device or use_per_device when loading to single device."
+                assert not tensor_p, \
+                    "Cannot use tensor_p when loading to single device."
+                self._load_single(progressbar, device, self.config, self.modules, verbose)
                 self.output_device = self.modules[-1].device
 
-            # Tensor-P load:
+            # Use/reserve
             else:
-                if not self.caps.get("supports_tp"):
-                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
-                if self.config.layer_map:
-                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for relayered models.")
+                rpd = reserve_per_device is not None
+                upd = use_per_device is not None
+                assert not (rpd and upd), \
+                    "Cannot specify both reserve_per_device or use_per_device."
+                num_devices = torch.cuda.device_count()
 
-                if tp_output_device is None:
-                    tp_output_device = active_devices[0]
+                if not upd:
+                    if reserve_per_device is None:
+                        reserve_per_device = [0.5] * num_devices
+                    elif any(isinstance(reserve_per_device, t) for t in [float, int]):
+                        reserve_per_device = [reserve_per_device] * num_devices
+                    elif not isinstance(reserve_per_device, list):
+                        raise ValueError("reserve_per_device must be float or list[float]")
+                    while len(reserve_per_device) < num_devices:
+                        reserve_per_device.append(0.5)
+                    reserve_per_device = [int(x * 1024**3) for x in reserve_per_device]
+                    active_devices = [
+                        i for i in range(num_devices)
+                        if i >= len(reserve_per_device) or reserve_per_device[i] >= 0
+                    ]
+
+                if upd:
+                    if any(isinstance(use_per_device, t) for t in [float, int]):
+                        use_per_device = [use_per_device] * num_devices
+                    elif not isinstance(use_per_device, list):
+                        raise ValueError("use_per_device must be float or list[float]")
+                    use_per_device = [int(x * 1024**3) for x in use_per_device]
+                    active_devices = [
+                        i for i, x in enumerate(use_per_device)
+                        if x > 0
+                    ]
+
+                # Split load
+                if not tensor_p:
+                    yield from self._load_autosplit(
+                        progressbar,
+                        reserve_per_device,
+                        use_per_device,
+                        active_devices,
+                        max_chunk_size,
+                        max_output_size,
+                        max_output_factor,
+                        callback,
+                        generator,
+                        self.config,
+                        self.modules,
+                        verbose,
+                        max_batch_size,
+                        self.cache_weakrefs,
+                        autosplit_no_forward,
+                    )
+                    self.output_device = self.modules[-1].device
+
+                # Tensor-P load:
                 else:
-                    assert torch.device(tp_output_device).index in active_devices, \
-                        "Output device must be part of split."
+                    if not self.caps.get("supports_tp"):
+                        raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
+                    if self.config.layer_map:
+                        raise NotImplementedError(f"Tensor-parallel is not currently implemented for relayered models.")
+                    # CPU expert offload hooks into a module's load onto a CUDA device. The TP loader
+                    # stages modules on the CPU and the workers rebuild them from the export, so a
+                    # requested offload would be dropped without notice and every expert would land
+                    # in VRAM
+                    ip = self.config.infer_params
+                    cpu_modes = [name for name, value in (
+                        ("moe_cpu_split", getattr(ip, "moe_cpu_split", 0)),
+                        ("moe_cpu_offload", getattr(ip, "moe_cpu_offload", 0)
+                            if getattr(self, "component", "text") == "text"
+                            else getattr(ip, "draft_moe_cpu_offload", 0)),
+                    ) if value]
+                    if cpu_modes:
+                        raise NotImplementedError(
+                            f"CPU expert offload ({', '.join(cpu_modes)}) is not currently implemented for "
+                            f"tensor-parallel loads; use layer-split mode or disable the offload."
+                        )
 
-                if tp_options is None:
-                    tp_options = {}
+                    if tp_output_device is None:
+                        tp_output_device = active_devices[0]
+                    else:
+                        assert torch.device(tp_output_device).index in active_devices, \
+                            "Output device must be part of split."
 
-                yield from self._load_tp(
-                    progressbar,
-                    reserve_per_device,
-                    use_per_device,
-                    active_devices,
-                    max_chunk_size,
-                    max_output_size,
-                    max_output_factor,
-                    callback,
-                    generator,
-                    tp_output_device,
-                    self.config,
-                    self.modules,
-                    tp_dev_limits,
-                    tp_backend,
-                    verbose,
-                    tp_options,
-                )
-                self.output_device = tp_output_device
+                    if tp_options is None:
+                        tp_options = {}
 
-        free_mem()
+                    yield from self._load_tp(
+                        progressbar,
+                        reserve_per_device,
+                        use_per_device,
+                        active_devices,
+                        max_chunk_size,
+                        max_output_size,
+                        max_output_factor,
+                        callback,
+                        generator,
+                        tp_output_device,
+                        self.config,
+                        self.modules,
+                        tp_dev_limits,
+                        tp_backend,
+                        verbose,
+                        tp_options,
+                    )
+                    self.output_device = tp_output_device
 
-        # Release all global shared tensors (refs still held by modules until model is unloaded)
-        g_tensor_cache.drop_all()
+            free_mem()
 
-        # Mark every attached cache usable.
-        for ref in self.cache_weakrefs.values():
-            cache = ref()
-            if cache is not None:
-                cache.initialized = True
+            # Release all global shared tensors (refs still held by modules until model is unloaded)
+            g_tensor_cache.drop_all()
+
+            # Mark every attached cache usable.
+            for ref in self.cache_weakrefs.values():
+                cache = ref()
+                if cache is not None:
+                    cache.initialized = True
+        finally:
+            if freeze:
+                gc.unfreeze()
 
 
     @torch.inference_mode
@@ -661,10 +738,6 @@ class Model(Model_TPMixin, Model_LSMixin):
         # idempotent, so already-running workers of other components are unaffected
         for host in getattr(self.config, "moe_cpu_hosts", {}).values():
             host.ensure_started()
-
-
-    def get_load_metrics(self):
-        return self.config.stc.get_metrics()
 
 
     def get_layout_tree(self, pre_indent: int) -> str:

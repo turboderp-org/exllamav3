@@ -59,9 +59,13 @@ namespace cg_gemv = cooperative_groups;
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
+#if defined(USE_ROCM)
+    return exl3_dp4a_us(a, b, c);
+#else
     int d;
     asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
+#endif
 }
 
 // i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for

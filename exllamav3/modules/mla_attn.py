@@ -16,6 +16,7 @@ from .attention_fn.mla_triton import (
     mla_unfold,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
+from .attention_fn.smem import NoFittingConfig
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -279,6 +280,27 @@ class MLAttention(Module):
         })
 
 
+
+    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params):
+        """MHA-form attention: everything (past and current chunk) is read back from the cache
+        and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
+        slice cannot reshape into a view), so fold it back into q's pe columns for the kernel's
+        packed [nope | pe] per-head rows."""
+        H = self.num_q_heads
+        R = bsz * seqlen
+        q = q.view(R, H, self.qk_head_dim)
+        q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
+        o = mla_attn_triton_prefill_mha(
+            q,
+            self.w_uk_flat, self.w_uv_flat,
+            ckv_cache, kpe_cache, block_table, host_seqlens,
+            bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
+            pre_appended_len = seqlen,
+            qc = qc,
+        )
+        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+        return self.o_proj.forward(o, params)
+
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
         was constructed with. A quantized cache request maps to the packed-latent layer: k_bits
@@ -318,10 +340,10 @@ class MLAttention(Module):
             stc = self.config.stc
             self.idx_kpool_ape = stc.get_tensor(
                 f"{self.key}.{self.key_indexer}.index_kpool_compress_ape", device,
-                no_defer = True, allow_bf16 = True).float()
+                no_defer = True, allow_bf16 = True, arena = False).float()
             self.idx_kpool_gate = stc.get_tensor(
                 f"{self.key}.{self.key_indexer}.index_kpool_compress_gate", device,
-                no_defer = True, allow_bf16 = True).to(torch.half)
+                no_defer = True, allow_bf16 = True, arena = False).to(torch.half)
 
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
@@ -336,12 +358,14 @@ class MLAttention(Module):
         # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
         if self.w_uk_flat is not None:
             return
-        w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
+        # Source only: the halves are copied into w_uk_flat / w_uv_flat below and w is dropped,
+        # so it stays out of the loader's slab blocks
+        w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True, arena = False)
         if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             # fp8 checkpoint: this tensor is read raw rather than through a Linear, so apply the
             # inverse weight scale here (scalar per-tensor or block grid)
             si = self.config.stc.get_tensor(
-                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True
+                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True, arena = False
             )
             wf = w.float()
             if si is not None:
@@ -876,39 +900,45 @@ class MLAttention(Module):
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
                 indices = to_device(indices, x.device)
-            return self._attend_sparse(
+            # q and q_pe_hm are dead here (the sparse kernel reads q_lat and token-major q_pe);
+            # the queries themselves die once the kernel returns, before the (R, H, v) unfold
+            # allocates.
+            del q, q_pe_hm
+            o_lat = self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
                 pool_len = max(host_seqlens) + seqlen,
             )
-
-        if use_mha:
-            # MHA-form prefill: everything (past and current chunk) is read back from the cache
-            # and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
-            # slice cannot reshape into a view), so fold it back into q's pe columns for the
-            # kernel's packed [nope | pe] per-head rows
-            q = q.view(R, H, self.qk_head_dim)
-            q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
-            o = mla_attn_triton_prefill_mha(
-                q,
-                self.w_uk_flat, self.w_uv_flat,
-                ckv_cache, kpe_cache, block_table, host_seqlens,
-                bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
-                pre_appended_len = seqlen,
-                qc = qc,
-            )
+            del q_lat, q_pe
+            o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+            del o_lat
             o = o.reshape(bsz, seqlen, H * self.v_head_dim)
             return self.o_proj.forward(o, params)
 
+        if use_mha:
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
-        o_lat = kernel(
-            q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
-            bsz = bsz, q_len = seqlen,
-            causal = causal, softmax_scale = self.sm_scale,
-            pre_appended_len = seqlen,
-            qc = qc,
-            **extra,
-        )
+        try:
+            o_lat = kernel(
+                q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
+                bsz = bsz, q_len = seqlen,
+                causal = causal, softmax_scale = self.sm_scale,
+                pre_appended_len = seqlen,
+                qc = qc,
+                **extra,
+            )
+        except NoFittingConfig:
+            # No latent-form tile fits this device's shared memory at this query length (the
+            # latent width sets the floor; Turing at 512-wide latents). The MHA form attends
+            # over per-head up-projections from the same cache at any query length, and the
+            # un-absorbed q is still live here. Dense causal only, as for use_mha
+            if not (causal and not sparse and self.w_uk_flat is not None):
+                raise
+            if host_seqlens is None:
+                host_seqlens = _host_seqlens(params, cache_seqlens)
+            del q_lat, q_pe_hm
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
 
         from .attention_fn.mla_triton import _debug_sync
         if _debug_sync:
@@ -921,15 +951,18 @@ class MLAttention(Module):
                     f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
 
         # Unfold W_UV per head from the flat layout; the kernel emits token-major output, so it
-        # feeds o_proj without a permute
+        # feeds o_proj without a permute. The queries are dead by now
+        del q, q_lat, q_pe, q_pe_hm
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+        del o_lat
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
         return self.o_proj.forward(o, params)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
                        block_table, indices, qc, pool_len = 0):
-        """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
+        """Gathered attention over the top-k selected latent rows, returning the head-major latent
+        output (H, R, D_c) for the caller's unfold (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
         the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
         gather kernel) and the indexer's causal bound keeps the selection causal, so the
@@ -956,9 +989,7 @@ class MLAttention(Module):
             qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
             pool_len = pool_len,   # entries the selection can reference (context, not pool)
         )
-        o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
-        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return o_lat
 
 
     def decode_flash_attn(
@@ -1077,31 +1108,30 @@ class MLAttention(Module):
         )
 
 
-    def autosplit_extra_measure(self, params):
-        """
-        The (1, chunk)-at-context-0 pass this follows is NOT this module's memory worst case:
-        sparse DSA replaces the MHA prefill with a different transient set once the context
-        exceeds index_topk, and the BC decode slots allocate their statics only when a decode
-        shape first occurs.
-
-        Both are exercised here so an OoM lands where the loader advances to the next
-        device, rather than after deployment. Outputs are discarded; only allocation shapes
-        matter. The BC slots are configured but never run, so nothing is graph-captured at
-        load time and the end-of-load tensor-cache drop leaves no baked pointers behind.
-        """
+    def _autosplit_layer(self, params):
+        """The cache layer the autosplit hooks act on, with its quantization flag and the
+        chunk length, or None when the module has nothing to prepare or measure"""
 
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
-            return
+            return None
         cache = params.get("cache")
         if cache is None or self.device is None:
-            return
+            return None
         from ..cache import CacheLayer_MLA_quant, CacheLayer_MLA_fp16
         layer = cache if not hasattr(cache, "layers") else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
         quant = isinstance(layer, CacheLayer_MLA_quant)
         if not quant and not isinstance(layer, CacheLayer_MLA_fp16):
+            return None
+        return layer, quant, params["batch_shape"][1]
+
+    def autosplit_prepare(self, params):
+        """Decode slot statics for the whole (bsz, q_len) family, allocated before the loader's
+        measuring window (they stay resident; nothing is graph-captured at load time)"""
+        found = self._autosplit_layer(params)
+        if found is None:
             return
-        chunk = params["batch_shape"][1]
+        layer, quant, chunk = found
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= 16) slot family can
         # request, both regimes. Backings are bucketed and shared across slots and layers,
@@ -1118,6 +1148,15 @@ class MLAttention(Module):
                 for rg in regimes:
                     bcm._configure(b, q, rg)
 
+
+    def autosplit_extra_measure(self, params):
+        """Sparse DSA prefill at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach: exercised here so an OoM lands where the loader advances to
+        the next device rather than after deployment. Outputs are discarded"""
+        found = self._autosplit_layer(params)
+        if found is None:
+            return
+        layer, quant, chunk = found
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
         if self.indexer_mode is None:

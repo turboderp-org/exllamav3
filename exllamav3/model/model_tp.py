@@ -305,16 +305,9 @@ class Model_TPMixin:
 
     def tp_cpu_cache_store(self, cache_ids: list[int], slot: int, page_index: int):
         """
-        Copy a cache page out to system RAM on every rank, stored under slot. Returns the number of stores that
-        had to pin memory synchronously, summed over ranks, since that stall happens out of sight of the main
-        process.
+        Copy a cache page out to system RAM on every rank, stored under slot
         """
-        cold = self.tp_worker_dispatch_wait_multi(
-            self.active_devices,
-            mp_cpu_cache_store,
-            (cache_ids, slot, page_index)
-        )
-        return sum(cold)
+        self.tp_dispatch_all(mp_cpu_cache_store, (cache_ids, slot, page_index))
 
 
     def tp_cpu_cache_fetch(self, cache_ids: list[int], slot: int, page_index: int):
@@ -347,13 +340,15 @@ class Model_TPMixin:
         return r
 
 
-    def tp_dispatch_lm_head_argmax(self, args):
+    def tp_dispatch_lm_head_argmax(self, args, return_max: bool = False):
         """
         Compute argmax over a tensor-parallel sharded LM head.
 
         Each device that owns a non-empty LM-head slice computes local maximum values and vocabulary indices for
         its shard. The partial maxima are gathered to the output device, where the final winner is selected and the
-        global token index is returned.
+        global token index is returned. With return_max, the winning logit value comes back alongside (the same
+        value the layer-split path exports as draft confidence); it is already on the output device from the
+        gather, so this adds no transfer or synchronization.
 
         Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating, runs after
         the spawned workers have been sent their local argmax command.
@@ -368,9 +363,9 @@ class Model_TPMixin:
             v, i = self.tp_worker_dispatch_single(
                 self.tp_output_device,
                 mp_model_forward_lm_head_argmax,
-                args + (ad[self.tp_output_device], None, None)
+                args + (ad[self.tp_output_device], None, None, self.config.vocab_size)
             )
-            return i
+            return (i, v) if return_max else i
 
         gd = sorted(set(ad.keys()) | {self.tp_output_device})
         ldims = [1 if d in ad else 0 for d in gd]
@@ -381,7 +376,7 @@ class Model_TPMixin:
                 self.tp_worker_dispatch(
                     device,
                     mp_model_forward_lm_head_argmax,
-                    args + (ad.get(device, -1), gd, ldims)
+                    args + (ad.get(device, -1), gd, ldims, self.config.vocab_size)
                 )
                 dispatched.append(device)
 
@@ -405,8 +400,10 @@ class Model_TPMixin:
             p += ldim
         vals = torch.stack(vals, dim = -1)
         inds = torch.stack(inds, dim = -1)
-        winner = vals.argmax(dim = -1)
-        argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        winner = vals.argmax(dim = -1, keepdim = True)
+        argmax = inds.gather(-1, winner).squeeze(-1)
+        if return_max:
+            return argmax, vals.gather(-1, winner).squeeze(-1)
         return argmax
 
 
@@ -537,7 +534,7 @@ class Model_TPMixin:
                 progress.update(idx + 1)
 
             # Append final gather layer
-            if last_module.caps["logits_output"]:
+            if last_module.caps.get("logits_output"):
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
 
             # Final callback, 100% loaded
@@ -580,6 +577,8 @@ class Model_TPMixin:
             "positions",
             "position_ids",
             "recurrent_slots",
+            "recurrent_slots_scan",
+            "recurrent_slots_scan_in",
             "inv_freq",
             "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
         ]:

@@ -7,7 +7,7 @@
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
-- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
+- **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
@@ -163,6 +163,7 @@ installations once the venv is active, `python convert.py -i ...`
 compilation. Set this to a reasonable value like 4 in that case.
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
 will build/load it at runtime instead.
+- `EXLLAMA_EXT_LINEINFO`, `EXLLAMA_EXT_COMPRESS`: see [doc/env_vars.md](doc/env_vars.md).
 
 ## Examples
 
@@ -212,6 +213,7 @@ python examples/chat.py -h
 | **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
 | **MiMo-RL**                                      | `MiMoForCausalLM` |  |  |
+| **MiMo-V2.6-Flash**                              | `MiMoV2ForCausalLM` | ✓ | no audio |
 | **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
 | **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
 | **Mixtral**                                      | `MixtralForCausalLM` |  |  |

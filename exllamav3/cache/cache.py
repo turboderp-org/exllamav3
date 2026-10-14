@@ -121,8 +121,10 @@ class Cache:
             Max number of recurrent state slots (max supported batch size for recurrent models)
 
         :param max_history:
-            For recurrent models, max number of past states to reserve space for per batch item. For speculative
-            decoding on recurrent models, this should be equal to the number of draft tokens.
+            For recurrent models, the longest speculative pass (in draft tokens) a batch item can roll back: sizes
+            the conv rings and the staged scan inputs the rewind replays from. For speculative decoding on
+            recurrent models, this should be equal to the number of draft tokens. The recurrent state itself is
+            two rows per batch item regardless of this value.
 
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
@@ -164,7 +166,7 @@ class Cache:
         self.recurrent_state_cls = model.recurrent_state_cls
 
         rl = self.model.get_recurrent_layers()
-        self.num_layers = len(rl)
+        self.num_recurrent_layers = len(rl)
         self.recurrent_layers = {}
         for layer in rl:
             for instance in self.model.get_layer_instances(layer.layer_idx):

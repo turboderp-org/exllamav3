@@ -94,9 +94,12 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
     while (true)
     {
+        // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
+        // forward pass that feeds it
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
         // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
         // readback for the full sleep quantum (a 1 ms nap at this spot showed up as a slow first
@@ -109,7 +112,9 @@ void run_cpu_reduce_jobs
                 break;
             if (++spins < 65536)
             {
-                #ifdef __linux__
+                #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
+                    asm volatile("yield" ::: "memory");
+                #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else
                     _mm_pause();
@@ -326,14 +331,15 @@ void pg_all_reduce_cpu_kernel
 
     // Block-uniform gate on the CPU release counter reaching `target` (plain >= like the rest of
     // the stage machinery; the sequence would need 2^31 chunks to wrap). The last observed value
-    // is cached: when the CPU is ahead, most chunks pass with no pinned-memory read at all
+    // is cached: when the CPU is ahead, most chunks pass with no pinned-memory read at all.
+    // The fast-path test reads a per-thread copy of the cached value, refreshed only behind the
+    // barrier, so every thread takes the same branch
     __shared__ bool s_wait_ok;
     __shared__ uint32_t s_cpu_seen;
-    if (t == 0) s_cpu_seen = 0;
-    __syncthreads();
+    uint32_t cpu_seen = 0;
     auto wait_cpu = [&] (uint32_t target) -> bool
     {
-        if (s_cpu_seen >= target) return true;
+        if (cpu_seen >= target) return true;
         if (t == 0)
         {
             s_wait_ok = true;
@@ -342,7 +348,8 @@ void pg_all_reduce_cpu_kernel
             while (true)
             {
                 uint32_t ep = (uint32_t)ldg_acquire_sys_u32(&ctx->cpusum_stage_cpu);
-                if (ep >= target) { s_cpu_seen = ep; break; }
+                s_cpu_seen = ep;
+                if (ep >= target) break;
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_kernel"))
@@ -354,6 +361,7 @@ void pg_all_reduce_cpu_kernel
             }
         }
         __syncthreads();
+        cpu_seen = s_cpu_seen;
         return s_wait_ok;
     };
 
@@ -552,6 +560,12 @@ void pg_all_reduce_cpu
     size_t device_data_size = tensor.numel() * tensor.element_size();
 
     TORCH_CHECK(cpu_data_size % 16 == 0, "data_size must be multiple of 16");
+    TORCH_CHECK(tensor.dtype() == at::kFloat || tensor.dtype() == at::kHalf || tensor.dtype() == at::kBFloat16,
+                "pg_all_reduce_cpu: Unknown dtype");
+
+    // Every rank reduces a tensor of the same shape, so an empty reduce is a no-op on all of them.
+    // It must not reach the job queue either: a zero-size job is the CPU helper's end-of-round marker
+    if (!tensor.numel()) return;
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
 

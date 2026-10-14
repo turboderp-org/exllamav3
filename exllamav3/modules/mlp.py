@@ -14,6 +14,125 @@ from ..util.tensor import g_tensor_cache
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
+
+def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
+    """
+    Slopes of the gated activation a = act(g) * u with respect to u and to g, elementwise in fp32, following
+    the activation kernels including their clamps. Returns (da/du, da/dg), or None for an activation without
+    a closed form here.
+    """
+    g = g.float()
+    u = u.float()
+
+    if activation_fn == "swiglu_oai":
+        free_g = free_u = None
+        if act_limit:
+            free_g, free_u = g < act_limit, u.abs() < act_limit
+            g = g.clamp(max = act_limit)
+            u = u.clamp(-act_limit, act_limit)
+        sg = torch.sigmoid(1.702 * g)
+        du = g * sg
+        dg = sg * (1.0 + 1.702 * g * (1.0 - sg)) * (u + 1.0)
+        if act_limit:
+            du = du * free_u
+            dg = dg * free_g
+        return du, dg
+
+    match activation_fn:
+        case "silu":
+            sg = torch.sigmoid(g)
+            f = g * sg
+            df = sg * (1.0 + g * (1.0 - sg))
+        case "gelu":
+            t = torch.tanh(0.7978845608028654 * (g + 0.044715 * g ** 3))
+            f = 0.5 * g * (1.0 + t)
+            df = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608028654 * (1.0 + 0.134145 * g * g)
+        case "relu2":
+            r = F.relu(g)
+            f = r * r
+            df = 2.0 * r
+        case _:
+            return None
+
+    if act_limit:
+        du = f.clamp(max = act_limit) * (u.abs() < act_limit)
+        dg = df * u.clamp(-act_limit, act_limit) * (f < act_limit)
+    else:
+        du = f
+        dg = df * u
+    return du, dg
+
+
+def capture_out_sensitivity(
+    capture: dict,
+    gate: Linear,
+    up: Linear,
+    down: Linear,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    activation_fn: str,
+    act_limit: float,
+    weights: torch.Tensor | None = None,
+):
+    """
+    Accumulate, per intermediate channel of a gated MLP, how strongly the MLP's output responds to an error in
+    the gate and up projections' outputs: the mean square slope of act(g) * u along each of the two, to be
+    multiplied by the energy of the channel's down projection row (see finalize_out_sensitivity). This is the
+    part of the downstream sensitivity that is local to the MLP; it decides whether the converter applies
+    output channel scales to the two projections (regularize() in quant/exl3_lib/quantize.py).
+
+    :param capture:
+        dict of accumulators, keyed by Linear key (params["capture_sens"] during calibration)
+
+    :param g, u:
+        outputs of the gate and up projections, shape (..., intermediate)
+
+    :param weights:
+        optional weight per row (routing weights of a block-sparse MLP)
+    """
+    n = g.shape[-1]
+    slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+    if slopes is None:
+        return
+    rows = g.numel() // n
+    dn = None
+    for linear, c in zip((up, gate), slopes):
+        if linear is None or linear.qmap is None:
+            continue
+        if weights is not None:
+            c = c * weights.float().view(-1, 1)
+        c = torch.nan_to_num(c, nan = 0.0, posinf = 0.0, neginf = 0.0)
+        acc = capture.get(linear.key)
+        if acc is None:
+            if dn is None:
+                dn = down.inner.get_weight_tensor()[:n].float().square().sum(dim = 1).double()
+            acc = capture[linear.key] = {
+                "sum": torch.zeros(n, dtype = torch.double, device = g.device),
+                "count": 0,
+                "down": dn.to(g.device),
+            }
+        acc["sum"] += c.double().square().sum(dim = 0)
+        acc["count"] += rows
+
+
+def merge_out_sensitivity(capture: dict, other: dict):
+    """Fold the accumulators of another device's calibration shard into capture"""
+    for key, acc in other.items():
+        if key not in capture:
+            capture[key] = acc
+        else:
+            m = capture[key]
+            m["sum"] += acc["sum"].to(m["sum"].device)
+            m["count"] += acc["count"]
+
+
+def finalize_out_sensitivity(capture: dict) -> dict:
+    """Per-channel output sensitivity for every captured Linear, keyed by Linear key, on the CPU"""
+    return {
+        key: (acc["sum"] / max(acc["count"], 1) * acc["down"]).float().cpu()
+        for key, acc in capture.items()
+    }
+
 class MLP(Module):
 
     def __init__(
@@ -279,7 +398,7 @@ class MLP(Module):
             self.bc is not None and bsz == 1 and q_len == 1 and
             x.dtype == torch.float16 and x.is_contiguous()
         ):
-            d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+            d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], d)
@@ -459,12 +578,19 @@ class GatedMLP(Module):
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
         select_hq_bits: int = 0,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        interm_div: float = 1.0,
     ):
         super().__init__(config, key, None)
 
         self.out_dtype = out_dtype
         self.interm_dtype = interm_dtype
+        # Activations whose act(gate) * up exceeds the fp16 range: up is scaled down before the
+        # fp16 intermediate and the (fp32) output scaled back up. Needs interm_dtype and
+        # out_dtype float so nothing else rounds
+        self.interm_div = interm_div
+        assert interm_div == 1.0 or (interm_dtype == torch.float and out_dtype == torch.float), \
+            "GatedMLP: interm_div requires interm_dtype = out_dtype = torch.float"
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.hidden_size = hidden_size
@@ -651,8 +777,9 @@ class GatedMLP(Module):
 
         # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
+        # (not with interm_div: the graph has no hook for the pre-activation rescale)
         self.bc = None
-        if self.num_slices == 1 and self.downs[0].inner.bc is not None:
+        if self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (
@@ -746,7 +873,14 @@ class GatedMLP(Module):
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
+                    if "capture_sens" in params:
+                        capture_out_sensitivity(
+                            params["capture_sens"], self.gates[s], self.ups[s], self.downs[s],
+                            g, u, self.activation_fn, self.act_limit
+                        )
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    if self.interm_div != 1.0:
+                        u *= 1.0 / self.interm_div   # act(g) * u is linear in u
                     self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
@@ -779,12 +913,17 @@ class GatedMLP(Module):
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    if self.interm_div != 1.0:
+                        u *= 1.0 / self.interm_div   # act(g) * u is linear in u
                     self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
                     if d is None: d = d_
                     else: d += d_
                     del d_
+
+            if self.interm_div != 1.0:
+                d *= self.interm_div
 
             if self.tp_reduce:
                 self.tp_collect(params["backend"], d)
@@ -840,6 +979,7 @@ class GatedMLP(Module):
                 "activation_fn": self.activation_fn,
                 "out_dtype": self.out_dtype,
                 "interm_dtype": self.interm_dtype,
+                "interm_div": self.interm_div,
                 "intermediate_split_size": self.intermediate_split_size,
                 "act_limit": self.act_limit
             },

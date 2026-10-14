@@ -23,6 +23,7 @@ from ..modules.gated_rmsnorm import GatedRMSNorm
 from ..modules.qsa_indexer import QSAIndexer
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
+from ..util.rope import RoPE
 from .qwen3_5 import Qwen3_5VLMoeBaseConfig
 from .qwen4_exp_mtp import Qwen4ExpMTPModel
 
@@ -56,10 +57,6 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
             **kwargs
         )
         pfx = lambda key: f"text_config->{key}"
-
-        # PLE hashing must see the literal MM placeholder token where the generator substitutes
-        # embedding alias ids (HF hashes the placeholder like any other token)
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
 
         # Gated-residual hyper-connections
         self.hc_mult = self.read_cfg(int, pfx("hc_count"), 4)
@@ -264,6 +261,8 @@ class Qwen4ExpModel(Model):
                         eos_token_id = config.ple_eos_token_id,
                         conv_kernel_size = config.ple_conv_kernel_size,
                         rms_norm_eps = config.rms_norm_eps,
+                        # PLE hashing must see the literal MM placeholder token where the generator
+                        # substitutes embedding alias ids (HF hashes the placeholder like any other token)
                         mm_token_id = config.image_token_id,
                     )
                 ]
@@ -302,6 +301,7 @@ class Qwen4ExpModel(Model):
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
+        GatedResidual.link_sites(self.modules)
 
         self.calibration_all_experts = True
         self.caps.update({
@@ -312,6 +312,11 @@ class Qwen4ExpModel(Model):
             "linear_attn": True,
         })
         self.recurrent_state_cls = GDNState
+
+        # Generator needs MRoPE freqs when using MMEmbeddings
+        if config.vision:
+            self.caps.update({"mrope": True})
+            self.g_rope = RoPE("cpu", config.rope_settings)
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:

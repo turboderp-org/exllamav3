@@ -27,6 +27,10 @@ class AttnArgs(NamedTuple):
     max_kv_len: int | None = None   # host-known bound on the past length any row attends to
                                     # (lets cached kernels size windows / staging below the
                                     # block-table span; e.g. QSA's dense regime)
+    window_right: int = 0           # keys ahead of the query a windowed row may see (block-diffusion drafts)
+    sink_key0: bool = False         # sinks bias each segment's first key instead of adding a logit (MiMo-ViT)
+    staging_pages: int | None = None    # pages the quantized-cache prefill staging scratch is sized to
+                                        # (a per-layer constant: the pool, or QSA's bounded window)
 
     def sanity_check(self):
         # Cache must be paged
@@ -65,7 +69,7 @@ class AttnArgs(NamedTuple):
     def get_window_size(self):
         if self.window_size is None or self.window_size == -1:
             return -1, -1
-        return self.window_size, 0
+        return self.window_size, self.window_right
 
     def is_swa(self):
         return self.window_size is not None and self.window_size != -1

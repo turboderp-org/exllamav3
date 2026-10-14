@@ -65,6 +65,14 @@ std::mutex disk_mutex;
 bool disk_cache_loaded = false;
 std::map<uint64_t, DiskCacheRecordV1> disk_cache;
 
+// EXL3_DEBUG_AUTOTUNE: print every probe/measurement launch and synchronize after it, so a launch that
+// never completes (a grid-barrier kernel past true co-residency) is named instead of hanging silently
+static bool debug_autotune()
+{
+    static const bool v = std::getenv("EXL3_DEBUG_AUTOTUNE") != nullptr;
+    return v;
+}
+
 uint64_t salt_hash(uint64_t hash)
 {
     hash ^= COOP_AUTOTUNE_VERSION;
@@ -407,7 +415,7 @@ void measure_candidate_sample
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -416,6 +424,14 @@ void measure_candidate_sample
             smem,
             stream
         ));
+        if (debug_autotune())
+        {
+            fprintf(stderr, "[measure] grid=%dx%d block=%d rep=%d/%d ... ",
+                    candidate.num_sms, candidate.concurrency, candidate.block_dim, i + 1, repeats);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaEventRecord(end, stream));
     cuda_check(cudaEventSynchronize(end));
@@ -465,7 +481,7 @@ void measure_stage
         set_kernel_attr_once(candidate.kernel, smem);
 
         // One untimed launch avoids first-use effects from contaminating the first measured round.
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -474,6 +490,14 @@ void measure_stage
             smem,
             stream
         ));
+        if (debug_autotune())
+        {
+            fprintf(stderr, "[autotune probe] kernel=%p grid=%dx%dx%d block=%d smem=%zu ... ",
+                    candidate.kernel, candidate.num_sms, 1, candidate.concurrency, candidate.block_dim, smem);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaStreamSynchronize(stream));
 
@@ -607,7 +631,7 @@ bool CoopKernelAutotuner::launch_locked
     }
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(EXL3_COOP_LAUNCH
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -641,7 +665,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     {
         launch_cache[salted_hash] = launch_config;
         set_kernel_attr_once(launch_config.kernel, smem);
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             launch_config.kernel,
             dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -661,7 +685,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     store_disk_cache(salted_hash, launch_config);
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(EXL3_COOP_LAUNCH
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),

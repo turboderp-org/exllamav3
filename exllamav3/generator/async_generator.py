@@ -87,7 +87,13 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self.generator.enqueue(job.job)
+        try:
+            self.generator.enqueue(job.job)
+        except Exception:
+            # A rejected job (e.g. too long for the cache) must not stay tracked: it would never produce a
+            # result, and a non-empty job map keeps the iteration loop spinning instead of idling
+            del self.jobs[job.job]
+            raise
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.
@@ -112,9 +118,9 @@ class AsyncGenerator:
             async_job.put_result(_CANCELLED_SENTINEL)
         self.jobs.clear()
 
-        cpu_cache = getattr(self.generator, "cpu_page_cache", None)
-        if cpu_cache is not None:
-            cpu_cache.close()
+        # Release what the sync generator holds on the host (recurrent checkpoints, the CPU page cache
+        # tier, pinned buffers) now: the failed jobs and their tracebacks can keep it reachable for a while
+        self.generator.close()
 
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
@@ -175,6 +181,26 @@ class AsyncJob:
         shared iteration task but still queued for this consumer precede the injection in the stream.
         """
         self.job.constrain_output_now(output)
+
+    def set_sampler(self, sampler):
+        """
+        Replace the sampler mid-generation; see Job.set_sampler. Safe to call from any coroutine on the
+        generator's event loop, including the body of an `async for` over this job. Results already queued
+        for this consumer were sampled before the change.
+        """
+        self.job.set_sampler(sampler)
+
+    def set_filters(self, filters):
+        """
+        Replace the filters mid-generation; see Job.set_filters and set_sampler above.
+        """
+        self.job.set_filters(filters)
+
+    def set_banned_strings(self, banned_strings):
+        """
+        Replace the banned strings mid-generation; see Job.set_banned_strings and set_sampler above.
+        """
+        self.job.set_banned_strings(banned_strings)
 
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,

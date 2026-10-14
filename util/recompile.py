@@ -1,7 +1,9 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3 import Config, Model
+from exllamav3.modules import Embedding
 from exllamav3.conversion.compile import compile_model
+from exllamav3.conversion.ngram import quantize_embedding
 import argparse
 from exllamav3.loader.safetensors import SafetensorsCollection, VariantSafetensorsCollection
 import yaml
@@ -46,6 +48,14 @@ def main(args):
                 vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
             config.stc = vstc
 
+    # Quantize the token embedding table
+    if args.embed_bits:
+        for module in model.modules:
+            if isinstance(module, Embedding) and module.allow_table and config.stc.has_tensor(module.key + ".weight"):
+                weight = config.stc.get_tensor(module.key + ".weight", allow_bf16 = True, no_defer = True)
+                module.compiled, rfn = quantize_embedding(module.key, weight, args.embed_bits, f"cuda:{args.device}")
+                print(f" -- Quantized: {module.key}  bpw: {args.embed_bits}  rfn: {rfn:.6f}")
+
     # New bpw etc.
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
     bpw_layer = round(bpw_layer, 2)
@@ -72,5 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
     parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192", default = 8192)
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
+    parser.add_argument("-eb", "--embed_bits", type = int, help = "Quantize the token embedding table to this many bits per weight, 1-8", default = None)
+    parser.add_argument("-d", "--device", type = int, help = "Device for quantization, default: 0", default = 0)
     _args = parser.parse_args()
     main(_args)

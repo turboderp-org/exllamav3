@@ -114,9 +114,9 @@ void BC_GatedMLP::run_bszN
     {
         if (!g.ready)
         {
-            g.capture_begin();
+            GraphCapture capture(g);
             run_bszN_gr(x, d, num_tokens, &g);
-            g.capture_end();
+            capture.finish();
         }
 
         std::vector<PPTR> args;
@@ -203,9 +203,9 @@ void BC_MLP::run_bsz1
     {
         if (!graph_bsz1.ready)
         {
-            graph_bsz1.capture_begin();
+            GraphCapture capture(graph_bsz1);
             run_bsz1_gr(x, d, &graph_bsz1);
-            graph_bsz1.capture_end();
+            capture.finish();
         }
 
         std::vector<PPTR> args;
