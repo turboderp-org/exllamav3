@@ -187,7 +187,7 @@ class RecurrentCache(OrderedDict):
 
     def put(self, key, state):
         """
-        Add state to cache
+        Add state to cache, skipping new checkpoints larger than the cache budget.
         """
         if key in self:
             self.move_to_end(key)
@@ -195,6 +195,8 @@ class RecurrentCache(OrderedDict):
             # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
             # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
             state_size = state.checkpoint_size
+            if state_size > self.max_size:
+                return
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
                 pt = self.pagetable

@@ -7,6 +7,7 @@ allocates fresh memory. Checked against the pool's allocation/reuse counters and
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -174,3 +175,32 @@ def test_closed_cache_frees_memory_for_a_replacement():
     new.put(1, FakeState(position = 0))
     # Allocated fresh, since the pool was emptied and the old buffers' memory returned
     assert host_pool.allocated == allocated + 4 and host_pool.reused == reused
+
+
+@pytest.mark.nogpu
+@pytest.mark.parametrize("budget", [0, 4095, 4096])
+def test_put_budget_boundary(budget, monkeypatch):
+    state = FakeState(position = 256, rows = 1)  # 4096-byte checkpoint
+    cache = make_cache(budget)
+    stash = Mock(wraps = state.stash)
+    monkeypatch.setattr(state, "stash", stash)
+    cache.put("checkpoint", state)
+    if budget < 4096:
+        stash.assert_not_called()
+        assert not cache and cache.current_size == 0
+    else:
+        stash.assert_called_once_with()
+        assert cache["checkpoint"]["checkpoint_size"] == cache.current_size == 4096
+
+
+@pytest.mark.nogpu
+def test_put_oversized_preserves_existing_checkpoint():
+    cache = make_cache(4096)
+    cache.put("existing", FakeState(position = 256, rows = 1))
+    saved, metrics = cache["existing"], cache.metrics.copy()
+    incoming = SimpleNamespace(checkpoint_size = 4097, stash = Mock())
+    cache.put("oversized", incoming)
+    incoming.stash.assert_not_called()
+    assert list(cache) == ["existing"] and cache["existing"] is saved
+    assert cache.current_size == 4096
+    assert cache.metrics == metrics
