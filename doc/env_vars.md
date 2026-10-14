@@ -633,6 +633,14 @@ promotions per step over all layers (one per layer), and as many demotions; the 
 start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
 step's bookkeeping cost every 128 steps.
 
+Both dynamic modes save each layer's decayed expert selection counts to
+`~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
+directory and the expert count) every 4096 decode steps and on unload, and the next load of the same
+model permutes the experts hottest first from that profile, so the GPU slice starts with the frequent
+experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
+what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
+(an explicit stats file in the same per-layer format) takes precedence.
+
 ### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
 
 Debug: after every landed transfer, read the expert back and compare it with the checkpoint (a

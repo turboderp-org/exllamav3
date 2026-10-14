@@ -48,6 +48,70 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 """
 
 
+# Directory of the saved expert frequency profiles; None = <user cache dir>/exllamav3/expert_stats
+# (the test suite points it at a scratch directory so runs neither read nor leave profiles)
+EXPERT_STATS_DIR = None
+
+
+def _expert_stats_path(config, num_experts):
+    """Per-model file for the routed-expert frequencies the dynamic placement collects, keyed on
+    the model directory and the expert count (a stale or foreign profile only costs what the
+    default identity placement costs anyway)"""
+    import hashlib
+    key = hashlib.sha1(f"{os.path.abspath(config.directory)}|{num_experts}".encode()).hexdigest()[:16]
+    root = EXPERT_STATS_DIR
+    if root is None:
+        cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        root = os.path.join(cache, "exllamav3", "expert_stats")
+    return os.path.join(root, key + ".json")
+
+
+def _expert_stats_load(config, num_experts):
+    import json
+    try:
+        with open(_expert_stats_path(config, num_experts)) as f:
+            d = json.load(f)
+        return d.get("layers", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def save_expert_stats(infer_params):
+    """Write every split module's decayed selection counts (in checkpoint expert order, undoing
+    the load-time permutation) so the next load of this model starts from the hot/cold ranking
+    instead of the arbitrary head/tail split. A session too short to have routed a meaningful
+    sample keeps the file's previous entries (it must not overwrite a settled profile); the
+    counts themselves are decayed, so the threshold is in decode steps, not hits"""
+    import json, tempfile
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None)
+    if not reg or reg[0]._swap_tick_count < _STATS_MIN_STEPS:
+        return
+    config, E = reg[0].config, reg[0].num_experts
+    layers = _expert_stats_load(config, E)
+    for m in reg:
+        if m._split_hist is None or getattr(m, "tid2eid_key", None):
+            continue
+        hist = m._split_hist.tolist()
+        if m.num_experts != E or sum(hist) <= 0.0:
+            continue
+        perm = m._split_perm or list(range(E))
+        counts = [0.0] * E
+        for r, c in enumerate(hist):
+            counts[perm[r]] = c
+        layers[m.key] = counts
+    if not layers:
+        return
+    path = _expert_stats_path(config, E)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok = True)
+        fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f" !! expert stats not saved ({path}): {e}")
+
+
 @torch.inference_mode()
 def run_pending_swap_sweeps(infer_params):
     """Run any pending dynamic-placement sweep (see BlockSparseMLP._split_swap_tick). Called
@@ -87,6 +151,8 @@ def run_pending_swap_sweeps(infer_params):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
 
 
+_STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
+_STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
 _PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
@@ -453,6 +519,8 @@ class BlockSparseMLP_CPU:
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
+                    if reg[0] is self:
+                        save_expert_stats(self.config.infer_params)
                     reg.remove(self)
                 self._split_map = None
                 self._split_hist = None
@@ -576,9 +644,9 @@ class BlockSparseMLP_CPU:
         # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
         # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
-        if (
-            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
+        if int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and (
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            or os.path.exists(_expert_stats_path(self.config, self.num_experts))
         ):
             return False
         return super().can_defer_load()
@@ -751,6 +819,7 @@ class BlockSparseMLP_CPU:
         # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
         self._split_perm = None
+        self._split_seeded = False
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
@@ -773,26 +842,28 @@ class BlockSparseMLP_CPU:
         spares = min(spares, max(0, first - 1))
         self._split_spares = spares
         wfirst = first - spares
-        stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-        if stats_path and self._split_dynamic:
-            # Static placement from a stats file only applies with dynamic swapping disabled
-            print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
-            stats_path = None
-        if stats_path and self.tid2eid_key:
-            print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
-            stats_path = None
-        if stats_path:
-            import json
-            counts = json.load(open(stats_path)).get(self.key)
-            if counts is not None and len(counts) == self.num_experts:
-                perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
-                self._split_perm = perm
-                if self.gated:
-                    self.gates = [self.gates[e] for e in perm]
-                self.ups = [self.ups[e] for e in perm]
-                self.downs = [self.downs[e] for e in perm]
+        # Hot/cold placement: an explicit stats file (EXL3_MOE_CPU_SPLIT_STATS) or, failing
+        # that, the profile a previous run of this model saved (save_expert_stats). The expert
+        # lists are permuted hottest first, so the GPU slice holds the frequent experts from
+        # the first token and the worker the rare ones; the dynamic map then starts from there
+        counts = None
+        if not self.tid2eid_key:
+            stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            if stats_path:
+                import json
+                counts = json.load(open(stats_path)).get(self.key)
+                if counts is None:
+                    print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
             else:
-                print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
+                counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
+        if counts is not None and len(counts) == self.num_experts:
+            perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
+            self._split_perm = perm
+            if self.gated:
+                self.gates = [self.gates[e] for e in perm]
+            self.ups = [self.ups[e] for e in perm]
+            self.downs = [self.downs[e] for e in perm]
+            self._split_seeded = True
 
         self.device = torch.device(device)
 
@@ -863,7 +934,8 @@ class BlockSparseMLP_CPU:
         mode = ("promote-on-miss" if spares else "dynamic") if self._split_dynamic else "static"
         print(f" -- CPU split experts (worker, {mode}): {self.key} "
               f"[{first}..{self.num_experts}) of {self.num_experts}"
-              + (f", {spares} spare slots" if spares else ""))
+              + (f", {spares} spare slots" if spares else "")
+              + (", placement from saved profile" if getattr(self, "_split_seeded", False) else ""))
         return True
 
 
@@ -878,6 +950,8 @@ class BlockSparseMLP_CPU:
         if reg[0] is not self:
             return
         self._swap_tick_count += 1
+        if self._swap_tick_count % _STATS_SAVE_INTERVAL == 0:
+            save_expert_stats(ip)
         if self._split_spares:
             # Promote-on-miss replaces the sweep: one pass over every split module per step
             _split_promote_step(ip, reg, self._split_submit_rows)
