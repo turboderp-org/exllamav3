@@ -228,6 +228,10 @@ class RecurrentCache(OrderedDict):
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
         # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
         state_size = state.checkpoint_size if state is not None else stashed["checkpoint_size"]
+        # A checkpoint larger than the whole budget (e.g. -rcs 0) is not stored at all, without evicting or
+        # stashing anything; a later restore misses and falls back to replay
+        if state_size > self.max_size:
+            return
         while self.update_total_size() + state_size > self.max_size:
             assert self.current_size >= 0, "Not enough space in cache for single state"
             pt = self.pagetable

@@ -123,7 +123,7 @@ def add_args(
         parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
         parser.add_argument("-dcd", "--disk_cache_dir", type = str, help = "Directory for a persistent third-tier page/checkpoint cache behind the CPU tier (needs -ccs > 0), default: disabled", default = None)
         parser.add_argument("-dcs", "--disk_cache_size", type = float, help = f"Disk third-tier cache budget for the whole directory (all models and cache modes), in GB, default: {default_disk_cache_size}", default = default_disk_cache_size)
-        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
+        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"Recurrent state checkpoint cache size (system RAM), in GB, 0 disables checkpoints, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
