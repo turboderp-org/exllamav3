@@ -345,11 +345,12 @@ samplers, optionally preceded by repetition/presence/frequency penalties) run as
 kernels working directly in logit space, instead of the step-by-step softmax/sort pipeline.
 Collapsed temperature/min-P stacks sample the same token as the uncollapsed reference for the
 same seed, up to float rounding at exact ties; top-K/top-P stacks keep the same token set as
-the sort-based reference (ties at the exact cutoff are all kept) but draw their Gumbel noise by
-token id rather than sorted position, so individual seeds map to different samples from the
-same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
-design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
-reference implementation.
+the sort-based reference, except for ties at the exact cutoff (top-K keeps all of them, top-P
+keeps all of them at the combined weight of the ties the cumulative sum reaches), but draw
+their Gumbel noise by token id rather than sorted position, so individual seeds map to different
+samples from the same distribution. Stacks the collapse does not recognize fall back to the
+step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
+against the reference implementation.
 
 ## CPU MoE offload
 

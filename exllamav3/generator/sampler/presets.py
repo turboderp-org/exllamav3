@@ -58,7 +58,7 @@ class TopKSampler(CustomSampler):
 
 class TopPSampler(CustomSampler):
     """
-    Truncates distribution to the top probabilities <= top_p (at least 1 candidate) before sampling
+    Truncates distribution to the smallest set of top tokens with cumulative probability >= top_p before sampling
     """
     def __init__(self, top_p: float, temperature: float = 1.0, temperature_last = False):
         if top_p == 0 or temperature == 0:

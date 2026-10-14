@@ -11,8 +11,9 @@ inv_temp, minp_log, seed, mode, filters, top_k, top_p, inv_temp_filter, histogra
     mode 2: the same restricted to x_i >= fp32(max x + minp_log)                       (min-P)
     mode 3: restricted to the min-P set (F_MINP), then the top_k largest (F_TOPK, ties at the k-th value all
             kept), then the top-P prefix (F_TOPP) of the descending order under softmax((x - max) *
-            inv_temp_filter) over that set: tokens before the one whose inclusive cumulative probability
-            first exceeds top_p are kept, the top token always
+            inv_temp_filter) over that set: tokens whose preceding cumulative probability is below top_p are
+            kept (the crossing token included). If that prefix ends k tokens into a group of n exact ties, the
+            whole group stays eligible with ln(k / n) added to each member's objective
 
 The noise is the per-element stream of gumbel_noise_f32 (Philox keyed on (seed, row * dim + i)), so the
 expected token is computable exactly; rows whose winner is within the __logf noise tolerance of a runner-up
@@ -90,20 +91,23 @@ def masked_inputs(logits, size, mask = None, bits = None) -> np.ndarray:
 
 
 def kept_set(x: np.ndarray, mode, minp_log = 0.0, filters = 0, top_k = 0, top_p = 1.0, inv_temp_filter = 1.0):
-    """Boolean kept set of one row (float32 x) under SS_Fused's documented rules, or None where the reference is
-    ambiguous (a cumulative probability within 4e-6 of top_p, or a token within 1e-3 nat of the 32-nat tail
-    boundary). Top-K keeps cutoff ties, and a cutoff 32 or more filter-temperature nats below the max drops
-    every token that deep; top-P drops the crossing token together with all its ties"""
+    """Candidate (kept set, objective bias) pairs of one row (float32 x) under SS_Fused's documented rules: one,
+    or every top-P cutoff consistent with the kernel's mass error when cumulative probabilities lie within 4e-6
+    of top_p; None where the reference is ambiguous otherwise (a token within 1e-3 nat of the 32-nat tail
+    boundary, or too many candidate cutoffs). Top-K keeps cutoff ties, and a cutoff 32 or more filter-temperature
+    nats below the max drops every token that deep; top-P keeps the crossing token, and a crossing tie group
+    whole but biased by ln(k / n)"""
     finite = np.isfinite(x)
+    bias = np.zeros(len(x))
     if mode == 1:
-        return finite
+        return [(finite, bias)]
     m = x[finite].max() if finite.any() else np.float32(-np.inf)
     keep = finite.copy()
     if mode == 2 or (mode == 3 and filters & F_MINP):
         thr = np.float32(np.float32(m) + np.float32(minp_log))
         keep &= x >= thr
     if mode == 2:
-        return keep
+        return [(keep, bias)]
     if filters & F_TOPK and keep.sum() > top_k:
         vals = np.sort(x[keep])[::-1]
         kth = vals[top_k - 1]
@@ -122,22 +126,27 @@ def kept_set(x: np.ndarray, mode, minp_log = 0.0, filters = 0, top_k = 0, top_p 
         w = np.exp((v - np.float64(m)) * inv_temp_filter)
         c = np.cumsum(w) / w.sum()
         # The kernel's mass is __expf in fp32 (relative error ~2 ulp plus |arg| * 2^-24 for args down to -32),
-        # summed exactly in 2^40 fixed point: normalized cumulative sums carry up to ~3e-6 of error. Tie groups
-        # are kept or dropped whole, so only the cumulative mass at the end of each group decides
-        group_end = np.append(v[1:] != v[:-1], True)
-        if np.min(np.abs(c[group_end] - top_p)) < 4e-6:
+        # summed exactly in 2^40 fixed point: normalized cumulative sums carry up to ~3e-6 of error, so every
+        # prefix length the error band admits is a candidate
+        c_before = np.append(0.0, c[:-1])
+        n_lo = max(int(np.sum(c_before < top_p - 4e-6)), 1)
+        n_hi = max(int(np.sum(c_before < top_p + 4e-6)), 1)
+        if n_hi - n_lo > 64:
             return None
-        cross = int(np.argmax(c > top_p)) if (c > top_p).any() else len(c)
-        if cross < len(c):
-            # The crossing token's whole tie group goes, including ties sorted before it
-            cross = int(np.argmax(v == v[cross]))
-        nkeep = max(cross, 1)
-        # The top token keeps its exact ties
-        top_ties = int((v == v[0]).sum())
-        nkeep = max(nkeep, top_ties)
-        keep = np.zeros_like(keep)
-        keep[idx[:nkeep]] = True
-    return keep
+        candidates = []
+        for nkeep in range(n_lo, n_hi + 1):
+            # The last kept token's tie group stays eligible whole, weighted as the k of its n members the
+            # prefix reaches
+            group = v == v[nkeep - 1]
+            k, n = int(group[:nkeep].sum()), int(group.sum())
+            ckeep = np.zeros_like(keep)
+            ckeep[idx[:nkeep]] = True
+            ckeep[idx[group]] = True
+            cbias = np.zeros(len(x))
+            cbias[idx[group]] = math.log(k / n)
+            candidates.append((ckeep, cbias))
+        return candidates
+    return [(keep, bias)]
 
 
 def expected_tokens(logits, mode, seed, *, size = None, mask = None, bits = None, inv_temp = 1.0, **kw):
@@ -151,20 +160,23 @@ def expected_tokens(logits, mode, seed, *, size = None, mask = None, bits = None
     u, g = u.reshape(bsz, dim), g.reshape(bsz, dim)
     out = []
     for r in range(bsz):
-        keep = kept_set(x[r], mode, **kw)
-        if keep is None:
+        candidates = kept_set(x[r], mode, **kw)
+        if candidates is None:
             out.append(None)
             continue
-        if not keep.any():
-            out.append(0)
-            continue
         with np.errstate(invalid = "ignore"):
-            obj = (x[r] * np.float32(inv_temp)).astype(np.float32).astype(np.float64) + g[r]
-        obj = np.where(keep, obj, -np.inf)
-        # fp32 rounding of the scaled logit and of the sum (an FMA may merge them) plus the noise bound
-        tol = gumbel_noise_tolerance(u[r]) + 2.0 ** -22 * np.abs(np.where(keep, obj, 0.0)) + 1e-7
-        tol[u[r] >= U_TIGHT] = 4.0
-        out.append(certain_argmax(obj, tol))
+            obj0 = (x[r] * np.float32(inv_temp)).astype(np.float32).astype(np.float64) + g[r]
+        winners = set()
+        for keep, bias in candidates:
+            if not keep.any():
+                winners.add(0)
+                continue
+            obj = np.where(keep, obj0 + bias, -np.inf)
+            # fp32 rounding of the scaled logit and of the sums (an FMA may merge them) plus the noise bound
+            tol = gumbel_noise_tolerance(u[r]) + 2.0 ** -22 * np.abs(np.where(keep, obj, 0.0)) + 1e-7
+            tol[u[r] >= U_TIGHT] = 4.0
+            winners.add(certain_argmax(obj, tol))
+        out.append(winners.pop() if len(winners) == 1 else None)
     return out
 
 
@@ -326,7 +338,7 @@ def test_fused_topk_exact_kept_set(device):
     logits = snapped_logits(1, dim, 3.0, 5).to(device)
     x = logits.float().cpu().numpy()[0]
     for k in (1, 3, 17):
-        ref = kept_set(x, 3, filters = F_TOPK, top_k = k)
+        [(ref, _)] = kept_set(x, 3, filters = F_TOPK, top_k = k)
         seen = set()
         for seed in range(40 * k):
             seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPK, top_k = k).item())
@@ -347,15 +359,19 @@ def test_fused_topk_ties_kept(device):
 
 @torch.inference_mode()
 def test_fused_topp_ties_at_cutoff(device):
-    """Top-P crossing inside a group of tied values: the crossing token is dropped together with all its exact
-    ties (SS_Fused docstring). Probabilities e/(e+4), 1/(e+4) x 4: cumsums 0.405, 0.554, 0.702, ... cross
-    top_p = 0.6 inside the tied group, so only the top token remains (sort-order truncation would keep one of the
-    tied tokens as well)"""
-    logits = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]], dtype = torch.half, device = device)
-    seen = set()
-    for seed in range(300):
-        seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPP, top_p = 0.6).item())
-    assert seen == {0}, f"kept {sorted(seen)}"
+    """Top-P crossing inside a large group of exact ties: the crossing token is included, and the group counts as
+    only the ties the cumulative sum reaches (SS_Fused docstring). Probabilities e^5 / (e^5 + 1000) = 0.1292 and
+    1 / (e^5 + 1000) x 1000: top_p = 0.1297 is reached by the first tied token, so the whole group weighs as much
+    as one token. At inv_temp -> 0 the top token and the group then win equally often, and the group's wins
+    spread over its members; keeping the group unweighted would almost never pick the top token, and dropping
+    it would always"""
+    rows = 400
+    logits = torch.zeros((rows, 1001), dtype = torch.half, device = device)
+    logits[:, 0] = 5.0
+    out = run_fused(logits, 3, inv_temp = 1e-4, seed = 7, filters = F_TOPP, top_p = 0.1297).view(-1).tolist()
+    top = sum(t == 0 for t in out)
+    assert 0.35 * rows < top < 0.65 * rows, f"top token sampled {top}/{rows}"
+    assert len(set(out) - {0}) > 100, "tied draws not spread over the group"
 
 
 @pytest.mark.parametrize("depth", [20.0, 31.0, 31.9, 33.0, 40.0])
@@ -381,14 +397,14 @@ def test_fused_topk_deep_cutoff(depth, device):
 @torch.inference_mode()
 def test_fused_topk_tail_then_topp(device):
     """Top-K cutting into the tail, then top-P over what remains: the three in-range tokens (probabilities 0.506,
-    0.307, 0.186 among themselves; the deep tokens weigh nothing at the filter temperature) cross top_p = 0.9 at
-    the third, so the first two remain"""
+    0.307, 0.186 among themselves; the deep tokens weigh nothing at the filter temperature) cross top_p = 0.7 at
+    the second, so the first two remain"""
     deep = -40.0 - 0.01 * torch.arange(1000).float()
     logits = torch.cat((torch.tensor([0.0, -0.5, -1.0]), deep)).half().view(1, -1).to(device)
     seen = set()
     for seed in range(300):
         seen.add(run_fused(logits, 3, inv_temp = 1e-4, seed = seed, filters = F_TOPK | F_TOPP, top_k = 5,
-                           top_p = 0.9).item())
+                           top_p = 0.7).item())
     assert seen == {0, 1}, f"kept {sorted(seen)}"
 
 
