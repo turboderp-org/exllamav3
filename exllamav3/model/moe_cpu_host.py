@@ -1356,46 +1356,32 @@ class MoeCpuHost:
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
             return None
         h_ = y.shape[1]
-        hi = spec["hi"]
         dev = y.device
-        with torch.cuda.device(dev):
-            counts = self.dev_count.get(dev)
-            if counts is None:
-                counts = self.dev_count[dev] = \
-                    torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
-            slot_idx = self.next_slot
-            self.next_slot = (self.next_slot + 1) % self.num_slots
-            self.seq += 1
-            seq = self.seq
-            slot = self.slots[slot_idx]
-
-            tail = int(self.v_jobs_tail[0])
-            if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                import time
-                while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (ring stall)")
-                    time.sleep(0.0002)
-            job = self.v_jobs[tail % MOE_JOB_RING]
-            _set_job_seq(job, seq)
-            job[1] = layer_idx
-            job[2] = rows
-            job[3] = spec["topk"]
-            job[4] = slot_idx
-            job[5] = 2    # MOE_JOB_KIND_COMPUTE_GATED
-            self.v_jobs_tail[0] = tail + 1
-
-            if self.slot_last_seq[slot_idx]:
-                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
-                                       self.gpu_base_ptr + 128)
-            ext.moe_split_issue(
-                selected_experts.view(-1), split_map, split_hist,
-                y, routing_weights,
-                slot["sel_dev"], slot["x_dev"], slot["w_dev"],
-                counts, slot_idx, hi, first_cpu,
-            )
-            ext.exl3_moe_flag_write(slot["data_ready"], seq)
-            self.slot_last_seq[slot_idx] = seq
+        counts = self.dev_count.get(dev)
+        if counts is None:
+            counts = self.dev_count[dev] = \
+                torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
+        slot_idx = self.next_slot
+        self.next_slot = (self.next_slot + 1) % self.num_slots
+        self.seq += 1
+        seq = self.seq
+        slot = self.slots[slot_idx]
+        # One extension call: the job descriptor into the shared ring, the slot's consumed wait,
+        # the issue kernel and the data_ready flag, all on the stream of y's device. It declines
+        # (touching nothing) only when the job ring is near overflow, which a long prefill can
+        # reach; then throttle on the worker's progress and retry
+        args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
+                selected_experts.view(-1), split_map, split_hist, y, routing_weights,
+                slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
+                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
+        if not ext.exl3_moe_split_issue_fused(*args):
+            import time
+            while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                if self.v_abort[0] or not self.proc.is_alive():
+                    raise RuntimeError("CPU MoE worker failed (ring stall)")
+                time.sleep(0.0002)
+            ext.exl3_moe_split_issue_fused(*args)
+        self.slot_last_seq[slot_idx] = seq
         return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
 
     def submit_collect_fused(self, handle, final_2d):
@@ -1404,10 +1390,9 @@ class MoeCpuHost:
         PCIe reads). Never synchronizes the host."""
         seq, slot_idx, rows, h_, ho, dev, counts = handle
         slot = self.slots[slot_idx]
-        with torch.cuda.device(dev):
-            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
-            ext.moe_split_collect_add(final_2d, slot["out_dev"], counts, slot_idx, ho)
-            ext.exl3_moe_flag_write(slot["consumed"], seq)
+        ext.exl3_moe_split_collect_fused(
+            final_2d, slot["out_dev"], counts, slot_idx, ho,
+            slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128)
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """

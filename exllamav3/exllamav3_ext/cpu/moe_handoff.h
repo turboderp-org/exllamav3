@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <ATen/Tensor.h>
+#include <c10/util/Optional.h>
 
 // Persistent-worker handoff for CPU-offloaded MoE experts (pattern follows the native TP
 // backend's CPU-assisted all-reduce: pinned shared-memory flags, GPU-side publish/wait kernels,
@@ -107,6 +109,23 @@ struct MoeJob
 // only -- these ops are only ever issued from the process enqueueing the GPU work).
 void exl3_moe_flag_write(uintptr_t flag, int64_t value);
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag);
+
+// Fused split-path handoff (see moe_handoff.cu): the job descriptor, the slot's consumed wait,
+// the issue kernel and the data_ready flag in one call; the done wait, the collect kernel and the
+// consumed flag in the other
+bool exl3_moe_split_issue_fused
+(
+    uintptr_t shm_base, int64_t seq, int64_t layer, int64_t rows, int64_t topk, int64_t slot, int64_t prev_seq,
+    at::Tensor sel, const c10::optional<at::Tensor>& map, const c10::optional<at::Tensor>& hist,
+    const at::Tensor& y, const at::Tensor& w, int64_t h_sel_ptr, int64_t h_x_ptr, int64_t h_w_ptr,
+    at::Tensor dev_count, int64_t hi, int64_t first_cpu,
+    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag
+);
+void exl3_moe_split_collect_fused
+(
+    at::Tensor final_out, int64_t h_out_ptr, const at::Tensor& dev_count, int64_t slot, int64_t ho,
+    uintptr_t done_flag, int64_t seq, uintptr_t consumed_flag, uintptr_t abort_flag
+);
 void exl3_moe_cpu_set_memops(bool enabled);
 
 // Child worker loop: consumes jobs until quit is set. Layer indices in job descriptors refer to

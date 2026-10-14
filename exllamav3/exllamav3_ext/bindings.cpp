@@ -192,6 +192,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_split_issue_fused", &exl3_moe_split_issue_fused, "exl3_moe_split_issue_fused");
+    m.def("exl3_moe_split_collect_fused", &exl3_moe_split_collect_fused, "exl3_moe_split_collect_fused");
     m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
           py::arg("group") = 0, py::arg("planar") = 0);
