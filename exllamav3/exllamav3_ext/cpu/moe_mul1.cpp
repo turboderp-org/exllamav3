@@ -1172,9 +1172,19 @@ inline void vbmi_band_rows
     }
 }
 
+// Split-K slice of one 8-tile group (decode_phase): the band kernels run tile rows [kt0, kt1)
+// only and store their raw int32 accumulators at raw + row * 128 + (tile - n_base) * 16 instead
+// of the scaled output, for the worker completing the group to sum and finish (finish_partials)
+struct KSlice
+{
+    int kt0, kt1;
+    int n_base;
+    int32_t* raw;
+};
+
 template <int bits, bool hb, int rows, int band>
 M1_TARGET_VBMI
-void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0, const KSlice* ks = nullptr)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
@@ -1197,8 +1207,10 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
 
     const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
     const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
-    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
-    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    const int kt0 = ks ? ks->kt0 : 0;
+    const int kt1 = ks ? ks->kt1 : tiles_k;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size + kt0 * row_stride;
+    for (int tile_k = kt0; tile_k < kt1; ++tile_k, packed_row += row_stride)
     {
         const int32_t* splat = in.splat32 + tile_k * 16;
         for (int b = 0; b < band; ++b)
@@ -1237,6 +1249,13 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
             vbmi_band_rows<bits, hb, rows, band, 0>(p0, p1, p2, p3, b, splat, mat.k, acc);
         }
     }
+    if (ks)
+    {
+        for (int b = 0; b < band; ++b)
+            for (int i = 0; i < rows; ++i)
+                _mm512_storeu_si512(ks->raw + i * 128 + (n0 - ks->n_base + b) * 16, acc[b][i]);
+        return;
+    }
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
         {
@@ -1251,7 +1270,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
 // than forcing unrolling for batched shapes.
 template <int bits, bool hb, int rows, int band>
 M1_TARGET_VBMI
-void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0, const KSlice* ks = nullptr)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
@@ -1274,8 +1293,10 @@ void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
 
     const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
     const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
-    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
-    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    const int kt0 = ks ? ks->kt0 : 0;
+    const int kt1 = ks ? ks->kt1 : tiles_k;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size + kt0 * row_stride;
+    for (int tile_k = kt0; tile_k < kt1; ++tile_k, packed_row += row_stride)
     {
         const int32_t* splat = in.splat32 + tile_k * 16;
 #ifdef __GNUC__
@@ -1314,6 +1335,13 @@ void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
             vbmi_band_rows<bits, hb, rows, band, 0>(p0, p1, p2, p3, b, splat, mat.k, acc);
         }
     }
+    if (ks)
+    {
+        for (int b = 0; b < band; ++b)
+            for (int i = 0; i < rows; ++i)
+                _mm512_storeu_si512(ks->raw + i * 128 + (n0 - ks->n_base + b) * 16, acc[b][i]);
+        return;
+    }
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
         {
@@ -1326,7 +1354,7 @@ void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
 
 template <int bits, bool hb, int rows>
 M1_TARGET_VBMI
-void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1, const KSlice* ks = nullptr)
 {
     constexpr int band_cap = 8;
 
@@ -1346,23 +1374,43 @@ void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
         {
             if (band == 8)
             {
-                vbmi_decode_band<bits, hb, rows, 8>(mat, in, tout, n0);
+                vbmi_decode_band<bits, hb, rows, 8>(mat, in, tout, n0, ks);
                 n0 += band;
                 continue;
             }
         }
         switch (band)
         {
-            case 1: vbmi_band<bits, hb, rows, 1>(mat, in, tout, n0); break;
-            case 2: vbmi_band<bits, hb, rows, 2>(mat, in, tout, n0); break;
-            case 3: vbmi_band<bits, hb, rows, 3>(mat, in, tout, n0); break;
-            case 4: vbmi_band<bits, hb, rows, 4>(mat, in, tout, n0); break;
-            case 5: vbmi_band<bits, hb, rows, 5>(mat, in, tout, n0); break;
-            case 6: vbmi_band<bits, hb, rows, 6>(mat, in, tout, n0); break;
-            case 7: vbmi_band<bits, hb, rows, 7>(mat, in, tout, n0); break;
-            default: vbmi_band<bits, hb, rows, 8>(mat, in, tout, n0); break;
+            case 1: vbmi_band<bits, hb, rows, 1>(mat, in, tout, n0, ks); break;
+            case 2: vbmi_band<bits, hb, rows, 2>(mat, in, tout, n0, ks); break;
+            case 3: vbmi_band<bits, hb, rows, 3>(mat, in, tout, n0, ks); break;
+            case 4: vbmi_band<bits, hb, rows, 4>(mat, in, tout, n0, ks); break;
+            case 5: vbmi_band<bits, hb, rows, 5>(mat, in, tout, n0, ks); break;
+            case 6: vbmi_band<bits, hb, rows, 6>(mat, in, tout, n0, ks); break;
+            case 7: vbmi_band<bits, hb, rows, 7>(mat, in, tout, n0, ks); break;
+            default: vbmi_band<bits, hb, rows, 8>(mat, in, tout, n0, ks); break;
         }
         n0 += band;
+    }
+}
+
+// Sum a group's split-K partials (parts slices of 2 x 128 int32, see KSlice) and apply the
+// band kernels' epilogue: the integer sum is exact, so the result matches an unsplit run
+M1_TARGET_VBMI
+void finish_partials(const int32_t* raw, int parts, const PreparedIn& in, float* tout, int n, int n_base)
+{
+    for (int i = 0; i < in.rows; ++i)
+    {
+        const float scale = mul1_k_inv() * in.q[i];
+        const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+        for (int col = 0; col < 128; col += 16)
+        {
+            __m512i acc = _mm512_loadu_si512(raw + i * 128 + col);
+            for (int part = 1; part < parts; ++part)
+                acc = _mm512_add_epi32(acc, _mm512_loadu_si512(raw + part * 256 + i * 128 + col));
+            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(scale), corr);
+            _mm512_storeu_ps(tout + static_cast<size_t>(i) * n + n_base * 16 + col, out);
+        }
     }
 }
 
@@ -1883,7 +1931,10 @@ Isa detect_isa()
 
 const Isa g_isa = []{ return detect_isa(); }();
 
-void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+// ks (split-K slice, see KSlice): VBMI tier only and never K8, which that tier routes to the VNNI
+// kernels; decode_phase checks split_k_ok first
+void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1,
+               const KSlice* ks = nullptr)
 {
     if (tn0 >= tn1) return;
     switch (g_isa) {
@@ -1893,51 +1944,51 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             {
                 switch (mat.bits * 4 + m - 1)
                 {
-                    case 1 * 4 + 0: vbmi_tiles<1, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 1: vbmi_tiles<1, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 2: vbmi_tiles<1, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 3: vbmi_tiles<1, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 0: vbmi_tiles<2, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 1: vbmi_tiles<2, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 2: vbmi_tiles<2, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 3: vbmi_tiles<2, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 0: vbmi_tiles<3, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 1: vbmi_tiles<3, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 2: vbmi_tiles<3, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 3: vbmi_tiles<3, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 1 * 4 + 0: vbmi_tiles<1, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 1 * 4 + 1: vbmi_tiles<1, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 1 * 4 + 2: vbmi_tiles<1, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 1 * 4 + 3: vbmi_tiles<1, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 2 * 4 + 0: vbmi_tiles<2, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 2 * 4 + 1: vbmi_tiles<2, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 2 * 4 + 2: vbmi_tiles<2, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 2 * 4 + 3: vbmi_tiles<2, true, 4>(mat, in, tout, tn0, tn1, ks); return;
+                    case 3 * 4 + 0: vbmi_tiles<3, true, 1>(mat, in, tout, tn0, tn1, ks); return;
+                    case 3 * 4 + 1: vbmi_tiles<3, true, 2>(mat, in, tout, tn0, tn1, ks); return;
+                    case 3 * 4 + 2: vbmi_tiles<3, true, 3>(mat, in, tout, tn0, tn1, ks); return;
+                    case 3 * 4 + 3: vbmi_tiles<3, true, 4>(mat, in, tout, tn0, tn1, ks); return;
                 }
                 return;
             }
             switch (mat.bits * 4 + m - 1)
             {
-                case 1 * 4 + 0: vbmi_tiles<1, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: vbmi_tiles<1, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: vbmi_tiles<1, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: vbmi_tiles<1, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: vbmi_tiles<2, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: vbmi_tiles<2, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: vbmi_tiles<2, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: vbmi_tiles<2, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: vbmi_tiles<3, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: vbmi_tiles<3, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: vbmi_tiles<3, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: vbmi_tiles<3, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: vbmi_tiles<4, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: vbmi_tiles<4, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: vbmi_tiles<4, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: vbmi_tiles<4, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: vbmi_tiles<5, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: vbmi_tiles<5, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: vbmi_tiles<5, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: vbmi_tiles<5, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: vbmi_tiles<6, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: vbmi_tiles<6, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: vbmi_tiles<6, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: vbmi_tiles<6, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: vbmi_tiles<7, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: vbmi_tiles<7, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: vbmi_tiles<7, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: vbmi_tiles<7, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 0: vbmi_tiles<1, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 1 * 4 + 1: vbmi_tiles<1, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 1 * 4 + 2: vbmi_tiles<1, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 1 * 4 + 3: vbmi_tiles<1, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 2 * 4 + 0: vbmi_tiles<2, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 2 * 4 + 1: vbmi_tiles<2, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 2 * 4 + 2: vbmi_tiles<2, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 2 * 4 + 3: vbmi_tiles<2, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 3 * 4 + 0: vbmi_tiles<3, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 3 * 4 + 1: vbmi_tiles<3, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 3 * 4 + 2: vbmi_tiles<3, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 3 * 4 + 3: vbmi_tiles<3, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 4 * 4 + 0: vbmi_tiles<4, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 4 * 4 + 1: vbmi_tiles<4, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 4 * 4 + 2: vbmi_tiles<4, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 4 * 4 + 3: vbmi_tiles<4, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 5 * 4 + 0: vbmi_tiles<5, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 5 * 4 + 1: vbmi_tiles<5, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 5 * 4 + 2: vbmi_tiles<5, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 5 * 4 + 3: vbmi_tiles<5, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 6 * 4 + 0: vbmi_tiles<6, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 6 * 4 + 1: vbmi_tiles<6, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 6 * 4 + 2: vbmi_tiles<6, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 6 * 4 + 3: vbmi_tiles<6, false, 4>(mat, in, tout, tn0, tn1, ks); return;
+                case 7 * 4 + 0: vbmi_tiles<7, false, 1>(mat, in, tout, tn0, tn1, ks); return;
+                case 7 * 4 + 1: vbmi_tiles<7, false, 2>(mat, in, tout, tn0, tn1, ks); return;
+                case 7 * 4 + 2: vbmi_tiles<7, false, 3>(mat, in, tout, tn0, tn1, ks); return;
+                case 7 * 4 + 3: vbmi_tiles<7, false, 4>(mat, in, tout, tn0, tn1, ks); return;
                 // K8: byte pairing impossible (shift % 8 == 0) and the byte windows straddle
                 // the register pairs -- measured slower than the dword scheme, so route there
                 case 8 * 4 + 0: vnni_tiles<8, false, 1>(mat, in, tout, tn0, tn1); return;
@@ -2499,6 +2550,11 @@ struct Chunk
     float weight[MAX_M];
 };
 
+struct PaddedCounter
+{
+    alignas(64) std::atomic<int> v;
+};
+
 struct ForwardCtx
 {
     const MoeCpuLayer* layer;
@@ -2518,6 +2574,15 @@ struct ForwardCtx
     // of I) and per 128-column block of H
     std::atomic<int>* blk_done = nullptr;
     std::atomic<int>* out_done = nullptr;
+    // Split-K: completed slices per 8-tile group (gate/up groups, then down groups) and the
+    // slices' raw accumulators, 2 x 128 int32 per slice
+    std::atomic<int>* grp_done_gu = nullptr;
+    std::atomic<int>* grp_done_d = nullptr;
+    int32_t* partials = nullptr;
+    // Per phase: split-K slices per group, units, and one cursor per worker (decode_phase)
+    int parts[2] = { 1, 1 };
+    int units[2] = { 0, 0 };
+    PaddedCounter* cursor = nullptr;
 
     int phase = 0;
 };
@@ -2531,6 +2596,9 @@ struct ForwardArena
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
     std::unique_ptr<std::atomic<int>[]> counters;
     size_t num_counters = 0;
+    std::vector<int32_t> partials;
+    std::unique_ptr<PaddedCounter[]> cursors;
+    size_t num_cursors = 0;
 
     static ForwardArena& get()
     {
@@ -2901,21 +2969,57 @@ void forward_phase(void* vctx, int worker, int num_workers)
 // transform, activation, the down input's transform; the final transform and accumulate)
 // run on whichever worker completes a 128-column block last. Same arithmetic in the same
 // order as the five-phase path, so the results agree bitwise
+inline bool split_k_ok(const MoeCpuMatrix& mat) { return g_isa == Isa::Vbmi && (mat.hb || mat.bits < 8); }
+
+// Split-K slices per 8-tile group for a decode phase of `groups` groups on nw workers. Small
+// jobs have fewer groups than workers, or a few more: whole groups would leave workers idle or
+// give some of them one group more than the rest, so each group is split in P slices along k
+// (KSlice), each a sequential run of the group's packed stream, summed exactly by whichever
+// worker completes the group. P minimizes the busiest worker's share, with a small cost per
+// slice
+int decode_parts(int groups, int nw, bool split_ok)
+{
+    if (!split_ok) return 1;
+    int best_p = 1;
+    float best = 1e30f;
+    for (int p = 1; p <= 4; p *= 2)
+    {
+        const int per_worker = (groups * p + nw - 1) / nw;
+        const float cost = per_worker * (1.0f / p + 0.03f);
+        if (cost < best) { best = cost; best_p = p; }
+    }
+    return best_p;
+}
+
 void decode_phase(void* vctx, int worker, int num_workers)
 {
     ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
     const MoeCpuLayer& L = *c.layer;
-    const int nc = static_cast<int>(c.chunks.size());
     const int H = L.hidden_size;
     const int I = L.interm_size;
     DecodeScratch& s = DecodeScratch::get(H, I);
 
-    // Work is split in 8-tile groups (= one 128-column block, the transforms' unit), evenly
-    // over the workers as one flat range: the imbalance is at most one group
-    auto range = [&](int total, int& g0, int& g1)
+    // Units (a group, or one of its P split-K slices, see decode_parts) are split evenly over
+    // the workers as one flat range, each worker taking its own from the front through its
+    // cursor. Then it takes what is left of the others' ranges through theirs: the slowest
+    // worker of a phase is a different one every job (memory-side stragglers), which no static
+    // split can balance. A unit's result does not depend on who computes it
+    const int P = c.parts[c.phase];
+    const int total = c.units[c.phase];
+    PaddedCounter* cur = c.cursor + c.phase * num_workers;
+    auto end_of = [&](int w) { return static_cast<int>(static_cast<int64_t>(total) * (w + 1) / num_workers); };
+    auto claim = [&](int w)
     {
-        g0 = static_cast<int>(static_cast<int64_t>(total) * worker / num_workers);
-        g1 = static_cast<int>(static_cast<int64_t>(total) * (worker + 1) / num_workers);
+        const int e = end_of(w);
+        if (cur[w].v.load(std::memory_order_relaxed) >= e) return -1;
+        const int u = cur[w].v.fetch_add(1, std::memory_order_relaxed);
+        return u < e ? u : -1;
+    };
+    auto run_units = [&](auto&& unit)
+    {
+        for (int u; (u = claim(worker)) >= 0;) unit(u);
+        for (int k = 1; k < num_workers; ++k)
+            for (int u; (u = claim((worker + k) % num_workers)) >= 0;) unit(u);
     };
 
     if (c.phase == 0)
@@ -2924,14 +3028,13 @@ void decode_phase(void* vctx, int worker, int num_workers)
         // finishes the block itself
         const int gu = L.gates.empty() ? 1 : 2;
         const int nb = I / 128;
-        int g0, g1;
-        range(nc * nb * gu, g0, g1);
         int prep_j[2] = { -1, -1 };
-        for (int id = g0; id < g1; ++id)
+        run_units([&](int id)
         {
-            const int j = id / (nb * gu);
-            const int b = (id % (nb * gu)) / gu;
-            const bool up = gu == 1 || (id % gu);
+            const int gid = id / P;
+            const int j = gid / (nb * gu);
+            const int b = (gid % (nb * gu)) / gu;
+            const bool up = gu == 1 || (gid % gu);
             const Chunk& ch = c.chunks[j];
             const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
             PreparedIn& p = up ? s.pu : s.pg;
@@ -2941,23 +3044,34 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 prep_j[up] = j;
             }
             float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j) * MAX_SLOTS * I;
-            run_rows(mat, p, tout, b * 8, b * 8 + 8);
+            if (P == 1)
+                run_rows(mat, p, tout, b * 8, b * 8 + 8);
+            else
+            {
+                const int tk = mat.k / 16;
+                const int part = id % P;
+                const KSlice ks { tk * part / P, tk * (part + 1) / P, b * 8, c.partials + static_cast<size_t>(id) * 256 };
+                run_tiles(mat, p, nullptr, p.rows, b * 8, b * 8 + 8, &ks);
+                if (c.grp_done_gu[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
+                finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, p, tout, I, b * 8);
+            }
             fold_rows(tout, p, 1, I, b * 128, b * 128 + 128);
             if (c.blk_done[j * nb + b].fetch_add(1, std::memory_order_acq_rel) == gu - 1)
                 decode_gu_block(c, j, b * 128);
-        }
+        });
     }
     else
     {
+        const int nc = static_cast<int>(c.chunks.size());
         const int nb = H / 128;
-        int g0, g1;
-        range(nc * nb, g0, g1);
         int prep_j = -1;
-        for (int id = g0; id < g1; ++id)
+        run_units([&](int id)
         {
-            const int j = id / nb;
-            const int b = id % nb;
+            const int gid = id / P;
+            const int j = gid / nb;
+            const int b = gid % nb;
             const Chunk& ch = c.chunks[j];
+            const MoeCpuMatrix& mat = L.downs[ch.expert];
             if (prep_j != j)
             {
                 s.pd.tin = c.prep_d[j].tin;
@@ -2965,11 +3079,21 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 prep_j = j;
             }
             float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
-            run_rows(L.downs[ch.expert], s.pd, tout, b * 8, b * 8 + 8);
+            if (P == 1)
+                run_rows(mat, s.pd, tout, b * 8, b * 8 + 8);
+            else
+            {
+                const int tk = mat.k / 16;
+                const int part = id % P;
+                const KSlice ks { tk * part / P, tk * (part + 1) / P, b * 8, c.partials + static_cast<size_t>(id) * 256 };
+                run_tiles(mat, s.pd, nullptr, s.pd.rows, b * 8, b * 8 + 8, &ks);
+                if (c.grp_done_d[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
+                finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, s.pd, tout, H, b * 8);
+            }
             fold_rows(tout, s.pd, 1, H, b * 128, b * 128 + 128);
             if (c.out_done[b].fetch_add(1, std::memory_order_acq_rel) == nc - 1)
                 decode_out_block(c, b * 128, false);
-        }
+        });
     }
 }
 
@@ -3342,7 +3466,9 @@ void exl3_moe_cpu_forward_raw(
     if (decode)
     {
         const size_t num_blk = static_cast<size_t>(nc) * (I / 128);
-        const size_t n = num_blk + H / 128;
+        const size_t num_grp_gu = num_blk * (layer->gates.empty() ? 1 : 2);
+        const size_t num_grp_d = static_cast<size_t>(nc) * (H / 128);
+        const size_t n = num_blk + H / 128 + num_grp_gu + num_grp_d;
         if (ar.num_counters < n)
         {
             ar.counters.reset(new std::atomic<int>[n]);
@@ -3350,7 +3476,36 @@ void exl3_moe_cpu_forward_raw(
         }
         for (size_t i = 0; i < n; ++i) ar.counters[i].store(0, std::memory_order_relaxed);
         ctx.blk_done = ar.counters.get();
-        ctx.out_done = ar.counters.get() + num_blk;
+        ctx.out_done = ctx.blk_done + num_blk;
+        ctx.grp_done_gu = ctx.out_done + H / 128;
+        ctx.grp_done_d = ctx.grp_done_gu + num_grp_gu;
+        // Up to four split-K slices per group
+        grow(ar.partials, std::max(num_grp_gu, num_grp_d) * 4 * 256);
+        ctx.partials = ar.partials.data();
+
+        // Participants as Pool::run counts them
+        const int nw = (n_run > 0 && n_run < g_pool.num_workers) ? n_run : g_pool.num_workers;
+        bool ok_gu = true, ok_d = true;
+        for (const Chunk& ch : ctx.chunks)
+        {
+            ok_gu = ok_gu && split_k_ok(layer->ups[ch.expert])
+                          && (layer->gates.empty() || split_k_ok(layer->gates[ch.expert]));
+            ok_d = ok_d && split_k_ok(layer->downs[ch.expert]);
+        }
+        ctx.parts[0] = decode_parts(static_cast<int>(num_grp_gu), nw, ok_gu);
+        ctx.parts[1] = decode_parts(static_cast<int>(num_grp_d), nw, ok_d);
+        ctx.units[0] = static_cast<int>(num_grp_gu) * ctx.parts[0];
+        ctx.units[1] = static_cast<int>(num_grp_d) * ctx.parts[1];
+        if (ar.num_cursors < static_cast<size_t>(2 * nw))
+        {
+            ar.cursors.reset(new PaddedCounter[2 * nw]);
+            ar.num_cursors = 2 * nw;
+        }
+        for (int ph = 0; ph < 2; ++ph)
+            for (int w = 0; w < nw; ++w)
+                ar.cursors[ph * nw + w].v.store(
+                    static_cast<int>(static_cast<int64_t>(ctx.units[ph]) * w / nw), std::memory_order_relaxed);
+        ctx.cursor = ar.cursors.get();
     }
 
     const int num_phases = decode ? 2 : (rows == 1 ? 5 : 6);
