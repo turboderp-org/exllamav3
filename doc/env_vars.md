@@ -594,9 +594,10 @@ recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice part
 products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
 models is reproducible as well.
 
-### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
+### `EXL3_MOE_PINNED_ARENA` (default: `0`)
 
-Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
+Default for `Config.infer_params.moe_cpu_pinned_arena` (`-mcpa` / `--moe_cpu_pinned_arena` in
+`model_init`). Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
 and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down trellis tensors out as
 one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs an expert's block
 straight out of the arena on the copy stream instead of having the worker's stager thread
@@ -619,7 +620,7 @@ pinned KV tiers): when registering a chunk fails for lack of it, the chunks alre
 keep the DMA path and the experts in the rest of the arena stream through the staged path, with
 one notice at load.
 
-### `EXL3_MOE_CPU_PROMOTE` (default: `4`)
+### `EXL3_MOE_CPU_PROMOTE` (default: `6`)
 
 Spare GPU expert slots per layer for promote-on-miss in `--moe_cpu_split` mode with the pinned
 arena (`EXL3_MOE_PINNED_ARENA=1`); `0` keeps the periodic swap sweep instead. Each decode step, a

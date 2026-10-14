@@ -66,6 +66,7 @@ def add_args(
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
     parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
@@ -226,6 +227,8 @@ def init(
         config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "moe_cpu_pinned_arena", False):
+        config.infer_params.moe_cpu_pinned_arena = True
     if getattr(args, "ngram_ram", False):
         config.infer_params.ngram_stream_from_disk = False
     if getattr(args, "ngram_lock", False):
@@ -250,6 +253,7 @@ def init(
         draft_config.infer_params.moe_cpu_offload = dmcl
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
+        draft_config.infer_params.moe_cpu_pinned_arena = config.infer_params.moe_cpu_pinned_arena
     else:
         draft_config = None
 

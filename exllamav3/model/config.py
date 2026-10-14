@@ -47,6 +47,11 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Pinned expert arena for the CPU worker: the worker's expert weights live in
+        # shared chunks the parent maps and page-locks, so streamed prefill DMAs expert blocks
+        # straight out of the arena and the per-layer split can promote experts into spare GPU
+        # slots on the fly (see moe_cpu_host.MoeCpuTuning). EXL3_MOE_PINNED_ARENA is the default
+        self.moe_cpu_pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)

@@ -919,10 +919,11 @@ class MoeCpuHost:
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         self.aux = {}
         self._dev_bufs = {}      # per device: persistent streamed-prefill buffers (see _device_buffers)
-        # Pinned arena (EXL3_MOE_PINNED_ARENA): parent-side mappings of the worker's memfd
-        # chunks (mmap, int16 view) indexed like the worker's chunk list, and per layer the
-        # per-expert (chunk, byte offset) of its contiguous [gate | up | down] trellis block
-        self.pinned = TUNING.pinned_arena
+        # Pinned arena (config.infer_params.moe_cpu_pinned_arena, EXL3_MOE_PINNED_ARENA its
+        # default): parent-side mappings of the worker's memfd chunks (mmap, int16 view) indexed
+        # like the worker's chunk list, and per layer the per-expert (chunk, byte offset) of its
+        # contiguous [gate | up | down] trellis block
+        self.pinned = bool(getattr(config.infer_params, "moe_cpu_pinned_arena", TUNING.pinned_arena))
         self.arena_maps = []
         self.arena_views = []
         # Chunks are registered in order; the first one the driver refuses for lack of page-locked

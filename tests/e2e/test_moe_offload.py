@@ -15,7 +15,6 @@ assert_logits_agree: median/mean KL scaled by the model's noise floor, top-1 at 
 that a wrong expert mapping, stale weights or a broken handoff (KL of order 1) cannot meet. Runs over every registry model tagged "moe" + "mul1" (CPU offload needs mul1 experts).
 """
 
-import contextlib
 import json
 import os
 
@@ -41,19 +40,9 @@ def placement_args(model_dir: str, placement: str) -> list[str]:
         return ["-mcl", str(max(1, tc["num_hidden_layers"] // 2))]
     if placement in ("split", "promote"):
         experts = tc.get("num_experts") or tc.get("n_routed_experts") or tc.get("num_local_experts")
-        return ["-mcs", str(max(1, experts // 4))]
+        # The promote placement needs the worker's arena mapped in this process (pinned arena)
+        return ["-mcs", str(max(1, experts // 4))] + (["-mcpa"] if placement == "promote" else [])
     raise ValueError(placement)
-
-
-class _pinned_arena:
-    """The promote placement needs the worker's arena mapped in this process (EXL3_MOE_PINNED_ARENA is read
-    into the tuning singleton at import), set for the load and restored after"""
-    def __enter__(self):
-        from exllamav3.model.moe_cpu_host import TUNING
-        self.tuning, self.was = TUNING, TUNING.pinned_arena
-        TUNING.pinned_arena = True
-    def __exit__(self, *a):
-        self.tuning.pinned_arena = self.was
 
 
 def _prompts(lm):
@@ -90,13 +79,12 @@ def gpu_reference(model_registry, device):
 @pytest.mark.parametrize("placement", ["layer", "split", "promote"])
 def test_offload_matches_gpu(model_id, model_dir, placement, device, gpu_reference):
     ref = gpu_reference(model_id)
-    with _pinned_arena() if placement == "promote" else contextlib.nullcontext():
-        with load_model(model_dir, device, *placement_args(model_dir, placement)) as lm:
-            got = _run(lm)
-            if placement == "promote":
-                mods = getattr(lm.model.config.infer_params, "moe_cpu_swap_modules", [])
-                moved = sum(getattr(m, "_split_promo_n", 0) for m in mods)
-                assert moved > 0, "promote placement: no expert was promoted during the decode runs"
+    with load_model(model_dir, device, *placement_args(model_dir, placement)) as lm:
+        got = _run(lm)
+        if placement == "promote":
+            mods = getattr(lm.model.config.infer_params, "moe_cpu_swap_modules", [])
+            moved = sum(getattr(m, "_split_promo_n", 0) for m in mods)
+            assert moved > 0, "promote placement: no expert was promoted during the decode runs"
     floor = ref["floor"]
     assert_logits_agree(ref["forward"], got["forward"], floor, f"{placement} prefill", abs_median_kl = ABS_MEDIAN_KL)
     assert_logits_agree(ref["decode"], got["decode"], floor, f"{placement} decode", abs_median_kl = ABS_MEDIAN_KL)

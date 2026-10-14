@@ -829,17 +829,16 @@ class BlockSparseMLP_CPU:
         # via the install message (the child re-reads it from its own checkpoint handle)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
             and not self.tid2eid_key
-        # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 4, 0 off): with
+        # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 6, 0 off): with
         # the pinned arena the parent moves experts between the GPU slots and the worker's arena
         # by DMA, so a routed expert the CPU had to compute can take a spare GPU slot for the
         # next tokens and the least-used resident goes the other way. The worker is registered
         # from `spares` experts below the GPU slice, whose GPU slots start out as the free
-        # spares (their experts live in the worker's extra slots)
-        from ..model.moe_cpu_host import TUNING
+        # spares (their experts live in the worker's extra slots); every GPU slot may be a spare
         spares = 0
-        if self._split_dynamic and TUNING.pinned_arena:
-            spares = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE", 4)))
-        spares = min(spares, max(0, first - 1))
+        if self._split_dynamic and getattr(self.config.infer_params, "moe_cpu_pinned_arena", False):
+            spares = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE", 6)))
+        spares = min(spares, first)
         self._split_spares = spares
         wfirst = first - spares
         # Hot/cold placement: an explicit stats file (EXL3_MOE_CPU_SPLIT_STATS) or, failing
