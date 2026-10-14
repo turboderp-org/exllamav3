@@ -620,7 +620,7 @@ pinned KV tiers): when registering a chunk fails for lack of it, the chunks alre
 keep the DMA path and the experts in the rest of the arena stream through the staged path, with
 one notice at load.
 
-### `EXL3_MOE_CPU_PROMOTE` (default: `6`)
+### `EXL3_MOE_CPU_PROMOTE` (default: `4`)
 
 Spare GPU expert slots per layer for promote-on-miss in `--moe_cpu_split` mode with the pinned
 arena (`EXL3_MOE_PINNED_ARENA=1`); `0` keeps the periodic swap sweep instead. Each decode step, a
