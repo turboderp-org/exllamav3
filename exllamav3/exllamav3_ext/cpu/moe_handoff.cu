@@ -121,6 +121,26 @@ MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
 std::atomic<bool> g_memops_enabled { true };
 
+inline uint32_t load_acquire_u32(const uint32_t* p)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    long v = _InterlockedCompareExchange(
+        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(p)), 0L, 0L);
+    return static_cast<uint32_t>(v);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+inline void store_release_u32(uint32_t* p, uint32_t v)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
+#else
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
 } // namespace
 
 void exl3_moe_cpu_set_memops(bool enabled)
@@ -252,7 +272,7 @@ bool exl3_moe_split_issue_fused
     uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
     MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
     const uint32_t tail = *jobs_tail;
-    if (tail - __atomic_load_n(jobs_head, __ATOMIC_ACQUIRE) >= MOE_JOB_RING - 4) return false;
+    if (tail - load_acquire_u32(jobs_head) >= MOE_JOB_RING - 4) return false;
     // Descriptor first: host-visible before the GPU can publish the data flag
     MoeJob& job = jobs[tail % MOE_JOB_RING];
     job.seq = (uint32_t) (seq & 0xFFFFFFFFull);
@@ -262,7 +282,7 @@ bool exl3_moe_split_issue_fused
     job.topk = (uint32_t) topk;
     job.slot = (uint32_t) slot;
     job.kind = MOE_JOB_KIND_COMPUTE_GATED;
-    __atomic_store_n(jobs_tail, tail + 1, __ATOMIC_RELEASE);
+    store_release_u32(jobs_tail, tail + 1);
 
     const at::cuda::OptionalCUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
@@ -306,26 +326,6 @@ inline void cpu_pause_()
     __builtin_ia32_pause();
 #else
     _mm_pause();
-#endif
-}
-
-inline uint32_t load_acquire_u32(const uint32_t* p)
-{
-#if defined(_MSC_VER) && !defined(__clang__)
-    long v = _InterlockedCompareExchange(
-        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(p)), 0L, 0L);
-    return static_cast<uint32_t>(v);
-#else
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
-#endif
-}
-
-inline void store_release_u32(uint32_t* p, uint32_t v)
-{
-#if defined(_MSC_VER) && !defined(__clang__)
-    (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
-#else
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
 #endif
 }
 
