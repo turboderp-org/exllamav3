@@ -340,12 +340,16 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            0,
-            clear = True,
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                0,
+                clear = True,
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def get_test_state(self, position: int):
@@ -355,13 +359,17 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            position,
-            clear = True,
-            test_state = True,
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                position,
+                clear = True,
+                test_state = True,
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def new_from_stashed(self, stashed_state, position):
@@ -370,13 +378,17 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            position,
-            clear = False,
-            stashed = stashed_state
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                position,
+                clear = False,
+                stashed = stashed_state
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def release_state(self, state):

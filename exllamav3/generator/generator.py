@@ -1281,18 +1281,32 @@ class Generator:
 
     def new_recurrent_state(self) -> PairedState:
         """A fresh (cleared) pair of recurrent states for a new sequence, one side per recurrent model"""
-        return PairedState(
-            self.cache.get_new_state() if self.target_recurrent else None,
-            self.draft_cache.get_new_state() if self.draft_recurrent else None,
-        )
+        target = draft = None
+        try:
+            target = self.cache.get_new_state() if self.target_recurrent else None
+            draft = self.draft_cache.get_new_state() if self.draft_recurrent else None
+            return PairedState(target, draft)
+        except BaseException:
+            if draft is not None:
+                draft.free()
+            if target is not None:
+                target.free()
+            raise
 
 
     def recurrent_state_from_stashed(self, stashed: dict, position: int) -> PairedState:
         """The pair restored from a checkpoint stash (PairedState.stash) at `position`"""
-        return PairedState(
-            self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None,
-            self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None,
-        )
+        target = draft = None
+        try:
+            target = self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None
+            draft = self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None
+            return PairedState(target, draft)
+        except BaseException:
+            if draft is not None:
+                draft.free()
+            if target is not None:
+                target.free()
+            raise
 
 
     def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None):

@@ -1047,7 +1047,7 @@ class Job:
                     self.recurrent_state.rewind_to(target)
                 else:
                     stashed = self.find_recurrent_stash(target)
-                    self.recurrent_state.free()
+                    self.free_recurrent_state()
                     if stashed is not None:
                         replay_from = stashed["position"]
                         self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
