@@ -1,7 +1,8 @@
 # ORPO and GRPO for the EXL3 QLoRA trainer (plan, 2026-10-14)
 
-Status: **ORPO built and CPU-tested** (branch `feat/orpo`, handoff Session 60; box
-list there). GRPO not started.
+Status: **ORPO built and CPU-tested** (branch `feat/orpo`, PR #172, handoff Session
+60). **GRPO built and CPU-tested** (branch `feat/grpo`, handoff Session 61). Neither is
+box-verified; the box lists are in the handoff entries.
 
 Requested for the user's friend Neko. Queue order: ORPO first, then GRPO.
 Both train the LoRA adapter on the frozen EXL3 base; neither loads a second

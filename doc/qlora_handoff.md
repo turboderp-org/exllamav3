@@ -5633,6 +5633,85 @@ chosen held fixed. The test asserts that.
 
 ---
 
+### Session 61 — GRPO: on-policy RL from plug-in reward functions, native-generator rollouts, CPU-tested
+
+> Written 2026-10-14 on branch `feat/grpo` (on top of `feat/orpo`, PR #172). Second item of
+> the Neko queue; research and the TRL / axolotl / paper comparison in
+> `doc/orpo_grpo_plan.md`. CPU-tested in the scratch CPU-torch venv: `tests/test_grpo.py`
+> (9: advantages, reward combining, REINFORCE equivalence of the ratio-1 surrogate,
+> two-sided clipping + metrics, k3 KL, the four reductions and sequence-level IS, the
+> reward plug-in loader, the built-in rewards, the exact stop-token sampler on a chain
+> stub) and `tests/test_grpo_trainer.py` (4: the trainer's own sampler collection, stop
+> ids, generate_and_score on both samplers, policy_pass with masking / reference /
+> old-policy caches — the trainer module imports with `exllamav3` stubbed where the
+> extension is missing). The YAML launcher dry-runs `method: grpo` and forwards every
+> key. **Not box-verified**: no GRPO step has run on a GPU.
+
+**What it is.** Group Relative Policy Optimization (DeepSeekMath, arXiv:2402.03300) with
+TRL 1.15.0 `GRPOTrainer` semantics (`exllamav3/training/grpo.py` docstring lists them).
+Per optimizer step: `--prompts-per-step` prompts × `--num-generations` completions sampled
+from the CURRENT policy, scored by `--reward` functions, group-normalized advantages,
+per-token logps on the differentiable forward in micro-batches of `--batch` rows, the
+clipped surrogate (`--epsilon`, `--epsilon-high`; `--loss-type dapo|grpo|bnpo|dr_grpo`;
+`--importance-sampling-level token|sequence`), optional `--beta` × k3 KL. The three
+"other models" of the textbook picture never load: the reference is the frozen base via
+`adapters_disabled()` (and `--beta 0`, TRL's default, skips that forward), the old policy is
+`detach()` of the current logps (ratio 1) or, under `--num-iterations > 1`, the logps
+captured right after rollout, and the reward is a function.
+
+**Rollouts.** `--rollout-sampler native` (default): `net.apply_to_native()`, one `Job` per
+completion row with `stop_conditions` = EOS + the chat format's turn-end token
+(`stop_token_ids`), `max_new_tokens + 1` (the Job budget counts the prefill sample),
+tokens collected from both the streaming result and the eos `held` blob, the stop token
+kept as the completion's last token (appended from `eos_triggering_token_id` if the stream
+dropped it) so the policy is trained to stop; `eos_reason != "stop_token"` marks the row
+truncated (`--mask-truncated-completions` drops those from the loss). `--rollout-sampler
+exact`: `grpo.sample_completions_exact`, the EBFT exact sampler generalized with per-row
+stop ids. Scoring is ALWAYS the training forward on both sides of the ratio (TRL's rule
+under vLLM), so the native kernels' rounding only makes the samples very slightly
+off-policy; a TIS/MIS-style correction from `Job(return_probs=True)` is the obvious
+follow-up if a box run shows drift. Refused for routed-expert LoRA (fused MoE kernels bypass
+the runtime slots), same as EBFT.
+
+**Reward plug-ins** (`grpo.load_reward_func`): a built-in name (`rewards.py`:
+`exact_answer` with boxed / `####` / last-number extraction against an `answer` column,
+`think_format`, `length_target`), `path/to/file.py:func` (loaded by path) or
+`package.module:func`. TRL's signature `f(prompts=, completions=, completion_ids=,
+**other_columns) -> list[float | None]` so TRL reward files drop in unchanged; every
+non-prompt dataset column is passed as a per-row list; `None` abstains (NaN, excluded
+from the row's sum; an all-abstain row gets 0 and a warning). `--reward-weights`.
+
+**Built:** `exllamav3/training/grpo.py` (`group_advantages`, `combine_rewards`,
+`grpo_loss`, `apply_sampling_filters`, `sample_completions_exact`, `load_reward_func`,
+`call_reward_funcs`), `exllamav3/training/rewards.py`, `training/qlora_train_grpo.py`
+(sibling of the EBFT trainer: same load / LoRA / optimizer / checkpoint / run-log / report
+plumbing; `build_prompt_examples` reuses the preference trainer's prompt renderers;
+`--self-test` prints one generation batch with rewards and a policy pass; `--eval-*` =
+mean reward on held-out prompts, higher is better, `--save-best` keeps the best reward;
+`--print-samples` every `--sample-every` steps shows the step's own best completions),
+`training/qlora_train_grpo_config.yaml`, launcher `GRPO_KEYS` / `GRPO_DEFAULTS` /
+`method: grpo`, README rows, tests.
+
+**Box list (next GPU session):**
+
+1. `--self-test` on Qwen3.5-4B (any love quant) with a GSM8K-style jsonl
+   (`--prompt-key question --reward exact_answer`): completions print with rewards,
+   the policy pass is finite, `|grad|_1 > 0`. Then the same with `--rollout-sampler
+   exact` for a few prompts: the two samplers' completions should look alike and
+   `kl` (with `--beta 0.04`) should start near 0.
+2. A short run (`--steps 100 --num-generations 8 --prompts-per-step 4 --lr 1e-5
+   --max-completion-length 256`): train reward climbs, `frac_zero_std` falls, `clip_frac`
+   stays ~0 at mu=1, completion length stays bounded. `--num-iterations 2` should show
+   non-zero clip_frac on the second pass.
+3. VRAM: the paged cache (`--sampler-cache-tokens`) sits next to the training net;
+   on the 3090 size it so `prompts_per_step * G * (prompt + max_new)` fits, else rows
+   run in waves (slower, still correct).
+4. If TRL is around: `GRPOTrainer` on the bf16 HF checkpoint, same prompts / rewards /
+   G / lr / seed — reward curves should track; loss values match only at mu=1
+   (ratio 1) up to sampler differences.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
