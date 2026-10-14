@@ -1,6 +1,6 @@
 """
-Preference optimization (DPO / KTO / SimPO) of an EXL3 model, native path --
-no HuggingFace Transformers in the loop.
+Preference optimization (DPO / KTO / SimPO / ORPO) of an EXL3 model, native
+path -- no HuggingFace Transformers in the loop.
 
 Trains LoRA adapters on a frozen EXL3 base with a preference objective instead
 of SFT cross-entropy, using the same transformers-free differentiable forward
@@ -8,9 +8,9 @@ as training/qlora_train_native.py. For DPO/KTO the REFERENCE model is the
 frozen base itself, obtained by running the same net under
 ``NativeLlamaQLoRA.adapters_disabled()`` (the PEFT disable-adapter trick) -- no
 second model copy is ever loaded, so the VRAM story matches SFT plus one extra
-no-grad forward per batch. SimPO is REFERENCE-FREE: no reference forward at
-all, so a SimPO step is roughly half the compute of a DPO step on the same
-pairs (and exactly SFT's VRAM story).
+no-grad forward per batch. SimPO and ORPO are REFERENCE-FREE: no reference
+forward at all, so a step is roughly half the compute of a DPO step on the
+same pairs (and exactly SFT's VRAM story).
 
 Loss semantics follow HuggingFace TRL's stable trainers (DPOTrainer /
 KTOTrainer / CPOTrainer's "simpo" loss; KTO was promoted to TRL's stable API
@@ -43,6 +43,17 @@ Methods:
                  0.1 of dpo/kto; there is no ln-2 step-0 anchor. Optional
                  --sft-weight > 0 adds TRL CPOTrainer's cpo_alpha NLL term on
                  the chosen completions (the "CPO-SimPO" mix).
+  --method orpo  Paired data, same format/keys as dpo. Reference-free,
+                 monolithic SFT + preference (ORPO, arXiv:2403.07691; TRL's
+                 experimental ORPOTrainer / axolotl ``rl: orpo``): loss =
+                 NLL(chosen) - beta * log sigmoid(log odds ratio) on
+                 length-normalized probabilities, --beta = the paper's lambda
+                 (default 0.1; paper 0.1-0.25). --orpo-nll picks what the NLL
+                 term supervises: ``full`` (prompt + chosen, batch-token mean;
+                 what TRL and axolotl compute, the default) or ``completion``
+                 (chosen tokens only). Meant to replace SFT on a base model,
+                 so SFT-like LRs (not DPO's 5e-6) are the usual starting
+                 point; it works on instruct checkpoints too.
 
 Usage (defaults are illustrative; DPO on a paired dataset):
     python training/qlora_train_pref.py --method dpo \
@@ -94,7 +105,8 @@ from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
 from exllamav3 import Config, Model, Tokenizer  # noqa: E402
 from exllamav3.training.native_llama import NativeLlamaQLoRA  # noqa: E402
 from exllamav3.training.preference import (  # noqa: E402
-    dpo_loss, kto_loss, simpo_loss, mismatched_kl_shift,
+    dpo_loss, kto_loss, simpo_loss, orpo_loss, mismatched_kl_shift,
+    ORPO_NLL_MODES,
     DPO_LOSS_TYPES, KTO_LOSS_TYPES,
 )
 
@@ -397,6 +409,49 @@ def simpo_batch_metrics(net, batch, pad_id, args):
     return loss, metrics
 
 
+def orpo_batch_metrics(net, batch, pad_id, args):
+    """Loss + logging metrics for one micro-batch of ORPO pairs. Same data
+    layout as DPO/SimPO (chosen block, then rejected block, ONE policy
+    forward, no reference). Loss = NLL(chosen) + odds-ratio term. With
+    --orpo-nll full (TRL / axolotl semantics) the forward supervises every
+    non-pad token, so the per-token logps serve both the full-sequence NLL
+    on the chosen rows and the completion-only means the odds need; with
+    ``completion`` the NLL is the batch-token mean over chosen completion
+    tokens (the same term as SimPO's --sft-weight)."""
+    rows = ([(e["prompt_ids"], e["chosen_ids"]) for e in batch]
+            + [(e["prompt_ids"], e["rejected_ids"]) for e in batch])
+    input_ids, labels, attn = rows_to_batch(rows, pad_id)
+    b = len(batch)
+    cmask = labels[:, 1:] != -100                      # completion positions
+    if args.orpo_nll == "full":
+        full_labels = input_ids.masked_fill(attn == 0, -100)
+        tok_logps, fmask = net.compute_logps(
+            input_ids, full_labels, attention_mask=attn, chunk=args.ce_chunk,
+            return_per_token=True)
+        cmask = cmask.to(tok_logps.device)
+        pol_logps = (tok_logps * cmask).sum(dim=-1)
+        counts = cmask.sum(dim=-1)
+        fm = fmask[:b]
+        nll = -(tok_logps[:b] * fm).sum() / fm.sum().clamp(min=1)
+    else:
+        pol_logps, counts = net.compute_logps(input_ids, labels, attention_mask=attn,
+                                              chunk=args.ce_chunk)
+        nll = -pol_logps[:b].sum() / counts[:b].sum().clamp(min=1)
+    losses, cr, rr, log_odds = orpo_loss(
+        pol_logps[:b], pol_logps[b:], counts[:b], counts[b:], beta=args.beta)
+    loss = nll + losses.mean()
+    metrics = {
+        "margin": (cr - rr).mean().item(),
+        "acc": (cr > rr).float().mean().item(),
+        "nll": nll.item(),
+        "log_odds": log_odds.mean().item(),
+        "sup": int(cmask.sum()),
+        "tot": int(attn.sum()),
+        "n": b,
+    }
+    return loss, metrics
+
+
 def kto_batch_metrics(net, batch, pad_id, args):
     """Loss + logging metrics for one micro-batch of KTO rows. Two extra
     no-grad forwards estimate the KL reference point on mismatched pairs
@@ -481,10 +536,12 @@ def _run_main():
             "would need a cross-rank all-reduce).")
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--method", choices=["dpo", "kto", "simpo"], required=True,
+    ap.add_argument("--method", choices=["dpo", "kto", "simpo", "orpo"],
+                    required=True,
                     help="Preference objective: dpo (paired chosen/rejected), "
-                         "kto (unpaired desirable/undesirable labels), or "
-                         "simpo (paired, reference-free, length-normalized).")
+                         "kto (unpaired desirable/undesirable labels), "
+                         "simpo (paired, reference-free, length-normalized), "
+                         "or orpo (paired, reference-free SFT + odds ratio).")
     ap.add_argument("--model", required=True, help="Path to a local EXL3 model dir")
     ap.add_argument("--out", default="out/exl3_pref_adapter")
     ap.add_argument("--device", default="cuda:0",
@@ -514,7 +571,8 @@ def _run_main():
                     help="Inverse temperature on the log-ratio. Default: 0.1 "
                          "for dpo/kto (TRL default); 2.0 for simpo (the SimPO "
                          "paper's 2.0-2.5 range -- note TRL's CPOConfig still "
-                         "defaults to 0.1, pass it explicitly for parity).")
+                         "defaults to 0.1, pass it explicitly for parity); "
+                         "0.1 for orpo (the paper's lambda; TRL default).")
     ap.add_argument("--label-smoothing", type=float, default=0.0,
                     help="(dpo sigmoid / simpo) cDPO-style robust label-flip "
                          "probability.")
@@ -527,6 +585,11 @@ def _run_main():
                          "on the CHOSEN completions (TRL CPOTrainer's "
                          "cpo_alpha). 0 = the pure SimPO paper objective; "
                          "> 0 = the CPO-SimPO mix.")
+    ap.add_argument("--orpo-nll", choices=list(ORPO_NLL_MODES), default="full",
+                    help="(orpo) tokens the SFT (NLL) term supervises: full = "
+                         "prompt + chosen completion, batch-token mean (what "
+                         "TRL's ORPOTrainer and axolotl compute; default), "
+                         "completion = chosen completion tokens only.")
     ap.add_argument("--rpo-alpha", type=float, default=0.0,
                     help="(dpo) RPO / DPO+SFT: weight on an auxiliary length-"
                          "normalized NLL loss over the CHOSEN completion (Pang "
@@ -764,7 +827,7 @@ def _run_main():
         _FAIL_CTX["phase"] = "init_lora"
         net.apply_init_lora(args.init_lora, ref_model_dir=args.init_ref_model,
                             svd_niter=args.init_svd_niter)
-        if args.init_lora == "qerr" and method != "simpo":
+        if args.init_lora == "qerr" and method not in ("simpo", "orpo"):
             print(" -- note: with --init-lora qerr the step-0 policy is the "
                   "error-repaired model but the DPO/KTO reference is the raw "
                   "quantized base, so rewards start slightly nonzero.")
@@ -778,6 +841,8 @@ def _run_main():
     elif method == "kto":
         mline = (f"loss {args.kto_loss}, weights D {args.desirable_weight} / "
                  f"U {args.undesirable_weight}")
+    elif method == "orpo":
+        mline = f"nll {args.orpo_nll} (reference-free)"
     else:
         mline = (f"gamma {args.gamma}, sft_weight {args.sft_weight}, "
                  f"label_smoothing {args.label_smoothing} (reference-free)")
@@ -790,7 +855,7 @@ def _run_main():
 
     # 3. Data.
     _FAIL_CTX["phase"] = "build_dataset"
-    paired = method in ("dpo", "simpo")   # simpo shares the DPO data format
+    paired = method in ("dpo", "simpo", "orpo")   # simpo/orpo share the DPO data format
     build_examples = build_dpo_examples if paired else build_kto_examples
     keys = (dict(prompt_key=args.prompt_key, chosen_key=args.chosen_key,
                  rejected_key=args.rejected_key) if paired else
@@ -956,7 +1021,8 @@ def _run_main():
             return tot ** 0.5
 
     batch_metrics = {"dpo": dpo_batch_metrics, "kto": kto_batch_metrics,
-                     "simpo": simpo_batch_metrics}[method]
+                     "simpo": simpo_batch_metrics,
+                     "orpo": orpo_batch_metrics}[method]
 
     def save(tag):
         net.save_adapter(args.out, base_model_name_or_path=args.model)
@@ -980,7 +1046,8 @@ def _run_main():
                 loss, m = batch_metrics(net, vb, pad_id, args)
                 tot_loss += loss.item() * m["n"]
                 tot_n += m["n"]
-                for k in ("margin", "acc", "kl", "reward_d", "reward_u", "nll"):
+                for k in ("margin", "acc", "kl", "reward_d", "reward_u", "nll",
+                          "log_odds"):
                     if k in m and m[k] == m[k]:   # skip NaN (empty subsets)
                         s, n = agg.get(k, (0.0, 0))
                         agg[k] = (s + m[k] * m["n"], n + m["n"])
@@ -1019,6 +1086,8 @@ def _run_main():
             parts.append(f"kl {em['kl']:.3f}")
         if "nll" in em:
             parts.append(f"nll {em['nll']:.3f}")
+        if "log_odds" in em:
+            parts.append(f"log-odds {em['log_odds']:+.3f}")
         if "reward_d" in em and "reward_u" in em:
             parts.append(f"reward D {em['reward_d']:.3f} / U {em['reward_u']:.3f}")
         return " | ".join(parts)
@@ -1198,7 +1267,8 @@ def _run_main():
                 accum_loss += loss_val * w_i
                 step_sup += m["sup"]
                 step_tot += m["tot"]
-                for k in ("margin", "acc", "kl", "reward_d", "reward_u", "nll"):
+                for k in ("margin", "acc", "kl", "reward_d", "reward_u", "nll",
+                          "log_odds"):
                     if k in m and m[k] == m[k]:
                         s, n = step_m.get(k, (0.0, 0))
                         step_m[k] = (s + m[k] * m["n"], n + m["n"])
@@ -1222,11 +1292,13 @@ def _run_main():
             end_loss = accum_loss
             ema = accum_loss if ema is None else 0.9 * ema + 0.1 * accum_loss
             mm = {k: s / n for k, (s, n) in step_m.items()}
-            if method in ("dpo", "simpo"):
+            if method in ("dpo", "simpo", "orpo"):
                 extras = (f"acc {mm.get('acc', 0):.3f} | "
                           f"margin {mm.get('margin', 0):+.3f}")
                 if "nll" in mm:
                     extras += f" | nll {mm['nll']:.3f}"
+                if "log_odds" in mm:
+                    extras += f" | log-odds {mm['log_odds']:+.3f}"
             else:
                 extras = (f"kl {mm.get('kl', 0):.3f} | "
                           f"rD {mm.get('reward_d', float('nan')):+.3f} "
@@ -1392,6 +1464,8 @@ def _hparam_note(args):
         return (f"method=simpo beta={args.beta} gamma={args.gamma} "
                 f"sft_weight={args.sft_weight} "
                 f"label_smoothing={args.label_smoothing}")
+    if args.method == "orpo":
+        return f"method=orpo beta={args.beta} nll={args.orpo_nll}"
     return (f"method=kto beta={args.beta} loss={args.kto_loss} "
             f"wD={args.desirable_weight} wU={args.undesirable_weight}")
 

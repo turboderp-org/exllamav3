@@ -1,8 +1,8 @@
-# EXL3 preference-optimization config (DPO / KTO / SimPO) -- ready to run.
+# EXL3 preference-optimization config (DPO / KTO / SimPO / ORPO) -- ready to run.
 #   python training/qlora_train.py --config training/qlora_train_pref_config.yaml
 #   python training/qlora_train.py --config training/qlora_train_pref_config.yaml --dry-run
 #
-# One backend (qlora_train_pref.py) serves all three methods; switch with the
+# One backend (qlora_train_pref.py) serves all four methods; switch with the
 # `method` key below. Keys mirror the backend CLI flags one-to-one (snake_case
 # here; the launcher converts to --kebab-case). Preference training is
 # single|split only (no ddp). Verify a NEW dataset once with `inspect: 3` -- it
@@ -24,12 +24,15 @@ method: dpo               # dpo: paired chosen/rejected, frozen base = reference
                           #   reference-based; needs batch >= 2 (KL point from mismatched pairs).
                           # simpo: paired chosen/rejected, REFERENCE-FREE (length-normalized reward
                           #   + target margin gamma) -- no reference forward, ~half a dpo step
+                          # orpo: paired chosen/rejected, REFERENCE-FREE monolithic SFT + odds-ratio
+                          #   term (replaces the SFT stage; SFT-like LRs) -- no reference forward
 parallel: single          # single: one GPU (`device`). split: layers autosplit across all visible
                           #   GPUs (then set reserve_per_device / use_per_device if needed)
 device: cuda:0
 
 beta: null                # inverse temperature. null = per-method default: 0.1 for dpo/kto, 2.0
-                          #   for simpo (the paper's 2.0-2.5; TRL's CPOConfig still defaults 0.1)
+                          #   for simpo (the paper's 2.0-2.5; TRL's CPOConfig still defaults 0.1),
+                          #   0.1 for orpo (the paper's lambda; 0.1-0.25 in the paper's runs)
 label_smoothing: 0.0      # (dpo sigmoid / simpo) cDPO-style robust label-flip probability
 
 # --- dpo-only ---
@@ -42,6 +45,9 @@ undesirable_weight: 1.0   # loss weight lambda_U on undesirable rows
 gamma: 0.5                # target reward margin (TRL simpo_gamma; paper 0.5-1.6, scales with beta)
 sft_weight: 0.0           # add an NLL loss on the chosen completions (TRL cpo_alpha). 0 = pure
                           #   SimPO; >0 = the CPO-SimPO mix
+# --- orpo-only (method: orpo) ---
+orpo_nll: full            # tokens the SFT (NLL) term supervises: full = prompt + chosen (what TRL's
+                          #   ORPOTrainer and axolotl compute) | completion = chosen tokens only
 
 # ---------------------------------------------------------------------------
 # LoRA adapter + init  (same knobs as the SFT config)

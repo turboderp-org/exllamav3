@@ -5557,6 +5557,82 @@ the `exllamav3` package directly and so needs the built extension (box-only, unc
 
 ---
 
+### Session 60 — ORPO (reference-free paired preference) in the pref trainer and realtime ingest, CPU-tested
+
+> Written 2026-10-14 on branch `feat/orpo` from master `299e831b`. Requested for the user's
+> friend Neko, first of a two-item queue (ORPO, then GRPO); the research behind both —
+> paper, TRL 1.15.0 and axolotl 0.20.0 semantics, how each handles the reference / old
+> policy — is in `doc/orpo_grpo_plan.md`. CPU-tested in a scratch CPU-torch venv:
+> `tests/test_preference.py` (+3: log1mexp, ORPO formula/anchors, gradient direction) and
+> `tests/test_realtime.py` (+1: `test_ingest_orpo`, full and completion NLL modes, config
+> validation) — 44 pass; the YAML launcher dry-runs `method: orpo` and forwards
+> `--orpo-nll`. **Not box-verified** (no GPU here).
+
+**What it is.** ORPO (Hong et al. 2024, arXiv:2403.07691) is a monolithic objective:
+`L = NLL(chosen) - beta * log sigmoid(log odds(y_w|x) - log odds(y_l|x))` with
+`odds = P / (1 - P)` on the LENGTH-NORMALIZED probability `P = exp(mean per-token logp)`.
+No reference model exists in the method, so it is the SimPO shape in this trainer: one
+policy forward over the `[chosen ; rejected]` block, no `adapters_disabled()` pass,
+SFT's VRAM story and about half a DPO step. `beta` is the paper's lambda (0.1 Mistral,
+0.2 Llama-2, 0.25 Phi-2; TRL default 0.1). The paper applies it to PRETRAINED bases in
+place of the SFT stage, so SFT-like learning rates are the natural starting point rather
+than DPO's 5e-6; it runs on instruct checkpoints as well.
+
+**The one semantic choice.** TRL's `ORPOTrainer` and axolotl's in-trainer ORPO both compute
+the NLL term over the FULL chosen sequence — prompt included (`labels = input_ids where
+attention_mask == 1`, "orpo chosen nll loss is computed over the full prompt and
+response"), as a batch-token mean — while the odds use completion-only means (prompt
+labels `-100`). The paper calls it the standard causal NLL and never spells out masking.
+`--orpo-nll full` (default) reproduces TRL/axolotl numerically; `completion` restricts
+the NLL to the chosen completion tokens (the same term as SimPO's `--sft-weight`). Under
+`full` the forward supervises every non-pad token and the per-token logps are re-masked
+for the completion means, so it is still ONE forward.
+
+**Built:**
+
+- `exllamav3/training/preference.py`: `orpo_loss(policy_chosen_logps,
+  policy_rejected_logps, chosen_counts, rejected_counts, beta)` -> `(losses,
+  chosen_rewards, rejected_rewards, log_odds)` — the odds-ratio term only; the trainer adds
+  the NLL. `log1mexp` (Mächler's two-branch `log(1 - exp(x))`, clamped a hair below 0 so an
+  exact-1 probability stays finite). `ORPO_NLL_MODES`.
+- `exllamav3/training/native_llama.py`: `compute_logps(..., return_per_token=True)` returns
+  `(token_logps[b, t-1], mask[b, t-1])` instead of the row sums — one forward serves several
+  maskings (ORPO here, GRPO's per-token ratios / KL next). The summed path is unchanged
+  (`token_logps.sum(-1)`, `mask.sum(-1)`).
+- `training/qlora_train_pref.py`: `--method orpo`, `--orpo-nll full|completion`,
+  `orpo_batch_metrics` (metrics: margin, acc, nll, `log_odds`; `log_odds` added to the
+  aggregated keys and the step / eval lines), beta default 0.1, paired-data path shared with
+  dpo/simpo, qerr note skipped (no reference), `_hparam_note`.
+- `training/qlora_train.py` + `qlora_train_pref_config.yaml`: `method: orpo`, `orpo_nll` key
+  (PREF_KEYS / PREF_DEFAULTS).
+- `exllamav3/training/realtime.py`: `RealtimeConfig.pair_objective: dpo|orpo` and
+  `orpo_nll`; a `prompt+chosen+rejected` sample keeps its `"dpo"` kind and stats bucket, the
+  loss is picked at window time (`_orpo_batch`); `_logps(per_token=True)`.
+- Tests as above; `tests/test_realtime.py`'s `StubNet.compute_logps` grew the
+  `return_per_token` form (per-token logp `-1 + p` at supervised positions).
+- README (feature bullet, credits), `training/README.md`, module docstrings.
+
+**Gradient note worth keeping** (it tripped a first test draft): in logp space the chosen-side
+gradient of the odds term is `-beta * sigma(-log_odds) / (1 - P_w)`, and `1 / (1 - P_w)`
+GROWS with `P_w`, so the paper's "the term fades once chosen is preferred" (the
+`sigma(-log_odds)` factor, its eq. for delta(d)) is only monotone on the rejected side with
+chosen held fixed. The test asserts that.
+
+**Box list (next GPU session):**
+
+1. `--method orpo` on the Qwen3.5-4B love pairs used for the DPO/SimPO runs, `--orpo-nll
+   full`, lr ~5e-5..1e-4 (SFT-like), beta 0.1: step-0 loss should sit near `NLL + 0.1*ln2`
+   with `log-odds ~0`, then nll falls and log-odds / acc rise. Compare against the SimPO
+   run's eval and `--sft-eval-dataset` CE.
+2. Same with `--orpo-nll completion` — expect a lower printed nll (no prompt tokens) and a
+   similar preference trajectory.
+3. Realtime: `pair_objective: orpo` through `training/realtime_chat.py` on the same pairs,
+   check the stats bucket and that no reference forward runs (step time ~half of DPO).
+4. If a TRL env is around: TRL `ORPOTrainer` on the bf16 HF checkpoint with the same pairs,
+   beta, lr — the step-0 `nll_loss` and `log_odds_ratio` should match ours to quant noise.
+
+---
+
 ## 0d. Multi-GPU strategy (rationale)
 
 "Multi-GPU" splits by *goal*, and QLoRA changes which tool fits, because only the
