@@ -78,8 +78,8 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
 # for itself on the (rank-identical) residual stream instead of receiving the selection by
 # broadcast from the output rank: two collectives per MoE layer per token fewer. Every router in
-# use is on those paths; the grouped DS3 router (n_group > 1, not supported by any loadable
-# architecture) is still torch-composed and would keep the broadcast
+# use is on those paths except the grouped DS3 router (n_group > 1, Ling 3.x), which is still
+# torch-composed (fp32 logits) and keeps the broadcast
 _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
 _routing_check_stats = {}
 

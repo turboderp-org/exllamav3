@@ -99,6 +99,7 @@ class MLAttention(Module):
         key_kv_a_norm: str = "kv_a_layernorm",
         key_kv_b: str = "kv_b_proj",
         key_o: str = "o_proj",
+        key_head_gate: str | None = None,
         qbits_key: str = "bits",
         select_hq_bits: int = 0,
         indexer_mode: str | None = None,
@@ -177,6 +178,7 @@ class MLAttention(Module):
         self.kv_a_proj_with_mqa = None
         self.kv_a_layernorm = None
         self.o_proj = None
+        self.head_gate = None
         self.idx_wq_b = None
         self.idx_wk = None
         self.idx_k_norm = None
@@ -253,6 +255,14 @@ class MLAttention(Module):
             select_hq_bits = select_hq_bits, qbits_key = qbits_key,
         ))
 
+        # Ling 3.x: a per-head sigmoid gate on the attention output, from the block input (kept
+        # unquantized: the reference checkpoint excludes it from fp8)
+        if key_head_gate is not None:
+            self.head_gate = _sub("head_gate", lambda: Linear(
+                config, f"{key}.{key_head_gate}", hidden_size, num_q_heads,
+                qmap = None, out_dtype = torch.float, pad_to = 1,
+            ))
+
         if indexer_mode == "full":
             assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
             self.idx_wq_b = _sub("idx_wq_b", lambda: Linear(
@@ -299,7 +309,7 @@ class MLAttention(Module):
             qc = qc,
         )
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._out(o, params)
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
@@ -444,6 +454,9 @@ class MLAttention(Module):
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
+        if self.head_gate is not None:
+            assert not self.tp_reduce, "Tensor parallelism does not split the MLA head gate yet"
+            params["mla_head_gate"] = torch.sigmoid(self.head_gate.forward(x, params).float())
         attn_mode = params.get("attn_mode", "flash_attn_nc")
         match attn_mode:
             case "flash_attn":
@@ -455,6 +468,14 @@ class MLAttention(Module):
         if self.tp_reduce:
             self.tp_collect(params["backend"], x)
         return to2(x, out_dtype, self.out_dtype)
+
+
+    def _out(self, o: torch.Tensor, params: dict) -> torch.Tensor:
+        gate = params.pop("mla_head_gate", None)
+        if gate is not None:
+            shape = o.shape
+            o = (o.view(*shape[:-1], self.num_q_heads, self.v_head_dim).float() * gate.unsqueeze(-1)).to(o.dtype).view(shape)
+        return self.o_proj.forward(o, params)
 
 
     def project_q(self, x: torch.Tensor, params: dict, return_resid: bool = False):
@@ -914,7 +935,7 @@ class MLAttention(Module):
             o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
             del o_lat
             o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-            return self.o_proj.forward(o, params)
+            return self._out(o, params)
 
         if use_mha:
             return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
@@ -958,7 +979,7 @@ class MLAttention(Module):
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         del o_lat
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._out(o, params)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,

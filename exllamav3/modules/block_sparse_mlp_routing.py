@@ -173,7 +173,9 @@ def routing_std_bias(bsz, cfg, y, params):
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    # fp32 logits as in the reference gate: with 512 experts the 8th/9th selection scores are
+    # often within 1e-5 of each other, below the resolution of half logits
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -193,7 +195,8 @@ def routing_ds3(bsz, cfg, y, params):
         .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
         .reshape(-1, cfg.num_experts)
     )
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    # -inf, not 0: the selection bias can push eligible scores below zero
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,
@@ -205,7 +208,8 @@ def routing_ds3(bsz, cfg, y, params):
     denominator = topk_weights.sum(dim = -1, keepdim = True) + 1e-20
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
-    return topk_indices, topk_weights
+    # half weights, as every other router returns (TP broadcast buffers and the decode kernels)
+    return topk_indices, topk_weights.half()
 
 
 def routing_dots(bsz, cfg, y, params):
