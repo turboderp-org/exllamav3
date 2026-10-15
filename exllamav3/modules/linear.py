@@ -154,9 +154,15 @@ class Linear(Module):
         ss = scale_inv.shape
         if len(ss) > 0:
             assert len(ws) == len(ss) == 2
-            assert all(w == s * 128 for w, s in zip(ws, ss))
-            weight = weight.view(ss[0], 128, ss[1], 128)
-            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            assert all(s == (w + 127) // 128 for w, s in zip(ws, ss)), \
+                f"fp8 scale grid {tuple(ss)} does not cover a {tuple(ws)} weight in 128x128 blocks"
+            if all(w == s * 128 for w, s in zip(ws, ss)):
+                weight = weight.view(ss[0], 128, ss[1], 128)
+                scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            else:
+                # A dimension that is not a multiple of 128 ends in a partial block (Ling's MTP
+                # head gate: 64 rows); expand the grid over whole blocks and crop
+                scale_inv = scale_inv.repeat_interleave(128, 0)[:ws[0]].repeat_interleave(128, 1)[:, :ws[1]]
         weight = weight.float() * scale_inv
         return weight.view(ws).half()
 
