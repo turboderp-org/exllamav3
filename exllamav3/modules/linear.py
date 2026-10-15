@@ -194,7 +194,12 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
-                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
+                weight = []
+                for k in key:
+                    # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
+                    w = self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True)
+                    scale_inv = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    weight.append(self.apply_fp8_scales_inv_(w, scale_inv) if scale_inv is not None else w)
                 bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
