@@ -78,7 +78,7 @@ parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-
 parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
-parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-hq", "--hq", type = int, nargs = "?", const = 1, default = 0, help = "Increase bitrate of select layers for supported models (MoE mostly): each promoted module's floor rises by its select_hq_bits above the base rate; -hq 2 doubles the promotion (-hq N: N times)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
@@ -270,7 +270,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("head_bits", False, recipe_head_bits or 6),
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
-        ("hq", False, False),
+        ("hq", False, 0),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
         ("embed_bits", False, 16),
@@ -297,6 +297,9 @@ def prepare(args) -> (dict, dict, bool, str):
             in_args[arg_] = int(v)
         elif not (half_ok and v in HALF_RATES):
             return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
+    in_args["hq"] = int(in_args["hq"] or 0)   # jobs saved by older versions hold a bool
+    if in_args["hq"] < 0:
+        return None, None, False, f"--hq must be a positive promotion multiplier, got {in_args['hq']}"
     if in_args["embed_bits"] != 16 and not 1 <= in_args["embed_bits"] <= 8:
         return None, None, False, f"--embed_bits must be an integer 1-8, or 16, got {in_args['embed_bits']}"
     if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
@@ -1240,7 +1243,7 @@ def main(args, job_state):
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
-    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
+    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (f" (--hq {hq} enabled)" if hq > 1 else " (--hq enabled)" if hq else ""))
 
     # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
     # into the output directory up front, so the calibration forward pass runs on the quantized

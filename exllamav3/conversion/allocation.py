@@ -56,7 +56,7 @@ def create_q_strategy(
     bpw: float,
     head_bpw: float,
     mtp_bpw: float,
-    hq: bool,
+    hq: int,
     vision_model: Model = None,
     vision_bpw: int = None,
     half_steps: bool = False,
@@ -69,12 +69,14 @@ def create_q_strategy(
     all eligible Linear layers into qgroups, assigns an initial bitrate from the requested average bpw (rounded down
     to a supported rate) and then spends the remaining bit budget one step at a time according to group priority.
     With half_steps (mul1 codebook) the steps below 4 bpw are half bits (1.5 / 2.5 / 3.5), except for modules that
-    opt out with q_half_bits = False (kernels without half-integer instances). The --hq floor is base + select_hq_bits
-    rounded down to a supported rate (2.5 + 2 -> 4). Auxiliary targets, such as output heads using head_bits, are
-    collected alongside the main budgeted weights and merged into the returned strategy.
+    opt out with q_half_bits = False (kernels without half-integer instances). The --hq floor is base + hq *
+    select_hq_bits rounded down to a supported rate (2.5 + 2 -> 4), hq being the promotion multiplier (1 for plain
+    --hq, 2 for --hq 2, 0 = no floor). Auxiliary targets, such as output heads using head_bits, are collected
+    alongside the main budgeted weights and merged into the returned strategy.
     """
     from ..modules.module import Module
     from ..modules.linear import Linear
+    hq_mult = max(int(hq), 1)
 
     sum_numel = 0
     sum_bits = 0
@@ -107,7 +109,7 @@ def create_q_strategy(
                 qt = QTarget(
                     numel = numel,
                     target_bpw = base_bpw,
-                    min_bpw = rate_floor(base_bpw + module.select_hq_bits, hs),
+                    min_bpw = rate_floor(base_bpw + hq_mult * module.select_hq_bits, hs),
                     priority = priority,
                     half_steps = hs
                 )
@@ -132,7 +134,7 @@ def create_q_strategy(
                     target_bpw = mtp_bpw,
                     # --hq promotes the same select layers (attention, shared experts) inside
                     # the MTP head as in the trunk; 16 = store unquantized, never promoted
-                    min_bpw = rate_floor(mtp_bpw + module.select_hq_bits, half_steps and getattr(module, "q_half_bits", True))
+                    min_bpw = rate_floor(mtp_bpw + hq_mult * module.select_hq_bits, half_steps and getattr(module, "q_half_bits", True))
                               if mtp_bpw <= 8 else mtp_bpw,
                     priority = priority
                 )
@@ -216,7 +218,7 @@ def create_q_strategy_from_recipe(
     mtp_bpw: float,
     vision_model: Model = None,
     vision_bpw: int = None,
-    hq: bool = False,
+    hq: int = 0,
     half_steps: bool = False,
 ) -> (dict, float):
     """
@@ -278,7 +280,7 @@ def create_q_strategy_from_recipe(
             elif module.qbits_key == "mtp_bits":
                 if hq and mtp_bpw <= 8:
                     hs = half_steps and getattr(module, "q_half_bits", True)
-                    targets[module.key] = max(mtp_bpw, rate_floor(mtp_bpw + module.select_hq_bits, hs))
+                    targets[module.key] = max(mtp_bpw, rate_floor(mtp_bpw + int(hq) * module.select_hq_bits, hs))
                 else:
                     targets[module.key] = mtp_bpw
             else:
