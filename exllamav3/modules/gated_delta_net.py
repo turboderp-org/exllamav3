@@ -710,8 +710,8 @@ class GatedDeltaNet(Module):
         # sensitivity signal
         self.f_proj = self.g_proj = None
         if self.kda_direct:
-            self.f_proj = Linear(config, f"{key}.{key_f}", hidden_size, self.k_dim, qmap = qmap, out_dtype = torch.float)
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, self.v_dim, qmap = qmap, out_dtype = torch.float)
+            self.f_proj = Linear(config, f"{key}.{key_f}", hidden_size, self.k_dim, qmap = qmap, out_dtype = torch.float, select_hq_bits = select_hq_bits)
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, self.v_dim, qmap = qmap, out_dtype = torch.float, select_hq_bits = select_hq_bits)
             self.register_submodule(self.f_proj)
             self.register_submodule(self.g_proj)
             self.f_a_proj = self.f_b_proj = self.g_a_proj = self.g_b_proj = None

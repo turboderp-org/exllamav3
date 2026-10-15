@@ -209,6 +209,7 @@ python examples/chat.py -h
 | **Hy3**                                          | `HYV3ForCausalLM` |  |  |
 | **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
 | **Kimi Linear**                                  | `KimiLinearForCausalLM` |  |  |
+| **Ling 3.x**                                     | `BailingMoeV3ForCausalLM` |  |  |
 | **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
 | **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |

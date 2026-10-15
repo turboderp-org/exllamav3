@@ -618,6 +618,9 @@ def build_bc_mla(module, layer):
         _proj_ok(m.o_proj, in_features = H * D_v, out_features = m.hidden_size) and
         m.kv_a_layernorm.weight is not None and
         m.w_uk_flat is not None and
+        # The graph runs attention straight into o_proj; a head-wise output gate (Ling 3.x)
+        # sits between them and is only applied by the dispatch path
+        m.head_gate is None and
         # DSA indexer layers (GLM-5.2): full layers need the quantized wq_b, the fp16 key/
         # weight heads, the biased key norm and the paged key plane on this cache layer
         (m.indexer_mode is None or (

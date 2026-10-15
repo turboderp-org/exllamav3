@@ -34,9 +34,10 @@ class BailingHybridConfig(Config):
         directory: str,
         **kwargs,
     ):
+        from .bailing_hybrid_mtp import BailingHybridMTPModel
         super().__init__(
             directory,
-            {"text": BailingHybridModel},
+            {"text": BailingHybridModel, "mtp": BailingHybridMTPModel},
             **kwargs
         )
 
@@ -96,6 +97,80 @@ class BailingHybridConfig(Config):
         self.act_limits = self.read_cfg(list, "expert_swiglu_limit_list", [0] * self.num_hidden_layers)
         self.shared_act_limits = self.read_cfg(list, "share_expert_swiglu_limit_list", [0] * self.num_hidden_layers)
 
+        # MTP head: one DeepSeek-V3-style layer stored past the trunk (model.layers.N), see
+        # bailing_hybrid_mtp.py. The clamp lists cover the trunk only
+        self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        if not self.num_mtp_layers:
+            self.model_classes.pop("mtp", None)
+
+
+def bailing_mla(config, key, layer_idx, qbits_key = "bits"):
+    """MLA with the head-wise sigmoid output gate (g_proj) and `dense` as the output projection"""
+    return MLAttention(
+        config = config,
+        key = key,
+        layer_idx = layer_idx,
+        hidden_size = config.hidden_size,
+        num_q_heads = config.num_q_heads,
+        kv_lora_rank = config.kv_lora_rank,
+        qk_nope_head_dim = config.qk_nope_head_dim,
+        qk_rope_head_dim = config.qk_rope_head_dim,
+        v_head_dim = config.v_head_dim,
+        rope_settings = config.rope_settings,
+        q_lora_rank = config.q_lora_rank,
+        sm_scale = config.sm_scale,
+        rms_norm_eps = config.rms_norm_eps,
+        key_o = "dense",
+        key_head_gate = "g_proj" if config.head_gate else None,
+        qmap = "block.attn",
+        out_dtype = torch.float,
+        select_hq_bits = 2,
+        qbits_key = qbits_key,
+    )
+
+
+def bailing_moe(config, key, act_limit, shared_act_limit, qbits_key = "bits"):
+    """Sigmoid MoE with group-limited routing (ds3) and one shared expert"""
+    return BlockSparseMLP(
+        config = config,
+        key = key,
+        hidden_size = config.hidden_size,
+        intermediate_size = config.moe_intermediate_size,
+        num_experts = config.num_experts,
+        num_experts_per_tok = config.num_experts_per_tok,
+        key_up = "experts.{expert_idx}.up_proj",
+        key_gate = "experts.{expert_idx}.gate_proj",
+        key_down = "experts.{expert_idx}.down_proj",
+        key_routing_gate = "gate",
+        key_e_score_bias = "gate.expert_bias",
+        activation_fn = "silu",
+        act_limit = float(act_limit or 0.0),
+        qmap = "block.mlp",
+        interm_dtype = torch.half,
+        out_dtype = torch.float,
+        router_type = "ds3",
+        routed_scaling_factor = config.routed_scaling_factor,
+        n_group = config.n_group,
+        topk_group = config.topk_group,
+        qbits_key = qbits_key,
+        shared_experts = GatedMLP(
+            config = config,
+            key = f"{key}.shared_experts",
+            hidden_size = config.hidden_size,
+            intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
+            key_up = "up_proj",
+            key_gate = "gate_proj",
+            key_down = "down_proj",
+            activation_fn = "silu",
+            act_limit = float(shared_act_limit or 0.0),
+            qmap = "block.mlp",
+            interm_dtype = torch.half,
+            out_dtype = torch.float,
+            select_hq_bits = 2,
+            qbits_key = qbits_key,
+        ) if config.num_shared_experts else None,
+    )
+
 
 class BailingHybridModel(Model):
     config_class = BailingHybridConfig
@@ -153,26 +228,7 @@ class BailingHybridModel(Model):
                     select_hq_bits = 2,
                 )
             else:
-                attn = MLAttention(
-                    config = config,
-                    key = f"{key}.attention",
-                    layer_idx = idx,
-                    hidden_size = config.hidden_size,
-                    num_q_heads = config.num_q_heads,
-                    kv_lora_rank = config.kv_lora_rank,
-                    qk_nope_head_dim = config.qk_nope_head_dim,
-                    qk_rope_head_dim = config.qk_rope_head_dim,
-                    v_head_dim = config.v_head_dim,
-                    rope_settings = config.rope_settings,
-                    q_lora_rank = config.q_lora_rank,
-                    sm_scale = config.sm_scale,
-                    rms_norm_eps = config.rms_norm_eps,
-                    key_o = "dense",
-                    key_head_gate = "g_proj" if config.head_gate else None,
-                    qmap = "block.attn",
-                    out_dtype = torch.float,
-                    select_hq_bits = 2,
-                )
+                attn = bailing_mla(config, f"{key}.attention", idx)
 
             if config.mlp_layer_types[idx] == "dense":
                 mlp = GatedMLP(
@@ -190,43 +246,7 @@ class BailingHybridModel(Model):
                     select_hq_bits = 1,
                 )
             else:
-                mlp = BlockSparseMLP(
-                    config = config,
-                    key = f"{key}.mlp",
-                    hidden_size = config.hidden_size,
-                    intermediate_size = config.moe_intermediate_size,
-                    num_experts = config.num_experts,
-                    num_experts_per_tok = config.num_experts_per_tok,
-                    key_up = "experts.{expert_idx}.up_proj",
-                    key_gate = "experts.{expert_idx}.gate_proj",
-                    key_down = "experts.{expert_idx}.down_proj",
-                    key_routing_gate = "gate",
-                    key_e_score_bias = "gate.expert_bias",
-                    activation_fn = "silu",
-                    act_limit = float(config.act_limits[idx] or 0.0),
-                    qmap = "block.mlp",
-                    interm_dtype = torch.half,
-                    out_dtype = torch.float,
-                    router_type = "ds3",
-                    routed_scaling_factor = config.routed_scaling_factor,
-                    n_group = config.n_group,
-                    topk_group = config.topk_group,
-                    shared_experts = GatedMLP(
-                        config = config,
-                        key = f"{key}.mlp.shared_experts",
-                        hidden_size = config.hidden_size,
-                        intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
-                        key_up = "up_proj",
-                        key_gate = "gate_proj",
-                        key_down = "down_proj",
-                        activation_fn = "silu",
-                        act_limit = float(config.shared_act_limits[idx] or 0.0),
-                        qmap = "block.mlp",
-                        interm_dtype = torch.half,
-                        out_dtype = torch.float,
-                        select_hq_bits = 2,
-                    ) if config.num_shared_experts else None,
-                )
+                mlp = bailing_moe(config, f"{key}.mlp", config.act_limits[idx], config.shared_act_limits[idx])
 
             self.modules += [
                 TransformerBlock(
