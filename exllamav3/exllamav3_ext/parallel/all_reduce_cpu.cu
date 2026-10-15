@@ -560,7 +560,7 @@ void pg_all_reduce_cpu
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     pg_check_timeout(ctx);
 
-    TORCH_CHECK(is_avx2_supported(), "AVX2 is required for tensor-parallel inference using native backend");
+    TORCH_CHECK(is_avx_supported(), "AVX is required for tensor-parallel inference using the native backend (use the nccl backend on this CPU)");
 
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);

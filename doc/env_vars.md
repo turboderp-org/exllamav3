@@ -965,6 +965,14 @@ Print a line (once per process) when the fp16 all-reduce wire first activates. A
 for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
 comparison is only meaningful if the fp16-wire run actually used it.
 
+### `EXL3_TP_REDUCE_MAX_ISA` (default: unset, auto-detect)
+
+`avx`, `avx2` or `avx512`: cap the CPU all-reduce of the native tensor-parallel backend at a
+lower instruction-set tier than the CPU supports, for exercising the lower tiers on a newer
+machine. The tiers compute the same sums (the AVX tier does its 16-bit moves on 128-bit lanes and
+its adds on 256-bit floats; the fp16 wire needs F16C on every tier). Plain AVX is the floor: a CPU
+without it must use the NCCL backend.
+
 ### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
 
 Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce

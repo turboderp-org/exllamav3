@@ -35,15 +35,16 @@ MB_BLOCKS = 4          # CPUREDUCE_MB_BLOCKS
 STAGE_STRIDE = 16      # REDUCE_STAGE_STRIDE (u32 words)
 MAX_REDUCE_JOBS = 2048
 
-# Byte offsets in PGContext (alignas(64) struct, parallel/context.cuh)
+# Byte offsets in PGContext (alignas(64) struct, parallel/context.cuh): sync_timeout, then the 64-byte
+# sync_timeout_name, then the 16-aligned per-device flag arrays and the 64-aligned cache-line fields
 OFF = dict(
-    sync_timeout = 0,
-    barrier_arrive = 16, barrier_release = 80, broadcast_stage_device = 144, reduce_stage_produced = 208,
-    reduce_stage_consumed = 272, gather_stage_produced = 336, gather_stage_consumed = 400,
-    broadcast_ll_epoch = 512, broadcast_ll_sequence_device = 576,
-    reduce_jobs_head = 640, reduce_jobs_tail = 704,
-    cpusum_stage_device = 768, cpusum_stage_device_mb = 1792, cpusum_stage_recv = 5888,
-    cpusum_stage_recv_mb = 6912, cpusum_stage_cpu = 11008, reduce_jobs = 11072,
+    sync_timeout = 0, sync_timeout_name = 4,
+    barrier_arrive = 80, barrier_release = 144, broadcast_stage_device = 208, reduce_stage_produced = 272,
+    reduce_stage_consumed = 336, gather_stage_produced = 400, gather_stage_consumed = 464,
+    broadcast_ll_epoch = 576, broadcast_ll_sequence_device = 640,
+    reduce_jobs_head = 704, reduce_jobs_tail = 768,
+    cpusum_stage_device = 832, cpusum_stage_device_mb = 1856, cpusum_stage_recv = 5952,
+    cpusum_stage_recv_mb = 6976, cpusum_stage_cpu = 11072, reduce_jobs = 11136,
 )
 SIZEOF_CONTEXT = OFF["reduce_jobs"] + 16 * MAX_REDUCE_JOBS
 
