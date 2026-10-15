@@ -84,7 +84,7 @@ def save_expert_stats(infer_params):
     counts themselves are decayed, so the threshold is in decode steps, not hits"""
     import json, tempfile
     reg = getattr(infer_params, "moe_cpu_swap_modules", None)
-    if not reg or reg[0]._swap_tick_count < _STATS_MIN_STEPS:
+    if not reg or reg[0]._split_step_count < _STATS_MIN_STEPS:
         return
     config, E = reg[0].config, reg[0].num_experts
     layers = _expert_stats_load(config, E)
@@ -317,11 +317,11 @@ def _split_promote_step(ip, modules, rows):
         st = ps.stats
         st["steps"] += 1
         st["ms"] += time.perf_counter() - t0
-        if modules[0]._swap_tick_count % 128 == 0:
+        if modules[0]._split_step_count % 128 == 0:
             p = sum(m._split_promo_n for m in ps.modules)
             d = sum(m._split_demo_n for m in ps.modules)
             pend = sum(len(m._split_pending) for m in ps.modules)
-            print(f" -- promote-on-miss: step {modules[0]._swap_tick_count}, {p} promotions, {d} demotions, {pend} in flight; "
+            print(f" -- promote-on-miss: step {modules[0]._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
                   f"last {st['steps']} steps: {st['routed'] / st['steps']:.1f} routed/step, "
                   f"{st['missed'] / st['steps']:.1f} on the CPU ({100 * (1 - st['missed'] / max(st['routed'], 1)):.1f}% hit), "
                   f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step", flush = True)
@@ -491,7 +491,8 @@ class BlockSparseMLP_CPU:
             self._split_map = torch.tensor(mp, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
             self._split_selcpu_t = None
-            self._swap_tick_count = 0
+            self._swap_tick_count = 0      # steps since the last placement sweep (the sweep zeroes it)
+            self._split_step_count = 0     # steps since load: the profile save gates on this one
             if spares:
                 self._split_mp = mp
                 self._split_free_gpu = list(range(first - spares, first))
@@ -505,6 +506,20 @@ class BlockSparseMLP_CPU:
             if reg is None:
                 reg = []
                 ip2.moe_cpu_swap_modules = reg
+                # A server killed with Ctrl-C never reaches unload: save what the session
+                # learned at interpreter exit as well (a no-op after a normal unload, which
+                # empties the registry; best effort, the CUDA tensors may already be gone)
+                import atexit, weakref
+                ref = weakref.ref(ip2)
+                def _save_at_exit():
+                    ip = ref()
+                    if ip is None:
+                        return
+                    try:
+                        save_expert_stats(ip)
+                    except Exception:
+                        pass
+                atexit.register(_save_at_exit)
             reg.append(self)
 
     def cpu_unload(self):
@@ -951,7 +966,8 @@ class BlockSparseMLP_CPU:
         if reg[0] is not self:
             return
         self._swap_tick_count += 1
-        if self._swap_tick_count % _STATS_SAVE_INTERVAL == 0:
+        self._split_step_count += 1
+        if self._split_step_count % _STATS_SAVE_INTERVAL == 0:
             save_expert_stats(ip)
         if self._split_spares:
             # Promote-on-miss replaces the sweep: one pass over every split module per step
