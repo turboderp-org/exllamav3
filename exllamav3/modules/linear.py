@@ -621,12 +621,26 @@ class Linear(Module):
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
             # Drop the affected rows; the inf_nan counter above still reports them
             finite = torch.isfinite(x).all(dim = 1)
+            row_w = params.get("capture_row_w")
             if not finite.all():
                 x = x[finite]
                 rows = x.shape[0]
+                if row_w is not None:
+                    row_w = row_w[finite]
 
             params["capture"][self.qmap]["H"].addmm_(x.T, x)
             params["capture"][self.qmap]["count"] += rows
+
+            # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
+            # conversion/moe_affinity.py), combined with it before quantization
+            if row_w is not None:
+                hd = params["capture"][self.qmap]
+                if "H_aff" not in hd:
+                    hd["H_aff"] = torch.zeros_like(hd["H"])
+                    hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
+                row_w = row_w.to(torch.float)
+                hd["H_aff"].addmm_(x.T, x * row_w.unsqueeze(1))
+                hd["aff_sum"] += row_w.sum()
 
 
     @override

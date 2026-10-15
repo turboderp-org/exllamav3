@@ -1064,6 +1064,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
+        # Calibration with affinity-weighted expert Hessians (convert.py --moe_affinity_eps): with every expert
+        # active, routing_weights is the full router softmax. Keep its per-expert sum over all rows and a fixed
+        # random sample of (expert input, affinities) rows; the per-expert gate/up Hessians are built from the
+        # sample just before quantization (see conversion/moe_affinity.py)
+        aff = params.get("moe_affinity")
+        if aff is not None and params.get("activate_all_experts") and self.routing_gate is not None:
+            st = aff["layers"].setdefault(self.key, {"x": [], "p": [], "psum": 0.0, "rows": 0})
+            st["psum"] = st["psum"] + routing_weights.float().sum(0)
+            st["rows"] += bsz
+            keep = (torch.rand(bsz, generator = aff["generator"]) < aff["frac"]).to(y.device)
+            if keep.any():
+                st["x"].append(y[keep].half().cpu())
+                st["p"].append(routing_weights[keep].half().cpu())
+
         # Calibration: the experts' output sensitivity is weighted by the routing the model would
         # actually do, which is not the selection in use when every expert is activated
         sens_weights = None
@@ -1368,6 +1382,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 a = self.gateless_act(u)
                                 if a.dtype != torch.half:
                                     a = a.half()
+                            if aff is not None and params.get("activate_all_experts"):
+                                # Down Hessian also accumulated weighted by this expert's affinity per row
+                                params["capture_row_w"] = w.view(-1)
+                                try:
+                                    return self.downs[exp_i].forward(a, params)
+                                finally:
+                                    params.pop("capture_row_w", None)
                             return self.downs[exp_i].forward(a, params)
 
                         current_state = mlp(expert_idx, current_state)
