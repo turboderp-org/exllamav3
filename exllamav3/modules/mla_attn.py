@@ -834,7 +834,6 @@ class MLAttention(Module):
             # inherit it; a per-token scalar commutes with the rotation
             q *= self._l4_scale(bsz, seqlen, position, positions, position_ids, x.device)
         _dbg_sync("project_q", x.device)
-        q_nope = q[:, :, :self.qk_nope_head_dim]
         q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
 
         # Latent K/V. The normalized latent is what gets cached, matching the reference order
@@ -900,9 +899,12 @@ class MLAttention(Module):
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
                 indices = to_device(indices, x.device)
-            # q and q_pe_hm are dead here (the sparse kernel reads q_lat and token-major q_pe);
-            # the queries themselves die once the kernel returns, before the (R, H, v) unfold
-            # allocates.
+            # NoPE's zero-width slice is still a view of the entire projected query.
+            # Give the unused rope argument its own empty storage before dropping q.
+            if self.qk_rope_head_dim == 0:
+                q_pe = torch.empty_like(q_pe)
+            # The sparse kernel reads q_lat and token-major q_pe; the unused query
+            # projection can now return to the allocator before attention output/staging.
             del q, q_pe_hm
             o_lat = self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,

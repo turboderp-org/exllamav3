@@ -1,5 +1,6 @@
 from __future__ import annotations
 import multiprocessing
+import torch
 from multiprocessing import Process, Pipe
 from multiprocessing.reduction import ForkingPickler
 from ..util import find_free_port
@@ -407,6 +408,56 @@ class Model_TPMixin:
         return argmax
 
 
+    def tp_dispatch_lm_head_topk(self, args, top_k: int, scale: float = 1.0, softcap: float = 0.0):
+        """
+        Per-row top-k over a tensor-parallel sharded LM head, for drafters that need more than the argmax
+        (DFlash2's selector walks the top-k candidates). Each shard takes its local top-k, scaled and
+        softcapped as the selector would, the k candidates per shard are gathered to the output device
+        (k values and k ids per shard, the same small gather as the argmax partials) and merged there to the
+        global top-k. Returns (scores, ids) of shape (..., top_k), unsorted, on the output device.
+
+        Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating,
+        runs after the spawned workers have been sent their command.
+        """
+        head_key = self.modules[self.logit_layer_idx].key
+        ad = {}
+        for device in self.active_devices:
+            a, b, _ = self.plan[device][head_key]
+            if b > a:
+                ad[device] = a
+        vocab = self.config.vocab_size
+
+        if len(ad) == 1 and self.tp_output_device in ad:
+            return self.tp_worker_dispatch_single(
+                self.tp_output_device,
+                mp_model_forward_lm_head_topk,
+                args + (ad[self.tp_output_device], None, None, vocab, top_k, scale, softcap)
+            )
+
+        gd = sorted(set(ad.keys()) | {self.tp_output_device})
+        ldims = [top_k if d in ad else 0 for d in gd]
+
+        dispatched = []
+        for device in self.active_devices:
+            if device in gd:
+                self.tp_worker_dispatch(
+                    device,
+                    mp_model_forward_lm_head_topk,
+                    args + (ad.get(device, -1), gd, ldims, vocab, top_k, scale, softcap)
+                )
+                dispatched.append(device)
+
+        out = None
+        for device in dispatched:
+            r = self.tp_worker_result(device)
+            if device == self.tp_output_device:
+                out = r
+        assert out is not None, "TP logic error"
+        all_v, all_i = out
+        v, idx = torch.topk(all_v, top_k, dim = -1, sorted = False)
+        return v, all_i.gather(-1, idx)
+
+
     # def tp_dispatch_lm_head_argmax_old(self, args):
     #     ad = []
     #     for device in self.active_devices:
@@ -464,6 +515,18 @@ class Model_TPMixin:
         # main process before child workers have received their commands.
         active_devices.remove(self.tp_output_device)
         active_devices.append(self.tp_output_device)
+
+        # Fix a TP crash on gfx1100: a loading thread's first CUDA call, made mid-load,
+        # can hang the ROCm runtime (no PCIe atomics). Warm the thread's per-device state up front,
+        # leaving the current device as it was
+        torch.cuda.init()
+        current = torch.cuda.current_device()
+        for d in active_devices:
+            torch.cuda.set_device(d)
+            w = torch.zeros(1, device = torch.device("cuda", d))
+            torch.cuda.synchronize(d)
+            del w
+        torch.cuda.set_device(current)
 
         # Create TP context
         self.active_devices = active_devices

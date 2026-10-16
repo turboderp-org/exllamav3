@@ -105,6 +105,7 @@ def harness(monkeypatch):
         h._stream_fused_t = lambda spec, aux, h: 0
         h._stream_recon_layer = lambda st, layer_idx, spec, aux, device: None
         h.pinned, h.next_wslot, h.wseq, h.gpu_base_ptr = True, 0, 0, 0
+        h.arena_registered = None
         h.layer_blocks = [[(0, 0)] for _ in specs]
         h.arena_views = [torch.ones(2048, dtype = torch.int16)]
         h.wviews = [torch.ones(2048, dtype = torch.int16)] * 2

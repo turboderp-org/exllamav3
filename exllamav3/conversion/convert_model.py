@@ -74,7 +74,7 @@ parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Work
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
-parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
+parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py, or hand-written), used in place of the budgeted allocation from --bits / --head_bits. Tensor keys may be wildcard patterns, resolved top to bottom (later entries override).")
 parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
@@ -204,8 +204,11 @@ def prepare(args) -> (dict, dict, bool, str):
         if not os.path.isfile(args.recipe):
             return None, None, False, f"Recipe file not found: {args.recipe}"
         import yaml
-        with open(args.recipe, "r", encoding = "utf8") as f:
-            recipe = yaml.safe_load(f)
+        try:
+            with open(args.recipe, "r", encoding = "utf8") as f:
+                recipe = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            return None, None, False, f"Recipe is not valid YAML (keys starting with '*' must be quoted):\n{e}"
         recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
         if not isinstance(recipe_tensors, dict) or not recipe_tensors:
             return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
@@ -223,7 +226,7 @@ def prepare(args) -> (dict, dict, bool, str):
         if args.bits is not None:
             print(" !! Warning: --recipe given, --bits is used for reporting only")
         if args.hq:
-            print(" !! Warning: --hq has no effect with --recipe")
+            print(" !! Warning: with --recipe, --hq only applies to MTP layers")
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -1217,6 +1220,28 @@ def main(args, job_state):
         if ext_hin:
             use_reference_state = False
 
+    # Get quantization strategy for model @bitrate. Decided before any calibration work so a recipe that
+    # doesn't cover the model fails up front
+    print(" -- Deciding quantization strategy")
+    hq = args["hq"]
+    if args.get("recipe_strategy"):
+        print(f"    Applying recipe: {args.get('recipe')}")
+        strategy, final_bpw = create_q_strategy_from_recipe(
+            model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            hq = hq, half_steps = args["codebook"] == "mul1",
+        )
+    else:
+        strategy, final_bpw = create_q_strategy(
+            model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
+        )
+    args["final_bits"] = round(final_bpw, 2)
+    print(" -- Quantization strategy, summary:")
+    print(print_strategy(strategy))
+    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
+
     # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
     # into the output directory up front, so the calibration forward pass runs on the quantized
     # table; resumable and skipped when already complete
@@ -1258,26 +1283,6 @@ def main(args, job_state):
 
     def put_preserve(si, params_):
         quant_preserves[si] = params_["quant_preserve"]
-
-    # Get quantization strategy for model @bitrate
-    print(" -- Deciding quantization strategy")
-    hq = args["hq"]
-    if args.get("recipe_strategy"):
-        print(f"    Applying recipe: {args.get('recipe')}")
-        strategy, final_bpw = create_q_strategy_from_recipe(
-            model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
-            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-        )
-    else:
-        strategy, final_bpw = create_q_strategy(
-            model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
-            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
-        )
-    args["final_bits"] = round(final_bpw, 2)
-    print(" -- Quantization strategy, summary:")
-    print(print_strategy(strategy))
-    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy

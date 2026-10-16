@@ -17,6 +17,7 @@ _stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 from ..util.misc import install_parent_death_signal
 from ..util.pinned_arena import PinnedArena
+from ..constants import PAGE_SIZE
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -364,6 +365,70 @@ def mp_model_forward_lm_head_argmax(
     return (out_v, out_i) if device == output_device else None
 
 
+def mp_model_forward_lm_head_topk(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+    offset: int,
+    gather_devices: list[int] | None,
+    ldims: list[int] | None,
+    vocab_size: int,
+    top_k: int,
+    scale: float,
+    softcap: float,
+):
+    """
+    Per-row top-k of the logits through this rank's shard of the LM head, as (scores, vocabulary ids)
+    k wide, gathered to the output device where the shards' candidates are merged (DFlash2's selector
+    needs the top-k, not the logits). Same shard walk and padding crop as mp_model_forward_lm_head_argmax;
+    the selector's scaling and softcap are applied here so the scores compare across shards. A shard
+    narrower than k pads with -inf.
+    """
+    consumer = local_context["inf_consumer"]
+    device = local_context["device"]
+    output_device = local_context["output_device"]
+    backend = local_context["backend"]
+
+    x = consumer.recv(shared_input)
+
+    if offset >= 0:
+        module = local_context["logits_module"]
+        x = module.prepare_for_device(x, params)
+        x = module.forward(x, params)
+        if offset + x.shape[-1] > vocab_size:
+            x = x[..., :max(0, vocab_size - offset)]
+        x = x.float() * scale
+        if softcap > 0.0:
+            x = torch.tanh(x / softcap) * softcap
+        k = min(top_k, x.shape[-1])
+        if k > 0:
+            v, i = torch.topk(x, k, dim = -1, sorted = False)
+            i = i + offset
+        else:
+            v = torch.empty(*x.shape[:-1], 0, dtype = torch.float, device = x.device)
+            i = torch.empty(*x.shape[:-1], 0, dtype = torch.long, device = x.device)
+        if k < top_k:
+            pad = top_k - k
+            v = torch.cat([v, torch.full((*v.shape[:-1], pad), -float("inf"), dtype = v.dtype, device = v.device)], dim = -1)
+            i = torch.cat([i, torch.zeros((*i.shape[:-1], pad), dtype = i.dtype, device = i.device)], dim = -1)
+    else:
+        v = torch.empty(*x.shape[:-1], 0, dtype = torch.float, device = torch.device("cuda", device))
+        i = torch.empty(*x.shape[:-1], 0, dtype = torch.long, device = v.device)
+
+    if gather_devices is None:
+        return v, i
+
+    if device == output_device:
+        out_v = torch.empty(*v.shape[:-1], sum(ldims), dtype = v.dtype, device = v.device)
+        out_i = torch.empty(*i.shape[:-1], sum(ldims), dtype = i.dtype, device = i.device)
+    else:
+        out_v = out_i = None
+
+    backend.gather_small(v.contiguous(), out_v, gather_devices, output_device, ldims)
+    backend.gather_small(i.contiguous(), out_i, gather_devices, output_device, ldims)
+    return (out_v, out_i) if device == output_device else None
+
+
 # def mp_model_forward_lm_head_argmax_old(
 #     local_context: dict,
 #     shared_input: dict,
@@ -446,6 +511,22 @@ class RankSlotPool:
         self.max_slots = max_slots
         self.slots = {}
         self.arena = PinnedArena(max_slots * self.slab_size, "CPU page cache (TP rank)")
+        # With a disk tier: slot -> events after the last stream copies into or out of its slab, which the
+        # rank's disk worker waits for before it reads or overwrites the slab from a host thread
+        self.record_events = False
+        self.events = {}
+
+
+    def slab(self, slot: int):
+        base = slot * self.slab_size
+        return self.arena.tensor[base : base + self.slab_size]
+
+
+    def note_copies(self, slot: int):
+        if self.record_events:
+            ev = torch.cuda.Event()
+            ev.record()
+            self.events[slot] = [ev]
 
 
     def close(self):
@@ -501,15 +582,280 @@ def mp_cpu_cache_store(local_context: dict, cache_ids: list[int], slot: int, pag
     buffers = pool.get(slot)
     for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
         buffer.copy_(tensor[page_index], non_blocking = True)
+    pool.note_copies(slot)
 
 
 def mp_cpu_cache_fetch(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
     """
     Copy a stored page back into this rank's shard of a page slot (host-to-device, async on the current stream)
     """
-    buffers = local_context["cpu_page_cache"].slots[slot]
+    pool = local_context["cpu_page_cache"]
+    buffers = pool.get(slot)        # a slot promoted from disk has not been stored into on this rank yet
     for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
         tensor[page_index].copy_(buffer, non_blocking = True)
+    pool.note_copies(slot)
+
+
+# -- Disk tier (generator/disk_cache.py), rank side --------------------------------------------------------------
+#
+# A page on disk is one image in the canonical layout: every cache tensor's page slice with all kv heads in model
+# order, the layout the non-TP tier writes. A rank holds a kv head range of each attention layer's cache, and in
+# every cache format a head range is a contiguous sub-range of each token row (fp16 rows are heads x head_dim,
+# the packed quantized rows and their scales are in head order), so a rank's shard maps onto the image as
+# PAGE_SIZE fixed-stride chunks per tensor. Each rank reads and writes its own chunks straight from/into the file
+# (memmap, the page cache assembles the image), so the split chosen at one load has no bearing on the file and a
+# later load with another split, or no TP at all, restores the same page. Completion is signalled to the main
+# process's writer thread through marker files, since only the main thread may use the dispatch pipes.
+
+def mp_disk_layout(local_context: dict, cache_ids: list[int]) -> list[dict]:
+    """
+    This rank's shard geometry, one entry per slab segment (same order as RankSlotPool.segments): the cache,
+    layer key and tensor index that identify the tensor across ranks, the local row and its offset and the
+    canonical row width in bytes. Rows are tokens where the tensor is page-major by token, else the whole page.
+    """
+    pool = local_context["cpu_page_cache"]
+    out = []
+    i = 0
+    for cache_id in cache_ids:
+        for module in local_context["kv_modules"]:
+            layer = module.tp_cache_lookup[cache_id]
+            heads = module.num_kv_heads
+            first = getattr(module, "tp_kv_first", 0)
+            total = getattr(module, "tp_kv_total", heads)
+            for idx, t in enumerate([t for t in layer.get_tensors() if t is not None]):
+                nbytes = t[0].numel() * t.element_size()
+                rows = PAGE_SIZE if t.dim() >= 2 and t.shape[1] == PAGE_SIZE else 1
+                lrb = nbytes // rows
+                if total != heads:
+                    assert heads and lrb % heads == 0, \
+                        f"cache rows of {module.key} do not split by kv head ({lrb} bytes, {heads} heads)"
+                    unit = lrb // heads
+                    row_offset, crb = first * unit, total * unit
+                else:
+                    row_offset, crb = 0, lrb
+                out.append({
+                    "cache_id": cache_id, "key": module.key, "idx": idx,
+                    "slab_offset": pool.segments[i][0], "nbytes": nbytes, "rows": rows,
+                    "local_row_bytes": lrb, "row_offset": row_offset, "canonical_row_bytes": crb,
+                    "dtype": str(t.dtype),
+                })
+                i += 1
+    return out
+
+
+class DiskRankWorker:
+    """One thread per rank moving this rank's shard of page images between its slabs and the page files"""
+
+    def __init__(self, pool: RankSlotPool, layout: list[dict], image_size: int, device: int, local_context: dict):
+        import threading
+        from collections import deque
+        self.pool = pool
+        self.layout = layout
+        self.image_size = image_size
+        self.device = device
+        self.local_context = local_context
+        self.queue = deque()
+        self.cv = threading.Condition()
+        self.thread = threading.Thread(target = self._run, name = f"disk_cache_rank{device}", daemon = True)
+        self.thread.start()
+
+    def submit(self, kind: str, what, path: str, data_offset: int, plan = None):
+        with self.cv:
+            self.queue.append((kind, what, path, data_offset, plan))
+            self.cv.notify()
+
+    def _run(self):
+        while True:
+            with self.cv:
+                while not self.queue:
+                    self.cv.wait()
+                kind, what, path, data_offset, plan = self.queue.popleft()
+            marker = f"{path}.d{self.device}"
+            try:
+                if kind in ("write", "read"):
+                    self._page_io(kind, what, path, data_offset)
+                else:
+                    self._state_io(kind, what, path, data_offset, plan)
+            except Exception as e:
+                marker += ".err"
+                print(f" !! Disk cache tier (rank {self.device}): {kind} failed: {e}")
+            open(marker, "w").close()
+
+    def _page_io(self, kind, slot, path, data_offset):
+        import numpy as np
+        for ev in self.pool.events.pop(slot, []):
+            ev.synchronize()
+        slab = self.pool.slab(slot).numpy()
+        mm = np.memmap(path, dtype = np.uint8, mode = "r+" if kind == "write" else "r",
+                       offset = data_offset, shape = (self.image_size,))
+        for seg in self.layout:
+            rows, lrb, crb = seg["rows"], seg["local_row_bytes"], seg["canonical_row_bytes"]
+            image = mm[seg["image_offset"] : seg["image_offset"] + rows * crb].reshape(rows, crb)
+            image = image[:, seg["row_offset"] : seg["row_offset"] + lrb]
+            local = slab[seg["slab_offset"] : seg["slab_offset"] + rows * lrb].reshape(rows, lrb)
+            if kind == "write":
+                image[...] = local
+            else:
+                local[...] = image
+        if kind == "write":
+            mm.flush()
+        del mm
+
+    def _state_io(self, kind, what, path, data_offset, plan):
+        """Move this rank's pieces of every stashed tensor between the stash (pooled host tensors) and the
+        canonical checkpoint image; a read allocates the stash first and files it under the handle"""
+        import numpy as np
+        from ..cache.recurrent import host_pool
+        cache_id, cp_handle = what
+        lc = self.local_context
+        write = kind == "state_write"
+        image_size = max(e["offset"] + e["nbytes"] for layer in plan.values() for e in layer["tensors"])
+        mm = np.memmap(path, dtype = np.uint8, mode = "r+" if write else "r", offset = data_offset, shape = (image_size,))
+        stashed_in = lc["recurrent_cache"][cp_handle] if write else None
+        stashed_out = []
+        for i, module in enumerate(lc["recurrent_modules"]):
+            layer = module.tp_recurrent_lookup[cache_id]
+            entry = plan[module.key]
+            if write:
+                tensors = []
+                pack_stash(stashed_in[i], tensors)
+            else:
+                tensors = []
+            specs = _layer_pieces(layer, len(entry["tensors"]))
+            for j, (info, spec) in enumerate(zip(entry["tensors"], specs)):
+                dtype = getattr(torch, info["dtype"])
+                itemsize = torch.empty((), dtype = dtype).element_size()
+                shape = list(info["shape"])
+                region = mm[info["offset"] : info["offset"] + info["nbytes"]].view(_raw_np(itemsize)).reshape(shape)
+                if write:
+                    t = tensors[j]
+                else:
+                    local_shape = list(shape)
+                    if spec is not None:
+                        local_shape[spec["dim"]] = sum(le - ls for ls, le, _ in spec["pieces"])
+                    t = host_pool.take(local_shape, dtype)
+                    tensors.append(t)
+                raw = t.contiguous().view(_RAW_TORCH[itemsize]).numpy()
+                if spec is None:
+                    if write:
+                        region[...] = raw
+                    else:
+                        raw[...] = region
+                    continue
+                d = spec["dim"]
+                for ls, le, cs in spec["pieces"]:
+                    li = [slice(None)] * raw.ndim
+                    ci = [slice(None)] * raw.ndim
+                    li[d] = slice(ls, le)
+                    ci[d] = slice(cs, cs + (le - ls))
+                    if write:
+                        region[tuple(ci)] = raw[tuple(li)]
+                    else:
+                        raw[tuple(li)] = region[tuple(ci)]
+            if not write:
+                stashed_out.append(unpack_stash(entry["struct"], tensors))
+        if write:
+            mm.flush()
+        else:
+            lc["recurrent_cache"][cp_handle] = stashed_out
+        del mm
+
+
+def mp_disk_set_layout(local_context: dict, image_size: int, layout: list[dict]):
+    """Attach the disk worker to this rank's slot pool with the canonical offsets the main process assigned"""
+    pool = local_context["cpu_page_cache"]
+    pool.record_events = True
+    local_context["disk_worker"] = DiskRankWorker(pool, layout, image_size, local_context["device"], local_context)
+
+
+# Checkpoints: a stash on a rank is a list, one entry per recurrent module, of tensors in whatever containers
+# the layer's stash() returns. The disk tier stores a checkpoint in a canonical layout as well: each stashed
+# tensor at full width, with the rank's part described by the layer state's tp_stash_pieces() (a split
+# dimension and (local start, local end, canonical start) pieces; None for a tensor every rank holds whole).
+
+def pack_stash(obj, tensors: list) -> object:
+    """JSON-able description of a stash with its tensors replaced by indices into `tensors`; container types
+    and dict key types (layer keys are ints, strings or tuples of them) are preserved"""
+    if isinstance(obj, torch.Tensor):
+        tensors.append(obj)
+        return {"__t__": len(tensors) - 1, "shape": list(obj.shape), "dtype": str(obj.dtype).removeprefix("torch.")}
+    if isinstance(obj, tuple):
+        return {"__tuple__": [pack_stash(o, tensors) for o in obj]}
+    if isinstance(obj, list):
+        return [pack_stash(o, tensors) for o in obj]
+    if isinstance(obj, dict):
+        return {"__dict__": [[pack_stash(k, tensors), pack_stash(v, tensors)] for k, v in obj.items()]}
+    return obj
+
+
+def unpack_stash(obj, tensors: list) -> object:
+    if isinstance(obj, dict):
+        if "__t__" in obj:
+            return tensors[obj["__t__"]]
+        if "__tuple__" in obj:
+            return tuple(unpack_stash(o, tensors) for o in obj["__tuple__"])
+        if "__dict__" in obj:
+            return {unpack_stash(k, tensors): unpack_stash(v, tensors) for k, v in obj["__dict__"]}
+        return {k: unpack_stash(v, tensors) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [unpack_stash(o, tensors) for o in obj]
+    return obj
+
+
+_RAW_TORCH = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+def _raw_np(itemsize: int):
+    import numpy as np
+    return {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}[itemsize]
+
+
+def _layer_pieces(layer, n: int):
+    specs = layer.tp_stash_pieces() if hasattr(layer, "tp_stash_pieces") else None
+    if specs is None:
+        specs = [None] * n
+    assert len(specs) == n, f"tp_stash_pieces of {type(layer).__name__} describes {len(specs)} tensors, stash has {n}"
+    return specs
+
+
+def mp_disk_state_describe(local_context: dict, cache_id: int, cp_handle: int) -> list[dict]:
+    """This rank's part of a stashed checkpoint: per recurrent module its key, the stash's container
+    structure and, per tensor, the local shape, dtype and split specification"""
+    stashed = local_context["recurrent_cache"][cp_handle]
+    out = []
+    for module, s in zip(local_context["recurrent_modules"], stashed):
+        layer = module.tp_recurrent_lookup[cache_id]
+        tensors = []
+        struct = pack_stash(s, tensors)
+        specs = _layer_pieces(layer, len(tensors))
+        out.append({
+            "key": module.key,
+            "struct": struct,
+            "tensors": [
+                {"shape": list(t.shape), "dtype": str(t.dtype).removeprefix("torch."), "split": spec}
+                for t, spec in zip(tensors, specs)
+            ],
+        })
+    return out
+
+
+def mp_disk_state_write(local_context: dict, cache_id: int, cp_handle: int, path: str, data_offset: int, plan: dict):
+    """Queue this rank's pieces of checkpoint cp_handle for writing into the canonical image at data_offset;
+    plan maps module key -> list of {offset, shape} per stashed tensor (image-relative offsets)"""
+    local_context["disk_worker"].submit("state_write", (cache_id, cp_handle), path, data_offset, plan)
+
+
+def mp_disk_state_read(local_context: dict, cache_id: int, cp_handle: int, path: str, data_offset: int, plan: dict):
+    """Queue reading this rank's pieces of a checkpoint image into pooled host buffers, stored in the rank's
+    recurrent cache under cp_handle; plan additionally carries each module's stash structure"""
+    local_context["disk_worker"].submit("state_read", (cache_id, cp_handle), path, data_offset, plan)
+
+
+def mp_disk_write(local_context: dict, slot: int, path: str, data_offset: int):
+    local_context["disk_worker"].submit("write", slot, path, data_offset)
+
+
+def mp_disk_read(local_context: dict, slot: int, path: str, data_offset: int):
+    local_context["disk_worker"].submit("read", slot, path, data_offset)
 
 
 class PseudoParentConn:

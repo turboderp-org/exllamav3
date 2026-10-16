@@ -30,6 +30,9 @@ HYBRID = 24
 
 DRAFT_CASES = {
     "mtp": ("mtp", lambda dirs: ["-mtp"], REFERENCE_TEXT),
+    # Verification passes on a quantized cache take the Triton QC decode path (1 < q_len <= 16), which no
+    # other case reaches: plain decode goes through the BC graph and prefill through the other kernel
+    "mtp-qc": ("mtp", lambda dirs: ["-mtp", "-cq", "8,6"], REFERENCE_TEXT),
     "dflash": ("dense-8b", lambda dirs: ["-dm", dirs["dflash-8b"]], REFERENCE_TEXT),
     "ngram": ("dense", lambda dirs: ["-ngram", "2"], _REPEAT_TEXT),
     "ngram-recurrent": ("recurrent", lambda dirs: ["-ngram", "2"], _REPEAT_TEXT),

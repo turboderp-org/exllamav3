@@ -76,13 +76,15 @@ def build_exl3_nope(directory, device, H = 16, hidden = 1024, kv_lora = 512, nop
     return module
 
 
-def test_mla_nope_decode_matches_prefill(tmp_path, device):
+@pytest.mark.parametrize("nope", [128, 256])
+def test_mla_nope_decode_matches_prefill(tmp_path, device, nope):
     """Kimi Linear: pe dims present but never rotated. The decode graph used to require a rope instance whenever
     qk_rope_head_dim > 0 (and its C++ ran the rope stage unconditionally, which raises on a rope-less module), so
     this configuration silently fell back to the dispatch path. Now the graph must run, agree with the dispatch
-    decode path at fp16 noise, and both must agree with the prefill path."""
+    decode path at fp16 noise, and both must agree with the prefill path. NoPE 256 is the GLM-5.3 head width,
+    whose AOT absorb kernel miscompiled on gfx1100 without the JIT's pointer specialization."""
     import exllamav3.modules.attention_fn.bc_mla as bcm
-    module = build_exl3_nope(tmp_path, device, seed = 13)
+    module = build_exl3_nope(tmp_path, device, nope = nope, seed = 13)
     bsz, S = 2, 300
     # Random trellis weights decode to O(1) entries, so a small input keeps the scores O(1)
     x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.03).half()

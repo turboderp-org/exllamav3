@@ -650,6 +650,10 @@ void BC_MLAttention::run_gr
             // static's tail can hold scores from an earlier, longer sequence; an eager call
             // scans only [0, t_scan) (graphs patch the scan width per replay)
             const at::Tensor scores_scan = (graph || multirow) ? s.scores : s.scores.narrow(1, 0, t_scan);
+            // The eager pass is what allocates the split top-k's workspace, and it scans the live prefix
+            // only: make sure the workspace the captured full-width scan will need exists before any capture
+            if (!graph)
+                dsa_topk_prepare(s.scores, (int) (index_kpool ? s.pool_idx.size(1) : s.indices.size(1)));
             if (multirow)
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, q_len);
             else if (index_kpool)

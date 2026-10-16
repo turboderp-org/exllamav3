@@ -249,7 +249,7 @@ struct ScanReplayJob
     uintptr_t qkv;          // staged post-conv qkv rows of this batch row, [prefix, qkv_dim] bf16
     uintptr_t g;            // staged log decay, [prefix, heads] or [prefix, heads, dk] (KDA) fp32
     uintptr_t beta;         // staged beta / dt, [prefix, heads] bf16
-    uintptr_t base;         // state row read for the first token, fp32 [heads, dk, dv]
+    uintptr_t base;         // state row read for the first token, fp32 or fp16 [heads, dk, dv]
     uintptr_t scratch;      // state row written (first token from base, then in place)
     uintptr_t D;            // Mamba2 skip scales [heads] fp32, else 0
     int prefix;
@@ -273,5 +273,6 @@ void batched_scan_replay
     int num_k_heads,
     int num_v_heads,
     int k_head_dim,
-    int v_head_dim
+    int v_head_dim,
+    bool state_half = false     // the jobs' state rows hold fp16 elements (see state_ld in gdn.cu)
 );

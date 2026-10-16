@@ -525,9 +525,47 @@ jobs:
           Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
           python patch_pyproject_deps.py
 
+          # Memory high-water sampler for the build steps: lowest MemAvailable (Linux) / available physical
+          # memory (Windows) seen, rewritten every few seconds, so a job that dies mid-build still leaves the
+          # last reading in the file
+          $memwatch = @'
+          import ctypes, os, sys, time
+          out = sys.argv[1]
+          def available_mib():
+              if os.name == "nt":
+                  class MS(ctypes.Structure):
+                      _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                                 [(n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                                  "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+                  ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+                  ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                  return ms.ullAvailPhys >> 20
+              with open("/proc/meminfo") as f:
+                  for line in f:
+                      if line.startswith("MemAvailable:"):
+                          return int(line.split()[1]) >> 10
+              return -1
+          lowest = None
+          while True:
+              a = available_mib()
+              if lowest is None or a < lowest:
+                  lowest = a
+                  with open(out, "w") as f:
+                      f.write(str(lowest))
+              time.sleep(3)
+          '@
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'memwatch.py') -Value $memwatch -Encoding UTF8
+
       - name: Build for CUDA
         if: matrix.cuda != ''
         run: |
+          # Ninja's default is nproc + 2 parallel compiles; six nvcc processes over eight architectures
+          # exhaust a 16 GB hosted runner, which starves the runner agent and ends the job with "lost
+          # communication with the server". Bound the parallelism (sccache's nvcc mode adds processes of its
+          # own on Windows) and record the lowest available memory seen during the build
+          $env:MAX_JOBS = if ($IsWindows) { "3" } else { "4" }
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
+
           # --- Spawn the VS shell
           if ($IsWindows) {
             Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
@@ -548,7 +586,12 @@ jobs:
           # uncompressed extension grows past what the Windows loader accepts (issue #413)
           $env:EXLLAMA_EXT_COMPRESS = "require"
 
-          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
 
       - name: Build for ROCm
         if: matrix.rocm != ''
@@ -563,8 +606,15 @@ jobs:
           # verbatim, wrapper included
           $hipcc = Join-Path (python -m rocm_sdk path --bin) 'hipcc'
           $env:PYTORCH_NVCC = "ccache $hipcc"
+          $env:MAX_JOBS = "4"
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
 
-          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
 
       - name: Compiler cache statistics
         if: (matrix.cuda != '' || matrix.rocm != '') && always()

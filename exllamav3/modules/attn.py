@@ -1436,6 +1436,10 @@ class Attention(Module):
                     module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
 
         module.device = device
+        # This rank's kv heads within the layer's full head range: what the CPU/disk cache tiers need to place
+        # the shard of a cache page into the layout-independent (canonical) page image
+        module.tp_kv_first = first
+        module.tp_kv_total = exported["num_kv_heads"]
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
             module.tp_owner = module.tp_single_owner(local_context, key)

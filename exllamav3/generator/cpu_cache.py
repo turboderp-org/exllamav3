@@ -1,5 +1,6 @@
 from __future__ import annotations
 import heapq
+import threading
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
@@ -30,6 +31,11 @@ class CPUPageCache:
     first, pruned tail-first. A chain whose parent page is still live in the GPU page table counts as rooted.
     The order is consumed as a snapshot and rebuilt after at most max(64, max_slots/8) evictions, so recency
     updates between rebuilds are approximated.
+
+    With a disk tier attached (DiskPageCache) every stored page is also queued for writing from its slot, and
+    pages found on disk are promoted into a slot (asynchronously by the enqueue-time prefetch, synchronously by
+    the allocation) and then restored as any other entry; fetch() waits on a promotion still in flight. A slot
+    with a write or a read in flight is passed over by eviction.
     """
 
     def __init__(
@@ -109,11 +115,18 @@ class CPUPageCache:
             cache_model.tp_cpu_cache_init(cache_ids, self.max_slots)
 
         self.pagetable = None
+        self.disk_tier = None
+        self._devices = sorted({t.device for t, _, _, _ in self.segments}, key = str)
 
-        # phash -> {slot, prev_hash, access_serial, tokens}
+        # phash -> {slot, prev_hash, access_serial, tokens, pending (Event of a promotion in flight, else
+        # None), failed (a promotion that found no readable file)}
         self.entries = {}
         self.slot_views = []
         self.free_slots = deque()
+        # slot -> events recorded after the last stream copies into or out of its slab. Slab bytes otherwise only
+        # move on the segment devices' streams, which orders them; a disk promotion writes the slab from a host
+        # thread and has to wait for these first
+        self.slot_events = {}
         # Slots handed out so far. In TP mode this is the only record the main process keeps of them, since the
         # buffers themselves belong to the ranks
         self.num_slots = 0
@@ -128,6 +141,8 @@ class CPUPageCache:
             "dedup_hits": 0,    # pushes skipped because the page was already stored
             "restores": 0,      # pages copied back into the GPU cache at allocation
             "evictions": 0,     # tier entries dropped to make room
+            "promotions": 0,    # pages brought in from the disk tier
+            "promotion_failures": 0,
         }
 
         # This process's half of every slot: slot i is the slab_size bytes at i * slab_size. Each rank holds
@@ -139,6 +154,30 @@ class CPUPageCache:
 
     def attach(self, pagetable):
         self.pagetable = pagetable
+        if self.disk_tier is not None:
+            self.disk_tier.attach(pagetable)
+
+
+    def attach_disk(self, disk_tier):
+        self.disk_tier = disk_tier
+        disk_tier.attach(self.pagetable)
+
+
+    def slab_view(self, slot: int) -> torch.Tensor | None:
+        """This process's slab of a slot as a flat uint8 tensor (pinned); None when every cache is
+        tensor-parallel and the slabs live in the ranks"""
+        if self.arena is None:
+            return None
+        base = slot * self.slab_size
+        return self.arena.tensor[base : base + self.slab_size]
+
+
+    def _busy(self, phash: bytes, e: dict) -> bool:
+        """A slot whose contents are still being read from disk or written to it must not be recycled"""
+        pending = e.get("pending")
+        if pending is not None and not pending.is_set():
+            return True
+        return self.disk_tier is not None and phash in self.disk_tier.pending_pages
 
 
     def __contains__(self, phash: bytes):
@@ -190,13 +229,22 @@ class CPUPageCache:
                 self._build_order()
                 deferred = 0
             h = self._order.popleft()
-            if protect and h in protect and deferred < len(self.entries):
+            e = self.entries.get(h)
+            if e is not None and ((protect and h in protect) or self._busy(h, e)) and deferred < len(self.entries):
                 self._order.append(h)
                 deferred += 1
                 continue
             self._order_pops += 1
             e = self.entries.pop(h, None)
             if e is not None:
+                if self._busy(h, e):
+                    # Everything is busy or protected and this slot's bytes are still in use: wait the
+                    # transfer out rather than hand out a slot something is reading or writing
+                    pending = e.get("pending")
+                    if pending is not None:
+                        pending.wait()
+                    if self.disk_tier is not None and h in self.disk_tier.pending_pages:
+                        self.disk_tier.flush()
                 self.metrics["evictions"] += 1
                 return e["slot"]
 
@@ -269,27 +317,112 @@ class CPUPageCache:
             # Each rank copies its own shard of the page
             for m, ids in self.tp_groups:
                 m.tp_cpu_cache_store(ids, slot, page.page_index)
+        tokens = page.sequence.clone()
         self.entries[page.phash] = {
             "slot": slot,
             "prev_hash": page.prev_hash,
             "access_serial": serial,
-            "tokens": page.sequence.clone(),
+            "tokens": tokens,
+            "pending": None,
         }
         self.metrics["pushes"] += 1
+        if self.disk_tier is not None:
+            events = self._copy_events()
+            self.slot_events[slot] = events
+            # Write-through: the writer waits for the copies above before it reads the slab
+            self.disk_tier.write_page(page.phash, page.prev_hash, tokens, slot, events, page.persistable)
 
 
-    def fetch(self, phash: bytes, page_index: int, serial: int) -> dict:
+    def _copy_events(self) -> list:
+        """Events recorded on the current stream of every device a slot's segments come from"""
+        events = []
+        for dev in self._devices:
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(dev))
+            events.append(ev)
+        return events
+
+
+    def begin_promote(self, phash: bytes, serial: int, protect: set | None = None) -> dict | None:
+        """
+        Start bringing a page from the disk tier into a slot: the entry exists from here on (so the hash is
+        found by `in` and by the chain walks) with its promotion event pending until the read completes;
+        fetch() waits on it. Returns the entry, or None if the page is not on disk.
+        """
+        e = self.entries.get(phash)
+        if e is not None:
+            return e
+        disk = self.disk_tier
+        if disk is None or not disk.has_page(phash):
+            return None
+        slot = self._new_slot(protect)
+        e = {
+            "slot": slot,
+            "prev_hash": disk.page_prev_hash(phash),
+            "access_serial": serial,
+            "tokens": None,
+            "pending": threading.Event(),
+            "failed": False,
+            "from_disk": True,
+        }
+        self.entries[phash] = e
+
+        def done(tokens):
+            if tokens is None:
+                e["failed"] = True
+            else:
+                e["tokens"] = tokens
+            e["pending"].set()
+
+        # The slot's previous tenant may still have copies in flight on the streams (a restore of it enqueued
+        # by an earlier allocation, or its own store); the reader waits for them before writing the slab
+        disk.submit_promotion(phash, slot, done, self.slot_events.pop(slot, []))
+        self.metrics["promotions"] += 1
+        return e
+
+
+    def promote(self, phash: bytes, serial: int, protect: set | None = None) -> dict | None:
+        """Bring a page from the disk tier into a slot and wait for it; None if it is not on disk or the file
+        turned out unreadable"""
+        e = self.begin_promote(phash, serial, protect)
+        if e is None:
+            return None
+        if e["pending"] is not None:
+            e["pending"].wait()
+        if e.get("failed"):
+            self._drop_failed(phash, e)
+            return None
+        return e
+
+
+    def _drop_failed(self, phash: bytes, e: dict):
+        if self.entries.get(phash) is e:
+            del self.entries[phash]
+            self.free_slots.append(e["slot"])
+        self.metrics["promotion_failures"] += 1
+
+
+    def fetch(self, phash: bytes, page_index: int, serial: int) -> dict | None:
         """
         Copy a stored page back into the GPU cache at page_index (host-to-device, async on the current stream).
         The entry remains in the tier; the restored copy may well be evicted again before this one goes stale.
-        Returns the entry so the caller can restore page metadata (token IDs).
+        Returns the entry so the caller can restore page metadata (token IDs), or None when the entry was a
+        promotion from disk that failed (the page is then left to prefill).
         """
         e = self.entries[phash]
+        pending = e.get("pending")
+        if pending is not None:
+            pending.wait()
+            if e.get("failed"):
+                self._drop_failed(phash, e)
+                return None
         e["access_serial"] = serial
         for v, (t, _, _, _) in zip(self.slot_views[e["slot"]] if self.segments else (), self.segments):
             t[page_index].copy_(v, non_blocking = True)
         for m, ids in self.tp_groups:
             m.tp_cpu_cache_fetch(ids, e["slot"], page_index)
+        if self.disk_tier is not None:
+            self.slot_events[e["slot"]] = self._copy_events()
         self.metrics["restores"] += 1
         return e
 
@@ -305,5 +438,7 @@ class CPUPageCache:
         self.segments = []
         self.entries = {}
         self.free_slots.clear()
+        self.slot_events = {}
         self.num_slots = 0
         self.pagetable = None
+        self.disk_tier = None

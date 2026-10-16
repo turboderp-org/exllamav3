@@ -234,6 +234,16 @@ class SWALayerState:
         )
 
 
+    def tp_stash_pieces(self):
+        """Disk tier checkpoint layout: both window slices are split by kv head (dim 1 of the stashed rows)"""
+        m = self.module
+        first = getattr(m, "tp_kv_first", None)
+        if first is None:
+            return [None, None]
+        spec = {"dim": 1, "total": m.tp_kv_total, "pieces": [(0, m.num_kv_heads, first)]}
+        return [spec, dict(spec)]
+
+
     def unstash(self, slot, stashed, position):
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
@@ -1355,6 +1365,9 @@ class SlidingAttention(Module):
                     module.recurrent_layers.append(rli)
                     module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
 
+        # This rank's kv head range within the layer, for the disk tier's canonical checkpoint layout
+        module.tp_kv_first = first
+        module.tp_kv_total = exported["num_kv_heads"]
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
