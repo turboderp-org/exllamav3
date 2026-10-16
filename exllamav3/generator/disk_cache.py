@@ -298,8 +298,8 @@ class DiskPageCache:
         os.makedirs(self.pages_dir, exist_ok = True)
         os.makedirs(self.states_dir, exist_ok = True)
         if min_free is None:
-            st = os.statvfs(self.dir)
-            min_free = min(16 * 1024**3, st.f_blocks * st.f_frsize // 50)
+            usage = shutil.disk_usage(self.dir)
+            min_free = min(16 * 1024**3, usage.total // 50)
         manifest = os.path.join(self.dir, "manifest.json")
         if not os.path.exists(manifest):
             with open(manifest, "w") as f:
@@ -1000,8 +1000,8 @@ class DiskPageCache:
         if now - self._space_checked > 5.0:
             self._space_checked = now
             try:
-                st = os.statvfs(self.dir)
-                self._space_ok = st.f_bavail * st.f_frsize >= self.min_free
+                usage = shutil.disk_usage(self.dir)
+                self._space_ok = usage.free >= self.min_free
             except OSError:
                 self._space_ok = True
         if not self._space_ok:
