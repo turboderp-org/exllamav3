@@ -12,6 +12,7 @@ slot size and something to copy. The fingerprint is overridden so no model is ne
 
 import errno
 import os
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -299,6 +300,44 @@ def test_no_writes_below_min_free(device, tmp_path):
     disk.flush()
     assert not disk.has_page(phash(1)) and disk.metrics["skipped_low_space"] >= 1 and not disk.write_disabled
     disk.min_free = 0
+    disk._space_checked = 0.0
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    assert disk.has_page(phash(2))
+    disk.close()
+    tier.close()
+
+
+def _fake_disk_usage(free, total):
+    return SimpleNamespace(free = free, total = total, used = total - free)
+
+
+@pytest.mark.parametrize("total, expected_min_free", [
+    (100 * 2**30, 2 * 2**30),        # 2% of the file system
+    (1000 * 2**30, 16 * 2**30),      # capped at 16 GiB
+])
+def test_opens_where_statvfs_does_not_exist(monkeypatch, device, tmp_path, total, expected_min_free):
+    """os.statvfs is POSIX-only, so on Windows the tier must still open and take its default free-space
+    margin from the cross-platform query rather than aborting the model load"""
+    monkeypatch.delattr(os, "statvfs", raising = False)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: _fake_disk_usage(4 * 2**30, total))
+    tier, disk, tensor = build(4, device, tmp_path)
+    assert disk.min_free == expected_min_free
+    disk.close()
+    tier.close()
+
+
+def test_no_writes_below_min_free_where_statvfs_does_not_exist(monkeypatch, device, tmp_path):
+    monkeypatch.delattr(os, "statvfs", raising = False)
+    usage = _fake_disk_usage(4 * 2**30, 100 * 2**30)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
+    tier, disk, tensor = build(4, device, tmp_path)
+    disk.min_free = 8 * 2**30        # more than the 4 GiB the stub reports free
+    disk._space_checked = 0.0
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    assert not disk.has_page(phash(1)) and disk.metrics["skipped_low_space"] >= 1
+    usage.free = 16 * 2**30          # space came back
     disk._space_checked = 0.0
     tier.store(page(2, 2), serial = 2)
     disk.flush()
