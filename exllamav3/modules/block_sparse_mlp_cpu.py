@@ -1101,5 +1101,15 @@ class BlockSparseMLP_CPU:
         return True
 
     def _split_saved_lists_ref(self):
+        """The full expert Linear lists (GPU slice and worker tail together) in ROUTER order. The
+        saved lists are in checkpoint order; with a hot/cold placement permutation in effect, router
+        id r is checkpoint expert _split_perm[r] (the router tensors were permuted the same way at
+        load), so the sweep's checkpoint reads, the demotion's install keys and the transfer verify
+        must all go through the permutation."""
         g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
+        perm = self._split_perm
+        if perm is not None:
+            g = [g[e] for e in perm] if self.gated else g
+            u = [u[e] for e in perm]
+            d = [d[e] for e in perm]
         return g, u, d
