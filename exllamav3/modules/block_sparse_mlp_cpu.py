@@ -77,8 +77,8 @@ def _expert_stats_load(config, num_experts):
 
 
 def save_expert_stats(infer_params):
-    """Write every split module's decayed selection counts (in checkpoint expert order, undoing
-    the load-time permutation) so the next load of this model starts from the hot/cold ranking
+    """Write every split module's decayed selection counts (already in checkpoint expert order:
+    the router is left unpermuted, so the hit counts are per checkpoint expert) so the next load
     instead of the arbitrary head/tail split. A session too short to have routed a meaningful
     sample keeps the file's previous entries (it must not overwrite a settled profile); the
     counts themselves are decayed, so the threshold is in decode steps, not hits"""
@@ -94,10 +94,7 @@ def save_expert_stats(infer_params):
         hist = m._split_hist.tolist()
         if m.num_experts != E or sum(hist) <= 0.0:
             continue
-        perm = m._split_perm or list(range(E))
-        counts = [0.0] * E
-        for r, c in enumerate(hist):
-            counts[perm[r]] = c
+        counts = hist
         layers[m.key] = counts
     if not layers:
         return
@@ -462,32 +459,25 @@ class BlockSparseMLP_CPU:
                 ip.moe_cpu_split_assigned = getattr(ip, "moe_cpu_split_assigned", 0) + 1
 
     def cpu_post_load(self):
-        """After the module's tensors load on a CUDA device: apply the split placement
-        permutation to the router-side tensors, and set up dynamic placement state."""
-        # Split placement permutation: move the router (and per-expert routing tensors)
-        # into the same hot-to-cold expert order the weight lists were rearranged into.
-        # gate_tensor is (hidden, E), logits = y @ W: permute columns
-        if self.cpu_split_first is not None and self._split_perm is not None:
-            perm_t = torch.tensor(self._split_perm, device = self.routing_gate.inner.weight.device)
-            ig = self.routing_gate.inner
-            ig.weight = ig.weight[:, perm_t].contiguous()
-            if getattr(ig, "bias", None) is not None:
-                ig.bias = ig.bias[perm_t].contiguous()
-            if self.e_score_correction_bias is not None:
-                self.e_score_correction_bias = self.e_score_correction_bias[
-                    perm_t.to(self.e_score_correction_bias.device)].contiguous()
-            if self.per_expert_scale is not None:
-                self.per_expert_scale = self.per_expert_scale[
-                    perm_t.to(self.per_expert_scale.device)].contiguous()
-        # Dynamic placement state: router->physical-slot map (identity start), decayed
-        # selection counts, and the shared module registry the sweep walks. The first
-        # registered module owns the step counter
+        """After the module's tensors load on a CUDA device: set up dynamic placement state.
+        The hot/cold placement permutation is encoded in the router->slot map rather than by
+        permuting the router tensors, so the router and its per-expert side tensors (bias,
+        e_score_correction_bias, per_expert_scale) stay in checkpoint order and only the expert
+        weight lists are rearranged"""
+        # Dynamic placement state: router->physical-slot map, decayed selection counts, and the
+        # shared module registry the sweep walks. The first registered module owns the step counter
         if self.cpu_split_first is not None and getattr(self, "_split_dynamic", False):
             dev = torch.device(self.device)
             first, spares = self.cpu_split_first, self._split_spares
-            # Physical ids: [0, first) the GPU slots, first + i the worker's expert i. The spares'
-            # experts start in their worker slots, their GPU slots free
-            mp = [r if r < first - spares else first + (r - (first - spares)) for r in range(self.num_experts)]
+            # Placement permutation: _split_perm[slot] = checkpoint expert loaded at that slot,
+            # so the inverse maps a router id (checkpoint expert; the router is left unpermuted)
+            # to the slot that holds it. Physical ids: [0, first) the GPU slots, first + i the
+            # worker's expert i; the spares' experts start in their worker slots, GPU slots free
+            perm = self._split_perm or list(range(self.num_experts))
+            inv_perm = [0] * self.num_experts
+            for slot, e in enumerate(perm):
+                inv_perm[e] = slot
+            mp = [s if s < first - spares else first + (s - (first - spares)) for s in inv_perm]
             self._split_map = torch.tensor(mp, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
             self._split_selcpu_t = None
@@ -639,16 +629,6 @@ class BlockSparseMLP_CPU:
 
     @override
     def can_defer_load(self):
-        # The frequency-permuted expert split reads the router tensors right after load (to
-        # permute them); deferred fills would land after that read and be lost.
-        # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
-        # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
-        # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
-        if int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and (
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-            or os.path.exists(_expert_stats_path(self.config, self.num_experts))
-        ):
-            return False
         return super().can_defer_load()
 
     def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
