@@ -37,11 +37,14 @@ RECON_MB = max(1, int(os.environ.get("EXL3_MOE_RECON_MB", 256)))
 # Folded reconstruct (suh / Hadamard / svh applied to the dequantized weights, the dense
 # Linear prefill formulation) vs Hadamards on the activation slabs. Default on
 RECON_FOLDED = os.environ.get("EXL3_MOE_RECON_FOLDED", "1") != "0"
-# Batching pays while a single expert's GEMM cannot fill the GPU: with 128x128 output tiles an
-# m x n GEMM launches ceil(m/128) * ceil(n/128) blocks, and below roughly the SM count the
-# strided-batched kernel wins by a wide margin. EXL3_MOE_RECON_TILES sets the budget
-# (0 = batch everything); EXL3_MOE_RECON_MAX_ROWS caps rows directly
-RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 64))
+# The batched tier takes every expert up to the padded-rows budget (RECON_ROWS): its one-launch
+# reconstruct and the library GEMM over the slab beat the per-expert reconstruct path (one
+# dequant + three GEMMs + a gather and a scatter per expert) at every row count, large experts
+# included, so the tier is no longer limited to experts whose GEMM could not fill the GPU on
+# its own. EXL3_MOE_RECON_TILES restores that limit (ceil(m/128) * ceil(n/128) output tiles per
+# expert GEMM, as a budget); EXL3_MOE_RECON_MAX_ROWS caps rows directly. Both stay within
+# RECON_ROWS, which the autosplit worst-case measure assumes for a single group
+RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 0))
 RECON_MAX_ROWS = int(os.environ.get("EXL3_MOE_RECON_MAX_ROWS", 0))
 # Give up on adding a smaller expert to a group once padded rows would exceed this multiple of
 # the real rows: a group of very uneven experts wastes GEMM work on zeros.
@@ -111,11 +114,11 @@ def batch_cap(dims_g, dims_u, dims_d):
 def max_group_rows(dims_u, dims_d):
     """Row cap for an expert to join the batched tier (see RECON_TILES / RECON_MAX_ROWS)"""
     if RECON_MAX_ROWS > 0:
-        return RECON_MAX_ROWS
+        return min(RECON_MAX_ROWS, RECON_ROWS)
     if RECON_TILES > 0:
         n_min = min(dims_u[1], dims_d[1])
-        return max(128, (RECON_TILES * 128 * 128) // n_min)
-    return 1 << 30
+        return max(128, min(RECON_ROWS, (RECON_TILES * 128 * 128) // n_min))
+    return RECON_ROWS
 
 
 def worst_case_bytes(dims_g, dims_u, dims_d, interm_fp32: bool, assignments: int,

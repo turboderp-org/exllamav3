@@ -727,19 +727,16 @@ fp16 input of the down projection, as in the per-expert path). `EXL3_MOE_BATCH_R
 covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
 `EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
 
-### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
+### `EXL3_MOE_RECON_TILES` (default: `0`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
 
-Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
-fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
-the SM count the strided-batched kernel is much faster (PRO 6000, `k = 2048`: `n = 768` runs
-1.45x faster batched at `m = 1024` and 2.9x at `m = 256`, `n = 1792` breaks even at
-`m = 1024`), while above it the batched cuBLAS kernels are 10-15% slower than the single-GEMM
-ones, and the padded slabs cost traffic that grows with the rows. `EXL3_MOE_RECON_TILES` is
-that tile budget: an expert stays on the per-expert path once its narrowest projection
-(`min(intermediate, hidden)`) would span more tiles, i.e. above `TILES * 16384 / n_min` rows
-(1365 rows for `n = 768`, 512 for `n = 2048`). Measured at 8k tokens on a PRO 6000: lfm2.5
-(`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
-Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
+Tuning for the batched reconstruct tier. By default every expert above the fused kernel's row
+capacity joins the tier, up to the padded-row budget per group (`EXL3_MOE_RECON_ROWS`): the
+tier's one reconstruct and one library GEMM per projection over a slab beat the per-expert path
+(a reconstruct, three GEMMs and a gather and scatter per expert) at every row count, including
+the experts a large chunk piles thousands of rows onto, on both the full-rate and the half-rate
+fp32-accumulate GPUs. `EXL3_MOE_RECON_TILES` restores the earlier limit, a budget of output tiles
+(`m/128 * n/128`) above which an expert's GEMM was assumed to fill the GPU on its own and the
+expert stayed on the per-expert path; `0` batches
 every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
 knobs: experts per group; `EXL3_MOE_RECON_PAD`, the padded-to-real row ratio a group may reach
 before the planner starts a new one (groups fill largest expert first, so this splits only
