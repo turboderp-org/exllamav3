@@ -14,7 +14,6 @@ from .triton_paged import (
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
     fn_triton_attn_nocache,
-    has_triton,
 )
 
 # Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
@@ -91,6 +90,8 @@ def attn_dispatch(
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     window_size: int | None = None,
+    window_right: int = 0,
+    sink_key0: bool = False,
     softcap: float = 0.0,
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
@@ -98,6 +99,7 @@ def attn_dispatch(
     sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
     max_kv_len: int | None = None,
+    staging_pages: int | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -122,7 +124,7 @@ def attn_dispatch(
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
-            _qc_attn and has_triton and
+            _qc_attn and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and
@@ -180,6 +182,9 @@ def attn_dispatch(
         q_cache,
         sinks,
         max_kv_len = max_kv_len,
+        window_right = window_right,
+        sink_key0 = sink_key0,
+        staging_pages = staging_pages,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache

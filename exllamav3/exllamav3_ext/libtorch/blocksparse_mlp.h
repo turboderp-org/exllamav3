@@ -8,6 +8,7 @@ namespace py = pybind11;
 #include "mlp.h"
 #include "linear.h"
 #include "../graph.cuh"
+#include "../quant/exl3_moe_coop.cuh"
 
 #define MAX_EXPERTS 512
 #define TEMP_ROWS_GRAPH 32  // must match TEMP_ROWS_GRAPH in BlockSparseMLP.py
@@ -32,7 +33,8 @@ struct BC_BlockSparseMLP
     at::Tensor out_d;
     at::Tensor out_d2;
     c10::optional<at::Tensor> out_d_sh;
-    c10::optional<at::Tensor> z;
+    at::Tensor coop_ctr;    // int32 completion counters of the fused decode kernels (zeroed at creation)
+    at::Tensor had_u;       // (MAX_BSZN * top_k, Hi) rotated up input of the fused decode kernels (yh holds the gate's)
     at::Tensor dq_temp_up;
     at::Tensor dq_temp_down;
     int min_expert;
@@ -40,19 +42,19 @@ struct BC_BlockSparseMLP
     at::Tensor gate_ptrs_trellis;   at::Tensor gate_ptrs_trellis_cpu;
     at::Tensor gate_ptrs_suh;       at::Tensor gate_ptrs_suh_cpu;
     at::Tensor gate_ptrs_svh;       at::Tensor gate_ptrs_svh_cpu;
-    int gate_K;
+    float gate_K;
     bool gate_mcg;
     bool gate_mul1;
     at::Tensor up_ptrs_trellis;     at::Tensor up_ptrs_trellis_cpu;
     at::Tensor up_ptrs_suh;         at::Tensor up_ptrs_suh_cpu;
     at::Tensor up_ptrs_svh;         at::Tensor up_ptrs_svh_cpu;
-    int up_K;
+    float up_K;
     bool up_mcg;
     bool up_mul1;
     at::Tensor down_ptrs_trellis;   at::Tensor down_ptrs_trellis_cpu;
     at::Tensor down_ptrs_suh;       at::Tensor down_ptrs_suh_cpu;
     at::Tensor down_ptrs_svh;       at::Tensor down_ptrs_svh_cpu;
-    int down_K;
+    float down_K;
     bool down_mcg;
     bool down_mul1;
     bool act_silu;
@@ -71,21 +73,36 @@ struct BC_BlockSparseMLP
     at::Tensor gu_svh_ptr;
 
     // Per-expert bias pointer tables (int64 device tensors) for models with biased experts
-    // (gpt-oss); the down bias applies before the routing weight, so the weighted mgemm
-    // reduction is corrected with the weighted bias sum
+    // (gpt-oss); the down bias applies before the routing weight
     c10::optional<at::Tensor> gate_bias_ptrs;
     c10::optional<at::Tensor> up_bias_ptrs;
     c10::optional<at::Tensor> down_bias_ptrs;
 
-    // Padded hidden dim (gpt-oss): zero-padded input staging for the gate/up mgemms (the
-    // quantized K) and exact-width output copied out of the padded down result
-    c10::optional<at::Tensor> y_pad;
-    c10::optional<at::Tensor> out_trim;
+    // Output of the fused decode path (run_bszN): the trimmed, reduced row per token
+    at::Tensor out_bszn;    // (MAX_BSZN, H) fp32
 
-    // Static scratch for the num_tokens > 1 gathered input (each of num_tokens*top_k slots holds
-    // a copy of its token's row); sized [MAX_BSZN * top_k, Hi] Python-side. Unused (num_tokens==1
-    // keeps the zero-copy y.unsqueeze(0)/y_pad broadcast path)
-    at::Tensor a_gather;
+    // Validated static parameter block of the fused decode kernels (built in the constructor)
+    MoeCoopParams coop_p;
+    float coop_K_gu, coop_K_d; int coop_cb;
+
+    // Shared expert as its own one-expert fused launch (at its own bit width) instead of the
+    // three latency-bound GEMV launches of the BC_GatedMLP graph; the routed launch merges its
+    // output (through the sigmoid gate when there is one) exactly as before. Built when enabled
+    // and the shared MLP is EXL3 with 128-aligned widths
+    bool sh_coop = false;
+    MoeCoopParams sh_coop_p;
+    float sh_K_gu = 0, sh_K_d = 0; int sh_cb = 0;
+    std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
+    at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
+
+#if defined(USE_ROCM)
+    // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
+    // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
+    bool rdna_moe = false;
+    at::Tensor rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh;     // (2E) gate tables then up tables
+    int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
+    bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
+#endif
 
     int max_experts_per_token;
     int max_tokens_per_expert;
@@ -96,14 +113,7 @@ struct BC_BlockSparseMLP
 
     bool use_mgemm;
 
-    // graph_bszN[bsz - 1] covers bsz 1..MAX_BSZN (bsz==1 keeps the original zero-copy behavior
-    // internally; replaces the old single-instance graph_bsz1)
-    Graph graph_bszN[MAX_BSZN];
     Graph graph_single[TEMP_ROWS_GRAPH];
-    // Lazily-built per num_tokens (index num_tokens - 1); only entries for num_tokens >= 2 are
-    // populated. Depends only on (num_tokens, top_k), never on routing outcome, so built once and
-    // reused for every subsequent call at that bsz
-    std::vector<at::Tensor> flat_token_cache;
 
     BC_BlockSparseMLP
     (
@@ -117,7 +127,8 @@ struct BC_BlockSparseMLP
         at::Tensor _out_d,
         at::Tensor _out_d2,
         c10::optional<at::Tensor> _out_d_sh,
-        c10::optional<at::Tensor> _z,
+        at::Tensor _coop_ctr,
+        at::Tensor _had_u,
         at::Tensor _dq_temp_up,
         at::Tensor _dq_temp_down,
         int _min_expert,
@@ -125,19 +136,19 @@ struct BC_BlockSparseMLP
         at::Tensor _gate_ptrs_trellis,
         at::Tensor _gate_ptrs_suh,
         at::Tensor _gate_ptrs_svh,
-        int _gate_K,
+        float _gate_K,
         bool _gate_mcg,
         bool _gate_mul1,
         at::Tensor _up_ptrs_trellis,
         at::Tensor _up_ptrs_suh,
         at::Tensor _up_ptrs_svh,
-        int _up_K,
+        float _up_K,
         bool _up_mcg,
         bool _up_mul1,
         at::Tensor _down_ptrs_trellis,
         at::Tensor _down_ptrs_suh,
         at::Tensor _down_ptrs_svh,
-        int _down_K,
+        float _down_K,
         bool _down_mcg,
         bool _down_mul1,
         bool _act_silu,
@@ -152,23 +163,12 @@ struct BC_BlockSparseMLP
         at::Tensor _gu_trellis_ptr,
         at::Tensor _gu_suh_ptr,
         at::Tensor _gu_svh_ptr,
-        at::Tensor _a_gather,
+        at::Tensor _out_bszn,
         c10::optional<at::Tensor> _gate_bias_ptrs,
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
-        c10::optional<at::Tensor> _y_pad,
-        c10::optional<at::Tensor> _out_trim,
-        bool _act_relu2 = false
-    );
-
-    void run_bszN_gr
-    (
-        const at::Tensor& A_in,
-        const at::Tensor& x_dense,
-        at::Tensor& selected_experts,
-        at::Tensor& routing_weights,
-        int num_tokens,
-        Graph* graph
+        bool _act_relu2 = false,
+        bool _sh_coop = false
     );
 
     void run_bszN

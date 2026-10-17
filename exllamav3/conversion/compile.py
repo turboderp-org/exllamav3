@@ -37,7 +37,6 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             print(f" !! Warning, output directory is not empty")
 
     # Allocate shards
-    total_size = 0
     max_shard_bytes = args["shard_size"] * 1024**2
     out_map = []
     out_map.append([])
@@ -59,7 +58,6 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             current_shard_size = 0
             out_map.append([])
         current_shard_size += size
-        total_size += size
         out_map[-1].append(module)
 
     # Additional tensors. Skip any that the walked modules already emit: a tensor under a walked
@@ -103,11 +101,14 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             current_shard_size = 0
             out_map.append([])
         current_shard_size += size
-        total_size += size
         out_map[-1].append(key)
 
-    # Write model tensors
+    # Write model tensors. A tensor can be emitted by two walked modules when one module's key prefix covers
+    # another's tensors (e.g. an MTP head's input projection and final norm named as sublayers of its first
+    # block), so tensors already written to an earlier shard are skipped and the total is taken from what was
+    # actually written
     map_dict = {}
+    total_size = 0
     num_files = len(out_map)
     for file_idx, modules in enumerate(out_map):
         filename = (
@@ -124,9 +125,10 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             elif isinstance(m, str):
                 tensor = config.stc.get_tensor(m, allow_bf16 = True)
                 tensors = {m: tensor.contiguous()}
-            file_dict.update(tensors)
+            file_dict.update({k: v for k, v in tensors.items() if k not in map_dict})
         for name in file_dict.keys():
             map_dict[name] = filename
+        total_size += dsize(file_dict)
         save_file(file_dict, os.path.join(out_dir, filename))
         del file_dict
         free_mem()

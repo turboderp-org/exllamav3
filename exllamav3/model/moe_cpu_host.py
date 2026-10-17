@@ -6,8 +6,11 @@ import numpy as np
 import torch
 
 from ..ext import exllamav3_ext as ext
+from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
+from ..util.memory import check_host_memory, windows_memory_status
+from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -41,9 +44,13 @@ Shared-memory layout constants mirror cpu/moe_handoff.h.
 MOE_JOB_RING = 256
 MOE_MAX_SLOTS = 8
 MOE_JOB_MAX_EXPERTS = 256   # structural capacity of MoeJob.experts[]; see cpu/moe_handoff.h
-# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + one uint32 pad, all 4-byte
+# sizeof(MoeJob): 7 uint32 fields + experts[MOE_JOB_MAX_EXPERTS] + seq_hi, all 4-byte
 # fields so no compiler padding -- recompute this if the struct's fixed fields ever change
 MOE_JOB_BYTES = (7 + MOE_JOB_MAX_EXPERTS + 1) * 4
+MOE_JOB_SEQ_HI = 7 + MOE_JOB_MAX_EXPERTS   # u32 index of MoeJob.seq_hi
+# Flag width (MOE_FLAG_BITS in cpu/moe_handoff.h): ROCm's stream wait has no cyclic compare, so its
+# flags are 64-bit and never wrap; CUDA's are 32-bit and compared cyclically
+MOE_FLAG_BITS = 64 if torch.version.hip else 32
 MOE_CTRL_JOBS_OFFSET = 384
 MOE_SLOT_FLAGS_OFFSET = MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * MOE_JOB_BYTES
 MOE_MAX_WSLOTS = 8
@@ -53,6 +60,20 @@ MOE_STAGE_TAIL_OFFSET = MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE
 MOE_STAGE_HEAD_OFFSET = MOE_STAGE_TAIL_OFFSET + 64
 MOE_STAGE_JOBS_OFFSET = MOE_STAGE_TAIL_OFFSET + 128
 MOE_CTRL_SIZE = MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * MOE_JOB_BYTES
+
+
+def _set_job_seq(job, seq: int):
+    """Sequence number into a job descriptor (u32 view) as its two 32-bit halves"""
+    job[0] = seq & 0xFFFFFFFF
+    job[MOE_JOB_SEQ_HI] = seq >> 32
+
+
+def _write_flag(u32: np.ndarray, offset: int, value: int):
+    """Host-side write of a handoff flag at a byte offset into the region"""
+    if MOE_FLAG_BITS == 64:
+        u32[offset // 4 : offset // 4 + 2].view(np.uint64)[0] = value
+    else:
+        u32[offset // 4] = value & 0xFFFFFFFF
 
 
 def _align64(x):
@@ -77,29 +98,74 @@ class MoeCpuTuning:
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
         assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
+        # Physical cores kept free of pool workers for the host process, whether the pool pins
+        # its workers (EXL3_MOE_CPU_PIN) or lets them float; the host is confined to them once
+        # the worker has started, see moe_cpu_affinity.py. 0 disables the reservation
+        self.host_cores = int(os.environ.get("EXL3_MOE_HOST_CORES", 1))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
-        # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__)
-        self.threads = int(os.environ.get("EXL3_MOE_CPU_THREADS", max(1, (os.cpu_count() or 2) // 2)))
+        # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
+        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0 or the
+        # topology is unreadable
+        _, n_phys = ext.exl3_moe_cpu_core_order()
+        self.threads = int(os.environ.get(
+            "EXL3_MOE_CPU_THREADS",
+            default_worker_threads(n_phys, self.host_cores) if n_phys and self.host_cores > 0
+            else max(1, (os.cpu_count() or 2) // 2)))
         self.num_wslots = min(int(os.environ.get("EXL3_MOE_CPU_WSLOTS", 2)), MOE_MAX_WSLOTS)
         self.wslot_size = int(os.environ.get("EXL3_MOE_CPU_WSLOT_MB", 32)) * 1024 * 1024
         self.stage_threads = int(os.environ.get("EXL3_MOE_CPU_STAGE_THREADS", 4))
         # madvise(MADV_HUGEPAGE) on the expert-weight arena chunks: with defrag=madvise (the
         # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
-        # region once easily-compactable free memory runs low, which can stall loading badly
+        # region once easily-compactable free memory runs low, which can stall loading badly.
+        # On Windows the same flag makes each arena chunk attempt MEM_LARGE_PAGES at
+        # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
+        # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
-        # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
-        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
-        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
+        # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
+        # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
+        # AVX-512 tiers, band-2 + planar dwords on AVX2, native on scalar).
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout everywhere.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
+        # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
+        # into loader tensors and then copied into the arena, so this bounds the transient host
+        # memory on top of the arena to a slice of a layer instead of the whole layer (~1.2 GiB
+        # per layer on a 512-expert model). 0 loads the whole layer in one pass
+        self.load_batch_experts = int(os.environ.get("EXL3_MOE_CPU_LOAD_BATCH", 32))
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
-        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 512))
+        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))
+
+        # --- pinned expert arena (experimental, opt-in) ---
+        # EXL3_MOE_PINNED_ARENA=1: the worker's expert arena is memfd-backed and shared with the
+        # parent, which maps and page-locks it, so streamed prefill DMAs each expert's block
+        # straight out of the arena on the copy stream instead of having the worker's stager
+        # thread memcpy it into the pinned handoff ring first (the stager is the prefill
+        # bottleneck on fully offloaded models). Costs: the arena is registered with CUDA
+        # (~0.2 s per GiB at load), and shmem pages only get transparent hugepages when
+        # /sys/kernel/mm/transparent_hugepage/shmem_enabled allows it (advise/always/
+        # within_size), so on a default (never) system the CPU kernels run on 4K pages;
+        # EXL3_MOE_ARENA_HUGE=2m|1g backs the memfd with hugetlbfs pages instead (requires
+        # vm.nr_hugepages / hugepages-1048576kB reservations); Windows uses named sections, no
+        # hugepage variant.
+        self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
+        self.arena_huge = os.environ.get("EXL3_MOE_ARENA_HUGE", "").strip().lower()
+        assert self.arena_huge in ("", "2m", "1g"), "EXL3_MOE_ARENA_HUGE must be 2m or 1g"
+        if self.arena_huge and os.name == "nt":
+            raise RuntimeError("EXL3_MOE_ARENA_HUGE is Linux-only (hugetlbfs memfd); unset it on Windows")
+        # Batched reconstruct tier for the streamed heavy experts (see moe_batch_recon.py):
+        # experts too hot for the fused kernel are dequantized in groups with one launch per
+        # projection and run through padded bmm. EXL3_MOE_STREAM_BATCH_RECON=0 restores the
+        # per-expert loop
+        self.stream_batch_recon = os.environ.get("EXL3_MOE_STREAM_BATCH_RECON", "1") != "0"
+        # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
+        # on the GPU side
+        self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -110,6 +176,252 @@ class MoeCpuTuning:
 TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
+# Host placement is per process: planned for the first started host's worker count and kept
+# for later hosts (MTP head, draft model, reload). Workers spawned after it restore the
+# pre-pin mask (_HOST_ORIG_CPUS) so their pool can pin outside the host's LPs
+_HOST_AFFINITY_THREADS: int | None = None
+_HOST_ORIG_CPUS: list[int] | None = None
+
+
+def _apply_host_affinity(threads: int, host_cores: int):
+    """Confine the host process to the CPUs the worker pool leaves free. Never raises: an OS
+    failure leaves the host unpinned with a notice."""
+    global _HOST_AFFINITY_THREADS, _HOST_ORIG_CPUS
+    if _HOST_AFFINITY_THREADS is not None:
+        if threads > _HOST_AFFINITY_THREADS:
+            print(f" -- CPU MoE host affinity: placement planned for {_HOST_AFFINITY_THREADS} workers, "
+                  f"kept for a {threads}-thread worker")
+        return
+    _HOST_AFFINITY_THREADS = threads
+    order, n_phys = ext.exl3_moe_cpu_core_order()
+    cpus = plan_host_cpus(order, n_phys, threads, host_cores)
+    if cpus is None:
+        if host_cores > 0 and n_phys:
+            print(" -- CPU MoE host affinity: no LP free of workers in one processor group; "
+                  "host threads left unpinned")
+        return
+    try:
+        orig = process_cpus()
+    except OSError as e:
+        print(f" !! CPU MoE host affinity: {e}; host threads left unpinned")
+        return
+    err = apply_process_affinity(cpus)
+    if err is not None:
+        print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
+        return
+    _HOST_ORIG_CPUS = orig
+    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
+
+
+# memfd_create only ships in CPython when the interpreter was built against glibc >= 2.27; conda
+# and manylinux-built interpreters lack it (and the os.MFD_* constants) even on kernels that
+# have had the syscall since 4.17 (PR #341 discussion). Resolve it at runtime instead: os first,
+# then libc's symbol, then the raw syscall by architecture. The MFD_* values are kernel ABI
+MFD_CLOEXEC = 0x0001
+MFD_HUGETLB = 0x0004
+MFD_HUGE_2MB = 21 << 26
+MFD_HUGE_1GB = 30 << 26
+_MEMFD_SYSCALL = {"x86_64": 319, "aarch64": 279, "riscv64": 279, "loongarch64": 279,
+                  "ppc64le": 360, "ppc64": 360, "s390x": 350, "i686": 356, "armv7l": 385}
+
+
+def _memfd_via_libc(name: str, flags: int) -> int:
+    """libc's memfd_create symbol (any glibc >= 2.27 / musl >= 1.1.20 at runtime)"""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno = True)
+    fn = libc.memfd_create   # AttributeError when the runtime libc predates it
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    fd = fn(name.encode(), flags)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+
+def _memfd_via_syscall(name: str, flags: int) -> int:
+    """Raw memfd_create syscall, for a runtime libc without the wrapper"""
+    import ctypes
+    nr = _MEMFD_SYSCALL.get(os.uname().machine)
+    if nr is None:
+        raise RuntimeError(f"no memfd_create syscall number known for {os.uname().machine}")
+    libc = ctypes.CDLL(None, use_errno = True)
+    libc.syscall.restype = ctypes.c_long
+    fd = libc.syscall(ctypes.c_long(nr), ctypes.c_char_p(name.encode()), ctypes.c_uint(flags))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return int(fd)
+
+
+def _memfd_create(name: str, flags: int = 0) -> int:
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, flags)
+    try:
+        return _memfd_via_libc(name, flags)
+    except AttributeError:
+        pass
+    try:
+        return _memfd_via_syscall(name, flags)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"CPU MoE pinned arena: this Python build has no os.memfd_create and no fallback "
+            f"applies ({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
+
+
+# Windows large pages: there is no madvise/promotion path, so MEM_LARGE_PAGES must be requested
+# at VirtualAlloc time. That requires SeLockMemoryPrivilege enabled on this process's token
+# (the privilege is granted-but-disabled by default for accounts that have it), and the size
+# must be a multiple of GetLargePageMinimum() (2 MiB on x64). Large pages are committed and
+# non-pageable, so allocation can fail on a fragmented or busy system -- callers fall back to
+# a plain anonymous mapping per chunk. A failed request is expensive to repeat (the kernel
+# searches for contiguous memory each time) and contiguity does not come back during a load,
+# so the arena remembers how far down the size ladder it had to go (see _HugeArena._new_chunk).
+
+_WIN32_LARGE_PAGE_SUPPORT = None
+
+
+def _win32_enable_lock_memory_privilege() -> bool:
+    """Best-effort SeLockMemoryPrivilege enable on the current process token. Returns True
+    only when the privilege ends up enabled."""
+    import ctypes
+    from ctypes import wintypes
+
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    SE_PRIVILEGE_ENABLED = 0x00000002
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                    ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error = True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    # GetCurrentProcess returns the -1 pseudo-handle; without a pointer-sized restype ctypes
+    # truncates it to 32 bits and OpenProcessToken fails with ERROR_INVALID_HANDLE
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.LookupPrivilegeValueW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES,
+            ctypes.byref(token)):
+        return False
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeLockMemoryPrivilege", ctypes.byref(luid)):
+            return False
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0] = LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED)
+        advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+        # AdjustTokenPrivileges returns success even when it silently dropped privileges it
+        # couldn't assign; GetLastError distinguishes full assignment from partial
+        return ctypes.get_last_error() == 0
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _win32_large_page_alloc(size: int, min_size: int):
+    """Allocate MEM_LARGE_PAGES memory of up to `size` bytes, halving the request on each
+    failure down to `min_size`, and return the largest buffer obtained (a ctypes byte array
+    bound to the allocation -- buffer-protocol compatible, so it drops into the same
+    memoryview / torch.frombuffer consumers as an mmap object), or None when even `min_size`
+    cannot be supplied. A large request needs that many physically contiguous 2 MiB regions,
+    which a fragmented or busy system often cannot supply even when smaller runs exist, so a
+    shrunken chunk is still a win over falling back to 4K pages outright. A weakref.finalize
+    on the array issues VirtualFree(MEM_RELEASE) when the last reference dies, giving the
+    chunk the same free-on-GC lifetime semantics as an mmap object."""
+    import ctypes
+    import weakref
+
+    global _WIN32_LARGE_PAGE_SUPPORT
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    kernel32.GetLargePageMinimum.restype = ctypes.c_size_t
+
+    if _WIN32_LARGE_PAGE_SUPPORT is None:
+        large_page_min = kernel32.GetLargePageMinimum()
+        _WIN32_LARGE_PAGE_SUPPORT = bool(large_page_min) and _win32_enable_lock_memory_privilege()
+        if not _WIN32_LARGE_PAGE_SUPPORT and os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(" -- arena: MEM_LARGE_PAGES unavailable "
+                  f"(GetLargePageMinimum={large_page_min}, SeLockMemoryPrivilege "
+                  "not enabled); arena chunks will use regular pages", flush = True)
+    if not _WIN32_LARGE_PAGE_SUPPORT:
+        return None
+
+    granularity = kernel32.GetLargePageMinimum()
+    MEM_RESERVE = 0x2000
+    MEM_COMMIT = 0x1000
+    MEM_LARGE_PAGES = 0x20000000
+    PAGE_READWRITE = 0x04
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    kernel32.VirtualAlloc.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
+    kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
+
+    want = (size + granularity - 1) // granularity * granularity
+    floor = (min_size + granularity - 1) // granularity * granularity
+    addr = None
+    while True:
+        addr = kernel32.VirtualAlloc(
+            None, want, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE)
+        if addr or want <= floor:
+            break
+        want = max(want >> 1, floor)
+    if not addr:
+        return None
+    buf = (ctypes.c_uint8 * want).from_address(addr)
+    weakref.finalize(buf, kernel32.VirtualFree, ctypes.c_void_p(addr), 0, 0x8000)  # MEM_RELEASE
+    if want < size and os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+        print(f" -- arena: MEM_LARGE_PAGES negotiated down to {want >> 20} MiB "
+              f"(asked {size >> 20} MiB)", flush = True)
+    return buf
+
+
+def _copy_repacked(dst, tensor, group, planar):
+    """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
+    CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
+    to (nt/group, kt, nt%group), and with planar each tile's dwords are transposed -- dword w
+    to 8*(w%bits) + w/bits, i.e. the trailing (8, bits) dword dims swap (integer rates only,
+    where group is nonzero). One strided copy_; group 0 is a plain copy."""
+    tk, tn, ps = tensor.shape
+    if not group:
+        dst.copy_(tensor)
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
+            tensor.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tn // group, tk, group, ps).copy_(
+            tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
+
+
+def _copy_unpacked(dst, packed, group, planar):
+    """The inverse of _copy_repacked: a packed-layout [k/16, n/16, 16K] view back to native
+    tile order (and dword order) in `dst`"""
+    tk, tn, ps = dst.shape
+    if not group:
+        dst.copy_(packed)
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).copy_(
+            packed.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tk, tn // group, group, ps).copy_(
+            packed.view(tn // group, tk, group, ps).permute(1, 0, 2, 3))
+
 
 class _HugeArena:
     """
@@ -118,20 +430,116 @@ class _HugeArena:
     instead of thousands of separate small (sub-2MB) loader allocations
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
+    WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
+    CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
-    def __init__(self):
+    def __init__(self, shared = False, huge = "", conn = None):
+        """shared: back each chunk with shared memory and publish it over `conn` as
+        ("chunk", index, size, name) so the parent can map the same pages and page-lock them
+        for DMA: Linux sends a memfd descriptor after the message (SCM_RIGHTS, name = None),
+        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux)."""
+        self.shared = shared
+        self.huge = huge
+        self.conn = conn
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        # A private anonymous chunk (Linux, not shared) only takes RAM for the pages rehome()
+        # writes, and the last chunk of a load is usually mostly unused, so the host-memory
+        # guard runs on bytes written (in CHECK_STEP slices) rather than on whole chunks.
+        # Shared, hugetlb and Windows chunks are committed up front and keep the per-chunk check
+        self.lazy = not shared and os.name != "nt"
+        self.written = 0
+        self.checked = 0
+        self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
+        # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
+        # attempt: the size the last chunk was served at, or below the smallest size that failed
+        self.win32_large_ceiling = None
 
     def _new_chunk(self, min_bytes):
         import mmap, os
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
-        if os.name == "nt":
+        if not self.lazy:
+            check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
+                                    f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
+        if self.shared and os.name == "nt":
+            # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
+            # trips on the layer tensors' exports at worker exit). It charges commit and gets
+            # page-locked by the parent, so both free RAM and commit must cover the chunk
+            index = len(self.chunks)
+            avail_phys, avail_commit = windows_memory_status()
+            if size > min(avail_phys, avail_commit):
+                raise RuntimeError(
+                    f"CPU MoE pinned arena: chunk {index} needs {size >> 20} MiB, but only "
+                    f"{avail_phys >> 20} MiB of physical RAM and {avail_commit >> 20} MiB of commit "
+                    f"are available. Free RAM, offload fewer experts, or unset EXL3_MOE_PINNED_ARENA.")
+            name = f"exl3_moe_arena_{os.getpid()}_{index}"
+            try:
+                m = mmap.mmap(-1, size, tagname = name)
+            except OSError as e:
+                raise RuntimeError(
+                    f"CPU MoE pinned arena: cannot create the {size >> 20} MiB section for chunk "
+                    f"{index} ({e.strerror}). Free RAM or commit, or unset EXL3_MOE_PINNED_ARENA.") from e
+            if self.conn is not None:
+                self.conn.send(("chunk", index, size, name))
+        elif self.shared:
+            flags = 0
+            if self.huge == "1g":
+                size = (size + (1 << 30) - 1) & ~((1 << 30) - 1)
+                flags = MFD_HUGETLB | MFD_HUGE_1GB
+            elif self.huge == "2m":
+                flags = MFD_HUGETLB | MFD_HUGE_2MB
+            fd = _memfd_create(f"exl3_moe_arena_{len(self.chunks)}", flags)
+            try:
+                # Preallocate: a hugetlb memfd without enough reserved pages fails here with
+                # ENOMEM instead of SIGBUS on first touch
+                os.posix_fallocate(fd, 0, size)
+                m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            except OSError as e:
+                os.close(fd)
+                raise RuntimeError(
+                    f"CPU MoE pinned arena: cannot allocate a {size >> 20} MiB "
+                    f"{'hugetlb ' if self.huge else ''}memfd chunk ({e.strerror}). "
+                    + ("Reserve hugepages (vm.nr_hugepages / hugepages-1048576kB) or unset "
+                       "EXL3_MOE_ARENA_HUGE." if self.huge else
+                       "Check the memory cgroup limit, or unset EXL3_MOE_PINNED_ARENA.")) from e
+            if not self.huge and TUNING.arena_hugepage:
+                # Honoured only where shmem_enabled permits (advise/always/within_size)
+                try:
+                    m.madvise(mmap.MADV_HUGEPAGE)
+                except Exception:
+                    pass
+            if self.conn is not None:
+                # SCM_RIGHTS over the pipe's socketpair. socket.send_fds rather than
+                # multiprocessing.reduction.send_handle: the latter blocks for an
+                # acknowledgement byte, which would stall the worker's loading until the
+                # parent next pumps the pipe
+                import socket
+                self.conn.send(("chunk", len(self.chunks), size, None))
+                with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
+                    socket.send_fds(sock, [b"F"], [fd])
+            os.close(fd)   # the mapping keeps the pages alive
+        elif os.name == "nt":
             # mmap.MAP_PRIVATE / mmap.PROT_* don't exist on Windows; an anonymous mapping is
-            # writable by default there. Hugepage promotion doesn't apply (promote_hugepages
-            # is already a no-op via its try/except), the arena still serves its pooling role
-            m = mmap.mmap(-1, size)
+            # writable by default there. Windows has no post-hoc hugepage promotion, so the
+            # EXL3_MOE_ARENA_HUGEPAGE knob is honoured here instead: each chunk first tries a
+            # MEM_LARGE_PAGES VirtualAlloc (needs SeLockMemoryPrivilege and physically
+            # contiguous 2 MiB regions), halving the request down to 64 MiB -- and no lower
+            # than what the placement needs -- before falling back to a plain mapping, still
+            # at full chunk size since regular pages have no contiguity constraint. Later
+            # chunks start at the size the previous one was served at instead of walking the
+            # ladder from the top again, and stop asking once the smallest size has failed
+            m = None
+            if TUNING.arena_hugepage:
+                floor = max(self.WIN32_LARGE_FLOOR, min_bytes)
+                ceiling = self.win32_large_ceiling
+                if ceiling is None or ceiling >= floor:
+                    m = _win32_large_page_alloc(size if ceiling is None else min(size, ceiling), floor)
+                    self.win32_large_ceiling = len(m) if m is not None else floor // 2
+            if m is not None:
+                self.win32_large_bytes += len(m)
+            else:
+                m = mmap.mmap(-1, size)
         else:
             m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
         self.chunks.append(m)
@@ -139,8 +547,16 @@ class _HugeArena:
         self.cur_off = 0
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
             total = sum(len(c) for c in self.chunks)
-            print(f" -- arena: new chunk {size/1e6:.1f} MB, {len(self.chunks)} chunks, "
+            print(f" -- arena: new chunk {len(m)/1e6:.1f} MB, {len(self.chunks)} chunks, "
                   f"{total/1e9:.3f} GB total", flush = True)
+
+    def reserve(self, nbytes):
+        """Make sure the next `nbytes` of rehomes land contiguously in the current chunk;
+        returns the (chunk index, byte offset) they will start at"""
+        aligned = (nbytes + 63) & ~63
+        if self.cur is None or self.cur_off + aligned > len(self.cur):
+            self._new_chunk(aligned)
+        return len(self.chunks) - 1, self.cur_off
 
     def promote_hugepages(self):
         """One-shot MADV_COLLAPSE (Linux 6.1+) over each chunk, meant to run once after all
@@ -155,6 +571,21 @@ class _HugeArena:
         import mmap, os, time
         if not TUNING.arena_hugepage:
             return
+        if os.name == "nt":
+            # MEM_LARGE_PAGES is decided at VirtualAlloc time (see _new_chunk); there is no
+            # promotion step to run here, only coverage to report. Large pages are locked in
+            # RAM, which the user did not ask for explicitly, so say so whenever they are in
+            # use; an account without the privilege gets regular pages and no message
+            total = sum(len(c) for c in self.chunks)
+            if self.win32_large_bytes:
+                print(f" -- CPU MoE arena: {self.win32_large_bytes/1e9:.2f} GB of {total/1e9:.2f} GB "
+                      f"on large pages (locked in RAM, never paged out; set "
+                      f"EXL3_MOE_ARENA_HUGEPAGE=0 to use regular pages)", flush = True)
+            elif _WIN32_LARGE_PAGE_SUPPORT and total:
+                print(" -- CPU MoE arena: no large pages could be allocated, using regular pages "
+                      "(physical memory is too fragmented; large pages are usually available "
+                      "again after a reboot)", flush = True)
+            return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
         t0 = time.perf_counter()
         for c in self.chunks:
@@ -166,36 +597,40 @@ class _HugeArena:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
                   f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
-    def rehome(self, tensor, band_swizzle = False):
+    def rehome(self, tensor, band_swizzle = 0, planar = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
         returned view stays valid.
 
-        band_swizzle: repack a [k/16, n/16, 16K] trellis tensor band-contiguous during the
-        copy -- physical order becomes (group n/128, k-tile, member, tile), one strided copy_.
-        The returned view keeps the original logical shape; only the byte order differs
-        (consumed by the swz-aware kernels in moe_mul1.cpp)."""
+        band_swizzle/planar: repack a [k/16, n/16, 16K] trellis tensor with the given packed
+        layout during the copy (see _copy_repacked). The returned view keeps the original
+        logical shape; only the byte order differs (consumed by the swz-aware kernels in
+        moe_mul1.cpp)."""
         import torch
         if tensor is None or tensor.numel() == 0:
             return tensor
         nbytes = tensor.numel() * tensor.element_size()
         aligned = (nbytes + 63) & ~63
+        if self.lazy:
+            if self.written + aligned > self.checked:
+                step = max(aligned, self.CHECK_STEP)
+                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                self.checked = self.written + step
+            self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
             self._new_chunk(aligned)
         off = self.cur_off
         self.cur_off += aligned
         buf = memoryview(self.cur)[off : off + nbytes]
         dst = torch.frombuffer(buf, dtype = torch.uint8)
-        if band_swizzle:
-            tk, tn, ps = tensor.shape
-            dst.view(tensor.dtype).view(tn // 8, tk, 8, ps) \
-               .copy_(tensor.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+        if band_swizzle or planar:
+            _copy_repacked(dst.view(tensor.dtype).view(tensor.shape), tensor, band_swizzle, planar)
         else:
             dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
-def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
+def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
@@ -214,6 +649,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     ipds()
 
+    if cpus is not None:
+        # Spawned after the host was confined: drop the inherited host mask, or the pool's
+        # worker pins fail (Windows refuses a thread mask outside the process mask)
+        err = apply_process_affinity(cpus)
+        if err is not None:
+            print(f" !! CPU MoE worker affinity: {err}; worker confined to the host's LPs")
+
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
         # worker's poll loops back off to 50 us sleeps, which otherwise round up to the default
@@ -227,7 +669,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
     try:
         stc = SafetensorsCollection(model_dir)
         cpu = torch.device("cpu")
-        arena = _HugeArena()
+        # Pinned mode: memfd-backed chunks, published to the parent as they are created
+        arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None)
 
         def fetch(keys):
             out = []
@@ -239,16 +682,50 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
-        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
+        # Repack the trellis copies into the packed layout the kernel tier wants for each
+        # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
+        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        swz = TUNING.swizzle
 
         def rehome_trellis(t):
-            return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
+            grp = cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
+            pln = grp and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0)
+            return arena.rehome(t, band_swizzle = grp, planar = pln)
 
-        def rehome_all(ts):
-            return [(rehome_trellis(t[0]), arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3]))
-                   for t in ts]
+        def nbytes(t):
+            return t.numel() * t.element_size()
+
+        def rehome_experts(g, u, d):
+            """Per expert: the gate/up/down trellis tensors back to back (one contiguous
+            expert block in (g, u, d) order, the layout the stager produces and the DMA unit
+            of the pinned-arena streamed path), then the small aux tensors. Returns the
+            per-projection lists and the per-expert (chunk, byte offset) of each block."""
+            gs, us, ds, blocks, auxlocs = [], [], [], [], []
+            for e in range(len(u)):
+                projs = ([g[e]] if g else []) + [u[e], d[e]]
+                total = sum(nbytes(t[0]) for t in projs)
+                assert all(nbytes(t[0]) % 64 == 0 for t in projs), "trellis size not 64-byte aligned"
+                blocks.append(arena.reserve(total))
+                trellis = [rehome_trellis(t[0]) for t in projs]
+                # The aux tensors' (chunk, offset, bytes) go to the parent with the block: a demotion
+                # (promote-on-miss) writes an expert's suh/svh/bias into the arena from the GPU
+                aux, locs = [], []
+                for t in projs:
+                    pa, pl = [], []
+                    for a in (t[1], t[2], t[3]):
+                        if a is None or a.numel() == 0:
+                            pl.append(None)
+                        else:
+                            pl.append(arena.reserve(nbytes(a)) + (nbytes(a),))
+                        pa.append(arena.rehome(a))
+                    aux.append(tuple(pa))
+                    locs.append(pl)
+                auxlocs.append(locs)
+                if g:
+                    gs.append((trellis[0],) + aux[0])
+                us.append((trellis[-2],) + aux[-2])
+                ds.append((trellis[-1],) + aux[-1])
+            return gs, us, ds, blocks, auxlocs
 
         def biases(ts):
             return [t[3] for t in ts] if ts and ts[0][3] is not None else []
@@ -264,14 +741,24 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             msg = conn.recv()
             if msg[0] == "layer":
                 spec = msg[1]
-                stc.begin_deferred_load()
-                g = fetch(spec["gate_keys"])
-                u = fetch(spec["up_keys"])
-                d = fetch(spec["down_keys"])
-                stc.end_deferred_load()
-                # Copy into the hugepage-backed arena now that the deferred reads have actually
-                # populated these tensors
-                g, u, d = rehome_all(g), rehome_all(u), rehome_all(d)
+                num_experts = len(spec["up_keys"])
+                batch = TUNING.load_batch_experts or num_experts
+                g, u, d, blocks, auxlocs = [], [], [], [], []
+                for e0 in range(0, num_experts, batch):
+                    sl = slice(e0, e0 + batch)
+                    stc.begin_deferred_load()
+                    bg = fetch(spec["gate_keys"][sl])
+                    bu = fetch(spec["up_keys"][sl])
+                    bd = fetch(spec["down_keys"][sl])
+                    stc.end_deferred_load()
+                    # Copy into the hugepage-backed arena now that the deferred reads have
+                    # actually populated these tensors; the loader tensors die with this batch
+                    bg, bu, bd, bb, ba = rehome_experts(bg, bu, bd)
+                    g += bg
+                    u += bu
+                    d += bd
+                    blocks += bb
+                    auxlocs += ba
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -281,13 +768,15 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                     1 if swz else 0,
                 )
                 layer_views.append((g, u, d))
-                # Reclaim this layer's now-discarded loader tensors immediately (rehome_all copied
-                # everything into the arena)
+                # Reclaim this layer's now-discarded loader tensors immediately (rehome_experts
+                # copied everything into the arena)
                 try:
                     ctypes.CDLL(None).malloc_trim(0)
                 except Exception:
                     pass
-                conn.send(("ok",))
+                # The ack carries the expert block locations (only meaningful to a parent that
+                # maps the arena)
+                conn.send(("ok", blocks if pinned else None, auxlocs if pinned else None))
             elif msg[0] == "start":
                 shm_name, layout = msg[1], msg[2]
                 break
@@ -308,10 +797,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
                 new = stc.get_tensor(key + ".trellis", cpu)
                 assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
-                if swz and v_tr.shape[2] // 16 != 8:
-                    tk, tn, ps = new.shape
-                    v_tr.view(tn // 8, tk, 8, ps) \
-                        .copy_(new.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+                grp = cext.exl3_moe_cpu_swizzle_group(new.shape[2] / 16.0) if swz else 0
+                if grp:
+                    _copy_repacked(v_tr, new, grp, cext.exl3_moe_cpu_planar_layout(new.shape[2] / 16.0))
                 else:
                     v_tr.copy_(new)
                 v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
@@ -367,6 +855,32 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             shm.close()
 
 
+def probe_bandwidth(timed_copy, floor_s = 0.5, cap_s = 2.0, asleep_gbs = 5.0):
+    """Sustained pinned->device rate in GB/s from repeated `timed_copy()` calls. An idle link
+    sits at Gen1 (the Windows driver drops it after a few idle seconds) and retrains only after
+    0.2-0.3 s of sustained traffic, so: copy for at least floor_s, then until the last 8 copies
+    are within 5% of the best, up to cap_s while the rate still looks asleep. Median of the
+    last 8, so one copy straddling the retrain step cannot win."""
+    import time
+    t0 = time.perf_counter()
+    best, trace = 0.0, []
+    while True:
+        rate = timed_copy()
+        trace.append(rate)
+        best = max(best, rate)
+        t = time.perf_counter() - t0
+        tail = trace[-8:]
+        steady = len(tail) == 8 and min(tail) >= 0.95 * best
+        if t >= cap_s or (t >= floor_s and steady and best >= asleep_gbs):
+            return sorted(tail)[len(tail) // 2]
+
+
+def _pinning_exhausted(e: Exception) -> bool:
+    """Whether a cudaHostRegister failure means the process has no page-locked memory left
+    (cudaErrorMemoryAllocation, reported as "out of memory"), as opposed to a bad mapping"""
+    return "out of memory" in str(e).lower()
+
+
 class MoeCpuHost:
 
     def __init__(self, config):
@@ -387,7 +901,7 @@ class MoeCpuHost:
         self.cap_rows = TUNING.cap_rows
         # Per-component thread override: config.infer_params.moe_cpu_threads for the main model,
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
-        # tuning default (EXL3_MOE_CPU_THREADS env, else cpu_count/2)
+        # tuning default (EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)
         comp = getattr(config.infer_params, "moe_cpu_component", "text")
         cfg_threads = getattr(config.infer_params,
             "moe_cpu_threads" if comp == "text" else "draft_moe_cpu_threads", None)
@@ -404,6 +918,24 @@ class MoeCpuHost:
         self.next_wslot = 0
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         self.aux = {}
+        self._dev_bufs = {}      # per device: persistent streamed-prefill buffers (see _device_buffers)
+        # Pinned arena (config.infer_params.moe_cpu_pinned_arena, EXL3_MOE_PINNED_ARENA its
+        # default): parent-side mappings of the worker's memfd chunks (mmap, int16 view) indexed
+        # like the worker's chunk list, and per layer the per-expert (chunk, byte offset) of its
+        # contiguous [gate | up | down] trellis block
+        self.pinned = bool(getattr(config.infer_params, "moe_cpu_pinned_arena", TUNING.pinned_arena))
+        self.arena_maps = []
+        self.arena_views = []
+        # Chunks are registered in order; the first one the driver refuses for lack of page-locked
+        # memory (WDDM and WSL2 budget the pinnable memory at about half of RAM) ends the pinning,
+        # and experts in it and every later chunk stream through the staged path instead
+        self.arena_registered = None
+        self.layer_blocks = []
+        self.layer_auxloc = []
+        # Promote-on-miss transfers (see BlockSparseMLP_CPU._split_promote_step): per device a
+        # stream of its own and two expert-sized staging buffers (packed and native order)
+        self._promo = {}
+        self.batch_recon = TUNING.stream_batch_recon
 
     def _spawn(self):
         if self.proc is not None:
@@ -412,7 +944,8 @@ class MoeCpuHost:
         self.conn, child_conn = ctx.Pipe(duplex = True)
         self.proc = ctx.Process(
             target = _moe_cpu_child_main,
-            args = (child_conn, self.model_dir, self.threads, self.stage_threads),
+            args = (child_conn, self.model_dir, self.threads, self.stage_threads,
+                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS),
             daemon = True,
         )
         self.proc.start()
@@ -429,14 +962,100 @@ class MoeCpuHost:
             if msg[0] == "err":
                 raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
             if msg[0] == "ok":
+                # Layer acks arrive in registration order: entry i describes specs[i]
+                self.layer_blocks.append(msg[1] if len(msg) > 1 else None)
+                self.layer_auxloc.append(msg[2] if len(msg) > 2 else None)
                 self.acked += 1
+            elif msg[0] == "chunk":
+                self._attach_chunk(msg[1], msg[2], msg[3])
             return True
         if not self.proc.is_alive():
             raise RuntimeError("CPU MoE worker process died")
         return False
 
+    def _register_handoff(self, size):
+        """Page-lock the handoff segment. It is registered after the arena chunks (its size depends
+        on the layers), so when the pinned budget ran out on them it can run out here too; the
+        segment is what the staged path runs on, so arena chunks are given back, last first, until
+        it fits"""
+        while True:
+            try:
+                cuda_host_register(self.base_ptr, size,
+                                   flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+                return
+            except Exception as e:
+                last = max((i for i, v in enumerate(self.arena_views) if v is not None), default = None)
+                if not _pinning_exhausted(e) or last is None:
+                    raise
+                cuda_host_unregister(self.arena_views[last].data_ptr())
+                self.arena_views[last] = None
+                self.arena_maps[last].close()
+                self.arena_maps[last] = None
+                self.arena_registered = last
+                print(f" !! CPU MoE pinned arena: chunk {last} released to page-lock the handoff "
+                      f"segment; experts in it and the remaining chunks use the staged path", flush = True)
+
+
+    def _attach_chunk(self, index, size, name):
+        """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
+        ("chunk", ...) message; Windows: section `name`) and page-lock it for DMA. Registration
+        is done here, per chunk as it appears during loading, so its cost overlaps the rest of
+        the load instead of stacking up at startup. Any failure closes the mapping before the
+        error leaves this frame."""
+        import mmap
+        import socket
+        assert index == len(self.arena_maps), "arena chunk published out of order"
+        if name is not None:
+            # Opening by name fails loudly if the worker already dropped the section
+            m = shared_memory.SharedMemory(name = name)
+        else:
+            with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
+                _, fds, _, _ = socket.recv_fds(sock, 1, 1)
+            assert len(fds) == 1, "arena chunk descriptor missing"
+            fd = fds[0]
+            try:
+                m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            finally:
+                os.close(fd)
+        if self.arena_registered is not None:
+            # Page-locked memory ran out at an earlier chunk: nothing past it is pinned, and the
+            # mapping is not needed either (the staged path reads the arena in the worker)
+            m.close()
+            self.arena_maps.append(None)
+            self.arena_views.append(None)
+            return
+        view = None
+        try:
+            # count = size // 2: a section opened by name reports its page-rounded size, and
+            # frombuffer rejects a buffer shorter than the advertised chunk
+            view = torch.frombuffer(m.buf if name is not None else m, dtype = torch.int16,
+                                    count = size // 2)
+            cuda_host_register(view.data_ptr(), size, flags = CUDA_HOST_REGISTER_PORTABLE)
+        except Exception as e:
+            view = None   # no tensor over an unmapped region may survive in the traceback's frame
+            m.close()
+            if _pinning_exhausted(e):
+                # The driver has no page-locked memory left for this process (WDDM and WSL2 cap
+                # it at about half of RAM; the KV tiers and other processes share the budget).
+                # Not a fault: keep what is pinned, stage the rest
+                self.arena_registered = index
+                self.arena_maps.append(None)
+                self.arena_views.append(None)
+                print(f" !! CPU MoE pinned arena: no page-locked memory left for chunk {index} "
+                      f"({index * (size >> 20)} MiB registered); experts in the remaining chunks "
+                      f"use the staged path", flush = True)
+                return
+            raise RuntimeError(
+                f"CPU MoE pinned arena: chunk {index} ({size >> 20} MiB) could not be attached "
+                f"({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
+        self.arena_maps.append(m)
+        self.arena_views.append(view)
+        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(f" -- pinned arena: mapped + registered chunk {index} ({size >> 20} MiB)",
+                  flush = True)
+
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None):
+                       proj_dims = None, aux = None, interm_fp32 = False):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -457,13 +1076,14 @@ class MoeCpuHost:
             hi = hi, ho = ho, topk = topk,
             num_experts = len(up_keys),
             proj_dims = proj_dims,
+            interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
         )
         if proj_dims is not None:
             # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
             # stage function
             def tb(d):
                 k, n, K = d
-                return (k // 16) * (n // 16) * 16 * K * 2
+                return (k // 16) * (n // 16) * int(16 * K) * 2
             gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
             ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
             spec["proj_bytes"] = (gb, ub, db)
@@ -529,8 +1149,7 @@ class MoeCpuHost:
         buf = np.frombuffer(self.shm.buf, dtype = np.uint8)
         buf[:MOE_CTRL_SIZE] = 0
         self.base_ptr = buf.ctypes.data
-        cuda_host_register(self.base_ptr, size,
-                           flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+        self._register_handoff(size)
         # GPU-visible alias of the registered buffer: equal to base_ptr under UVA (Linux
         # desktop), but a distinct address under WDDM (Windows), where the host VA is not a
         # valid device pointer
@@ -614,6 +1233,8 @@ class MoeCpuHost:
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
+        # The worker was spawned before this and pins its own threads; keep the host off them
+        _apply_host_affinity(self.threads, TUNING.host_cores)
 
     def _start_watchdog(self):
         """
@@ -635,12 +1256,12 @@ class MoeCpuHost:
                         done0 = MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS
                         cons0 = MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_SLOTS):
-                            u32[(done0 + s * 64) // 4] = seq
-                            u32[(cons0 + s * 64) // 4] = seq
+                            _write_flag(u32, done0 + s * 64, seq)
+                            _write_flag(u32, cons0 + s * 64, seq)
                         fl = MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_WSLOTS):
-                            u32[(fl + s * 64) // 4] = wseq                          # stage_done
-                            u32[(fl + 64 * MOE_MAX_WSLOTS + s * 64) // 4] = wseq    # pinned_free
+                            _write_flag(u32, fl + s * 64, wseq)                         # stage_done
+                            _write_flag(u32, fl + 64 * MOE_MAX_WSLOTS + s * 64, wseq)   # pinned_free
                         self.v_abort[0] = 1
                     except Exception:
                         pass
@@ -736,46 +1357,32 @@ class MoeCpuHost:
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
             return None
         h_ = y.shape[1]
-        hi = spec["hi"]
         dev = y.device
-        with torch.cuda.device(dev):
-            counts = self.dev_count.get(dev)
-            if counts is None:
-                counts = self.dev_count[dev] = \
-                    torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
-            slot_idx = self.next_slot
-            self.next_slot = (self.next_slot + 1) % self.num_slots
-            self.seq += 1
-            seq = self.seq
-            slot = self.slots[slot_idx]
-
-            tail = int(self.v_jobs_tail[0])
-            if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                import time
-                while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (ring stall)")
-                    time.sleep(0.0002)
-            job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
-            job[1] = layer_idx
-            job[2] = rows
-            job[3] = spec["topk"]
-            job[4] = slot_idx
-            job[5] = 2    # MOE_JOB_KIND_COMPUTE_GATED
-            self.v_jobs_tail[0] = tail + 1
-
-            if self.slot_last_seq[slot_idx]:
-                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
-                                       self.gpu_base_ptr + 128)
-            ext.moe_split_issue(
-                selected_experts.view(-1), split_map, split_hist,
-                y, routing_weights,
-                slot["sel_dev"], slot["x_dev"], slot["w_dev"],
-                counts, slot_idx, hi, first_cpu,
-            )
-            ext.exl3_moe_flag_write(slot["data_ready"], seq)
-            self.slot_last_seq[slot_idx] = seq
+        counts = self.dev_count.get(dev)
+        if counts is None:
+            counts = self.dev_count[dev] = \
+                torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
+        slot_idx = self.next_slot
+        self.next_slot = (self.next_slot + 1) % self.num_slots
+        self.seq += 1
+        seq = self.seq
+        slot = self.slots[slot_idx]
+        # One extension call: the job descriptor into the shared ring, the slot's consumed wait,
+        # the issue kernel and the data_ready flag, all on the stream of y's device. It declines
+        # (touching nothing) only when the job ring is near overflow, which a long prefill can
+        # reach; then throttle on the worker's progress and retry
+        args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
+                selected_experts.view(-1), split_map, split_hist, y, routing_weights,
+                slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
+                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
+        if not ext.exl3_moe_split_issue_fused(*args):
+            import time
+            while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                if self.v_abort[0] or not self.proc.is_alive():
+                    raise RuntimeError("CPU MoE worker failed (ring stall)")
+                time.sleep(0.0002)
+            ext.exl3_moe_split_issue_fused(*args)
+        self.slot_last_seq[slot_idx] = seq
         return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
 
     def submit_collect_fused(self, handle, final_2d):
@@ -784,10 +1391,9 @@ class MoeCpuHost:
         PCIe reads). Never synchronizes the host."""
         seq, slot_idx, rows, h_, ho, dev, counts = handle
         slot = self.slots[slot_idx]
-        with torch.cuda.device(dev):
-            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
-            ext.moe_split_collect_add(final_2d, slot["out_dev"], counts, slot_idx, ho)
-            ext.exl3_moe_flag_write(slot["consumed"], seq)
+        ext.exl3_moe_split_collect_fused(
+            final_2d, slot["out_dev"], counts, slot_idx, ho,
+            slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128)
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """
@@ -834,7 +1440,7 @@ class MoeCpuHost:
                         raise RuntimeError("CPU MoE worker failed (ring stall)")
                     time.sleep(0.0002)
             job = self.v_jobs[tail % MOE_JOB_RING]
-            job[0] = seq
+            _set_job_seq(job, seq)
             job[1] = layer_idx
             job[2] = n
             job[3] = spec["topk"]
@@ -876,12 +1482,7 @@ class MoeCpuHost:
         for job in jobs:
             self._collect_one(job, out, rtmp, h)
 
-    def _ensure_stream_state(self, device):
-        key = torch.device(device).index or 0
-        st = self.sstate.get(key)
-        if st is not None:
-            return st
-        # Reconstruct scratch sized for the largest projection
+    def _max_proj_numel(self):
         mx = 0
         for s in self.specs:
             pd = s.get("proj_dims")
@@ -889,25 +1490,81 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the child's
-        # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into a
-        # parallel ring after each DMA
-        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+        return mx
+
+    def _stream_layout(self, spec):
+        """Packed trellis layout of a layer's streamed projections as ((group, planar) for g, u,
+        d), plus whether any of them needs the GPU restore pass. The arena holds the bytes in
+        the layout the CPU kernel tier wants per bitrate (exl3_moe_cpu_swizzle_group /
+        exl3_moe_cpu_planar_layout, the same rule the child loader and expert replacement
+        apply), and the GPU kernels only read native order, so every packed projection is
+        restored after its DMA. Rates are fixed per layer, so the policy is cached on the spec;
+        a layer with nothing packed reads vram_slots directly (no ring, no copy pass)"""
+        lay = spec.get("stream_layout")
+        if lay is None:
+            pd = spec["proj_dims"]
+            lay = []
+            for nm in ("g", "u", "d"):
+                if pd.get(nm) and TUNING.swizzle:
+                    K = pd[nm][2]
+                    lay.append((int(ext.exl3_moe_cpu_swizzle_group(K)),
+                                int(ext.exl3_moe_cpu_planar_layout(K))))
+                else:
+                    lay.append((0, 0))
+            lay = spec["stream_layout"] = (tuple(lay), any(g or p for g, p in lay))
+        return lay
+
+    def _device_buffers(self, device, spec = None):
+        """The persistent device-side buffers of the streamed-prefill path (VRAM weight ring,
+        native-order ring for restored experts, reconstruct scratch, fused-tier buffers, batched
+        tier statics), created on first request per device. The autosplit loader requests them
+        during a layer's measured load (prefill_worst_case_parts), before the worker starts, so
+        they count as allocated when the split is planned instead of appearing on the first real
+        prefill; _ensure_stream_state adopts them. The native-order ring exists only once a
+        layer whose experts arrive packed asks for it (spec given), so hosts whose tier packs
+        nothing never allocate it; once allocated it stays for later layers to account for"""
+        key = torch.device(device).index or 0
+        d = self._dev_bufs.get(key)
+        mx = self._max_proj_numel()
+        if d is None:
+            d = dict(
+                vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                              for _ in range(self.num_wslots)],
+                native_slots = None,
+                w_scratch = None,
+                fused_bufs = {},
+                recon = {},
+            )
+            self._dev_bufs[key] = d
+        if spec is not None and d["native_slots"] is None and self._stream_layout(spec)[1]:
+            d["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                                 for _ in range(self.num_wslots)]
+        # Reconstruct scratch sized for the largest projection registered so far; grows if a
+        # later layer is larger
+        if mx and (d["w_scratch"] is None or d["w_scratch"].numel() < mx):
+            d["w_scratch"] = torch.empty(mx, dtype = torch.half, device = device)
+        return d
+
+    def _ensure_stream_state(self, device):
+        key = torch.device(device).index or 0
+        st = self.sstate.get(key)
+        if st is not None:
+            return st
+        bufs = self._device_buffers(device)
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
-            vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                          for _ in range(self.num_wslots)],
-            native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                            for _ in range(self.num_wslots)] if swz else None,
-            swz = swz,
+            vram_slots = bufs["vram_slots"],
+            native_slots = bufs["native_slots"],
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
-            w_scratch = torch.empty(mx, dtype = torch.half, device = device) if mx else None,
-            # Fused-tier (exl3_moe) temp buffers, allocated lazily per (hidden, intermediate)
-            # shape: the kernel reads both dims from the buffers, so they must match the layer
+            w_scratch = bufs["w_scratch"],
+            # Fused-tier (exl3_moe) temp buffers per (hidden, intermediate) shape and the
+            # batched reconstruct tier state per layer, shared with the preallocated buffers
             fused_t = TUNING.stream_fused_t,
-            fused_bufs = {},
+            fused_bufs = bufs["fused_bufs"],
+            # Batched reconstruct tier state per layer (moe_batch_recon.BatchReconLayer)
+            recon = bufs["recon"],
         )
 
         # Probe pinned->device bandwidth once: the break-even assignment count for streaming an
@@ -916,29 +1573,21 @@ class MoeCpuHost:
         # EXL3_MOE_STREAM_T overrides the scaling.
         probe = min(self.wslot_size, 16 << 20)
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
-        bw = 0.0
+        def timed_copy():
+            ev0.record(st["copy_stream"])
+            st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2], non_blocking = True)
+            ev1.record(st["copy_stream"])
+            ev1.synchronize()
+            return probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
         with torch.cuda.stream(st["copy_stream"]):
-            # An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
-            # after a few idle seconds) and only retrains under sustained traffic, over a few
-            # hundred ms. Two warm-up copies would measure the sleeping link; warm it for a
-            # wall-clock budget, then take the best of several timed copies: streaming keeps
-            # the link awake, so the peak is the rate the break-even estimate should use
-            import time
-            t0 = time.perf_counter()
-            for _ in range(256):
-                st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
-                                                       non_blocking = True)
-                st["copy_stream"].synchronize()
-                if time.perf_counter() - t0 > 0.25:
-                    break
-            for _ in range(8):
-                ev0.record(st["copy_stream"])
-                st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
-                                                       non_blocking = True)
-                ev1.record(st["copy_stream"])
-                ev1.synchronize()
-                bw = max(bw, probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9)   # GB/s
+            # streaming keeps the link awake, so the sustained awake rate is the one to use
+            bw = probe_bandwidth(timed_copy)
         st["bw"] = bw
+        if st["native_slots"] is not None:
+            # The ring was carved on the compute stream during the measured load; the copy
+            # stream writes into it, so its first write is ordered after that stream (the
+            # allocator may have recycled a block whose last user is still queued there)
+            st["copy_stream"].wait_stream(torch.cuda.current_stream())
         if TUNING.stream_t_explicit:
             st["stream_t"] = self.stream_t
         else:
@@ -954,14 +1603,17 @@ class MoeCpuHost:
         self.sstate[key] = st
         return st
 
-    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch):
-        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias)"""
+    def _dq_linear(self, x, trellis_view, dims, suh, svh, bias, w_scratch, out_dtype = torch.half):
+        """reconstruct-path linear: had_in(x * suh) @ W -> had_out * svh (+ bias). out_dtype
+        follows the resident experts (fp32 for the down projection, the model's interm_dtype
+        for gate/up): on models with massive activations the output-side Hadamard concentrates
+        a 128-block past the fp16 range, and an in-place fp16 transform overflows to inf"""
         k, n, K = dims
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh, None, 1.0)
         w = w_scratch[:k * n].view(k, n)
         ext.reconstruct(w, trellis_view, K, False, True)
-        y = torch.empty((x.shape[0], n), dtype = torch.half, device = x.device)
+        y = torch.empty((x.shape[0], n), dtype = out_dtype, device = x.device)
         ext.hgemm(xh, w, y)
         ext.had_r_128(y, y, None, svh, 1.0)
         if bias is not None:
@@ -988,6 +1640,145 @@ class MoeCpuHost:
             return ((uf + 1.0) * gf * torch.sigmoid(1.702 * gf)).half()
         uf = torch.nn.functional.relu(u.float())
         return (uf * uf).half()
+
+    # -- promote-on-miss transfers ---------------------------------------------------------------
+    #
+    # With the pinned arena the parent maps the worker's expert memory, so an expert moves between
+    # the GPU slot tensors and its arena block by DMA on a side stream: no checkpoint read, no
+    # worker message, no quiesce. The arena holds the bytes in the CPU tier's packed layout
+    # (_stream_layout), the GPU slots in native order, so a transfer repacks through the staging
+    # buffers with the same strided copies the child loader uses. The caller orders the transfers
+    # against the compute streams (BlockSparseMLP_CPU._split_promote_step).
+
+    def promote_ready(self, layer_idx, cpu_local):
+        """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
+        mapped here and the expert's chunks were page-locked (the pinning may have stopped short)"""
+        if not self.pinned or layer_idx >= len(self.layer_blocks) or self.layer_blocks[layer_idx] is None:
+            return False
+        if layer_idx not in self.aux or self.specs[layer_idx].get("expert_bytes") is None:
+            return False
+        chunks = {self.layer_blocks[layer_idx][cpu_local][0]}
+        for proj in self.layer_auxloc[layer_idx][cpu_local]:
+            chunks |= {loc[0] for loc in proj if loc is not None}
+        return all(c < len(self.arena_views) and self.arena_views[c] is not None for c in chunks)
+
+
+    def _promo_state(self, device):
+        key = torch.device(device).index or 0
+        P = self._promo.get(key)
+        if P is None:
+            eb = max(sp.get("expert_bytes") or 0 for sp in self.specs)
+            P = self._promo[key] = dict(
+                stream = torch.cuda.Stream(device = device),
+                raw = torch.empty(eb // 2, dtype = torch.int16, device = device),
+            )
+        return P
+
+
+    def promo_stream(self, device):
+        return self._promo_state(device)["stream"]
+
+
+    def _promo_parts(self, layer_idx, linears):
+        """(projection index in the worker's (g, u, d) order, name, Linear, byte offset, bytes) of
+        the expert's projections; `linears` is (gate or None, up, down)"""
+        spec = self.specs[layer_idx]
+        gb, ub, db = spec["proj_bytes"]
+        parts, li, off = [], 0, 0
+        for name, lin, nb in zip(("g", "u", "d"), linears, (gb, ub, db)):
+            if lin is None:
+                continue
+            parts.append((li, name, lin, off, nb))
+            li += 1
+            off += nb
+        return parts
+
+
+    def promote_expert(self, layer_idx, cpu_local, linears):
+        """Copy worker expert `cpu_local` into the GPU slot `linears` (gate or None, up, down):
+        the trellis block by DMA from the arena, repacked to native order, the aux tensors from
+        their GPU copies. Enqueued on the device's promotion stream; returns the event after it"""
+        spec = self.specs[layer_idx]
+        eb = spec["expert_bytes"]
+        ci, off = self.layer_blocks[layer_idx][cpu_local]
+        src = self.arena_views[ci][off // 2 : (off + eb) // 2]
+        layout, _ = self._stream_layout(spec)
+        aux = self.aux[layer_idx]
+        up = linears[1]
+        P = self._promo_state(up.trellis.device)
+        stream = P["stream"]
+        with torch.cuda.stream(stream):
+            raw = P["raw"][:eb // 2]
+            # Raw memcpy: torch's copy_ does not take the registered arena for pinned memory and would
+            # copy synchronously (the same for the device-to-host copies of demote_expert)
+            ext.cuda_memcpy_async(raw.data_ptr(), src.data_ptr(), eb, 1)
+            for li, name, lin, o, nb in self._promo_parts(layer_idx, linears):
+                dst = lin.trellis.view(torch.int16)
+                piece = raw[o // 2 : (o + nb) // 2]
+                group, planar = layout[("g", "u", "d").index(name)]
+                if group:
+                    _copy_unpacked(dst, piece.view(dst.shape), group, planar)
+                else:
+                    dst.view(-1).copy_(piece)
+                for an, attr in (("suh", "suh"), ("svh", "svh"), ("bias", "bias")):
+                    lst = aux.get(f"{an}_{name}")
+                    t = getattr(lin, attr, None)
+                    if lst is None or lst[cpu_local] is None or t is None:
+                        continue
+                    t.copy_(lst[cpu_local], non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+        return ev
+
+
+    def demote_expert(self, layer_idx, cpu_local, linears):
+        """Copy the GPU slot `linears` into worker expert `cpu_local`: the trellis block repacked
+        and DMA'd into the arena, the aux tensors into both their GPU copies (the streamed
+        prefill's) and the arena (the CPU kernel's). The worker slot must be unused (unmapped)
+        until the returned event has landed"""
+        spec = self.specs[layer_idx]
+        eb = spec["expert_bytes"]
+        ci, off = self.layer_blocks[layer_idx][cpu_local]
+        dst_block = self.arena_views[ci][off // 2 : (off + eb) // 2]
+        layout, _ = self._stream_layout(spec)
+        aux = self.aux[layer_idx]
+        locs = self.layer_auxloc[layer_idx][cpu_local]
+        up = linears[1]
+        P = self._promo_state(up.trellis.device)
+        stream = P["stream"]
+        hold = []
+        with torch.cuda.stream(stream):
+            raw = P["raw"][:eb // 2]
+            for li, name, lin, o, nb in self._promo_parts(layer_idx, linears):
+                srct = lin.trellis.view(torch.int16)
+                piece = raw[o // 2 : (o + nb) // 2]
+                group, planar = layout[("g", "u", "d").index(name)]
+                if group:
+                    _copy_repacked(piece.view(srct.shape), srct, group, planar)
+                else:
+                    piece.copy_(srct.view(-1))
+                for j, (an, attr) in enumerate((("suh", "suh"), ("svh", "svh"), ("bias", "bias"))):
+                    lst = aux.get(f"{an}_{name}")
+                    t = getattr(lin, attr, None)
+                    if lst is None or lst[cpu_local] is None or t is None:
+                        continue
+                    lst[cpu_local].copy_(t, non_blocking = True)
+                    loc = locs[li][j]
+                    if loc is not None:
+                        lc, lo, ln = loc
+                        tc = t.contiguous()
+                        if tc is not t:
+                            hold.append(tc)      # a temporary: kept alive until the copy has landed
+                        ext.cuda_memcpy_async(self.arena_views[lc].data_ptr() + lo, tc.data_ptr(), ln, 2)
+            ext.cuda_memcpy_async(dst_block.data_ptr(), raw.data_ptr(), eb, 2)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            if hold:
+                # Temporaries live until their copies have landed; landed entries are dropped on the
+                # next call (no synchronization on the transfer stream)
+                P["hold"] = [(e, ts) for e, ts in P.get("hold", ()) if not e.query()] + [(ev, hold)]
+        return ev
+
 
     def install_expert(self, layer_idx, local_idx, keys):
         """Dynamic placement: replace worker expert `local_idx` of `layer_idx` with the
@@ -1039,13 +1830,88 @@ class MoeCpuHost:
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
                 counts_h, flat, shifted, neg)
 
+    def _stream_fused_t(self, spec, aux, h):
+        """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
+        (same rule as support_fused on the GPU side: silu/gelu gated or relu2 gateless, no
+        per-expert biases, no padded dims)"""
+        return TUNING.stream_fused_t if (
+            spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
+            and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
+        ) else 0
+
+    def _stream_recon_layer(self, st, layer_idx, spec, aux, device):
+        """Batched reconstruct tier state for a streamed layer, built once per (device,
+        layer); None when disabled or the experts carry biases (a batched add would be needed)"""
+        if not self.batch_recon or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
+            return None
+        recon = st["recon"].get(layer_idx)
+        if recon is None:
+            from ..modules.moe_batch_recon import BatchReconLayer
+            pd = spec["proj_dims"]
+            gated = pd.get("g") is not None
+            scales = {p: (aux["suh_" + p], aux["svh_" + p])
+                      for p in (("g", "u", "d") if gated else ("u", "d"))}
+            recon = BatchReconLayer(
+                pd.get("g"), pd["u"], pd["d"], (False, True), (False, True), (False, True),
+                spec["activation"], spec["act_limit"], device, scales)
+            st["recon"][layer_idx] = recon
+        return recon
+
+    def _stream_fused_bufs(self, st, spec, device):
+        """Fused-tier temp buffers for a streamed layer's (hidden, intermediate) shape, kept
+        per device (the kernel reads both dims from the buffers, so they must match the layer)"""
+        key = (spec["hi"], spec["proj_dims"]["u"][1])
+        fbufs = st["fused_bufs"].get(key)
+        if fbufs is None:
+            conc = ext.exl3_moe_max_concurrency(torch.device(device).index or 0)
+            fbufs = tuple(
+                torch.empty((conc, TUNING.stream_fused_t, dim), dtype = torch.half, device = device)
+                for dim in (key[0], key[0], key[1], key[1]))
+            st["fused_bufs"][key] = fbufs
+        return fbufs
+
+    def prefill_worst_case_parts(self, layer_idx, rows, device, assignments):
+        """Autosplit worst case for one layer's prefill on `device` with `assignments` routed
+        rows on CPU-resident experts, as (fixed, variable) bytes: the outputs and lists that
+        live for the whole call, and the larger of one batched-reconstruct group and the
+        per-expert path (freed before the GPU-side tiers allocate theirs). The persistent
+        device buffers are allocated for real here (_device_buffers) so the load accounts for
+        them"""
+        spec = self.specs[layer_idx]
+        h, hi = spec["ho"], spec["hi"]
+        A = assignments
+        # Plain CPU path: the fp32 output and the readback staging
+        fixed = rows * h * 4 + min(self.cap_rows, rows) * h * 4
+        if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
+                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
+            return fixed, 0
+        aux = self.aux[layer_idx]
+        pd = spec["proj_dims"]
+        gated = pd.get("g") is not None
+        n = pd["u"][1]
+        # Streamed path: padded fp32 output, the tail's compressed output, the input copy with
+        # its zero row, and the sorted assignment lists
+        fixed += (rows + 1) * h * 4 + rows * h * 4 + (rows + 1) * hi * 2 + A * 32
+        with torch.cuda.device(device):
+            bufs = self._device_buffers(device, spec)
+            if self._stream_fused_t(spec, aux, h):
+                self._stream_fused_bufs(bufs, spec, device)
+            recon = self._stream_recon_layer(bufs, layer_idx, spec, aux, device)
+        r = min(rows, A)
+        per_expert = r * (hi * 2 + n * 2 * (2 if gated else 1) + h * 4)
+        batched = recon.worst_case_bytes(A, slot_mode = False) if recon is not None else 0
+        return fixed, max(per_expert, batched)
+
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
+        from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
         E = spec["num_experts"]
         topk = selected_experts.shape[1]
-        out = torch.zeros((rows, h), dtype = torch.float, device = y.device)
+        # One spare row: the batched reconstruct tier's padding sink (never read back)
+        out_ext = torch.zeros((rows + 1, h), dtype = torch.float, device = y.device)
+        out = out_ext[:rows]
 
         # Group assignments by expert once: every expert's token segment is then a slice at
         # host-known prefix offsets. Anything per-expert/per-batch from here on is sync-free —
@@ -1066,7 +1932,7 @@ class MoeCpuHost:
         table = np.zeros(E + 1, dtype = np.bool_)
         for e in streamed:
             table[e + 1] = True
-        smask1 = torch.from_numpy(table).to(y.device, non_blocking = True)
+        smask1 = host_to_device(torch.from_numpy(table), y.device)
         is_streamed = smask1.index_select(0, shifted)
         sel_tail = flat.masked_fill(is_streamed, -1).view(rows, topk)
         tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
@@ -1086,25 +1952,26 @@ class MoeCpuHost:
         gated = pd.get("g") is not None
         abort = self.gpu_base_ptr + 128
         copy_stream = st["copy_stream"]
+        # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path. Experts
+        # in chunks past the registered ones (see _attach_chunk) go through the staged path too,
+        # decided per batch below
+        blocks = self.layer_blocks[layer_idx] if self.pinned else None
+        pinned_chunks = self.arena_registered
+
+        # Packed-layout policy of this layer's projections (see _stream_layout): packed bytes
+        # are restored to native order after the DMA, so the kernels below always see native
+        layout, restore = self._stream_layout(spec)
 
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
         # experts too hot for the temp buffers take the per-expert reconstruct path. Same
         # eligibility as support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2
         # gateless, no per-expert biases, no padded dims
-        fused_t = st["fused_t"] if (
-            spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
-            and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
-        ) else 0
+        fused_t = self._stream_fused_t(spec, aux, h)
+        recon = self._stream_recon_layer(st, layer_idx, spec, aux, y.device)
+        recon_ctx = None
         fbufs = None
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
-            key = (spec["hi"], pd["u"][1])
-            fbufs = st["fused_bufs"].get(key)
-            if fbufs is None:
-                conc = ext.exl3_moe_max_concurrency(torch.device(y.device).index or 0)
-                fbufs = tuple(
-                    torch.empty((conc, st["fused_t"], dim), dtype = torch.half, device = y.device)
-                    for dim in (key[0], key[0], key[1], key[1]))
-                st["fused_bufs"][key] = fbufs
+            fbufs = self._stream_fused_bufs(st, spec, y.device)
 
         for i0 in range(0, len(streamed), per_slot):
             batch = streamed[i0:i0 + per_slot]
@@ -1113,50 +1980,74 @@ class MoeCpuHost:
             self.wseq += 1
             seq = self.wseq
 
-            # Stage job: its own ring, consumed by the worker's dedicated stager thread, so the
-            # weight memcpys overlap the compute pool's work on the tail
-            stail = int(self.v_stage_tail[0])
-            while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
-                import time
-                if self.v_abort[0] or not self.proc.is_alive():
-                    raise RuntimeError("CPU MoE worker failed (stage ring stall)")
-                time.sleep(0.0002)
-            job = self.v_stage_jobs[stail % MOE_STAGE_RING]
-            job[0] = seq
-            job[1] = layer_idx
-            job[2] = len(batch)
-            job[3] = 0
-            job[4] = ws
-            job[5] = 1    # MOE_JOB_KIND_STAGE
-            job[6] = self.wslot_prev_seq[ws]
-            for bi, e in enumerate(batch):
-                job[7 + bi] = e
-            self.v_stage_tail[0] = stail + 1
-            self.wslot_prev_seq[ws] = seq
+            if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
+                # Pinned arena: DMA each expert's contiguous block straight out of the
+                # registered arena mapping on the copy stream (no worker involvement, the
+                # stager thread stays idle)
+                with torch.cuda.stream(copy_stream):
+                    if st["wslot_used"][ws]:
+                        copy_stream.wait_event(st["wconsumed_ev"][ws])
+                    raw = st["vram_slots"][ws]
+                    for bi, e in enumerate(batch):
+                        ci, off = blocks[e]
+                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
+                            self.arena_views[ci][off // 2 : (off + exp_b) // 2],
+                            non_blocking = True)
+            else:
+                # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
+                # the weight memcpys overlap the compute pool's work on the tail
+                stail = int(self.v_stage_tail[0])
+                while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
+                    import time
+                    if self.v_abort[0] or not self.proc.is_alive():
+                        raise RuntimeError("CPU MoE worker failed (stage ring stall)")
+                    time.sleep(0.0002)
+                job = self.v_stage_jobs[stail % MOE_STAGE_RING]
+                _set_job_seq(job, seq)
+                job[1] = layer_idx
+                job[2] = len(batch)
+                job[3] = 0
+                job[4] = ws
+                job[5] = 1    # MOE_JOB_KIND_STAGE
+                job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
+                for bi, e in enumerate(batch):
+                    job[7 + bi] = e
+                self.v_stage_tail[0] = stail + 1
+                self.wslot_prev_seq[ws] = seq
 
-            used = (len(batch) * exp_b) // 2
+                used = (len(batch) * exp_b) // 2
+                with torch.cuda.stream(copy_stream):
+                    if st["wslot_used"][ws]:
+                        copy_stream.wait_event(st["wconsumed_ev"][ws])
+                    ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
+                    st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
+                    ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
+
+            if restore and st["native_slots"] is None:
+                # First batch on this device that needs native-order bytes: adopt the ring the
+                # measured load allocated, or allocate it now (manual loads) on the compute
+                # stream. The caching allocator ties the block to the stream it was carved on,
+                # so the copy stream's first write into it is ordered after that stream
+                st["native_slots"] = self._device_buffers(y.device, spec)["native_slots"]
+                copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
-                if st["wslot_used"][ws]:
-                    copy_stream.wait_event(st["wconsumed_ev"][ws])
-                ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
-                st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
-                ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
-                if st["swz"]:
-                    # Restore the native tile order on the copy stream, one launch per projection
-                    # over the whole batch (K8 matrices were never swizzled: plain copy)
-                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
+                if restore:
+                    # Restore the native tile order on the copy stream, one launch per
+                    # projection over the whole batch (group-0 projections in an otherwise
+                    # packed layer take the plain-copy path in the same kernel)
+                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
                         if not pd.get(name):
                             continue
                         k, n, K = pd[name]
                         ext.moe_unswizzle_trellis(
                             st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, K != 8)
+                            k // 16, n // 16, K, layout[pi][0], layout[pi][1])
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
+            vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
@@ -1187,25 +2078,75 @@ class MoeCpuHost:
                     # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
                     for i in (0, 1, 2):
                         tbl[i] = tbl[i + 3]
-                tblt = torch.tensor(tbl, dtype = torch.int64).to(y.device, non_blocking = True)
-                ec = torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0],
-                                  dtype = torch.long).to(y.device, non_blocking = True)
+                tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
+                ec = host_to_device(torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0], dtype = torch.long), y.device)
                 tok = torch.cat([seg for _, _, seg, _ in per_e])
                 wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
                 Ku, Kd = pd["u"][2], pd["d"][2]
                 Kg = pd["g"][2] if gated else Ku
-                ext.exl3_moe(
-                    y, out, ec, tok, wts,
-                    fbufs[0], fbufs[1], fbufs[2], fbufs[3],
-                    spec["activation"], Kg, Ku, Kd,
-                    tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
-                    tblt[6], tblt[7], tblt[8],
-                    False, True, False, True, False, True,
-                    float(spec["act_limit"] or 0.0), n_fused)
+                # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over
+                # its expert range. Streamed experts are mul1 by construction
+                fc = [counts_h[e] for _, e, _, _ in per_e if counts_h[e] <= fused_t]
+                t1 = sum(1 for c in fc if 16 < c <= 32)
+                t2 = sum(1 for c in fc if c > 32)
+                tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
+                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
+                for n_act, lo, hi, mt in tiers:
+                    if not n_act:
+                        continue
+                    ext.exl3_moe(
+                        y, out, ec, tok, wts,
+                        fbufs[0], fbufs[1], fbufs[2], fbufs[3],
+                        spec["activation"], Kg, Ku, Kd,
+                        tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
+                        tblt[6], tblt[7], tblt[8],
+                        False, True, False, True, False, True,
+                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                    )
 
-            # Heavy tier: per-expert reconstruct
+            # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
+            # group; see moe_batch_recon.py) when eligible, else per expert
+            heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
+            if recon is not None:
+                # Experts above the batched tier's row cap stay on the per-expert loop (large
+                # slabs pad and stream more than they save in launches)
+                single = [(bi, e) for bi, e in heavy if counts_h[e] > recon.max_rows]
+                heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon.max_rows]
+            else:
+                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0 or biased experts): every
+                # heavy expert runs on the per-expert loop below
+                single = heavy
+                heavy = []
+            if heavy:
+                if recon_ctx is None:
+                    # Padding sources / sinks: a zero input row, an output sink row (out is a
+                    # view of the first `rows` rows of out_ext) and sentinel entries after the
+                    # sorted assignment lists
+                    hi = spec["hi"]
+                    y_in = y if y.shape[1] == hi else torch.nn.functional.pad(y, (0, hi - y.shape[1]))
+                    recon_ctx = (
+                        torch.cat([y_in, torch.zeros((1, hi), dtype = y.dtype, device = y.device)]),
+                        torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype,
+                                                            device = y.device)]),
+                        torch.cat([weight_sorted.half(), torch.zeros((1,), dtype = torch.half,
+                                                                     device = y.device)]),
+                    )
+                y_ext, tok_ext, w_ext = recon_ctx
+                base = vslot.data_ptr()
+                slot_of = {e: bi for bi, e in heavy}
+                for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon.cap):
+                    # Trellis addresses inside the VRAM slot, per projection
+                    bb = [base + slot_of[e] * exp_b for e in grp]
+                    recon.run_group(
+                        y_ext, out_ext, tok_ext, w_ext,
+                        grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
+                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
+                heavy = []
+            single_ids = {e for _, e in single} if recon is not None else None
             for bi, e, idx, wseg in per_e:
                 if fused_t and counts_h[e] <= fused_t:
+                    continue
+                if single_ids is not None and e not in single_ids:
                     continue
                 boff = (bi * exp_b) // 2
                 xg = y.index_select(0, idx)
@@ -1216,24 +2157,28 @@ class MoeCpuHost:
                 we = wseg.float().unsqueeze(1)
                 def tview(off_b, dims):
                     k, n, K = dims
-                    numel = (k // 16) * (n // 16) * 16 * K
+                    numel = (k // 16) * (n // 16) * int(16 * K)
                     return vslot[boff + off_b // 2 : boff + off_b // 2 + numel] \
-                        .view(k // 16, n // 16, 16 * K)
+                        .view(k // 16, n // 16, int(16 * K))
+                # Same output dtypes as the resident experts: the intermediate as the model's
+                # interm_dtype, the down projection fp32 (the activation casts to half for the
+                # down GEMM either way)
+                idt = torch.float if spec.get("interm_fp32") else torch.half
                 if gated:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
-                                         st["w_scratch"])
+                                         st["w_scratch"], out_dtype = idt)
                 uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
-                                     st["w_scratch"])
+                                     st["w_scratch"], out_dtype = idt)
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
                 dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
-                                     st["w_scratch"])
-                out.index_add_(0, idx, dy[:, :h].float() * we)
+                                     st["w_scratch"], out_dtype = torch.float)
+                out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
         # Collect the CPU tail (by now usually complete) and merge
@@ -1281,6 +2226,10 @@ class MoeCpuHost:
         self.aux = {}
         self.acked = 0
         self.live_layers = 0
+        self.seq = self.wseq = 0
+        self.next_slot = self.next_wslot = 0
+        self.slot_last_seq = [0] * MOE_MAX_SLOTS
+        self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:
@@ -1297,12 +2246,38 @@ class MoeCpuHost:
             self.slots = None
             self.wviews = None
             self.sstate = None
+            self._dev_bufs = {}
             self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
             self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
             self.v_stage_tail = self.v_stage_head = self.v_stage_jobs = None
             self._flags_u32 = None
             import gc
             gc.collect()
+        # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
+        # the worker (memfd, no name to unlink; a Windows section goes with its last handle)
+        for view in self.arena_views:
+            if view is None:
+                continue
+            try:
+                cuda_host_unregister(view.data_ptr())
+            except Exception:
+                pass
+        self.arena_views = []
+        self.layer_blocks = []
+        self.layer_auxloc = []
+        self._promo = {}
+        maps, self.arena_maps = self.arena_maps, []
+        if maps:
+            import gc
+            gc.collect()
+            for m in maps:
+                if m is None:
+                    continue
+                try:
+                    m.close()
+                except Exception:
+                    pass
+        if self.shm is not None:
             try:
                 self.shm.close()
                 self.shm.unlink()

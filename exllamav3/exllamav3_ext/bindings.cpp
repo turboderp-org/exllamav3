@@ -10,12 +10,14 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "turing/fa75.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
+#include "dflash2.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -24,6 +26,7 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
+#include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
 #include "cpu/reconstruct.h"
 #include "cpu/moe_handoff.h"
@@ -36,6 +39,7 @@
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
+#include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -79,6 +83,19 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    // Optional kernel families; Python checks these before taking a path that needs them. hgemm_f16acc is left
+    // out of ROCm builds (util/cuda_flags.py, HIP_EXCLUDED_SOURCES) with its bindings below: it serves GeForce
+    // parts, whose fp32-accumulate MMA runs at half rate, while RDNA's hgemm goes through the WMMA GEMM
+#if defined(USE_ROCM)
+    const bool cuda_only = false;
+#else
+    const bool cuda_only = true;
+#endif
+    m.attr("HAS_GR_MIX_TILED") = true;          // gr_mix_tiled, gr_mix_tiled_slices
+    m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
+    m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
+    m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
+
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
@@ -86,10 +103,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, size_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
+    m.def("stloader_deferred_batch", &stloader_deferred_batch, py::arg("file_handles"), py::arg("loads"), py::arg("max_chunk_size"));
 
     m.def("cuda_host_register", &cuda_host_register, py::arg("ptr"), py::arg("nbytes"), py::arg("flags"));
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
+    m.def("cuda_memcpy_async", &cuda_memcpy_async, py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("kind"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
@@ -107,6 +126,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_ds3_group", &routing_ds3_group, "routing_ds3_group");
+    m.def("routing_gemv_f32", &routing_gemv_f32, "routing_gemv_f32");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
@@ -125,10 +146,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_fused", &hc_mix_fused, "hc_mix_fused");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
+    m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
     m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_gemm_det", &routing_gemm_det, "routing_gemm_det");
+    m.def("det_quant_weight", &det_quant_weight, "det_quant_weight");
+    m.def("det_math_test", &det_math_test, "det_math_test");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
@@ -146,23 +173,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+    m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
+    m.def("quantize_tiles_frac", &quantize_tiles_frac, "quantize_tiles_frac");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
+    m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("reconstruct_had_slice_cpu", &reconstruct_had_slice_cpu, "reconstruct_had_slice_cpu");
     m.def("vision_gemm_blocked_cpu", &vision_gemm_blocked_cpu, "vision_gemm_blocked_cpu");
     m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
-    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
+          py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
@@ -171,16 +207,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
-    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
+    m.def("exl3_moe_split_issue_fused", &exl3_moe_split_issue_fused, "exl3_moe_split_issue_fused");
+    m.def("exl3_moe_split_collect_fused", &exl3_moe_split_collect_fused, "exl3_moe_split_collect_fused");
+    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("group") = 0, py::arg("planar") = 0);
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
+    m.def("exl3_moe_cpu_core_order", &exl3_moe_cpu_core_order, "exl3_moe_cpu_core_order");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_moe_cpu_has_avx512", &exl3_moe_cpu_has_avx512, "exl3_moe_cpu_has_avx512");
+    m.def("exl3_moe_cpu_swizzle_group", &exl3_moe_cpu_swizzle_group, "exl3_moe_cpu_swizzle_group");
+    m.def("exl3_moe_cpu_planar_layout", &exl3_moe_cpu_planar_layout, "exl3_moe_cpu_planar_layout");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
           py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
           py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
@@ -188,6 +231,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+#if !defined(USE_ROCM)
+    m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+    m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+#endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
@@ -221,10 +271,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
-    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none());
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
-    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
-    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none());
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg("activation"), py::arg("history"),
+          py::arg("incremental") = false);
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
     m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
         { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
@@ -237,10 +293,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
-    py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    py::class_<ScanReplayJob>(m, "ScanReplayJob")
+        .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>(),
+             py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg("prefix"), py::arg("tstride") = 1);
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_scan_replay", &batched_scan_replay, py::arg("jobs"), py::arg("device_index"), py::arg("kind"),
+          py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
+          py::arg("state_half") = false);
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
@@ -256,6 +315,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
+    m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
+    m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
+    m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
@@ -275,6 +337,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

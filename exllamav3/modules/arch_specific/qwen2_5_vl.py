@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch.nn.functional as F
-from .. import Module, RMSNorm, Linear
+from .. import Module, RMSNorm, LayerNorm, Linear
 from ...model import Config
 import torch
 
@@ -67,8 +67,11 @@ class Qwen2_5VLVisionPatchMerger(Module):
         out_hidden_size: int,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
+        norm_type: str = "rmsnorm",       # or "layernorm" (MiMo-V2)
+        gelu_approximate: str = "tanh",   # or "none"
     ):
         super().__init__(config, key, None)
+        self.gelu_approximate = gelu_approximate
         self.in_size = hidden_size * merge_size
         self.interm_size = hidden_size * merge_size
         self.out_size = out_hidden_size
@@ -98,12 +101,20 @@ class Qwen2_5VLVisionPatchMerger(Module):
         self.register_submodule(self.down)
 
         if key_norm:
-            self.norm = RMSNorm(
-                config = config,
-                key = f"{key}.{key_norm}",
-                rms_norm_eps = 1e-6,
-                out_dtype = torch.half,
-            )
+            if norm_type == "layernorm":
+                self.norm = LayerNorm(
+                    config = config,
+                    key = f"{key}.{key_norm}",
+                    layernorm_eps = 1e-6,
+                    out_dtype = torch.half,
+                )
+            else:
+                self.norm = RMSNorm(
+                    config = config,
+                    key = f"{key}.{key_norm}",
+                    rms_norm_eps = 1e-6,
+                    out_dtype = torch.half,
+                )
             self.register_submodule(self.norm)
 
     def optimizer_targets(self):
@@ -128,7 +139,7 @@ class Qwen2_5VLVisionPatchMerger(Module):
         y = y.view(-1, self.in_size)
 
         y = self.up.forward(y, params)
-        y = F.gelu(y, approximate = "tanh")
+        y = F.gelu(y, approximate = self.gelu_approximate)
         y = self.down.forward(y, params)
         y = y.view(bsz, -1, self.out_size)
 

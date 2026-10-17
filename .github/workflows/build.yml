@@ -20,6 +20,7 @@ on:
           - windows_smoke
           - cu132
           - torch_212_213
+          - rocm
           - sdist
 
 permissions:
@@ -52,7 +53,7 @@ jobs:
           # built against CUDA 13.2 below
           torches = ["2.8.0", "2.9.0", "2.10.0", "2.11.0"]
           torches_cu13 = ["2.12.0", "2.13.0"]
-          cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+          cudaarch = "7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
 
           combos = []
 
@@ -73,6 +74,17 @@ jobs:
           for os_, pyver, torch in itertools.product(oses, pyvers, torches_cu13):
               combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = torch, cudaarch = cudaarch))
 
+          # ROCm wheels (Linux): AMD's pip ROCm SDK with its own torch build, one torch per SDK
+          # release and the Python versions TabbyAPI installs. One wheel covers every RDNA
+          # generation through the compiler's family targets (one code object per generation,
+          # loaded on any member chip); CDNA parts run wave64 and are not supported by the
+          # kernels. Kept minimal until the ROCm port has had wider use
+          rocm_pyvers = ["3.12", "3.13.3", "3.14"]
+          rocmarch = "gfx10-1-generic;gfx10-3-generic;gfx11-generic;gfx12-generic"
+          for pyver in rocm_pyvers:
+              combos.append(dict(os = "ubuntu-22.04", pyver = pyver, cuda = "", rocm = "10.0.0", torch = "2.13.0",
+                                 cudaarch = rocmarch))
+
           if target == "windows":
               combos = [c for c in combos if c["os"] == "windows-2022"]
           elif target == "windows_smoke":
@@ -86,19 +98,41 @@ jobs:
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
           elif target == "torch_212_213":
               # Temporary: just the new Torch 2.12 / 2.13 wheels
-              combos = [c for c in combos if c["torch"] in torches_cu13]
+              combos = [c for c in combos if c["cuda"] and c["torch"] in torches_cu13]
+          elif target == "rocm":
+              combos = [c for c in combos if c["rocm"]]
+
+          # One job per OS, backend and torch saves the compiler cache (Python 3.12 where present);
+          # the other Python versions of the same torch only restore it, their compiles being
+          # identical (see the cache steps). One cache per torch rather than per job keeps the
+          # repository's cache storage to a generation or two of full builds. The smoke build
+          # never saves: its single-arch entries would seed the real builds with a near-empty cache
+          for c in combos:
+              c["save_cache"] = False
+          if target != "windows_smoke":
+              groups = {}
+              for c in combos:
+                  groups.setdefault((c["os"], c["cuda"], c["rocm"], c["torch"]), []).append(c)
+              for group in groups.values():
+                  saver = max(group, key = lambda c: (c["pyver"] == "3.12", c["pyver"]))
+                  saver["save_cache"] = True
 
           print(f"{len(combos)} jobs:")
           for c in combos:
-              print(f"  {c['os']} P{c['pyver']} CUDA {c['cuda']} T{c['torch']}")
+              backend = f"CUDA {c['cuda']}" if c["cuda"] else f"ROCm {c['rocm']}"
+              print(f"  {c['os']} P{c['pyver']} {backend} T{c['torch']}" + (" (saves the compiler cache)" if c["save_cache"] else ""))
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": combos}) + "\n")
 
   build_wheels:
-    name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
+    name: ${{ matrix.os }} P${{ matrix.pyver }} ${{ matrix.cuda && format('CUDA {0}', matrix.cuda) || format('ROCm {0}', matrix.rocm) }} T${{ matrix.torch }}
     needs: define_matrix
     runs-on: ${{ matrix.os }}
+    # A healthy wheel build takes well under an hour on the free runners; a job past this is hung
+    # (seen: a toolkit download that never completed). Failing it lets "Re-run failed jobs" pick
+    # it up instead of blocking the run until GitHub's six-hour limit
+    timeout-minutes: 150
     defaults:
       run:
         shell: pwsh
@@ -146,8 +180,101 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
+      # Compiler cache: on Linux ccache in front of nvcc / hipcc (named through PYTORCH_NVCC in the
+      # build steps: torch only wraps the compilers by itself from 2.13 on) and the host compiler
+      # (ccache's masquerade directory ahead on PATH, which torch 2.13's own "ccache c++" also
+      # resolves through, ccache skipping itself), on Windows sccache in front of nvcc (torch never
+      # wraps the compilers there, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
+      # compiler stays uncached since older torch versions name cl directly in the ninja rule, and
+      # the .cpp units are a small share of the build). The cache directory is carried between runs
+      # through the Actions cache: one cache per OS, backend and torch, saved by one job of the
+      # matrix (save_cache, see the matrix step) and restored by every job of that torch through
+      # the key prefix, falling back to any torch of the same backend (the kernel units that include
+      # no torch headers, most of the build, compile identically under every torch). Keys end in the
+      # commit so every save is a new entry and the restore takes the latest. The kernel
+      # translation units include no Python headers, so their compiles are
+      # identical across Python versions once the torch include path is too: the site-packages
+      # (whose path carries the Python version) is reached through a fixed link on PYTHONPATH
+      # (next step), and that is the path the cache sees in the preprocessed source
+      - name: Set up ccache
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y ccache
+          Write-Output "/usr/lib/ccache" >> "$env:GITHUB_PATH"
+          $dir = Join-Path $env:RUNNER_TEMP 'ccache'
+          Write-Output "CCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_BASEDIR=${{ github.workspace }}" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_NOHASHDIR=1" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines,locale" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_COMPRESS=1" >> "$env:GITHUB_ENV"
+          # zstd level: the default fast level leaves a good share of the object size on the table
+          # and compression only runs on a miss, so a mid level is a cheap way to keep the caches small
+          Write-Output "CCACHE_COMPRESSLEVEL=10" >> "$env:GITHUB_ENV"
+          Write-Output "CCACHE_MAXSIZE=2G" >> "$env:GITHUB_ENV"
+
+      - name: Set up sccache
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "v0.18.0"
+          $name = "sccache-$ver-x86_64-pc-windows-msvc"
+          curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$name.zip" "https://github.com/mozilla/sccache/releases/download/$ver/$name.zip"
+          if ($LASTEXITCODE -ne 0) { throw "sccache download failed with exit code $LASTEXITCODE" }
+          $dest = Join-Path $env:RUNNER_TEMP 'sccache'
+          Expand-Archive -Path "$name.zip" -DestinationPath $dest -Force
+          $bin = Join-Path $dest $name
+          & (Join-Path $bin 'sccache.exe') --version
+          Write-Output $bin >> "$env:GITHUB_PATH"
+          $dir = Join-Path $env:RUNNER_TEMP 'ccache'
+          Write-Output "SCCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_CACHE_SIZE=2G" >> "$env:GITHUB_ENV"
+          # sccache already stores entries zstd-compressed (hence the Actions cache's own zstd gains
+          # nothing on top); a mid level shrinks them further at a cost paid only on misses
+          Write-Output "SCCACHE_CACHE_ZSTD_LEVEL=10" >> "$env:GITHUB_ENV"
+          # Server log, the Windows counterpart of the ccache log: the server starts with the build's
+          # first compile and inherits these, logging every compile with its hit or miss and the
+          # inputs hashed for it. Uploaded per job with the diagnostics below
+          Write-Output "SCCACHE_ERROR_LOG=$(Join-Path $env:RUNNER_TEMP 'sccache.log')" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_LOG=debug" >> "$env:GITHUB_ENV"
+
+      - name: Stable site-packages path for the compiler cache
+        run: |
+          $site = python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+          $link = Join-Path $env:RUNNER_TEMP 'site'
+          # A junction needs no privilege on Windows and is transparent to the file APIs
+          $kind = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+          New-Item -ItemType $kind -Path $link -Target $site | Out-Null
+          Write-Output "PYTHONPATH=$link" >> "$env:GITHUB_ENV"
+
+      - name: Restore compiler cache
+        id: compiler_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-
+            ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-
+
+      # Compiler cache diagnostics. The restored cache carries ccache's counters from the builds
+      # that filled it, so they are zeroed here and the statistics step reports this job alone.
+      # CCACHE_DEBUG leaves a <object>.ccache-input-text next to every object file, listing what
+      # went into its hash; diffing the file for one source between a fast and a slow job shows
+      # what made the slow one miss. Those files and the ccache log are uploaded per job
+      - name: Compiler cache diagnostics
+        run: |
+          Write-Output "Restored cache key: '${{ steps.compiler_cache.outputs.cache-matched-key }}'"
+          if (-not $IsWindows) {
+            ccache --version | Select-Object -First 1
+            ccache -z
+            ccache -p | Select-String "base_dir|compiler_check|direct_mode|hash_dir|sloppiness|max_size"
+            Write-Output "CCACHE_DEBUG=1" >> "$env:GITHUB_ENV"
+            Write-Output "CCACHE_LOGFILE=$(Join-Path $env:RUNNER_TEMP 'ccache.log')" >> "$env:GITHUB_ENV"
+          }
+
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
+        timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -167,11 +294,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -196,6 +330,7 @@ jobs:
           Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip" "libcufft.zip"
 
           unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cudart-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvcc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
@@ -228,6 +363,7 @@ jobs:
 
       - name: Install Windows CUDA 13.2
         if: runner.os == 'Windows' && contains(matrix.cuda, '13.2')
+        timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -247,11 +383,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -287,6 +430,7 @@ jobs:
           }
 
           unzip '*.zip' -d $cudaRoot
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
             xcopy "$($archiveDir.FullName)\*" "$cudaRoot" /E /I /H /Y
@@ -316,11 +460,12 @@ jobs:
       - name: Install Linux CUDA ${{ matrix.cuda }}
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit-Linux
+        timeout-minutes: 30
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
           method: "network"
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.cuda != ''
 
       - name: Install CUDA build dependencies
         if: matrix.cuda != ''
@@ -340,6 +485,26 @@ jobs:
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
+
+      - name: Install ROCm build dependencies
+        if: matrix.rocm != ''
+        id: rocm_deps
+        run: |
+          # AMD's pip ROCm distribution: torch from the pytorch index, the SDK (runtime libraries plus
+          # the development tree with hipcc and the headers) from the core index. Both indexes also
+          # list torch's plain dependencies, hence best-match across indexes. No GPU is needed to build
+          $rocmVersion = '${{ matrix.rocm }}'
+          $rocmShort = $rocmVersion.Remove($rocmVersion.LastIndexOf('.'))
+          Write-Output "ROCM_VERSION_BUILD=$rocmShort" >> "$env:GITHUB_OUTPUT"
+
+          uv pip install --index-strategy unsafe-best-match `
+            --extra-index-url https://stable.repo.amd.com/rocm/pytorch/whl-next/ `
+            --extra-index-url https://stable.repo.amd.com/rocm/core/whl-next/ `
+            "torch==${{ matrix.torch }}+rocm$rocmVersion" "rocm[libraries,devel]==$rocmVersion"
+          # Expand the development tree (shipped as an archive inside the devel wheel)
+          python -m rocm_sdk init
+          python -m rocm_sdk version
           uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
       - name: Compute Torch requirement pin
@@ -382,22 +547,168 @@ jobs:
           Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
           python patch_pyproject_deps.py
 
+          # Memory high-water sampler for the build steps: lowest MemAvailable (Linux) / available physical
+          # memory (Windows) seen, rewritten every few seconds, so a job that dies mid-build still leaves the
+          # last reading in the file
+          $memwatch = @'
+          import ctypes, os, sys, time
+          out = sys.argv[1]
+          def available_mib():
+              if os.name == "nt":
+                  class MS(ctypes.Structure):
+                      _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                                 [(n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                                  "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+                  ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+                  ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                  return ms.ullAvailPhys >> 20
+              with open("/proc/meminfo") as f:
+                  for line in f:
+                      if line.startswith("MemAvailable:"):
+                          return int(line.split()[1]) >> 10
+              return -1
+          lowest = None
+          while True:
+              a = available_mib()
+              if lowest is None or a < lowest:
+                  lowest = a
+                  with open(out, "w") as f:
+                      f.write(str(lowest))
+              time.sleep(3)
+          '@
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'memwatch.py') -Value $memwatch -Encoding UTF8
+
       - name: Build for CUDA
         if: matrix.cuda != ''
         run: |
+          # Ninja's default is nproc + 2 parallel compiles; six nvcc processes over eight architectures
+          # exhaust a 16 GB hosted runner, which starves the runner agent and ends the job with "lost
+          # communication with the server". Bound the parallelism (sccache's nvcc mode adds processes of its
+          # own on Windows) and record the lowest available memory seen during the build
+          $env:MAX_JOBS = if ($IsWindows) { "3" } else { "4" }
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
+
           # --- Spawn the VS shell
           if ($IsWindows) {
             Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
+            # torch takes this command verbatim for the ninja nvcc rule (nvcc is on PATH from the
+            # CUDA install step; the host compiler from the VS shell)
+            $env:PYTORCH_NVCC = "sccache nvcc"
+          } else {
+            $env:PYTORCH_NVCC = "ccache ${{ steps.cuda-toolkit-Linux.outputs.CUDA_PATH }}/bin/nvcc"
           }
 
           # --- Build wheel
           $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_BUILD }}-torch${{ matrix.torch }}"
           $env:BUILD_TARGET = "cuda"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+          # Kernel images must be stored compressed: with every architecture in the list the
+          # uncompressed extension grows past what the Windows loader accepts (issue #413)
+          $env:EXLLAMA_EXT_COMPRESS = "require"
 
-          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
+
+      - name: Build for ROCm
+        if: matrix.rocm != ''
+        run: |
+          # The HIP compile is clang: no VS shell, no arch list to expand. The device code objects are
+          # stored compressed (hip_cflags), one per RDNA family target
+          $BUILDTAG = "+rocm${{ steps.rocm_deps.outputs.ROCM_VERSION_BUILD }}-torch${{ matrix.torch }}"
+          $env:BUILD_TARGET = "rocm"
+          $env:PYTORCH_ROCM_ARCH = '${{ matrix.cudaarch }}'
+          $env:EXLLAMA_EXT_COMPRESS = "1"
+          # torch does not put ccache in front of hipcc on its own; PYTORCH_NVCC names the device compiler
+          # verbatim, wrapper included
+          $hipcc = Join-Path (python -m rocm_sdk path --bin) 'hipcc'
+          $env:PYTORCH_NVCC = "ccache $hipcc"
+          $env:MAX_JOBS = "4"
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
+
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
+
+      - name: Compiler cache statistics
+        if: (matrix.cuda != '' || matrix.rocm != '') && always()
+        run: |
+          python -c "import sys; print('python prefix:', sys.prefix)"
+          if ($IsWindows) {
+            sccache --show-adv-stats
+            # flush the server's pending writes before the cache directory is saved
+            sccache --stop-server
+            $global:LASTEXITCODE = 0
+          } else {
+            ccache -s -v
+          }
+
+      - name: Upload compiler cache diagnostics
+        if: (matrix.cuda != '' || matrix.rocm != '') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccache-debug-${{ runner.os }}-py${{ matrix.pyver }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}
+          path: |
+            ${{ runner.temp }}/ccache.log
+            ${{ runner.temp }}/sccache.log
+            build/**/*.ccache-input-text
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Save compiler cache
+        if: matrix.save_cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-${{ github.sha }}
+
+      - name: Verify extension size
+        if: matrix.cuda != '' || matrix.rocm != ''
+        run: |
+          $verifyScript = @'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          # Well below the point where Windows refuses to load the module, and far above what a
+          # compressed build comes to, so this only trips when something is wrong with the build
+          limit = 1024 ** 3
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as zf:
+              exts = [
+                  i for i in zf.infolist()
+                  if Path(i.filename).name.startswith("exllamav3_ext") and i.filename.endswith((".pyd", ".so"))
+              ]
+          if len(exts) != 1:
+              raise SystemExit(f"Expected one compiled extension in {wheel.name}, found {len(exts)}")
+
+          size = exts[0].file_size
+          print(f"{exts[0].filename}: {size / 1024 ** 2:.1f} MiB (limit {limit / 1024 ** 2:.0f} MiB)")
+          if size > limit:
+              raise SystemExit("Compiled extension is too large; were the kernel images compressed?")
+          '@
+
+          Set-Content -Path verify_ext_size.py -Value $verifyScript -Encoding UTF8
+          python verify_ext_size.py
+
+      - name: Import the ROCm wheel
+        if: matrix.rocm != ''
+        run: |
+          # A prebuilt extension loads without a GPU (the HIP runtime only enumerates devices on first use),
+          # so this catches unresolved symbols and a wheel that would fall back to a JIT build
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          uv pip install $wheel.FullName
+          Push-Location $env:RUNNER_TEMP
+          python -c "import exllamav3, exllamav3.ext, exllamav3.version; assert exllamav3.ext.is_precompiled_extension_available(), 'extension not prebuilt'; print('import ok', exllamav3.version.__version__)"
+          Pop-Location
 
       - name: Verify wheel dependency metadata
         run: |
@@ -471,7 +782,7 @@ jobs:
         if: inputs.target == 'windows_smoke'
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
+          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}${{ matrix.rocm && format('rocm{0}', matrix.rocm) || '' }}-torch${{ matrix.torch }}
           path: dist/*.whl
 
   build_sdist:

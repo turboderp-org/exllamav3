@@ -11,18 +11,15 @@ import triton
 import triton.language as tl
 from .index import prepare_chunk_indices
 from .op import exp2
-from .utils import IS_NVIDIA_BLACKWELL
 from .utils import autotune_cache_kwargs
-
-PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
-PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]
+from .utils import autotune
 
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]

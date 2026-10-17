@@ -1,11 +1,27 @@
 import torch
+from ...util.backend import DSA_SPLIT_WARPS
 from ...util.device_copy import to_device
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
-    MAX_BSZ, MAX_QLEN
+from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, BCKernelTooLarge, \
+    signature_to_ast, MAX_BSZ, MAX_QLEN
+
+
+def mla_absorb_signature() -> tuple[dict, bool]:
+    """Signature and pointer_range_32 flag for the AOT compile of _mla_absorb_kernel. On HIP every pointer
+    is tagged ":16" AND pointer_range_32 is set (all the kernel's allocations are MB-scale
+    statics). The specializations compile to three different binaries on gfx1100/triton 3.7.1:
+    bare is a 64 KB-LDS 277-spill variant that emits NaN/garbage (surfaced downstream as
+    all-NaN logits and a "!!!!!" generation loop), divisibility-only is finite-but-wrong by
+    up to ~0.4 in rare elements, and both attrs together are exact (32 KB, 41 spills).
+    test_mla.py's wide-NoPE graph-vs-dispatch case covers the shape."""
+    sig = {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+    if torch.version.hip:
+        sig = {k: (v + ":16" if v.startswith("*") else v) for k, v in sig.items()}
+        return sig, True
+    return sig, False
 
 """
 Graph-captured decode attention for MLA (BC_MLAttention): the whole decode block -- q
@@ -176,6 +192,7 @@ class BCMLA:
             _mla_decode_split_kernel,
             _mla_decode_combine_kernel,
             _mla_unfold_kernel,
+            mla_unfold_block_k,
         )
 
         dev = self.device
@@ -194,14 +211,17 @@ class BCMLA:
             4, 2)
 
         absorb_bm = min(64, triton.next_power_of_2(max(R, 16)))
+        _absorb_sig, _absorb_range = mla_absorb_signature()
+        # pointer_range_32 is part of the compile contract -- see mla_absorb_signature()
         k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
-            {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+            _absorb_sig
             | {n: "constexpr" for n in (
                 "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
             dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
                  NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
                  BLOCK_M = absorb_bm, BLOCK_N = 128),
-            4, 2)
+            4, 2,
+            pointer_range_32 = _absorb_range)
 
         if self.quant:
             groups = D_c // 32
@@ -271,7 +291,8 @@ class BCMLA:
         k_unfold = _compile_kernel(dev, _mla_unfold_kernel,
             {"o_lat": "*fp16", "w_uv_flat": "*fp16", "out": "*fp16", "R": "i32"}
             | {n: "constexpr" for n in ("n_q_heads", "D_c", "D_v", "BLOCK_M", "BLOCK_K")},
-            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm, BLOCK_K = 128),
+            dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm,
+                 BLOCK_K = mla_unfold_block_k(dev, H, D_c, D_v, unfold_bm)),
             4, 2)
 
         # Static intermediates, shared between layers on the same device. Bucketed flat
@@ -478,7 +499,8 @@ class BCMLA:
                 Q_SPLIT = 1, OUT_LATENT = 1,
                 QC = self.k_bits if self.quant else 0,
             )
-            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+            # ROCm: 8 warps spill far less to scratch on these parts
+            k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
             sig_c = {
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
@@ -541,7 +563,10 @@ class BCMLA:
                     ext_indices = to_device(ext_indices, x.device)
 
         if (bsz, q_len, regime) not in self.configured:
-            self._configure(bsz, q_len, regime)
+            try:
+                self._configure(bsz, q_len, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
             self.configured.add((bsz, q_len, regime))
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
@@ -573,10 +598,11 @@ def build_bc_mla(module, layer):
     dev = torch.device(m.device)
     if not (
         bc_attn_enable and
-        # NoPE models (D_r 0) compile the rope stages out; otherwise a rope instance with a
-        # supported style is required
+        # NoPE models (D_r 0) compile the rope stages out, as do models whose pe slices are
+        # never rotated (Kimi Linear: D_r > 0 without a rope instance); otherwise a rope instance
+        # with a supported style is required
         (D_r == 0 or (
-            m.rope is not None and m.rope.rope_settings.rope_style != RopeStyle.NONE and
+            (m.rope is None or m.rope.rope_settings.rope_style != RopeStyle.NONE) and
             _is_pow2(D_r)
         )) and
         # The staging/attention kernels index with tl.arange over these widths
@@ -592,6 +618,9 @@ def build_bc_mla(module, layer):
         _proj_ok(m.o_proj, in_features = H * D_v, out_features = m.hidden_size) and
         m.kv_a_layernorm.weight is not None and
         m.w_uk_flat is not None and
+        # The graph runs attention straight into o_proj; a head-wise output gate (Ling 3.x)
+        # sits between them and is only applied by the dispatch path
+        m.head_gate is None and
         # DSA indexer layers (GLM-5.2): full layers need the quantized wq_b, the fp16 key/
         # weight heads, the biased key norm and the paged key plane on this cache layer
         (m.indexer_mode is None or (
@@ -616,7 +645,8 @@ def build_bc_mla(module, layer):
                 layer.get_idx() is not None
             ))
         )) and
-        not m.has_split_cache and
+        # A TP rank holds the whole layer and its whole cache layer (MLA is never head-split),
+        # so the graph captures the local cache layer exactly as in single-process mode
         isinstance(layer, (CacheLayer_MLA_fp16, CacheLayer_MLA_quant)) and
         (not isinstance(layer, CacheLayer_MLA_quant) or (
             layer.qk is not None and layer.qk.device == dev

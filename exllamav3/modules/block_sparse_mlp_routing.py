@@ -69,11 +69,30 @@ class RoutingCFG:
     router_bias: torch.Tensor | None = None
     tid2eid: torch.Tensor | None = None
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
+    gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
+    gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
+    gate_tensor_f32: torch.Tensor | None = None       # grouped DS3 router: fp32 gate for multi-row logits, lazy
+    e_score_bias_f32: torch.Tensor | None = None      # grouped DS3 router: fp32 selection bias, lazy
+    router_logits_f32_bsz1: torch.Tensor | None = None   # grouped DS3 router: single-row fp32 logits, lazy
+
+
+def _gate_t(cfg):
+    """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
+    scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
+    (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
+    projection leave the int8 slices unset and route on the half gate."""
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+        E, K = cfg.gate_tensor_t.shape
+        cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
+        cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)
+        ext.det_quant_weight(cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
+    return cfg.gate_tensor_t
 
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
-        if cfg.gate_tensor_t is None:
-            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        _gate_t(cfg)
         ext.routing_std(
             y,
             cfg.gate_tensor,
@@ -83,6 +102,8 @@ def routing_std(bsz, cfg, y, params):
             cfg.per_expert_scale,
             cfg.gate_tensor_t,
             None,
+            cfg.gate_i8,
+            cfg.gate_sb,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
@@ -99,6 +120,7 @@ def routing_std(bsz, cfg, y, params):
             return selected_experts, routing_weights
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+            _gate_t(cfg)
             ext.routing_std(
                 y,
                 cfg.gate_tensor,
@@ -106,8 +128,10 @@ def routing_std(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.per_expert_scale,
+                cfg.gate_tensor_t,
                 None,
-                None,
+                cfg.gate_i8,
+                cfg.gate_sb,
             )
         return selected_experts, routing_weights
 
@@ -116,40 +140,76 @@ def routing_std_bias(bsz, cfg, y, params):
     """Standard softmax routing with a bias on the router logits (gpt-oss): the bias enters
     before top-k selection, and the weights are the softmax over the selected biased logits
     (equivalent to renormalizing the full biased softmax over the top-k set)."""
-    if bsz == 1 and not params.get("activate_all_experts"):
-        if cfg.gate_tensor_t is None:
-            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-        ext.routing_std(
-            y,
-            cfg.gate_tensor,
-            cfg.router_logits_bsz1,
-            cfg.selected_experts_bsz1,
-            cfg.routing_weights_bsz1,
-            cfg.per_expert_scale,
-            cfg.gate_tensor_t,
-            cfg.router_bias,
-        )
-        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
-    if cfg.router_bias is not None:
-        router_logits = torch.addmm(cfg.router_bias, y, cfg.gate_tensor)
-    else:
-        router_logits = torch.matmul(y, cfg.gate_tensor)
     if params.get("activate_all_experts"):
+        if cfg.router_bias is not None:
+            router_logits = torch.addmm(cfg.router_bias, y, cfg.gate_tensor)
+        else:
+            router_logits = torch.matmul(y, cfg.gate_tensor)
         routing_weights = torch.softmax(router_logits.float(), dim = -1).half()
         selected_experts = (
             torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
             .repeat((bsz, 1))
         )
         return selected_experts, routing_weights
-    top_v, selected_experts = torch.topk(router_logits, cfg.num_experts_per_tok, dim = -1)
-    routing_weights = torch.softmax(top_v.float(), dim = -1).half()
+    # Every batch size on the deterministic ext path (bias before top-k inside the kernel)
+    _gate_t(cfg)
+    if bsz == 1:
+        router_logits, selected_experts, routing_weights = \
+            cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    else:
+        router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+    ext.routing_std(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        selected_experts,
+        routing_weights,
+        cfg.per_expert_scale,
+        cfg.gate_tensor_t,
+        cfg.router_bias,
+        cfg.gate_i8,
+        cfg.gate_sb,
+    )
     return selected_experts, routing_weights
 
 
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
+    """Group-limited DS3 routing (n_group > 1): fp32 logits (the reference gate's precision;
+    with hundreds of experts the selection margins sit below fp16 resolution), group scores
+    from each group's two best biased scores, the topk_group best groups eligible, top-K over
+    those, weights from the unbiased scores. Single rows project with the fixed-order fp32
+    GEMV, other row counts with an fp32 matmul; selection and weights run in one kernel
+    (routing_ds3_group). The torch composition stays for the all-experts calibration pass."""
+    if params.get("activate_all_experts"):
+        return _routing_ds3_torch(bsz, cfg, y, params)
+    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
+        cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
+    if bsz == 1:
+        _gate_t(cfg)
+        if cfg.router_logits_f32_bsz1 is None:
+            cfg.router_logits_f32_bsz1 = torch.empty((1, E), dtype = torch.float, device = y.device)
+        logits = cfg.router_logits_f32_bsz1
+        ext.routing_gemv_f32(y.view(-1), cfg.gate_tensor_t, logits.view(-1))
+        selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    else:
+        if cfg.gate_tensor_f32 is None:
+            cfg.gate_tensor_f32 = cfg.gate_tensor.float().contiguous()
+        logits = torch.matmul(y.view(-1, y.shape[-1]).float(), cfg.gate_tensor_f32)
+        _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+    ext.routing_ds3_group(
+        logits, cfg.e_score_bias_f32, selected_experts, routing_weights,
+        cfg.routed_scaling_factor, ROUTING_ACT_SIGMOID, cfg.n_group, cfg.topk_group,
+    )
+    return selected_experts, routing_weights
+
+
+def _routing_ds3_torch(bsz, cfg, y, params):
+    """Torch composition of the group-limited DS3 router (the all-experts calibration pass,
+    and the reference the kernel is tested against)"""
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -169,7 +229,8 @@ def routing_ds3(bsz, cfg, y, params):
         .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
         .reshape(-1, cfg.num_experts)
     )
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    # -inf, not 0: the selection bias can push eligible scores below zero
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,
@@ -181,14 +242,14 @@ def routing_ds3(bsz, cfg, y, params):
     denominator = topk_weights.sum(dim = -1, keepdim = True) + 1e-20
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
-    return topk_indices, topk_weights
+    # half weights, as every other router returns (TP broadcast buffers and the decode kernels)
+    return topk_indices, topk_weights.half()
 
 
 def routing_dots(bsz, cfg, y, params):
 
     if bsz == 1:
-        if cfg.gate_tensor_t is None:
-            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        _gate_t(cfg)
         ext.routing_ds3_nogroup(
             y,
             cfg.gate_tensor,
@@ -199,6 +260,8 @@ def routing_dots(bsz, cfg, y, params):
             cfg.routed_scaling_factor,
             cfg.gate_tensor_t,
             ROUTING_ACT_SIGMOID,
+            cfg.gate_i8,
+            cfg.gate_sb,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
@@ -217,6 +280,7 @@ def routing_dots(bsz, cfg, y, params):
             )
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+            _gate_t(cfg)
             ext.routing_ds3_nogroup(
                 y,
                 cfg.gate_tensor,
@@ -225,8 +289,10 @@ def routing_dots(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.routed_scaling_factor,
-                None,
+                cfg.gate_tensor_t,
                 ROUTING_ACT_SIGMOID,
+                cfg.gate_i8,
+                cfg.gate_sb,
             )
         return selected_experts, routing_weights
 
@@ -254,23 +320,46 @@ def _vl_rows(cfg, params, bsz, device):
     return mask
 
 
+def _esb_vl_h(cfg):
+    """fp16 copy of the vision selection bias (mean-centered like _esb_h; selection is shift
+    invariant), built lazily."""
+    if getattr(cfg, "e_score_bias_vl_h", None) is None:
+        esb = cfg.e_score_bias_vl
+        cfg.e_score_bias_vl_h = esb if esb.dtype == torch.half else (esb - esb.mean()).half()
+    return cfg.e_score_bias_vl_h
+
+
 def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
-    """Torch-composed sqrtsp routing for a chunk with image rows (reference Gate.forward):
-    image rows select top-k on scores + bias_vl; text rows use the hash table selection when
-    given (hash layers), else scores + bias. Weights: raw scores over the selected set,
-    normalized, times routed_scaling_factor."""
-    scores = _sqrtsp_scores(cfg, y)                                   # (bsz, E) fp32
-    bias_vl = cfg.e_score_bias_vl.float()
+    """sqrtsp routing for a chunk with image rows (reference Gate.forward): image rows select
+    top-k on scores + bias_vl; text rows use the hash table selection when given (hash layers),
+    else scores + bias. Weights: raw scores over the selected set, normalized, times
+    routed_scaling_factor. Composed from the deterministic ext kernels (one top-k pass per bias
+    over all rows, merged by the row mask), so tensor-parallel ranks agree bit for bit."""
+    bsz = y.shape[0]
+    _gate_t(cfg)
+    vl_col = vl.unsqueeze(-1)
+
+    def topk_with(bias_h):
+        logits, sel, w = _routing_buffers(cfg, bsz, y.device)
+        ext.routing_ds3_nogroup(
+            y, cfg.gate_tensor, logits, bias_h, sel, w, cfg.routed_scaling_factor,
+            cfg.gate_tensor_t, ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb,
+        )
+        return sel.clone(), w.clone()
+
+    sel_vl, w_vl = topk_with(_esb_vl_h(cfg))
     if hash_sel is None:
-        bias = cfg.e_score_correction_bias.float()
-        b = torch.where(vl.unsqueeze(-1), bias_vl.unsqueeze(0), bias.unsqueeze(0))
-        sel = (scores + b).topk(cfg.num_experts_per_tok, dim = -1).indices
+        sel_tx, w_tx = topk_with(_esb_h(cfg))
     else:
-        sel_vl = (scores + bias_vl.unsqueeze(0)).topk(cfg.num_experts_per_tok, dim = -1).indices
-        sel = torch.where(vl.unsqueeze(-1), sel_vl, hash_sel)
-    w = scores.gather(1, sel)
-    w = w / w.sum(dim = -1, keepdim = True) * cfg.routed_scaling_factor
-    return sel.long(), w.half()
+        logits, _, w_tx = _routing_buffers(cfg, bsz, y.device)
+        sel_tx = hash_sel.long()
+        ext.routing_sel_norm(
+            y, cfg.gate_tensor, logits, sel_tx, w_tx, cfg.routed_scaling_factor,
+            cfg.gate_tensor_t, ROUTING_ACT_SQRTSP, cfg.gate_i8, cfg.gate_sb,
+        )
+    sel = torch.where(vl_col, sel_vl, sel_tx)
+    w = torch.where(vl_col, w_vl, w_tx)
+    return sel, w
 
 
 def routing_sqrtsp(bsz, cfg, y, params):
@@ -291,8 +380,7 @@ def routing_sqrtsp(bsz, cfg, y, params):
     vl = _vl_rows(cfg, params, bsz, y.device)
     if vl is not None:
         return _routing_sqrtsp_vl(cfg, y, vl, None)
-    if cfg.gate_tensor_t is None:
-        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    _gate_t(cfg)
     if bsz == 1:
         router_logits = cfg.router_logits_bsz1
         selected_experts = cfg.selected_experts_bsz1
@@ -309,6 +397,8 @@ def routing_sqrtsp(bsz, cfg, y, params):
         cfg.routed_scaling_factor,
         cfg.gate_tensor_t,
         ROUTING_ACT_SQRTSP,
+        cfg.gate_i8,
+        cfg.gate_sb,
     )
     return selected_experts, routing_weights
 
@@ -333,8 +423,7 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
         hash_sel = to_device(cfg.tid2eid[safe_ids], y.device).long()
         return _routing_sqrtsp_vl(cfg, y, vl, hash_sel)
     selected_experts = to_device(cfg.tid2eid[input_ids], y.device).long()
-    if cfg.gate_tensor_t is None:
-        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    _gate_t(cfg)
     if bsz == 1:
         routing_weights = cfg.routing_weights_bsz1
         router_logits = cfg.router_logits_bsz1
@@ -349,5 +438,7 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
         cfg.routed_scaling_factor,
         cfg.gate_tensor_t,
         ROUTING_ACT_SQRTSP,
+        cfg.gate_i8,
+        cfg.gate_sb,
     )
     return selected_experts, routing_weights

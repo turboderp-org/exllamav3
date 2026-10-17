@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
+import torch
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
@@ -14,6 +15,7 @@ def add_args(
     default_cache_size = 8192,
     default_recurrent_cache_size = 4.0,
     default_cpu_cache_size = 0.0,
+    default_disk_cache_size = 50.0,
     add_sampling_args: bool = False,
     default_sampling_args: dict = None,
     default_autosplit_max_batch_size: int = 1,
@@ -38,6 +40,9 @@ def add_args(
     :param default_cpu_cache_size:
         Default value for -ccs / --cpu_cache_size argument
 
+    :param default_disk_cache_size:
+        Default value for -dcs / --disk_cache_size argument
+
     :param add_sampling_args:
         bool, add sampling arguments
 
@@ -61,8 +66,11 @@ def add_args(
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
     parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
-    parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
+    parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
+    parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
+    parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
+    parser.add_argument("-embd", "--embed_disk", action = "store_true", help = "Stream the token embedding table from disk per forward instead of holding it in system RAM")
     parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
@@ -77,6 +85,7 @@ def add_args(
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
     parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
+    parser.add_argument("-nw", "--no_warmup", action = "store_true", help = "Skip the post-load warmup (kernel compilation, GEMM autotuning and graph workspaces are then paid on the first requests instead)")
 
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
 
@@ -109,15 +118,20 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-rs32", "--recurrent_state_fp32", action = "store_true", help = "Store the recurrent state of GatedDeltaNet/KDA layers in fp32 instead of the default fp16 (twice the state pool and checkpoints; the scans compute in fp32 either way). Mamba2 layers always use fp32")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
         parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
-        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
+        parser.add_argument("-dcd", "--disk_cache_dir", type = str, help = "Directory for a persistent third-tier page/checkpoint cache behind the CPU tier (needs -ccs > 0), default: disabled", default = None)
+        parser.add_argument("-dcs", "--disk_cache_size", type = float, help = f"Disk third-tier cache budget for the whole directory (all models and cache modes), in GB, default: {default_disk_cache_size}", default = default_disk_cache_size)
+        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"Recurrent state checkpoint cache size (system RAM), in GB, 0 disables checkpoints, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
         parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
+        parser.add_argument("-hdt", "--hybrid_draft_tokens", type = int, help = "Hybrid drafting: when a job's current suffix matches at least this many tokens of its earlier context, draft that many tokens of the continuation (on top of any other drafting mode)", default = 0)
+        parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
@@ -213,8 +227,14 @@ def init(
         config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "moe_cpu_pinned_arena", False):
+        config.infer_params.moe_cpu_pinned_arena = True
     if getattr(args, "ngram_ram", False):
         config.infer_params.ngram_stream_from_disk = False
+    if getattr(args, "ngram_lock", False):
+        config.infer_params.ngram_lock = True
+    if getattr(args, "embed_disk", False):
+        config.infer_params.embed_stream_from_disk = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
     dmcl = getattr(args, "draft_moe_cpu_layers", 0)
     dmclt = getattr(args, "moe_cpu_threads", None)
@@ -233,6 +253,7 @@ def init(
         draft_config.infer_params.moe_cpu_offload = dmcl
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
+        draft_config.infer_params.moe_cpu_pinned_arena = config.infer_params.moe_cpu_pinned_arena
     else:
         draft_config = None
 
@@ -271,6 +292,7 @@ def init(
         draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
         vars(args).get("num_draft_tokens") or 0,
         4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
+        vars(args).get("hybrid_draft_tokens") or 0,
     )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
@@ -290,13 +312,19 @@ def init(
                 compand_a = args.cache_compand_a,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             )
+            # The draft cache gets the same speculative headroom and slot count: a recurrent drafter
+            # keeps its own state pool and checkpoints alongside the target's
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             ) if draft_model_dir else None
         else:
             cache = Cache(
@@ -305,11 +333,15 @@ def init(
                 layer_type = CacheLayer_fp16,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             )
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
             ) if draft_model_dir else None
     else:
         cache = None
@@ -369,6 +401,16 @@ def init(
         max_chunk_size = args.chunk_size,
         **kwargs
     )
+
+    # Warmup (before any generator is attached to the cache)
+    if not getattr(args, "no_warmup", False):
+        printp(not quiet, f" -- Warming up...")
+        model.warmup(
+            cache = cache,
+            max_chunk_size = args.chunk_size,
+            progressbar = progress,
+            verbose = args.load_verbose,
+        )
 
     # Load tokenizer
     if load_tokenizer:

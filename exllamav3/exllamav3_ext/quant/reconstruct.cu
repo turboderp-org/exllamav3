@@ -6,11 +6,12 @@
 #include "../util.cuh"
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
+#include "bits_k.cuh"
 #include "hadamard_inner.cuh"
 
-template <int K, int cb>
-__global__ __launch_bounds__(256)
-void reconstruct_kernel
+template <int K, int cb, bool HALF = false>
+__device__ __forceinline__
+void reconstruct_tile
 (
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
@@ -18,7 +19,7 @@ void reconstruct_kernel
     int packed_n_offset
 )
 {
-    constexpr int packed_size = 256 * K / 16;  // in uint16s
+    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);  // in uint16s
 
     int t = threadIdx.x;
     int lane_id = t % 32;
@@ -37,7 +38,7 @@ void reconstruct_kernel
 
     // Dequant
     register FragB frag[2];
-    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+    dq_dispatch<K, cb, HALF>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile
 //    __shared__ half tile[16 * 8 * 16];
@@ -83,12 +84,54 @@ void reconstruct_kernel
     *out_int4 = tile_int4[t];
 }
 
+template <int K, int cb, bool HALF = false>
+__global__ __launch_bounds__(256)
+void reconstruct_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* __restrict__ g_packed,
+    int packed_blocks_n,
+    int packed_n_offset
+)
+{
+    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
+}
+
+// Batched variant: blockIdx.z selects the matrix from a pointer table, outputs are consecutive
+// [k, n] slabs out_stride halfs apart. Whole matrices only.
+template <int K, int cb, bool HALF = false>
+__global__ __launch_bounds__(256)
+void reconstruct_batch_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* const* __restrict__ packed_ptrs,
+    int packed_blocks_n,
+    size_t out_stride
+)
+{
+    int b = blockIdx.z;
+    reconstruct_tile<K, cb, HALF>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0);
+}
+
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+#define __(i, cb) reconstruct_batch_kernel<i, cb>
+constexpr auto reconstruct_batch_kernel_instances = std::array
+{
+    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    reconstruct_batch_kernel<1, 2, true>, reconstruct_batch_kernel<2, 2, true>, reconstruct_batch_kernel<3, 2, true>
+};
+#undef __
+
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
 #define __(i, cb) reconstruct_kernel<i, cb>
 constexpr auto reconstruct_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    reconstruct_kernel<1, 2, true>, reconstruct_kernel<2, 2, true>, reconstruct_kernel<3, 2, true>
 };
 #undef __
 
@@ -99,7 +142,7 @@ void reconstruct_slice
 (
     at::Tensor unpacked,
     at::Tensor packed,
-    int K,
+    float K_,
     bool mcg,
     bool mul1,
     int64_t n_offset
@@ -112,21 +155,23 @@ void reconstruct_slice
     // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
     // model file can drive cbi outside the table and launch whatever pointer lies
     // there. Bound both the input and the computed index.
-    TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
-    TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
+    TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
     TORCH_CHECK_DTYPE(unpacked, kHalf);
 
     int rows = packed.size(0);
     int packed_cols = packed.size(1);
 
-    if (unpacked.numel() == 0)
-        return;
-
     TORCH_CHECK(unpacked.size(1) % 128 == 0, "unpacked N dimension must be divisible by 128");
     TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
     TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");
     TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
+
+    if (unpacked.numel() == 0)
+        return;
 
     int cols = unpacked.size(1) / 16;
     int packed_n_offset = n_offset / 16;
@@ -135,12 +180,14 @@ void reconstruct_slice
     dim3 gridDim(cols / 8, rows);
 
     int cbi = K - 1;
-    if (mcg) cbi += 8;
+    if (bk.half) cbi += 24;
+    else if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto reconstruct_fn = reconstruct_kernel_instances[cbi];
+    reconstruct_fn<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -161,9 +208,9 @@ void reconstruct_slice
 // column-then-row order is H W H).
 #define RH_THREADS 256
 
-template <int K, int cb>
-__global__ __launch_bounds__(RH_THREADS)
-void reconstruct_had_kernel
+template <int K, int cb, bool HALF = false>
+__device__ __forceinline__
+void reconstruct_had_tile
 (
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
@@ -173,7 +220,7 @@ void reconstruct_had_kernel
     int packed_n_offset
 )
 {
-    constexpr int packed_size = 256 * K / 16;
+    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
     constexpr float r_scale = 0.08838834764831845f;
 
     int t = threadIdx.x;
@@ -208,7 +255,7 @@ void reconstruct_had_kernel
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
         register FragB frag[2];
-        dq_dispatch<K, cb>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+        dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
 
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
         half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
@@ -315,12 +362,66 @@ void reconstruct_had_kernel
 }
 
 
+template <int K, int cb, bool HALF = false>
+__global__ __launch_bounds__(RH_THREADS)
+void reconstruct_had_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* __restrict__ g_packed,
+    const half* __restrict__ suh,
+    const half* __restrict__ svh,
+    int packed_blocks_n,
+    int packed_n_offset
+)
+{
+    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
+}
+
+// Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
+// are consecutive [k, n] slabs out_stride halfs apart. Whole matrices only (no n slicing).
+template <int K, int cb, bool HALF = false>
+__global__ __launch_bounds__(RH_THREADS)
+void reconstruct_had_batch_kernel
+(
+    half* __restrict__ g_unpacked,
+    const uint16_t* const* __restrict__ packed_ptrs,
+    const half* const* __restrict__ suh_ptrs,
+    const half* const* __restrict__ svh_ptrs,
+    int packed_blocks_n,
+    size_t out_stride
+)
+{
+    int b = blockIdx.z;
+    reconstruct_had_tile<K, cb, HALF>
+    (
+        g_unpacked + (size_t) b * out_stride,
+        packed_ptrs[b],
+        suh_ptrs[b],
+        svh_ptrs[b],
+        packed_blocks_n,
+        0
+    );
+}
+
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+#define __(i, cb) reconstruct_had_batch_kernel<i, cb>
+constexpr auto reconstruct_had_batch_kernel_instances = std::array
+{
+    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    reconstruct_had_batch_kernel<1, 2, true>, reconstruct_had_batch_kernel<2, 2, true>, reconstruct_had_batch_kernel<3, 2, true>
+};
+#undef __
+
+// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
 #define __(i, cb) reconstruct_had_kernel<i, cb>
 constexpr auto reconstruct_had_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    reconstruct_had_kernel<1, 2, true>, reconstruct_had_kernel<2, 2, true>, reconstruct_had_kernel<3, 2, true>
 };
 #undef __
 
@@ -334,7 +435,7 @@ void reconstruct_had_slice
     at::Tensor packed,
     at::Tensor suh,
     at::Tensor svh,
-    int K,
+    float K_,
     bool mcg,
     bool mul1,
     int64_t n_offset
@@ -347,15 +448,14 @@ void reconstruct_had_slice
     // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
     // model file can drive cbi outside the table and launch whatever pointer lies
     // there. Bound both the input and the computed index.
-    TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
-    TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
+    TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
     TORCH_CHECK_DTYPE(unpacked, kHalf);
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
-
-    if (unpacked.numel() == 0)
-        return;
 
     TORCH_CHECK(unpacked.size(0) % 128 == 0, "reconstruct_had: K dimension must be divisible by 128");
     TORCH_CHECK(unpacked.size(1) % 128 == 0, "reconstruct_had: N dimension must be divisible by 128");
@@ -365,16 +465,21 @@ void reconstruct_had_slice
     TORCH_CHECK(suh.numel() >= unpacked.size(0), "reconstruct_had: suh size");
     TORCH_CHECK(svh.numel() >= unpacked.size(1), "reconstruct_had: svh size");
 
+    if (unpacked.numel() == 0)
+        return;
+
     dim3 blockDim(256);
     dim3 gridDim(unpacked.size(1) / 128, unpacked.size(0) / 128);
 
     int cbi = K - 1;
-    if (mcg) cbi += 8;
+    if (bk.half) cbi += 24;
+    else if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+    auto reconstruct_had_fn = reconstruct_had_kernel_instances[cbi];
+    reconstruct_had_fn<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -390,11 +495,136 @@ void reconstruct
 (
     at::Tensor unpacked,
     at::Tensor packed,
-    int K,
+    float K_,
     bool mcg,
     bool mul1
 )
 {
     TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
-    reconstruct_slice(unpacked, packed, K, mcg, mul1, 0);
+    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0);
+}
+
+
+/*
+Batched reconstruct_had over B whole matrices of one shape: unpacked is [B, k, n] fp16
+(contiguous), packed_ptrs / suh_ptrs / svh_ptrs are int64 device tensors of B addresses of
+[k/16, n/16, 16K] trellis tensors and their k-length suh / n-length svh vectors. One launch
+dequantizes all B matrices into the original basis (see reconstruct_had_slice).
+*/
+void reconstruct_had_batch
+(
+    at::Tensor unpacked,
+    at::Tensor packed_ptrs,
+    at::Tensor suh_ptrs,
+    at::Tensor svh_ptrs,
+    float K_,
+    bool mcg,
+    bool mul1
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK_DIM(unpacked, 3);
+    TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_had_batch: unpacked must be contiguous");
+    TORCH_CHECK_DTYPE(packed_ptrs, kLong);
+    TORCH_CHECK_DTYPE(suh_ptrs, kLong);
+    TORCH_CHECK_DTYPE(svh_ptrs, kLong);
+    TORCH_CHECK(packed_ptrs.device() == unpacked.device(), "reconstruct_had_batch: pointer tables must be on the output device");
+    TORCH_CHECK(packed_ptrs.is_contiguous() && suh_ptrs.is_contiguous() && svh_ptrs.is_contiguous(),
+                "reconstruct_had_batch: pointer tables must be contiguous");
+
+    int batch = unpacked.size(0);
+    int k = unpacked.size(1);
+    int n = unpacked.size(2);
+    TORCH_CHECK(packed_ptrs.numel() >= batch && suh_ptrs.numel() >= batch && svh_ptrs.numel() >= batch,
+                "reconstruct_had_batch: pointer table too short");
+    TORCH_CHECK(k % 128 == 0, "reconstruct_had_batch: K dimension must be divisible by 128");
+    TORCH_CHECK(n % 128 == 0, "reconstruct_had_batch: N dimension must be divisible by 128");
+    if (!batch || !unpacked.numel())
+        return;
+
+    dim3 blockDim(RH_THREADS);
+    dim3 gridDim(n / 128, k / 128, batch);
+
+    int cbi = K - 1;
+    if (bk.half) cbi += 24;
+    else if (mcg) cbi += 8;
+    else if (mul1) cbi += 16;
+    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_batch_kernel_instances.size(),
+                "kernel index out of range: ", cbi);
+
+    auto reconstruct_had_batch_fn = reconstruct_had_batch_kernel_instances[cbi];
+    reconstruct_had_batch_fn<<<gridDim, blockDim, 0, stream>>>
+    (
+        (half*) unpacked.data_ptr(),
+        (const uint16_t* const*) packed_ptrs.data_ptr(),
+        (const half* const*) suh_ptrs.data_ptr(),
+        (const half* const*) svh_ptrs.data_ptr(),
+        n / 16,
+        (size_t) k * n
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+/*
+Batched reconstruct over B whole matrices of one shape: unpacked is [B, k, n] fp16 (contiguous),
+packed_ptrs an int64 device tensor of B addresses of [k/16, n/16, 16K] trellis tensors. One
+launch dequantizes all B matrices (rotated basis, as reconstruct).
+*/
+void reconstruct_batch
+(
+    at::Tensor unpacked,
+    at::Tensor packed_ptrs,
+    float K_,
+    bool mcg,
+    bool mul1
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK_DIM(unpacked, 3);
+    TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_batch: unpacked must be contiguous");
+    TORCH_CHECK_DTYPE(packed_ptrs, kLong);
+    TORCH_CHECK(packed_ptrs.device() == unpacked.device(), "reconstruct_batch: pointer table must be on the output device");
+    TORCH_CHECK(packed_ptrs.is_contiguous(), "reconstruct_batch: pointer table must be contiguous");
+
+    int batch = unpacked.size(0);
+    int k = unpacked.size(1);
+    int n = unpacked.size(2);
+    TORCH_CHECK(packed_ptrs.numel() >= batch, "reconstruct_batch: pointer table too short");
+    TORCH_CHECK(k % 16 == 0, "reconstruct_batch: K dimension must be divisible by 16");
+    TORCH_CHECK(n % 128 == 0, "reconstruct_batch: N dimension must be divisible by 128");
+    if (!batch || !unpacked.numel())
+        return;
+
+    dim3 blockDim(256);
+    dim3 gridDim(n / 128, k / 16, batch);
+
+    int cbi = K - 1;
+    if (bk.half) cbi += 24;
+    else if (mcg) cbi += 8;
+    else if (mul1) cbi += 16;
+    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_batch_kernel_instances.size(),
+                "kernel index out of range: ", cbi);
+
+    auto reconstruct_batch_fn = reconstruct_batch_kernel_instances[cbi];
+    reconstruct_batch_fn<<<gridDim, blockDim, 0, stream>>>
+    (
+        (half*) unpacked.data_ptr(),
+        (const uint16_t* const*) packed_ptrs.data_ptr(),
+        n / 16,
+        (size_t) k * n
+    );
+    cuda_check(cudaPeekAtLastError());
 }

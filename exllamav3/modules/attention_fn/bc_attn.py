@@ -1,10 +1,12 @@
 import os
 
 import torch
+from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+from .smem import smem_limit
 
 """
 Graph-captured decode attention (BC_Attention): the whole attention block for a decode step --
@@ -61,30 +63,59 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+class BCKernelTooLarge(RuntimeError):
+    """An AOT-compiled BC kernel needs more shared memory than the device grants. The BC kernels
+    bake their tiles in as constexprs sized for Ampere-class shared memory; the eager Triton path
+    walks a config ladder per device instead, so the builders decline and let it run."""
+
+
+# Split-decode attention launch config (util/backend.py); the pair serves the QSA sparse split kernel
+_SPLIT_WARPS, _SPLIT_STAGES = ATTN_SPLIT_WARPS_STAGES
+
+
+def signature_to_ast(fn, signature: dict, pointer_range_32: bool = False) -> tuple[dict, dict]:
+    """Convert a ":16"-suffixed BC signature into the plain signature + specialization attrs for
+    ASTSource. A ":16" suffix declares the argument 16-byte divisible (pointer alignment /
+    scalar divisibility), matching the JIT's specialization -- without it the AOT kernel loses
+    vectorized global loads (~1.5x on bandwidth-heavy kernels), and on some AMD parts the
+    unspecialized compile of wide-K tiles miscompiles outright (gfx1100, triton 3.7.1). Every
+    launch MUST then honor the alignment."""
+    attrs = {}
+    sig = {}
+    for name, ty in signature.items():
+        if isinstance(ty, str) and ty.endswith(":16"):
+            sig[name] = ty[:-3]
+            attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
+        else:
+            sig[name] = ty
+        if pointer_range_32 and isinstance(sig[name], str) and sig[name].startswith("*"):
+            attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
+    return sig, attrs
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
-                    num_warps: int, num_stages: int):
+                    num_warps: int, num_stages: int, pointer_range_32: bool = False):
+    """pointer_range_32 (AMD backend): every pointer argument addresses an allocation under 2 GB, which lets
+    the compiler use buffer loads/stores; the caller must have checked the allocations"""
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
-           tuple(sorted(signature.items())))
+           tuple(sorted(signature.items())), pointer_range_32)
     k = _kernel_cache.get(key)
     if k is None:
         import triton
         from triton.compiler import ASTSource
-        # A ":16" suffix on a signature entry declares the argument 16-byte divisible
-        # (pointer alignment / scalar divisibility), matching the JIT's specialization --
-        # without it the AOT kernel loses vectorized global loads (~1.5x on
-        # bandwidth-heavy kernels). Every launch MUST then honor the alignment
-        attrs = {}
-        sig = {}
-        for name, ty in signature.items():
-            if isinstance(ty, str) and ty.endswith(":16"):
-                sig[name] = ty[:-3]
-                attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
-            else:
-                sig[name] = ty
+        sig, attrs = signature_to_ast(fn, signature, pointer_range_32)
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            limit = smem_limit(device)
+            if ck.metadata.shared > limit:
+                if os.environ.get("EXL3_TRITON_SMEM_DEBUG"):
+                    print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
+                raise BCKernelTooLarge(
+                    f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
+            # The compiled module: a cubin from the CUDA backend, an hsaco code object from the AMD one
+            image = ck.asm["hsaco" if ROCM else "cubin"]
+            k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -122,6 +153,7 @@ class BCAttn:
         self.module = module
         self.device = torch.device(module.device)
         self.head_dim = module.head_dim
+        self.v_head_dim = getattr(module, "v_head_dim", module.head_dim)
         self.num_q_heads = module.num_q_heads
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
@@ -180,6 +212,7 @@ class BCAttn:
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
             head_dim = self.head_dim,
+            v_head_dim = self.v_head_dim,
             hidden_size = self.hidden_size,
             hidden_size_padded = self.hidden_padded,
             page_size = PAGE_SIZE,
@@ -260,9 +293,20 @@ class BCAttn:
             )
         self.slot_widths = {}
 
+    def _pointer_range_32(self) -> bool:
+        """Whether the split kernels may assume 32-bit buffer offsets (AMD buffer loads): every
+        allocation they address is under 2 GB. The caches are the only ones that can be larger; the
+        rest are graph statics, partials and the block table"""
+        if not ROCM:
+            return False
+        caches = (self.cache_k, self.cache_v, self.k_scales, self.v_scales)
+        return all(t.untyped_storage().nbytes() < 2 ** 31 for t in caches if isinstance(t, torch.Tensor))
+
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
+            combine_subtiles,
+            decode_row_layout,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -275,11 +319,8 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd_pad)
-        block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
-        block_rows = block_m * block_h
-        h_blocks = triton.cdiv(group_size, block_h)
+        block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
+        block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
@@ -289,39 +330,45 @@ class BCAttn:
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
+        # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the
+        # generator's block table), so the 16-byte divisibility the JIT would infer holds
+        cache_t += ":16"
         sig = {
-            "q": "*fp16", "k_cache": cache_t, "v_cache": cache_t,
-            "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
-            "partial_o": "*fp32", "partial_ml": "*fp32",
-            "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
+            "q": "*fp16:16", "k_cache": cache_t, "v_cache": cache_t,
+            "block_table": "*i32:16", "cache_seqlens": "*i32", "out": "*fp16:16",
+            "partial_o": "*fp32:16", "partial_ml": "*fp32:16",
+            "k_scales": "*fp16:16", "v_scales": "*fp16:16", "h32": "*fp16:16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
+                                  pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
-            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
-            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
+            "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+        rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
-            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
+            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = self.v_head_dim,
+            BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+        k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
 
         k_update = None
         if not self.quant:
@@ -353,7 +400,9 @@ class BCAttn:
                 gate_a = g_tensor_cache.get(dev, (R, 2 * qh * hd), torch.half, "bca_qgi")
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
-        o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
+        # Attention output in o_proj's input layout: v_head_dim lanes per head (the combine
+        # kernel drops the padded V lanes of an asymmetric module)
+        o = g_tensor_cache.get(dev, (bsz, q_len, qh, self.v_head_dim), torch.half, "bca_o")
         # Regime-1 slots never launch the dense split/combine; their partials are sized by the
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
         pn_o = programs * splits_cap * block_rows * hd_pad
@@ -379,7 +428,7 @@ class BCAttn:
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            block_n, splits_cap,
+            block_n, splits_cap, programs,
             xp, yp,
         )
 
@@ -403,7 +452,7 @@ class BCAttn:
         programs = rows * self.num_kv_heads * h_blocks
         block_n = 32
         target = 2 * _get_sm_count(self.device)
-        splits = max(1, min(target // programs, -(-k_pad // (4 * block_n)), 128))
+        splits = max(1, min(target // programs, -(-k_pad // (1 * block_n)), 128))
         per_split = -(-k_pad // splits)
         split_len = -(-per_split // block_n) * block_n
         return k_pad, kp_pool, block_h, h_blocks, programs, block_n, splits, split_len
@@ -422,7 +471,7 @@ class BCAttn:
             _qsa_pool_update_kernel,
             _qsa_sparse_split_kernel,
         )
-        from .triton_paged import _paged_attn_decode_combine_kernel
+        from .triton_paged import _paged_attn_decode_combine_kernel, combine_subtiles
 
         dev = self.device
         idx = self.qsa_idx
@@ -474,9 +523,9 @@ class BCAttn:
             cap = self.qsa_layer.pooled.shape[0] * self.qsa_layer.pooled.shape[1]
             s_max = -(-cap // 128) * 128
             scores = sbuf("bca_qsa_scores", R, s_max)
-            # The scoring kernel writes only [0, T); the warmup top-k scans the full static
-            # width, so the tail must hold -inf from this one-time fill (the captured graph
-            # patches the top-k scan width to T afterwards)
+            # The scoring kernel writes only [0, T); the graphed warmup top-k scans the full
+            # static width, so the tail must hold -inf from this one-time fill (the captured
+            # graph patches the top-k scan width to T afterwards; eager calls narrow it to T)
             scores.fill_(-float("inf"))
             pool_idx = sbuf("bca_qsa_pool_idx", R, kp_pool, dtype = torch.int32)
             indices = sbuf("bca_qsa_indices", R, k_pad, dtype = torch.int32)
@@ -516,21 +565,23 @@ class BCAttn:
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
-                4, 2)
+                _SPLIT_WARPS, _SPLIT_STAGES, pointer_range_32 = self._pointer_range_32())
 
+            sp_rows_sub, sp_d_sub = combine_subtiles(block_h, self.head_dim)
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
-                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
-                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
+                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
+                    "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, HD_PAD = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
-                     BLOCK_ROWS = block_h), 4, 1)
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim,
+                     BLOCK_ROWS = block_h, ROWS_SUB = sp_rows_sub, D_SUB = sp_d_sub), 4, 1)
+            k_sp_combine.grid_y = (block_h // sp_rows_sub) * (self.head_dim // sp_d_sub)
 
         self.bc.configure_slot_qsa(
             bsz, q_len, regime,
@@ -580,8 +631,17 @@ class BCAttn:
         # argument patched into the graph
         skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
         if self.slot_widths.get((bsz, q_len, regime), ...) != skey:
-            self._configure(bsz, q_len, causal, regime)
+            try:
+                self._configure(bsz, q_len, causal, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
+        # The decode kernels are compiled with 16-byte divisibility on their pointers (vectorized
+        # loads); the block table is the only one bound per call rather than a whole static, and
+        # the generator uploads it fresh each step. A caller passing a row slice of a device
+        # table could break the assumption silently, so fail here instead
+        assert block_table.data_ptr() % 16 == 0, \
+            "BC_Attention: block_table must be 16-byte aligned (pass a whole tensor, not a sliced view)"
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
                     position_ids, inv_freq, regime, t_total)
@@ -637,6 +697,12 @@ def _module_eligible(m):
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
+        # Asymmetric V head dim (MiMo-V2): the combine kernel writes the trimmed V lanes into
+        # the o_proj input directly; the gate stages and the QSA sparse kernels assume the full
+        # head width, so those combinations stay on the eager path
+        (getattr(m, "v_head_dim", m.head_dim) == m.head_dim or (
+            m.g_proj is None and not getattr(m, "interleaved_gate", False) and
+            getattr(m, "qsa_indexer", None) is None)) and
         # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
         # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)

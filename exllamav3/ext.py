@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -88,11 +89,11 @@ else:
     # compiler flags
 
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    extra_cuda_cflags = cuda_cflags(
+        cuda_home = torch.utils.cpp_extension.CUDA_HOME,
+        debug = ext_debug,
+        hip = bool(torch.version.hip),
+    )
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -105,6 +106,9 @@ else:
         if ext_debug:
             extra_cflags += ["/Zi"]
             extra_cuda_cflags += []
+    elif torch.version.hip:
+        # torch hands the C++ flags to hipcc as well, and -Ofast implies fast-math (see hip_cflags)
+        extra_cflags += ["-O3"]
     else:
         extra_cflags += ["-Ofast"]
         extra_cuda_cflags += []
@@ -112,13 +116,18 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
-    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe.
+    # ROCm: CUDAHOSTCXX belongs to nvcc; hipcc takes no -ccbin
+    if not windows and not torch.version.hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+    elif windows and os.environ.get("CUDAHOSTCXX"):
+        print(
+            " !! CUDAHOSTCXX is not used by the JIT build on Windows; "
+            "nvcc uses the same cl.exe as the C++ sources (see doc/env_vars.md)",
+            file = sys.stderr
+        )
 
-    if torch.version.hip:
-        extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
-
-    if verbose:
+    if verbose and not torch.version.hip:
         extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
@@ -129,27 +138,55 @@ else:
         extra_ldflags += ["cublas.lib"]
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
+    elif torch.version.hip:
+        # The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu)
+        extra_ldflags += ["-lhipblas"]
 
     # sources
 
     library_dir = os.path.dirname(os.path.abspath(__file__))
     sources_dir = os.path.join(library_dir, extension_name)
-    sources = [
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith(('.c', '.cpp', '.cu'))
-    ]
+    sources = extension_sources(sources_dir, hip = bool(torch.version.hip))
+    if torch.version.hip:
+        # With no target list, torch builds for every architecture it supports, wave64 ones included, which
+        # the kernels cannot compile for. maybe_set_rocm_arch_env fills it in from the visible devices, so an
+        # empty list here means HIP sees none (CUDA_VISIBLE_DEVICES is honored by HIP as well)
+        if not os.environ.get("PYTORCH_ROCM_ARCH"):
+            raise RuntimeError(
+                "No ROCm device is visible to build the extension for. Check CUDA_VISIBLE_DEVICES and "
+                "HIP_VISIBLE_DEVICES (HIP honors both), or set PYTORCH_ROCM_ARCH (e.g. gfx1100) explicitly."
+            )
+        use_rocm_sdk_devel(torch.utils.cpp_extension)
+        extra_cflags += hip_include_flags(sources_dir)
+        extra_cuda_cflags += hip_include_flags(sources_dir)
+        # Flags hipcc would add from its environment go on the command line instead, where the ccache wrapper
+        # (hip_compiler_wrapper) hashes them; left to hipcc, a changed define is a cache hit on the old object
+        extra_cuda_cflags += os.environ.get("HIPCC_COMPILE_FLAGS_APPEND", "").split()
 
     # Load extension
 
     maybe_set_arch_list_env()
-    exllamav3_ext = load(
-        name = extension_name,
-        sources = sources,
-        extra_include_paths = [sources_dir],
-        verbose = verbose,
-        extra_ldflags = extra_ldflags,
-        extra_cuda_cflags = extra_cuda_cflags,
-        extra_cflags = extra_cflags
-    )
+    if torch.version.hip:
+        # Dependency files for the HIP compile rule (header edits rebuild their includers) and the
+        # ccache/sccache wrapper torch applies to CUDA builds only
+        patch_hip_ninja_file_writer(torch.utils.cpp_extension)
+    try:
+        exllamav3_ext = load(
+            name = extension_name,
+            sources = sources,
+            extra_include_paths = [sources_dir],
+            verbose = verbose,
+            extra_ldflags = extra_ldflags,
+            extra_cuda_cflags = extra_cuda_cflags,
+            extra_cflags = extra_cflags
+        )
+    except IndexError as e:
+        # With no list given (or "native"), torch derives the architectures from the visible GPUs and
+        # fails with an IndexError when there are none
+        if torch.version.cuda and os.environ.get("TORCH_CUDA_ARCH_LIST", "") in ("", "native") and \
+                not torch.cuda.device_count():
+            raise RuntimeError(
+                f"No CUDA device is visible to determine the architectures to build {extension_name} for. "
+                "Set TORCH_CUDA_ARCH_LIST to the target architectures, e.g. TORCH_CUDA_ARCH_LIST=\"8.6;8.9+PTX\""
+            ) from e
+        raise

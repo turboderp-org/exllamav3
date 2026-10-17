@@ -23,13 +23,29 @@ def touch_device_measure_vram(local_context: dict):
     return torch.cuda.mem_get_info(device)
 
 
+def is_integrated_device(device) -> bool:
+    """True for GPUs that share system memory with the host (e.g. GB10, Jetson)"""
+    return bool(torch.cuda.get_device_properties(device).is_integrated)
+
+
+def device_mem_info(device) -> tuple[int, int]:
+    """(free, total) bytes for device. On an integrated GPU, CUDA's free figure is the host's
+    MemFree, which leaves out reclaimable page cache, so use MemAvailable instead"""
+    free, total = torch.cuda.mem_get_info(device)
+    if is_integrated_device(device):
+        available = host_memory_available()
+        if available is not None:
+            free = min(max(free, available), total)
+    return free, total
+
+
 # Reserve byte amount on device
 def set_memory_fraction_reserve(
     reserve: int,
     device: int
 ):
     touch_device(device)
-    free, total = torch.cuda.mem_get_info(device)
+    free, total = device_mem_info(device)
     # mem_get_info reports memory free *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
     # current reservation back, or memory held by an earlier load in the same process (a draft
@@ -54,7 +70,12 @@ def set_memory_fraction_use(
     touch_device(device)
     total = torch.cuda.get_device_properties(device).total_memory
     current = torch.cuda.memory_reserved(device)
-    fraction = min((current + use) / total, 1.0)
+    # The budget cannot exceed what the device can still give: a split value at or above the
+    # card's size would otherwise plan against memory the CUDA context and other processes
+    # already hold, and the loader's headroom check would pass loads that fail at the first
+    # real forward
+    free, _ = device_mem_info(device)
+    fraction = min((current + min(use, free)) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
     return int(fraction * total)
 
@@ -63,6 +84,19 @@ def set_memory_fraction_use(
 def unset_memory_fraction(active_devices: list[int]):
     for i in active_devices:
         torch.cuda.set_per_process_memory_fraction(1.0, device = i)
+
+
+# Automatic garbage collection paused for a block. Loading a module creates several Python objects
+# per weight tensor (records, jobs, views) and each automatic pass walks everything already alive,
+# so over a bulk load the passes add up; none of these objects form cycles that need collecting
+class gc_paused:
+    def __enter__(self):
+        self.was_enabled = gc.isenabled()
+        gc.disable()
+    def __exit__(self, *exc):
+        if self.was_enabled:
+            gc.enable()
+        return False
 
 
 # Free unused VRAM
@@ -555,3 +589,133 @@ def format_vram_report(reports: list[VRAMDeviceReport], color: bool = True, unit
             row(label, sum(getattr(r, attr) for r in reports), "bold" if label.startswith(("torch", "device")) else None, key = attr)
         lines.append("")
     return "\n".join(lines)
+
+
+# Host (system) memory guard for large CPU allocations. EXL3_HOST_MEM_RESERVE_MB (default 2048) is
+# kept free on top of the request; 0 disables the check.
+def host_memory_available() -> int | None:
+    """Bytes of host memory the kernel considers available, None when unknown"""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    # Windows without psutil: the available physical RAM psutil itself reports there
+    import os
+    if os.name == "nt":
+        try:
+            return int(windows_memory_status()[0])
+        except Exception:
+            pass
+    return None
+
+
+def check_host_memory(nbytes: int, what: str):
+    """Raise before allocating `nbytes` of host memory when it would leave the system with less
+    than the configured reserve"""
+    import os
+    reserve_mb = int(os.environ.get("EXL3_HOST_MEM_RESERVE_MB", 2048))
+    if reserve_mb <= 0:
+        return
+    avail = host_memory_available()
+    if avail is None:
+        return
+    if nbytes + (reserve_mb << 20) > avail:
+        raise RuntimeError(
+            f"{what} needs {nbytes >> 20} MiB of host memory, but only {avail >> 20} MiB is available "
+            f"and EXL3_HOST_MEM_RESERVE_MB = {reserve_mb} MiB is kept free. Lower the amount of data held "
+            f"in host memory (fewer offloaded experts, no --ngram_ram, ...) or set "
+            f"EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
+        )
+
+
+def _how_to_raise_memlock() -> str:
+    return (
+        "Raise the process's locked-memory limit (RLIMIT_MEMLOCK), e.g. `ulimit -l unlimited` before starting (the hard "
+        "limit must allow it: a `<user> - memlock unlimited` line in /etc/security/limits.conf, or LimitMEMLOCK=infinity "
+        "for a systemd service), or give the interpreter CAP_IPC_LOCK (setcap cap_ipc_lock+ep <python binary>)"
+    )
+
+
+def prepare_host_lock(nbytes: int, what: str):
+    """Before loading data that will be mlock()ed: make sure the process may lock another `nbytes`, raising the soft
+    RLIMIT_MEMLOCK up to the hard limit if needed, so a refusal costs nothing instead of a whole load"""
+    import os
+    if os.name == "nt":
+        raise RuntimeError(f"{what}: locking host memory is not supported on Windows")
+    import resource
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("CapEff:") and int(line.split()[1], 16) >> 14 & 1:   # CAP_IPC_LOCK
+                    return
+                if line.startswith("VmLck:"):
+                    locked = int(line.split()[1]) * 1024
+    except OSError:
+        locked = 0
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    inf = resource.RLIM_INFINITY
+    want = nbytes + locked + (64 << 20)
+    if soft == inf or soft >= want:
+        return
+    if hard == inf or hard >= want:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+        return
+    raise RuntimeError(
+        f"{what} needs {nbytes >> 20} MiB of locked memory, but this process may lock at most {hard >> 20} MiB. "
+        + _how_to_raise_memlock()
+    )
+
+
+_libc = None
+
+def lock_host_tensors(tensors: list[torch.Tensor], what: str) -> list[tuple[int, int]]:
+    """mlock() the storage of contiguous CPU tensors in place (no copy): the pages stay resident, never swapped or
+    reclaimed, until unlock_host_ranges() or process exit. Returns the locked (address, size) ranges; on failure
+    unlocks what it locked and raises"""
+    global _libc
+    import ctypes, ctypes.util, os
+    if _libc is None:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno = True)
+        _libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        _libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    done = []
+    for t in tensors:
+        assert t.device.type == "cpu" and t.is_contiguous()
+        size = t.numel() * t.element_size()
+        if _libc.mlock(ctypes.c_void_p(t.data_ptr()), ctypes.c_size_t(size)) != 0:
+            e = ctypes.get_errno()
+            unlock_host_ranges(done)
+            raise RuntimeError(f"{what}: mlock of {size >> 20} MiB failed: {os.strerror(e)}. " + _how_to_raise_memlock())
+        done.append((t.data_ptr(), size))
+    return done
+
+
+def unlock_host_ranges(ranges: list[tuple[int, int]]):
+    import ctypes
+    for addr, size in ranges:
+        _libc.munlock(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+
+
+def windows_memory_status() -> tuple[int, int]:
+    """(available physical bytes, available commit bytes) from GlobalMemoryStatusEx"""
+    import ctypes
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+    status = MEMORYSTATUSEX(dwLength = ctypes.sizeof(MEMORYSTATUSEX))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return status.ullAvailPhys, status.ullAvailPageFile
+

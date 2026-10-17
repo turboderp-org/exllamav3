@@ -63,6 +63,7 @@ BC_MLAttention::BC_MLAttention
     norm_eps            (_norm_eps),
     inv_freq            (std::move(_inv_freq)),
     rope_style          (_rope_style),
+    rope_active         (_qk_rope_head_dim > 0 && _rope_style != 0),
     attn_factor         (_attn_factor),
     rotate_dims         (_rotate_dims),
     l4_scaling_beta     (_l4_scaling_beta),
@@ -396,7 +397,7 @@ void BC_MLAttention::run_gr
     // Partial RoPE on the rope halves, in place on the statics; the position sources are patched
     // per call and the kernel branches on the pointers at runtime. NoPE models (GLM5.3,
     // qk_rope_head_dim 0) skip the stage entirely
-    if (qk_rope_head_dim > 0)
+    if (rope_active)
     {
         c10::optional<at::Tensor> out_k = s.kpe4;
         rope_gr(s.q_pe4, s.q_pe4, s.kpe4, out_k, inv_freq, (uint32_t) position, positions, position_ids,
@@ -487,7 +488,7 @@ void BC_MLAttention::run_gr
             s.k_idx_norm->launch(R, 1, 1, args, stream);
         }
         dbg("idx_norm");
-        if (qk_rope_head_dim > 0)
+        if (rope_active)
         {
             c10::optional<at::Tensor> no_k = {};
             c10::optional<at::Tensor> no_ko = {};
@@ -595,7 +596,7 @@ void BC_MLAttention::run_gr
             exl3_gemm_gr(s.q_a, idx_wq_b->trellis, s.qidx, idx_wq_b->suh,
                          xh.view({-1}).narrow(0, 0, (int64_t) R * q_lora_rank).view({R, q_lora_rank}),
                          idx_wq_b->svh, -1, idx_wq_b->mcg, idx_wq_b->mul1, 0, graph);
-            if (qk_rope_head_dim > 0)
+            if (rope_active)
             {
                 c10::optional<at::Tensor> no_k = {};
                 c10::optional<at::Tensor> no_ko = {};
@@ -607,12 +608,12 @@ void BC_MLAttention::run_gr
             at::Tensor wts_rows = s.wts;   // full padded height (cuBLASLt M >= 8)
             hgemm_gr(s.x_st, idx_weights_w.value(), wts_rows, graph);
             dbg("wts_hgemm");
+            // Scoring writes [0, t_scan) with the causal bound as -inf; the static's tail past
+            // t_scan keeps whatever an earlier, longer sequence scored. T / q_pos0 / bound_max
+            // patch. kpool: score over the pooled plane; scan width and causal bound count in
+            // POOL units (the kernel's compress_rate handles the per-row token bound)
+            int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
             {
-                // Scoring covers the full static width every step (bounds written as -inf), so
-                // no stale region survives shorter contexts. T / q_pos0 / bound_max patch
-                // kpool: score over the pooled plane; scan width and causal bound count in
-                // POOL units (the kernel's compress_rate handles the per-row token bound)
-                int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
                 std::vector<void*> args =
                 {
                     (void*) s.qidx.data_ptr(),
@@ -644,14 +645,22 @@ void BC_MLAttention::run_gr
                 }
             }
             // Batched: the per-job bound rides as a device pointer (t_seq = q_len), so the
-            // top-k needs no scan-width patch and only reads freshly written score rows
+            // top-k needs no scan-width patch and only reads freshly written score rows.
+            // Single-row: the scoring kernel retires tiles past t_scan without writing, so the
+            // static's tail can hold scores from an earlier, longer sequence; an eager call
+            // scans only [0, t_scan) (graphs patch the scan width per replay)
+            const at::Tensor scores_scan = (graph || multirow) ? s.scores : s.scores.narrow(1, 0, t_scan);
+            // The eager pass is what allocates the split top-k's workspace, and it scans the live prefix
+            // only: make sure the workspace the captured full-width scan will need exists before any capture
+            if (!graph)
+                dsa_topk_prepare(s.scores, (int) (index_kpool ? s.pool_idx.size(1) : s.indices.size(1)));
             if (multirow)
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, q_len);
             else if (index_kpool)
             {
                 // Select pools, then expand to raw token indices (x P) and append the query's
                 // incomplete tail pool per row
-                dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph);
+                dsa_topk_gr(scores_scan, s.pool_idx, index_topk / index_kpool, graph);
                 dbg("pool_topk");
                 std::vector<void*> args =
                 {
@@ -668,7 +677,7 @@ void BC_MLAttention::run_gr
                 }
             }
             else
-                dsa_topk_gr(s.scores, s.indices, index_topk, graph);
+                dsa_topk_gr(scores_scan, s.indices, index_topk, graph);
         dbg("topk");
         }
 
@@ -844,8 +853,9 @@ void BC_MLAttention::run
     TORCH_CHECK(!index_kpool || bsz == 1, "BC_MLAttention: kpool indexer requires bsz 1");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, nullptr);
         s.runs = 1;
@@ -854,9 +864,9 @@ void BC_MLAttention::run
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
         s.runs = 2;
     }
 
@@ -882,7 +892,7 @@ void BC_MLAttention::run
     params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
 
     // RoPE position sources (NoPE models never captured the stage)
-    if (qk_rope_head_dim > 0)
+    if (rope_active)
     {
         params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
         params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
@@ -902,7 +912,7 @@ void BC_MLAttention::run
     if (idx_mode == 1)
     {
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
-        if (qk_rope_head_dim > 0)
+        if (rope_active)
         {
             params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
             params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
@@ -936,7 +946,7 @@ void BC_MLAttention::run
             // the scalar scan width and clamps
             if (multirow)   // seq-state derive precedes the qidx stages in the graph
                 params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
-            if (qk_rope_head_dim > 0)
+            if (rope_active)
             {
                 params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
                 params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);

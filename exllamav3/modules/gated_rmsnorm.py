@@ -142,6 +142,7 @@ class GatedRMSNorm(Module):
                 "constant_bias": self.constant_bias,
                 "groups": self.groups,
                 "gate_first": self.gate_first,
+                "gate_activation": self.gate_activation,
             },
             "weight": producer.send(self.weight),
             "device": self.device,
@@ -157,11 +158,12 @@ class GatedRMSNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w)
+        module.weight = nn.Parameter(w, requires_grad = False)
         # load() builds the BC alongside the weight; the TP import must too, or graphed consumers
         # (BC_GatedDeltaNetSplit holds norm.bc) get a null pointer
         module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
-                                        module.groups, module.gate_first)
+                                        module.groups, module.gate_first,
+                                        1 if module.gate_activation == "sigmoid" else 0)
         torch.cuda.synchronize()
         return module
 
@@ -183,8 +185,9 @@ class GatedRMSNorm(Module):
             # Per-channel weight (Mamba2 group norm): element range; the caller fixes up
             # module.groups to the local group count
             w = w[first : last]
-        module.weight = nn.Parameter(w.to(module.device).contiguous())
+        module.weight = nn.Parameter(w.to(module.device).contiguous(), requires_grad = False)
         module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
-                                        module.groups, module.gate_first)
+                                        module.groups, module.gate_first,
+                                        1 if module.gate_activation == "sigmoid" else 0)
 
         return module

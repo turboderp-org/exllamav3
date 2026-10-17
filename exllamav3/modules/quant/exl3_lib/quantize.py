@@ -18,6 +18,27 @@ codebook_scale = 1.24371088
 codebook_mcg_mult = 0xCBAC1FED
 codebook_mul1_mult = 0x83DCD12D
 
+
+def quant_codebook(quant_args: dict) -> tuple[bool, bool]:
+    """(mcg, mul1) codebook selection of quant_args: {"mcg": True} or {"mul1": True} selects that codebook, neither
+    (or False) the default 3INST. Encoder, packing and the stored marker all read the selection through here, so the
+    trellis and the marker naming its codebook cannot disagree"""
+    mcg, mul1 = bool(quant_args.get("mcg")), bool(quant_args.get("mul1"))
+    assert not (mcg and mul1), "quant_args selects both the mcg and mul1 codebooks"
+    return mcg, mul1
+
+
+def codebook_markers(quant_args: dict) -> dict[str, torch.Tensor]:
+    """The marker tensor naming the selected codebook, as stored next to the trellis ({} for 3INST). Safetensors
+    has no uint32, and since the multipliers are locked the stored values are never read: only the presence of
+    the marker tells inference which codebook a tensor uses"""
+    mcg, mul1 = quant_codebook(quant_args)
+    if mcg:
+        return {"mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)}
+    if mul1:
+        return {"mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)}
+    return {}
+
 @lru_cache
 def tensor_core_perm(device):
     """
@@ -50,7 +71,20 @@ def tensor_core_perm_i(device):
 
 
 @lru_cache
-def get_temp_buffers(device, K: int, tile_len: int = 256):
+def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
+    index = torch.device(device).index if not isinstance(device, int) else device
+    if index is None:
+        index = torch.cuda.current_device()
+    # The extension picks the kernel per architecture / K / codebook and reports the wave it can
+    # keep resident (blocks per SM x SMs); the dense specializations keep costs in shared memory
+    # and store one branch bit (K = 1) or byte (K >= 2) per state
+    optimized, wave = ext.quantize_tiles_scratch(index, K, cb == 1, cb == 2, tile_len)
+    if optimized:
+        history_cols = (65536 >> K) // (8 if K == 1 else 1)
+        temp_costs = torch.empty((1,), dtype = torch.half, device = device)
+        temp_edges = torch.empty((wave, tile_len, history_cols), dtype = torch.uint8, device = device)
+        return temp_costs, temp_edges
+
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
@@ -65,6 +99,46 @@ def get_temp_buffers(device, K: int, tile_len: int = 256):
     return temp_costs, temp_edges
 
 
+def frac_k(K):
+    """(KA, MASK) for a half-integer bitrate K = KA + 0.5: alternating KA- and (KA + 1)-bit trellis
+    steps (MASK 0xAAAA, period 16). None for integer K. Half steps keep every tile a whole number of
+    32-bit words (streamable with int4 loads); the kernels accept any period-16 pattern, but only the
+    alternating one is instantiated."""
+    if isinstance(K, int) or float(K).is_integer():
+        return None
+    ka = int(K)
+    assert abs(ka + 0.5 - K) < 1e-9, f"fractional bitrate {K} must be a half-integer"
+    return ka, 0xAAAA
+
+
+def trellis_words(K) -> int:
+    """uint16 words per 256-weight tile at bitrate K (16 * K, an integer for half-integer K)"""
+    w = 16 * K
+    assert float(w).is_integer(), f"bitrate {K}: tile is not a whole number of uint16 words"
+    return int(w)
+
+
+@lru_cache
+def get_temp_buffers_frac(device, ka: int):
+    edges = 65536 >> ka
+    temp_costs = torch.zeros((128, 2, edges), dtype = torch.half, device = device)
+    temp_edges = torch.zeros((128, 256, edges), dtype = torch.short, device = device)
+    return temp_costs, temp_edges
+
+
+def quantize_tiles_frac(tiles, quant_args: dict):
+    """Half-integer bitrate (KA + 0.5): alternating pattern of KA / KA+1-bit steps. mul1 codebook only"""
+    tiles = tiles.contiguous()
+    assert tiles.shape[1] == 256 and tiles.dtype == torch.float
+    assert quant_codebook(quant_args)[1], "fractional bitrates require the mul1 codebook"
+    ka, mask = frac_k(quant_args["K"])
+    quantized_tiles = torch.zeros_like(tiles)
+    quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
+    temp_costs, temp_edges = get_temp_buffers_frac(tiles.device, ka)
+    ext.quantize_tiles_frac(tiles, quantized_tiles, quantized_idx, temp_costs, temp_edges, ka, mask)
+    return quantized_tiles, quantized_idx
+
+
 def quantize_tiles(tiles, quant_args: dict):
     """
     Quantize a batch of 16x16 tiles on the current device.
@@ -73,20 +147,18 @@ def quantize_tiles(tiles, quant_args: dict):
     reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
     (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     tiles = tiles.contiguous()
     assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
-    mcg = "mcg" in quant_args
-    mul1 = "mul1" in quant_args
+    mcg, mul1 = quant_codebook(quant_args)
+    cb = 2 if mul1 else 1 if mcg else 0
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    # NB: same call signature as other sites for tile_len 256, so the lru_cache key stays shared
-    if tiles.shape[1] == 256:
-        temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
-    else:
-        temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1])
+    temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1], cb)
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -111,6 +183,8 @@ def arch_prior_speed(device: int) -> float:
     before any measurements exist. From measured conversion throughput: Ampere lands at about
     half of Ada, which is about 80% of Blackwell (Hopper assumed equal to Blackwell); anything
     older is pessimistically assumed half of Ampere."""
+    if torch.version.hip:
+        return 1.0                                    # no measurements (HIP's major is the gfx generation)
     major, minor = torch.cuda.get_device_capability(device)
     if major >= 9: return 5.0                        # Hopper, Blackwell
     if major == 8: return 4.0 if minor == 9 else 2.0  # Ada / Ampere
@@ -182,6 +256,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     each GPU quantizes its slice on a per-device stream. Results are copied back through pinned memory and gathered
     on the first device.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     devices = quant_args["devices"]
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
@@ -268,9 +344,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
                 # Work buffers
                 K = quant_args["K"]
-                mcg = "mcg" in quant_args
-                mul1 = "mul1" in quant_args
-                temp_costs, temp_edges = get_temp_buffers(device, K)
+                mcg, mul1 = quant_codebook(quant_args)
+                temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
 
                 ext.quantize_tiles(
                     dev_tiles,
@@ -344,6 +419,13 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
     return quantized_tiles, quantized_idx
 
 
+# hipBLASLt 7.2 on gfx1201 (reached through rocBLAS for torch fp32 matmuls) silently returns wrong rows from
+# row 2^19 or 2^20 onward (algorithm-dependent) in fp32 GEMMs; https://github.com/ROCm/rocm-libraries/issues/13243.
+# The right-side rotation flattens to k * n / had_dim rows, which only the lm_head of large-vocab models exceeds
+# (2048 x 248320 -> ~4M rows), corrupting it. Keep every GEMM at or below 2^19 rows; chunking along k is exact,
+# so results are unchanged everywhere else
+_HAD_MAX_GEMM_ROWS = 1 << 19
+
 def preapply_had_l(x: torch.Tensor, had_dim):
     k, n = x.shape
     x_dtype = x.dtype
@@ -359,7 +441,14 @@ def preapply_had_r(x: torch.Tensor, had_dim):
     x_dtype = x.dtype
     x = x.to(torch.float)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
-    x = (x.view(k, -1, had_dim) @ had).view(k, n)
+    rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
+    if rows >= k:
+        x = (x.view(k, -1, had_dim) @ had).view(k, n)
+    else:
+        x = torch.cat([
+            (x[i:i + rows].reshape(-1, had_dim) @ had).view(-1, n)
+            for i in range(0, k, rows)
+        ], dim = 0)
     x = x.to(x_dtype)
     return x
 
@@ -539,7 +628,7 @@ def ldlq(
 
         buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
         assert buf_size_k % 16 == 0
-        assert size_n % buf_size_k == 0
+        assert size_k % buf_size_k == 0
 
         p_row = 0
 
@@ -609,6 +698,95 @@ def ldlq(
             torch.cuda.synchronize(device)
 
     return weight_q, encoded
+
+
+def ldlq_2hess(
+    weight: torch.Tensor,
+    L_in: torch.Tensor,
+    L_out: torch.Tensor,
+    quant_args: dict,
+    pb: ProgressBar | None = None
+):
+    """
+    LDLQ with error feedback along both axes, for a Kronecker-factored Hessian H ~ H_out (x) H_in (YAQA, Tseng et al.
+    2025). Objective tr(E^T H_in E H_out) with E = W - Q, shape (k, n); L_in (k, k) and L_out (n, n) are the block-16
+    LDL factors (zero diagonal, as for ldlq()). The 16x16 tiles are quantized along anti-diagonals from the far corner,
+    every tile of a diagonal being independent given the earlier ones. With L' = I + L the input of tile (a, c) is
+
+        W[a, c] + (L_in'^T E L_out')[a, c],     E restricted to the tiles already quantized
+
+    kept as a running matrix F that receives one rank-(16 * tiles) update per diagonal:
+    F += L_in'[rows, :]^T . blockdiag(dE) . L_out'[cols, :]
+
+    :return:
+        tuple, as ldlq(): quantized weight (k, n), indices (k // 16, n // 16, 256)
+    """
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
+        device = L_in.device
+        weight = weight.to(device)
+        size_k, size_n = weight.shape
+        assert size_k % 16 == 0 and size_n % 16 == 0
+        tiles_k, tiles_n = size_k // 16, size_n // 16
+
+        Lk = L_in.clone(); Lk.diagonal().fill_(1.0)      # unit lower triangular
+        Ln = L_out.clone(); Ln.diagonal().fill_(1.0)
+        F = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+        weight_q = torch.zeros_like(weight)
+        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = device)
+        W4 = weight.view(tiles_k, 16, tiles_n, 16)
+        Q4 = weight_q.view(tiles_k, 16, tiles_n, 16)
+        F4 = F.view(tiles_k, 16, tiles_n, 16)
+        perm, perm_i = tensor_core_perm(device), tensor_core_perm_i(device)
+        ar16 = torch.arange(16, device = device)
+
+        steps = tiles_k + tiles_n - 1
+        for step, s in enumerate(range(steps - 1, -1, -1)):
+            a = torch.arange(max(0, s - (tiles_n - 1)), min(tiles_k - 1, s) + 1, device = device)
+            c = s - a
+            tiles = (W4[a, :, c, :] + F4[a, :, c, :]).reshape(-1, 256)             # (T, 16, 16) row major
+            quant_w, quant_i = quantize_tiles_multigpu(tiles[:, perm].contiguous(), quant_args)
+            quant_w = quant_w[:, perm_i].view(-1, 16, 16)
+            Q4[a, :, c, :] = quant_w
+            encoded[a, c] = quant_i
+            if s > 0:
+                dE = W4[a, :, c, :] - quant_w                                           # (T, 16, 16)
+                rows = (a.unsqueeze(1) * 16 + ar16).flatten()                           # (16 T,)
+                cols = (c.unsqueeze(1) * 16 + ar16)                                     # (T, 16)
+                # Only tiles above and to the left can still be pending: restrict the update to that corner
+                k_hi = int(a.max().item()) * 16 + 16
+                n_hi = int(c.max().item()) * 16 + 16
+                right = torch.bmm(dE, Ln[cols][:, :, :n_hi])                            # (T, 16, n_hi)
+                F[:k_hi, :n_hi].addmm_(Lk[rows, :k_hi].T, right.reshape(-1, n_hi))
+            if pb and step % 4 == 0:
+                pb.update(min(tiles_k, step * tiles_k // steps))
+
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    return weight_q, encoded
+
+
+def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbose: bool, device):
+    """
+    Output-side Hessian factor in the quantizer's rotated basis, with its block LDL factor. The rotated weight relates
+    to the original by E_o = S_u P_k E_r P_n S_v, so tr(E_o^T H_in E_o H_out) = tr(E_r^T [..] E_r [P_n S_v H_out S_v P_n]):
+    the full output scale vector sv (signs and channel scales) goes into the transform.
+    """
+    Ho = H_out.to(device, torch.float).clone()
+    s = sv.flatten().to(device, torch.float)
+    Ho *= s.unsqueeze(0)
+    Ho *= s.unsqueeze(1)
+    blockwise_preapply_had_r_(Ho, had_n)
+    blockwise_preapply_had_l_(Ho, had_n)
+    Ho /= Ho.diagonal().mean().clamp_min(1e-30)
+    Ho.diagonal().add_(quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025)))
+    L_out, Ho = block_ldl(Ho, 16, quant_args, verbose)
+    L_out.diagonal().fill_(0.0)
+    return L_out.to(device), Ho.to(device)
 
 
 def fallback_quant(
@@ -905,8 +1083,9 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         H *= su
         blockwise_preapply_had_l_(H, had_k)
 
-        # Get block LDL decomposition of H, zero diagonal
-        if q_fallback:
+        # Get block LDL decomposition of H, zero diagonal. With scaled Hessians every tensor factors its
+        # own copy after regularize (see scaled_ldl), so nothing is kept here
+        if q_fallback or quant_args.get("scaled_hessian"):
             L = None
         else:
             L, H = block_ldl(H, 16, quant_args, verbose, debug_info = {
@@ -936,9 +1115,13 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     shape = encoded.shape
     assert len(shape) == 3 and shape[2] == 256
     assert encoded.dtype == torch.int16
-    packed_shape = (shape[0], shape[1], 256 * K // 16)
+    packed_shape = (shape[0], shape[1], trellis_words(K))
     packed = torch.zeros(packed_shape, dtype = torch.int16, device = encoded.device)
-    ext.pack_trellis(packed, encoded.contiguous(), K)
+    fk = frac_k(K)
+    if fk is not None:
+        ext.pack_trellis_frac(packed, encoded.contiguous(), fk[0], fk[1])
+    else:
+        ext.pack_trellis(packed, encoded.contiguous(), K)
     # unpacked = torch.zeros_like(encoded)
     # ext.unpack_trellis(unpacked, packed, K)
     # assert torch.equal(unpacked, encoded)
@@ -951,6 +1134,18 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     packed = torch.zeros(signs.shape[0] // 16, dtype = torch.int16, device = signs.device)
     ext.pack_signs(packed, signs)
     return packed
+
+
+# LDLQ error feedback inflates the tiles the quantizer actually sees relative to the regularized
+# weight (accumulated compensation grows along the recursion). Mean stream RMS over the recursion
+# relative to the first block, measured on Qwen3-8B (q/up/down, layer 10): K=1 1.06-1.10, 1.5
+# 1.03-1.05, 2 1.01-1.02, 2.5 ~1.01, 3 ~1.005, >= 4 ~1.0. The global scale search runs on the
+# pre-feedback weight, so its sample tiles are inflated by the expected drift and the scale it
+# picks lands the recursion's mean input at the codebook's operating point
+LDLQ_DRIFT = {1: 1.08, 1.5: 1.035, 2: 1.018, 2.5: 1.009, 3: 1.004}
+
+def ldlq_drift(K) -> float:
+    return LDLQ_DRIFT.get(float(K), 1.0)
 
 
 def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
@@ -1064,6 +1259,7 @@ def g_scale_gss(
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
         tiles = sample_scale_tiles(weight_r, width)
+        tiles *= ldlq_drift(quant_args["K"])
         if pb:
             pb.update(50)
         best_scale, best_mse = g_scale_search_batch([tiles], quant_args)[0]
@@ -1129,6 +1325,68 @@ def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 
     return diff_sq.item() / (sq.item() + 1e-20)
 
 
+def out_scales_ratio(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> float | None:
+    """
+    Predicted loss with output channel scales relative to the loss without them.
+
+    Quantization error is uniform in the rotated domain, so the scales don't change how much error there is but
+    where it lands: with scales every output channel gets the same relative error (error energy proportional to
+    the channel's energy), without them the same absolute error. For a per-channel sensitivity s (loss per unit
+    of error energy) and channel energy e, the ratio of the two losses is E[s * e] / (E[s] * E[e]): below one
+    when the sensitive channels are the low-energy ones, above one when they are the high-energy ones.
+
+    Returns None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    e = out_channel_scales.flatten().double().square()
+    s = out_sensitivity.flatten().to(e.device).double()
+    if s.shape[0] > e.shape[0]:
+        s = s[:e.shape[0]]
+    elif s.shape[0] < e.shape[0]:
+        s = F.pad(s, (0, e.shape[0] - s.shape[0]))
+    den = s.mean() * e.mean()
+    if not torch.isfinite(s).all() or not torch.isfinite(den) or den.item() <= 0.0:
+        return None
+    return ((s * e).mean() / den).item()
+
+
+# In auto mode, output scales are dropped for tensors whose sensitivity predicts a loss above this with them,
+# relative to without
+out_scales_max_ratio = 1.05
+
+# Added to the mean-normalized sensitivity when scales are derived from it, so channels the estimate saw
+# nothing of don't take scales without bound
+out_sensitivity_floor = 0.02
+
+
+def sensitivity_out_scales(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> torch.Tensor | None:
+    """
+    Output channel scales that minimize the predicted loss for a per-channel sensitivity.
+
+    With scale t on a channel its error energy is proportional to t^2, and the total error in the rotated domain
+    to sum(sigma^2 / t^2) for channel RMS sigma. For sensitivity s (loss per unit of error energy) the loss
+    (sum s t^2) (sum sigma^2 / t^2) is minimal at t ~ (sigma^2 / s)^(1/4). Plain output scales, t = sigma, are
+    that optimum for s ~ 1 / sigma^2.
+
+    out_channel_scales: the plain scales (channel RMS), (1, n). Returns the scales in the same shape, mean one over
+    the nonzero channels, or None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    sigma = out_channel_scales.flatten().double()
+    s = out_sensitivity.flatten().to(sigma.device).double()
+    if s.shape[0] > sigma.shape[0] or not torch.isfinite(s).all():
+        return None
+    s = s.clamp(min = 0.0)
+    mean = s.mean().item()
+    if mean <= 0.0:
+        return None
+    # Channels past the sensitivity's length are padding
+    s = F.pad(s / mean, (0, sigma.shape[0] - s.shape[0]), value = 1.0) + out_sensitivity_floor
+    t = (sigma.square() / s).pow(0.25)
+    live = t > 0
+    if not live.any():
+        return None
+    return (t / t[live].mean()).to(out_channel_scales.dtype).view_as(out_channel_scales)
+
+
 def regularize(
     weight: torch.Tensor,
     su: torch.Tensor,
@@ -1147,8 +1405,17 @@ def regularize(
     matrix, applies blockwise Hadamard transforms, and optionally searches for a global scale that minimizes sample
     quantization error. It returns the transformed weight plus the scale metadata needed to reconstruct the original
     linear layer behavior after quantization.
+
+    Output-channel scaling is forced on or off by quant_args["apply_out_scales"] (True/False). With None (auto)
+    it is on, except for tensors that come with a per-channel output sensitivity in quant_args["out_sensitivity"]
+    (gate and up projections of gated MLPs, see modules/mlp.py) and whose sensitive channels are the high-energy
+    ones (see out_scales_ratio).
+
+    A tensor that comes with the diagonal of its output-side Hessian in quant_args["out_hessian_diag"] takes its
+    scales from that instead (see sensitivity_out_scales), and quant_args["out_scales_hessian"] reports it
     """
     force_out_scales = quant_args["apply_out_scales"]
+    quant_args["out_scales_hessian"] = False
 
     # dist_ref = torch.empty((512,), dtype = torch.float, device = weight.device)
     # dist_r = torch.empty_like(dist_ref)
@@ -1159,28 +1426,7 @@ def regularize(
              F.kl_div((h2 + eps).log(), m, reduction = "sum")
         return js / 2
 
-    # From experiments, it seems the deciding factor in when scaling output channels is beneficial is when
-    # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
-    # on 2% of the channels
-    # TODO: More science
-    if not q_fallback and H_diag is not None:
-        diag = H_diag.sqrt()
-        diag, _ = torch.sort(diag, descending = True)
-        cutoff = diag.shape[0] // 50
-        skew_factor = diag[:cutoff].sum() / diag.sum()
-        if verbose:
-            print(f"     - input state skew: {skew_factor.item():.6f}")
-
-        if force_out_scales is None:
-            apply_out_scales = skew_factor.item() < 0.15
-        else:
-            apply_out_scales = force_out_scales
-
-    else:
-        apply_out_scales = True if force_out_scales is None else force_out_scales
-
-    if q_fallback:
-        apply_out_scales = force_out_scales
+    apply_out_scales = True if force_out_scales is None else force_out_scales
 
     # Apply output scales
     out_channel_scales = block_rms(weight, dim = 0, keepdim = True)
@@ -1188,6 +1434,24 @@ def regularize(
     if mean > 1e-30:
         out_channel_scales /= mean
         quant_args["zeros"] = False
+
+        out_hessian_diag = quant_args.get("out_hessian_diag")
+        out_sensitivity = quant_args.get("out_sensitivity")
+        hessian_scales = None
+        if out_hessian_diag is not None and force_out_scales is None and not q_fallback:
+            hessian_scales = sensitivity_out_scales(out_channel_scales, out_hessian_diag)
+        if hessian_scales is not None:
+            ratio = out_scales_ratio(out_channel_scales, out_hessian_diag)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f} (output Hessian)")
+            out_channel_scales = hessian_scales
+            quant_args["out_scales_hessian"] = True
+        elif out_sensitivity is not None and not q_fallback:
+            ratio = out_scales_ratio(out_channel_scales, out_sensitivity)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f}")
+            if force_out_scales is None and ratio is not None:
+                apply_out_scales = ratio <= out_scales_max_ratio
     else:
         quant_args["zeros"] = True
         if force_out_scales is not None:
@@ -1239,6 +1503,148 @@ def regularize(
     return apply_out_scales, weight, g_scale, su, sv
 
 
+def unrotate_H(H_rot: torch.Tensor, su_signs: torch.Tensor) -> torch.Tensor:
+    """Undo finalize_capture_H's input transform on the (damped) Hessian: H_rot = P (S H S) P^T with
+    the blockwise 128-Hadamard P (its own inverse) and the sign flips S"""
+    H = H_rot.float().clone()
+    blockwise_preapply_had_r_(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
+    s = su_signs.flatten().sign().float().to(H.device)
+    H *= s.unsqueeze(0)
+    H *= s.unsqueeze(1)
+    return H
+
+
+# Torch loads its CUDA linalg library on the first linalg call of the process and swaps the dispatch
+# stubs while doing so; two threads making that first call together fail with "lazy wrapper should
+# be called at most once". finalize_capture_H's factorization runs under its mutex, but scaled_ldl
+# runs on the device worker threads, so the library is loaded once under a lock before they start
+_linalg_load_lock = threading.Lock()
+_linalg_loaded = False
+
+def load_linalg(device):
+    global _linalg_loaded
+    if _linalg_loaded:
+        return
+    with _linalg_load_lock:
+        if not _linalg_loaded:
+            torch.linalg.cholesky(torch.eye(16, device = device))
+            _linalg_loaded = True
+
+
+def original_H(H_data: dict, device, cache: bool = False) -> torch.Tensor:
+    """The damped Hessian in the original basis, on device (undoing finalize_capture_H's rotation). With
+    `cache` the copy is kept in the H_data's per-device cache, for a Hessian many tensors share"""
+    dev_cache = H_data.setdefault("dev_cache", {}) if cache else None
+    H = dev_cache.get(("H_orig", device.index)) if cache else None
+    if H is None:
+        H = unrotate_H(H_data["H"].to(device), H_data["su"])
+        if cache:
+            dev_cache[("H_orig", device.index)] = H
+    return H
+
+
+def scaled_ldl(H_orig: torch.Tensor, su: torch.Tensor, quant_args: dict) -> torch.Tensor:
+    """
+    Block LDL of the Hessian in the domain LDLQ actually quantizes in. finalize_capture_H factors the
+    sign-flipped, rotated Hessian once per input (shared by q/k/v, gate/up, experts), but regularize
+    then divides each tensor's rows by that tensor's own input scales, so an error left in a heavily
+    scaled row comes back at full size in the output while the shared factorization weights every row
+    alike. The metric for the regularized weight is P diag(su) H diag(su) P with the full su (signs and
+    scales, the global scale cancels), which takes one factorization per tensor. H_orig is the damped
+    Hessian in the original basis (original_H), left untouched. Returns L with a zero diagonal, as
+    ldlq() expects
+    """
+    load_linalg(H_orig.device)
+    s = su.view(-1).float().to(H_orig.device)
+    H = H_orig * s.unsqueeze(0)
+    H *= s.unsqueeze(1)
+    blockwise_preapply_had_r_(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
+    L, _ = block_ldl(H, 16, quant_args, False)
+    dr = torch.arange(L.shape[0], device = L.device)
+    L[dr, dr] = 0
+    return L
+
+
+def damping_share(quant_args: dict) -> float:
+    """finalize_capture_H adds sigma_reg x the mean diagonal to H; as a share of the damped mean diagonal"""
+    r = quant_args.get("sigma_reg", 0.025)
+    return r / (1.0 + r)
+
+
+def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
+                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
+    """
+    Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
+    the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
+    W, Q (k, n) in the original basis: per output column c_n = (q_n^T H w_n) / (q_n^T H q_n) (closed form);
+    per input row r solves ((Q Q^T) o H) r = rowsum(Q o (H W)); alternated. Returns the rescaled weight_q
+    and the output error before / after, trace(E H E^T) / trace(W H W^T) = |X E|^2 / |X W|^2 over the
+    calibration rows. The fits use H as given (damped); `damping` is the share of H's mean diagonal that
+    finalize_capture_H added, taken back out of the diagonal for the reported error only
+    """
+    dev = weight_q.device
+    H = H.to(dev)
+    if damping > 0.0:
+        d_off = damping * H.diagonal().mean().item()
+        H_err = H.clone()
+        H_err.diagonal().sub_(d_off)
+    else:
+        H_err = H
+    W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
+    def cols(x, a, b):
+        return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
+    k, n = weight_q.shape
+    Q = weight_q
+    su = su.float().to(dev).view(k, 1)
+    sv = sv.float().to(dev).view(1, n)
+    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
+    HW = torch.empty((k, n), dtype = torch.float, device = dev)
+    den = 0.0
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        wc = cols(weight, a, b)
+        HW[:, a:b] = H @ wc
+        den += (wc * HW[:, a:b]).sum().item()
+    den_err = den
+    if H_err is not H:
+        den_err = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            den_err += (wc * (H_err @ wc)).sum().item()
+    def err(Qx):
+        e = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            E = cols(weight, a, b) - Qx[:, a:b]
+            e += (E * (H_err @ E)).sum().item()
+        return e / max(den_err, 1e-30)
+    e_before = err(Q)
+    for _ in range(rounds):
+        # output-side scales
+        num = torch.zeros(n, device = dev); dn = torch.zeros(n, device = dev)
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            HQ = H @ Q[:, a:b]
+            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            dn[a:b] = (Q[:, a:b] * HQ).sum(0)
+        c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
+        Q = Q * c.view(1, n)
+        sv = sv * c.view(1, n)
+        # input-side scales
+        A = (Q @ Q.T) * H
+        b_ = (Q * HW).sum(1)
+        A.diagonal().add_(1e-6 * A.diagonal().mean())
+        r = torch.linalg.solve(A, b_)
+        r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
+        Q = Q * r.view(k, 1)
+        su = su * r.view(k, 1)
+    e_after = err(Q)
+    return Q, su, sv, e_before, e_after
+
+
 def quantize_exl3(
     weight: torch.Tensor,
     H_data: dict,
@@ -1273,7 +1679,8 @@ def quantize_exl3(
         Dump extra stats
 
     :param swap_to_device:
-        If input tensor is on CPU, move to this device before quantization
+        Device a CPU-swapped weight came from. Accepted for API compatibility; the work always
+        happens on quant_args["devices"][0] and the weight is moved there
 
     :param save_reg:
         Save regularized tensor as image to the provided path
@@ -1295,10 +1702,9 @@ def quantize_exl3(
             torch.manual_seed(quant_args["seed"])
 
         devices = quant_args["devices"]
-        if weight.device != torch.device(devices[0]):
-            weight = weight.to(devices[0])
-
-        device = weight.device if swap_to_device is None else swap_to_device
+        device = torch.device(devices[0])
+        if weight.device != device:
+            weight = weight.to(device)
         k, n = weight.shape
 
         # Get H, LDL decomp. and input/output sign flips
@@ -1319,10 +1725,10 @@ def quantize_exl3(
         if L is not None:
             L = L.to(device)
 
-        if swap_to_device is not None:
-            weight = weight.to(swap_to_device)
         if verbose:
             weight_copy = weight.cpu()
+        # The post-LDLQ scale refit compares against the original weight (regularize works in place)
+        weight_orig = weight.clone() if weight.numel() <= 5e8 else weight.cpu()
         weight_r = weight
         del weight
 
@@ -1358,8 +1764,18 @@ def quantize_exl3(
         if weight_r.numel() > 5e8:
             weight_r = weight_r.cpu()
 
-        # Quantize
-        if not q_fallback:
+        # The input scales regularize folded into the weight belong in the Hessian too (see scaled_ldl)
+        if not q_fallback and quant_args.get("scaled_hessian"):
+            L = scaled_ldl(original_H(H_data, device), su, quant_args)
+
+        # Quantize. An external output-side Hessian factor (YAQA-style Kronecker approximation, see ldlq_2hess)
+        # switches to error feedback along both axes
+        H_out_r = None
+        if not q_fallback and quant_args.get("H_out") is not None:
+            L_out, H_out_r = prepare_H_out(quant_args["H_out"], sv, quant_args, verbose, device)
+            weight_q, encoded_q = ldlq_2hess(weight_r.to(device), L, L_out, quant_args, pb)
+            del L, L_out
+        elif not q_fallback:
             weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)  #zxc
             del L
         else:
@@ -1375,12 +1791,22 @@ def quantize_exl3(
                 Hd = H.to(device)
                 weight_r = None
                 E = E.to(device)
-                num = block_trace(E, Hd)
+                if H_out_r is not None:
+                    # Two-sided proxy tr(E^T H_in E H_out) / tr(W^T H_in W H_out)
+                    W = W.to(device)
+                    num = ((Hd @ E) * (E @ H_out_r)).sum().item()
+                    den = ((Hd @ W) * (W @ H_out_r)).sum().item()
+                    if verbose:
+                        print(f"     - one-sided proxy:  {block_trace(E, Hd) / max(block_trace(W, Hd), 1e-8):.6f}")
+                else:
+                    num = block_trace(E, Hd)
+                    E = None
+                    W = W.to(device)
+                    den = block_trace(W, Hd)
                 E = None
-                W = W.to(device)
-                den = block_trace(W, Hd)
                 W = None
                 Hd = None
+                H_out_r = None
                 proxy_err = num / max(den, 1e-8)
             except torch.OutOfMemoryError:
                 weight_r = None
@@ -1393,22 +1819,37 @@ def quantize_exl3(
 
         # free_mem()
 
-        if return_weight_q or verbose:
-            weight_q = weight_q.to(device)
-            weight_q = preapply_had_l(weight_q, had_k)
-            weight_q *= su
-            weight_q = preapply_had_r(weight_q, had_n)
-            weight_q *= sv
+        weight_q = weight_q.to(device)
+        weight_q = preapply_had_l(weight_q, had_k)
+        weight_q *= su
+        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q *= sv
 
+        # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+        if not q_fallback and H is not None and not quant_args.get("no_refit"):
+            H_orig = unrotate_H(H, H_data["su"])
+            weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv,
+                                                                   damping = damping_share(quant_args))
+            del H_orig
+            su = su_f.view(-1, 1).to(su.dtype)
+            sv = sv_f.view(1, -1).to(sv.dtype)
             if verbose:
-                weight = weight_copy.to(device)
-                nmse = block_nmse(weight_q, weight)
-                print(f"     - quant nmse: {nmse:.6f}")
+                print(f"     - regularized-domain proxy err: {proxy_err:.6f}")
+                print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+            # Report the output error of what is stored, in the original basis. The regularized-domain
+            # figure weights every row and column alike, which is off by the input and output scales
+            proxy_err = e_after
+        del weight_orig
+
+        if verbose:
+            weight = weight_copy.to(device)
+            nmse = block_nmse(weight_q, weight)
+            print(f"     - quant nmse: {nmse:.6f}")
 
         # Compile packed tensor
         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
         svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
-        trellis = pack_trellis(encoded_q.to(device), quant_args)
+        trellis = pack_trellis(encoded_q.to(device), quant_args) if not quant_args.get("no_pack") else encoded_q
 
         out_tensors = {
             # "scale": weight_scale.to(dtype = torch.float, copy = True),
@@ -1419,17 +1860,7 @@ def quantize_exl3(
             "trellis": trellis,
         }
 
-        # Safetensors doesn't know what to do with a torch.uint32 tensor. Anyway, since the multipliers are now
-        # locked, the values in these tensors are never read, but they need to be present in the model files to
-        # indicate which codebook to use during inference, per individual tensor.
-        if quant_args.get("mcg"):
-            out_tensors.update({
-                "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
-            })
-        if quant_args.get("mul1"):
-            out_tensors.update({
-                "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
-            })
+        out_tensors.update(codebook_markers(quant_args))
 
         quant_args.update({
             "apply_out_scales": apply_out_scales,
@@ -1574,6 +2005,7 @@ def quantize_exl3_batch(
         stager = _WeightStager(device)
         stager.prefetch(batch_idx[0], weights[batch_idx[0]])
         regs = {}
+        origs = {}
         for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
             if "seed" in qa:
@@ -1587,12 +2019,14 @@ def quantize_exl3_batch(
             if H_diag is not None and H_diag.is_cuda:
                 H_diag = H_diag.to(device)
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            # Original kept for the post-LDLQ scale refit (regularize works in place)
+            origs[t] = weight.clone() if weight.numel() <= 5e7 else weight.cpu()
             apply_out_scales, weight_r, _, su, sv = regularize(
                 weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
-        samples = [sample_scale_tiles(regs[t][0]) for t in batch_idx]
+        samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
         scales = g_scale_search_batch(samples, qa0)
         del samples
         g_scales = {}
@@ -1606,12 +2040,13 @@ def quantize_exl3_batch(
         pb.new_task(progress_text, tiles_k)
 
         # Quantize
-        if shared_H:
-            # A shared H_data serves many groups spread over several device threads; cache the
-            # device copies of L (and H, below) in the dict so each device pays the transfer
-            # once per layer instead of once per group. A benign race can duplicate a copy;
-            # the loser's tensor is simply collected
-            dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {})
+        scaled = qa0.get("scaled_hessian")
+        # A shared H_data serves many groups spread over several device threads; cache the
+        # device copies of L (and H, below) in the dict so each device pays the transfer
+        # once per layer instead of once per group. A benign race can duplicate a copy;
+        # the loser's tensor is simply collected
+        dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {}) if shared_H else None
+        if shared_H and not scaled:
             L = dev_cache.get(("L", device.index))
             if L is None:
                 L = finalized[batch_idx[0]][1].to(device)
@@ -1626,15 +2061,33 @@ def quantize_exl3_batch(
             weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
             encodeds = list(torch.split(encoded_cat, [w // 16 for w in widths], dim = 1))
         else:
-            Ls = torch.stack([finalized[t][1].to(device) for t in batch_idx])
-            weight_r_stack = torch.stack([regs[t][0] for t in batch_idx])
+            # Per-tensor L: same-shape tensors stack into one batched pass. With scaled Hessians a shared
+            # H no longer means a shared L, so the concatenated layout above is replaced by stacks per
+            # shape (gate/up of a group of experts are one stack; q/k/v fall into two). Each stack's L
+            # is factored here and released with the pass, so the extra memory is one stack's worth
+            by_shape = {}
             for t in batch_idx:
-                regs[t][0] = None
-            weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb)
-            del Ls
-            weight_rs = list(weight_r_stack.unbind(0))
-            weight_qs = list(weight_q_stack.unbind(0))
-            encodeds = list(encoded_stack.unbind(0))
+                by_shape.setdefault(tuple(regs[t][0].shape), []).append(t)
+            outs = {}
+            for ts in by_shape.values():
+                if scaled:
+                    Ls = torch.stack([
+                        scaled_ldl(original_H(H_datas[t], device, cache = shared_H), regs[t][1], quant_args_list[t])
+                        for t in ts
+                    ])
+                else:
+                    Ls = torch.stack([finalized[t][1].to(device) for t in ts])
+                weight_r_stack = torch.stack([regs[t][0] for t in ts])
+                for t in ts:
+                    regs[t][0] = None
+                weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb if len(by_shape) == 1 else None)
+                del Ls
+                for t, wr, wq, enc in zip(ts, weight_r_stack.unbind(0), weight_q_stack.unbind(0), encoded_stack.unbind(0)):
+                    outs[t] = (wr, wq, enc)
+            weight_rs = [outs[t][0] for t in batch_idx]
+            weight_qs = [outs[t][1] for t in batch_idx]
+            encodeds = [outs[t][2] for t in batch_idx]
+            del outs
 
         pb.update(tiles_k)
 
@@ -1661,6 +2114,24 @@ def quantize_exl3_batch(
                 E = None
                 proxy_err = -1.0
             weight_rs[bi] = None
+
+            # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+            if not qa.get("no_refit"):
+                wq = weight_qs[bi].to(device)
+                wq = preapply_had_l(wq, had_k)
+                wq *= su
+                wq = preapply_had_r(wq, had_n)
+                wq *= sv
+                H_orig = unrotate_H(Hd, H_datas[t]["su"])
+                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
+                                                                damping = damping_share(qa))
+                del wq, H_orig
+                su = su_f.view(-1, 1).to(su.dtype)
+                sv = sv_f.view(1, -1).to(sv.dtype)
+                if verbose:
+                    print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+                proxy_err = e_after
+            origs[t] = None
             weight_qs[bi] = None
 
             suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
@@ -1673,14 +2144,7 @@ def quantize_exl3_batch(
                 "svh": svh,
                 "trellis": trellis,
             }
-            if qa.get("mcg"):
-                out_tensors.update({
-                    "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
-                })
-            if qa.get("mul1"):
-                out_tensors.update({
-                    "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
-                })
+            out_tensors.update(codebook_markers(qa))
 
             qa.update({
                 "apply_out_scales": apply_out_scales,

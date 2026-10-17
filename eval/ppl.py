@@ -11,6 +11,7 @@ from exllamav3.util.memory import free_mem
 from exllamav3.util.measures import compute_target_log_probs
 import torch
 import math
+import json
 
 
 @disk_lru_cache("get_dataset_text")
@@ -68,6 +69,51 @@ def _load_wikitext2_raw() -> str:
 
     with open(raw_path, "r", encoding = "utf-8") as f:
         return f.read()
+
+
+def get_test_rows_file(path: str, max_rows: int | None):
+    """
+    Pre-tokenized test rows from a file, as (ids [rows, max_len] right-padded, ranges): per row,
+    logits at positions [a, b - 1) are scored against the tokens at [a + 1, b), matching qbench.
+
+    .safetensors: "ids" [rows, len] int64, plus either "prefix_len" (scalar: score positions from
+    there on, the qbench tokens_*.safetensors layout) or "ranges" [rows, 2] int64 (per-row [a, b)
+    over logits positions; rows may be right-padded beyond b). Neither: whole rows, like -l/-r.
+
+    .json: a qbench_prompts.py trace (variable-length (input_ids, response_ids) pairs), scored on
+    the sampled response tokens only, exactly as a qbench project with `test_trace` does.
+    """
+    if path.endswith(".json"):
+        with open(path, "r") as f:
+            trace = json.load(f)
+        rows = trace["rows"][:max_rows] if max_rows else trace["rows"]
+        assert rows, f"{path} contains no rows"
+        max_len = max(len(r["input_ids"]) + len(r["response_ids"]) for r in rows)
+        ids = torch.zeros((len(rows), max_len), dtype = torch.long)
+        ranges = []
+        for i, r in enumerate(rows):
+            seq = r["input_ids"] + r["response_ids"]
+            ids[i, :len(seq)] = torch.tensor(seq, dtype = torch.long)
+            ranges.append((len(r["input_ids"]) - 1, len(seq)))
+        return ids, ranges
+    from safetensors import safe_open
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        keys = set(f.keys())
+        assert "ids" in keys, f"{path} has no 'ids' tensor"
+        ids = f.get_tensor("ids").to(torch.long)
+        assert ids.dim() == 2, f"'ids' must be [rows, len], got {tuple(ids.shape)}"
+        if max_rows:
+            ids = ids[:max_rows]
+        if "ranges" in keys:
+            rg = f.get_tensor("ranges").to(torch.long)[:ids.shape[0]]
+            assert rg.shape == (ids.shape[0], 2), f"'ranges' must be [rows, 2], got {tuple(rg.shape)}"
+            ranges = [(int(a), int(b)) for a, b in rg.tolist()]
+        else:
+            prefix_len = int(f.get_tensor("prefix_len").flatten()[0].item()) if "prefix_len" in keys else 0
+            ranges = [(prefix_len, ids.shape[1])] * ids.shape[0]
+    for a, b in ranges:
+        assert 0 <= a < b - 1 <= ids.shape[1] - 1, f"bad scoring range {(a, b)} for rows of {ids.shape[1]}"
+    return ids, ranges
 
 
 def get_test_tokens_gguf(tokenizer) -> list[int]:
@@ -147,21 +193,32 @@ def eval_gguf(model, config, tokenizer, args, forward_fn):
 def eval_default(model, config, tokenizer, args, forward_fn):
 
     # Dataset
-    eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length)
     vocab_size = tokenizer.actual_vocab_size
-    if args.gen_prompt:
-        eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
+    if args.test_file:
+        assert not args.gen_prompt, "-gp does not apply to pre-tokenized rows (-t)"
+        eval_ids, ranges = get_test_rows_file(args.test_file, args.rows)
+        print(f" -- Test rows from {args.test_file}: {eval_ids.shape[0]} rows, "
+              f"{sum(b - a - 1 for a, b in ranges)} scored tokens")
+    else:
+        eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length)
+        if args.gen_prompt:
+            eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
+        ranges = [(0, eval_ids.shape[1])] * eval_ids.shape[0]
 
     # Test
     logprob_sum = 0.0
     logprob_count = 0
-    with ProgressBar("Evaluating", args.rows) as pb:
-        for row in range(eval_ids.shape[0]):
+    num_rows = eval_ids.shape[0]
+    with ProgressBar("Evaluating", num_rows) as pb:
+        for row in range(num_rows):
             pb.update(row)
-            input_ids = eval_ids[row:row + 1, :]
+            a, b = ranges[row]
+            # Only the row's real length goes through the model (padding beyond b is inert
+            # anyway); logits at [a, b - 1) predict the tokens at [a + 1, b)
+            input_ids = eval_ids[row:row + 1, :b]
             logits = forward_fn(model, input_ids)
-            logits = logits[:, :-1, :]
-            target_ids = input_ids[:, 1:].to(logits.device)
+            logits = logits[:, a:b - 1, :]
+            target_ids = input_ids[:, a + 1:b].to(logits.device)
             del input_ids
             target_log_probs = compute_target_log_probs(logits, target_ids, vocab_size)
             logprob_sum += target_log_probs.sum().item()
@@ -170,11 +227,14 @@ def eval_default(model, config, tokenizer, args, forward_fn):
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()
-        pb.update(args.rows)
+        pb.update(num_rows)
         mean_log_prob = logprob_sum / logprob_count
         perplexity = math.exp(-mean_log_prob)
 
-    print(f" -- Evaluated: {eval_ids.shape[0]} rows of {eval_ids.shape[1]} tokens")
+    if args.test_file:
+        print(f" -- Evaluated: {num_rows} rows, {logprob_count} scored tokens")
+    else:
+        print(f" -- Evaluated: {num_rows} rows of {eval_ids.shape[1]} tokens")
     print(f" -- Perplexity: {perplexity:.6f}")
 
 
@@ -212,9 +272,19 @@ def main(args):
             if not args.hf_tight and not args.hf_fp32:
                 hf_kwargs["dtype"] = torch.bfloat16
 
+        # -gs doubles as a per-device GiB budget: an explicit device map from accelerate's planner,
+        # since Transformers' own "auto" planner fills every device to the brim (its conversion
+        # transients, e.g. fusing 256 experts' gate/up projections, then OOM) or refuses outright
+        device_map = "auto" if args.hf_device is None else torch.device(args.hf_device)
+        if args.hf_device is None and args.gpu_split:
+            from exllamav3.util.hf_util import hf_device_map_from_split
+            device_map = hf_device_map_from_split(args.model_dir, args.gpu_split.split(","))
+            # The grouped_mm expert path mixes devices when a model is split (native KimiLinear on
+            # transformers 5.17); the eager expert loop is the reference path anyway
+            hf_kwargs["experts_implementation"] = "eager"
         model = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
-            device_map = "auto" if args.hf_device is None else torch.device(args.hf_device),
+            device_map = device_map,
             dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else hf_kwargs.pop("dtype", None),
             **hf_kwargs,
         )
@@ -233,6 +303,7 @@ def main(args):
         forward_fn = forward_fn_hf
 
 
+    assert not (args.gguf and args.test_file), "-t does not apply to GGUF-equivalent mode (-g)"
     if not args.gguf:
         eval_default(model, config, tokenizer, args, forward_fn)
     else:
@@ -244,6 +315,7 @@ if __name__ == "__main__":
     model_init.add_args(parser, cache = False)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
     parser.add_argument("-l", "--length", type = int, help = "Length", default = 2048)
+    parser.add_argument("-t", "--test_file", type = str, default = None, help = "Pre-tokenized test rows instead of wiki2: a .safetensors file with 'ids' [rows, len] (+ optional 'prefix_len' or 'ranges' [rows, 2], the qbench tokens file layout) or a qbench_prompts.py .json trace (scored on the sampled response tokens). -r caps the rows, -l is ignored")
     parser.add_argument("-g", "--gguf", action = "store_true", help = "Use GGUF-equivalent eval logic (ignores -r and -l)")
     parser.add_argument("-c", "--ctx-size", type = int, help = "For GGUF-equiv.: size of the prompt context (default: 512)", default = 512)
     parser.add_argument("-hf", "--hf", action = "store_true", help = "Use Transformers as backend (-m must be HF model)")

@@ -62,11 +62,12 @@ void BC_GatedDeltaNet::run_bsz1_b
     o_proj->run(core_attn_out_f, y);
 }
 
-bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history)
+bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history, int64_t stage_key)
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= seqlen && seqlen <= MAX_QLEN,
                 "BC_GatedDeltaNetSplit: shape out of range");
-    return !slot(bsz, seqlen, history).configured;
+    Slot& s = slot(bsz, seqlen, history);
+    return !s.configured || (history && s.stage_key != stage_key);
 }
 
 void BC_GatedDeltaNetSplit::configure_slot
@@ -128,6 +129,7 @@ void BC_GatedDeltaNetSplit::configure_slot
                 "BC_GatedDeltaNetSplit: statics must be contiguous");
 
     s.graph = std::make_unique<Graph>();
+    s.stage_key = 0;
     s.configured = true;
 }
 
@@ -178,6 +180,7 @@ void BC_GatedDeltaNetSplit::configure_slot_kda
                 "BC_GatedDeltaNetSplit (KDA): statics must be contiguous");
 
     s.graph = std::make_unique<Graph>();
+    s.stage_key = 0;
     s.configured = true;
 }
 
@@ -187,7 +190,7 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     at::Tensor ptrs_suh,
     at::Tensor ptrs_svh,
     at::Tensor meta,
-    int K,
+    float K,
     bool mcg,
     bool mul1
 )
@@ -220,7 +223,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan,
     bool history,
+    const c10::optional<at::Tensor>& slots_in,
     Slot& s,
     Graph* graph
 )
@@ -311,8 +316,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         num_v_heads,
         k_head_dim,
         v_head_dim,
-        slots,
+        slots_scan,
         history,
+        slots_in,
         graph
     );
 
@@ -330,7 +336,9 @@ void BC_GatedDeltaNetSplit::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
-    bool history
+    const at::Tensor& slots_scan,
+    bool history,
+    const c10::optional<at::Tensor>& slots_in
 )
 {
     py::gil_scoped_release release;
@@ -346,28 +354,30 @@ void BC_GatedDeltaNetSplit::run_bszN
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_half = recurrent_state.scalar_type() == at::kHalf;
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path. The snapshot is per slot:
+    // so a cache with different dimensions or state element type falls back to the eager path. The snapshot is per slot:
     // another slot's eager run against a second cache must not re-arm this slot's replay
     if ((int) conv_state.size(2) != s.graph_state_size ||
-        (int) recurrent_state.size(1) != s.graph_hist_stride)
+        (int) recurrent_state.size(1) != s.graph_hist_stride ||
+        (recurrent_state.scalar_type() == at::kHalf) != s.graph_state_half)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
-        s.graph->capture_end();
+        GraphCapture capture(*s.graph);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get());
+        capture.finish();
     }
 
     std::vector<PPTR> args;
@@ -381,7 +391,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
@@ -392,7 +402,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else
@@ -404,17 +414,28 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
+    // The speculative-pass scan reads its first token's state from slots_in (recorded after the
+    // slots param, so it patches in that order)
+    if (history)
+        args.insert(args.end() - 1, PPTR(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr()));
+    // The o_proj bias add runs in place on y, which is a different tensor every call
+    if (o_proj->bias)
+    {
+        args.emplace_back(GP_add_x, (void*) y.data_ptr());
+        args.emplace_back(GP_add_z, (void*) y.data_ptr());
+    }
     s.graph->launch(args, stream);
 }
 
-bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history)
+bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history, int64_t stage_key)
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= seqlen && seqlen <= MAX_QLEN,
                 "BC_Mamba2: shape out of range");
-    return !slot(bsz, seqlen, history).configured;
+    Slot& s = slot(bsz, seqlen, history);
+    return !s.configured || (history && s.stage_key != stage_key);
 }
 
 void BC_Mamba2::configure_slot
@@ -464,6 +485,7 @@ void BC_Mamba2::configure_slot
     s.core_f_g = s.core_attn_out_f.view({bsz, seqlen, num_k_heads, gs});
 
     s.graph = std::make_unique<Graph>();
+    s.stage_key = 0;
     s.configured = true;
 }
 
@@ -474,7 +496,9 @@ void BC_Mamba2::run_bszN_gr
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
+    const at::Tensor& slots_scan,
     bool history,
+    const c10::optional<at::Tensor>& slots_in,
     Slot& s,
     Graph* graph
 )
@@ -526,8 +550,9 @@ void BC_Mamba2::run_bszN_gr
         num_v_heads,
         k_head_dim,
         v_head_dim,
-        slots,
+        slots_scan,
         history,
+        slots_in,
         graph
     );
 
@@ -559,7 +584,9 @@ void BC_Mamba2::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
-    bool history
+    const at::Tensor& slots_scan,
+    bool history,
+    const c10::optional<at::Tensor>& slots_in
 )
 {
     py::gil_scoped_release release;
@@ -575,28 +602,30 @@ void BC_Mamba2::run_bszN
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_half = recurrent_state.scalar_type() == at::kHalf;
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path. The snapshot is per slot:
+    // so a cache with different dimensions or state element type falls back to the eager path. The snapshot is per slot:
     // another slot's eager run against a second cache must not re-arm this slot's replay
     if ((int) conv_state.size(2) != s.graph_state_size ||
-        (int) recurrent_state.size(1) != s.graph_hist_stride)
+        (int) recurrent_state.size(1) != s.graph_hist_stride ||
+        (recurrent_state.scalar_type() == at::kHalf) != s.graph_state_half)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
-        s.graph->capture_end();
+        GraphCapture capture(*s.graph);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get());
+        capture.finish();
     }
 
     std::vector<PPTR> args;
@@ -608,10 +637,21 @@ void BC_Mamba2::run_bszN
     args.emplace_back(GP_conv1d_state,   (void*) conv_state.data_ptr());
     args.emplace_back(GP_conv1d_slots,   (void*) slots.data_ptr());
     args.emplace_back(GP_gdn_rule_state, (void*) recurrent_state.data_ptr());
-    args.emplace_back(GP_gdn_rule_slots, (void*) slots.data_ptr());
+    args.emplace_back(GP_gdn_rule_slots, (void*) slots_scan.data_ptr());
+    if (history)
+        args.emplace_back(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr());
     if (s.yp)
         args.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     else
+    {
         args.emplace_back(GP_gemm_C, (void*) y.data_ptr());     // o_proj output
+        // The o_proj bias add runs in place on y, which is a different tensor every call (the
+        // padded path adds on the yp static instead)
+        if (o_proj->bias)
+        {
+            args.emplace_back(GP_add_x, (void*) y.data_ptr());
+            args.emplace_back(GP_add_z, (void*) y.data_ptr());
+        }
+    }
     s.graph->launch(args, stream);
 }

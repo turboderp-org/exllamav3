@@ -2,6 +2,7 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include "exl3_kernel_map.cuh"   // EXL3_GEMM_BASE_THREADS, SMEM_MAX
 
 #define MOE_ACT_SILU 0
 #define MOE_ACT_GELU 1
@@ -10,17 +11,9 @@
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
 #define MOE_TILESIZE_K 32
-#define MOE_TILESIZE_M 16
+#define MOE_TILESIZE_M 16          // default row tile; the 32 / 64 row tiles are separate kernel instances
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
-
-#ifndef EXL3_GEMM_BASE_THREADS
-#define EXL3_GEMM_BASE_THREADS 256
-#endif
-
-#ifndef SMEM_MAX
-#define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
-#endif
 
 #define EXL3_MOE_KERNEL_ARGS                    \
     const half* __restrict__ hidden_state,      \
@@ -56,4 +49,10 @@
     const int K_up,                             \
     const int K_down,                           \
                                                 \
-    int* __restrict__ locks
+    int* __restrict__ locks,                    \
+                                                \
+    float* __restrict__ output_scratch,         \
+    const int64_t* __restrict__ fused_base,     \
+                                                \
+    const int count_lo,                         \
+    const int count_hi

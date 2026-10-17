@@ -76,13 +76,15 @@ inline uint32_t load_u32_(const uint16_t* ptr, int index)
 }
 
 // Extract state `t_offset`'s bits-bit code as a 16-bit window from one 16x16 tile's packed
-// words (a uint16 array of length bits * 16)
-template <int bits>
+// words (a uint16 array of length tile_words32(bits, hb) * 2). hb selects the half-integer
+// rates 1.5 / 2.5 / 3.5; formulas match moe_mul1.cpp's rate_k2 / state_end / tile_words32.
+template <int bits, bool hb = false>
 inline uint16_t decode_state_scalar(const uint16_t* packed, int t_offset)
 {
-    constexpr int words32 = bits * 256 / 32;
-    const int b0 = t_offset * bits + bits - 16 + 256 * bits;
-    const int b1 = b0 + 16;
+    constexpr int rate2 = 2 * bits + (hb ? 1 : 0);   // rate in half-bit units
+    constexpr int words32 = 4 * rate2;
+    const int b1 = (((t_offset + 1) * rate2) >> 1) + 128 * rate2;
+    const int b0 = b1 - 16;
     const int shift = ((b1 - 1) / 32 + 1) * 32 - b1;
     const uint64_t merged = (static_cast<uint64_t>(load_u32_(packed, (b0 / 32) % words32)) << 32) |
                             load_u32_(packed, ((b1 - 1) / 32) % words32);

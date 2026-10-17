@@ -30,7 +30,8 @@ void ngram_dequant
 (
     const at::Tensor& packed,
     int64_t K,
-    const at::Tensor& heads,
-    const at::Tensor& bias,
-    at::Tensor out
+    const c10::optional<at::Tensor>& heads,
+    const c10::optional<at::Tensor>& aux,
+    at::Tensor out,
+    bool rotate
 );

@@ -18,12 +18,19 @@ if precompile and not torch:
 
 windows = os.name == "nt"
 
+# Shared with the JIT build; loaded by path because the package is not importable yet
+_spec = importlib.util.spec_from_file_location(
+    "cuda_flags", os.path.join(os.path.dirname(os.path.abspath(__file__)), "exllamav3", "util", "cuda_flags.py")
+)
+cuda_flags = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cuda_flags)
+
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+extra_cuda_cflags = cuda_flags.cuda_cflags(
+    cuda_home = cpp_extension.CUDA_HOME,
+    debug = ext_debug,
+    hip = bool(torch_version.hip),
+) if precompile and torch else []
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
@@ -36,6 +43,9 @@ if windows:
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
+elif torch and torch_version.hip:
+    # torch hands the C++ flags to hipcc as well, and -Ofast implies fast-math (see hip_cflags)
+    extra_cflags += ["-O3"]
 else:
     extra_cflags += ["-Ofast"]
     extra_cuda_cflags += []
@@ -43,11 +53,11 @@ else:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
         extra_cuda_cflags += []
 
-if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
-    extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+hip = bool(torch and torch_version.hip)
 
-if torch and torch_version.hip:
-    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+# nvcc's host compiler; hipcc takes no -ccbin
+if not hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
 extra_compile_args = {
     "cxx": extra_cflags,
@@ -57,11 +67,17 @@ extra_compile_args = {
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
 sources = [
-    os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
-    for root, _, files in os.walk(sources_dir)
-    for file in files
-    if file.endswith(('.c', '.cpp', '.cu'))
+    os.path.relpath(path, start=os.path.dirname(os.path.abspath(__file__)))
+    for path in cuda_flags.extension_sources(sources_dir, hip = hip)
 ]
+
+if hip:
+    cuda_flags.use_rocm_sdk_devel(cpp_extension)
+    extra_cflags += cuda_flags.hip_include_flags(sources_dir)
+    extra_cuda_cflags += cuda_flags.hip_include_flags(sources_dir)
+
+# The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu)
+libraries = ["cublas"] if windows else ["hipblas"] if hip else []
 
 setup_kwargs = (
     {
@@ -70,7 +86,7 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
-                libraries=["cublas"] if windows else [],
+                libraries=libraries,
             )
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},

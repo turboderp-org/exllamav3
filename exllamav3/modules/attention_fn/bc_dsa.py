@@ -1,11 +1,13 @@
 import os
 
 import torch
+from ...util.backend import DSA_MQA, DSA_N_SPLITS, DSA_SPLIT_WARPS
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import _compile_kernel
+from .bc_attn import _compile_kernel, BCKernelTooLarge
+from . import dsa_mqa
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
@@ -27,8 +29,21 @@ _bc_debug = os.environ.get("EXL3_BC_DSA_DEBUG", "0") != "0"
 
 MAX_QLEN = 16
 MAX_S = 16        # tokens per job per batched step; must match BC_DSV4BatchAttention::MAX_S
-N_SPLITS = 16
+# Key splits per decode row (util/backend.py)
+N_SPLITS = DSA_N_SPLITS
 BLOCK_H = 16
+
+
+def _compile_split(dev, sig_s: dict, consts_s: dict):
+    """The decode split kernel: on ROCm the MQA kernel (dsa_mqa.py) where the shape allows it, else upstream's
+    at 8 warps, which spills far less to scratch on these parts"""
+    if DSA_MQA:
+        t = dsa_mqa.decode_eligible(consts_s)
+        if t is not None:
+            sig = dict(sig_s) | {n: "constexpr" for n in ("HP", "BD", "KC", "KSTAGES")}
+            return _compile_kernel(dev, dsa_mqa._dsa_decode_mqa_kernel, sig, dsa_mqa.decode_consts(consts_s, t),
+                                   dsa_mqa.DECODE_WARPS, 1)
+    return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
 
 def _exl3_bc(lin):
@@ -236,8 +251,10 @@ class BCDsa:
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
-        ws_ml = st((seq * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")
-        ws_acc = st((seq * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")
+        # Split-decode partials: one backing per device sized for the largest slot, viewed to
+        # this slot's rows.
+        ws_ml = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")[:seq * hb * N_SPLITS * BLOCK_H * 2]
+        ws_acc = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")[:seq * hb * N_SPLITS * BLOCK_H * D]
         attn_out = st((G, seq, hpg * hd), torch.half, "bcd_aout")
         woa_c = st((G, seq, self.o_lora), torch.half, "bcd_woac")
         woa_t = st((seq, G * self.o_lora), torch.half, "bcd_woat")
@@ -267,7 +284,7 @@ class BCDsa:
             SEQ = 1, MULTIROW = 0, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
@@ -318,7 +335,10 @@ class BCDsa:
             return None
 
         if self.bc.needs_configure(seq, regime):
-            self._configure(seq, regime)
+            try:
+                self._configure(seq, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
 
         # Refresh the block-table static once per job step (any compressor layer may be the
         # one to do it; sliding layers never touch it, so this is tracked separately from
@@ -577,7 +597,7 @@ class BCDsaBatch:
             SEQ = S, MULTIROW = 1, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
@@ -616,7 +636,10 @@ class BCDsaBatch:
         """x (B, S, hidden) fp16 contiguous, bt (rows, npr) i32 device batch block table.
         Returns y (B, S, hidden) fp32 (a static: consume before the next BC call)."""
         if self.bc.needs_configure(B, S):
-            self._configure(B, S)
+            try:
+                self._configure(B, S)
+            except BCKernelTooLarge:
+                return None
 
         pin = self.pins[self.pin_i]
         self.pin_i = (self.pin_i + 1) % len(self.pins)

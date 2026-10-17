@@ -89,9 +89,13 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        hybrid_draft_tokens = args.hybrid_draft_tokens,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        disk_cache_dir = args.disk_cache_dir,
+        disk_cache_size = int(args.disk_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,
         max_chunk_size = args.generator_chunk_size,
@@ -251,6 +255,9 @@ def main(args):
 
                 # Edit last response
                 case "/e":
+                    if len(context) == 0:
+                        print_error(f"Context is empty, nothing to edit")
+                        continue
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
@@ -475,7 +482,7 @@ def main(args):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1

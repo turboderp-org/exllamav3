@@ -34,6 +34,13 @@ int DevCtx::get_cc(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!cc[device])
     {
+#if defined(USE_ROCM)
+        // HIP reports the gfx generation as the major version (gfx11 -> 11), which the NVIDIA thresholds
+        // below would read as Blackwell. Until RDNA devices get classes of their own, they take the
+        // conservative host-side choices of the oldest class (the device code is unaffected: the
+        // EXL3_SM75 gate in arch.cuh is compile-time and off for HIP)
+        cc[device] = CC_OLD;
+#else
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
@@ -41,8 +48,30 @@ int DevCtx::get_cc(int device)
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
         else if (prop.major >= 8) cc[device] = CC_AMPERE;
         else cc[device] = CC_OLD;
+#endif
     }
     return cc[device];
+}
+
+int DevCtx::get_smem_max(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!smem_max[device])
+    {
+        // The driver value, unclamped: this is a device capability, and callers that only need
+        // "what may I request for an EXL3 kernel" clamp to SMEM_MAX themselves (see
+        // get_smem_request). Clamping here would have made an sm_86 device indistinguishable
+        // from a 90 KB one and dragged it onto the Turing code paths.
+        int optin = 0;
+        cuda_check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        smem_max[device] = optin;
+    }
+    return smem_max[device];
+}
+
+int DevCtx::get_smem_request(int device)
+{
+    return MIN(get_smem_max(device), EXL3_SMEM_MAX_DEFAULT);
 }
 
 void* DevCtx::get_ws(int device)
@@ -63,7 +92,11 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         c10::cuda::CUDAGuard guard(device);
+#if defined(USE_ROCM)
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS) * sizeof(int);
+#else
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
+#endif
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);
@@ -82,9 +115,15 @@ int g_get_num_sms(int device)
     return DevCtx::instance().get_num_sms(device);
 }
 
+int g_get_smem_max(int device)
+{
+    return DevCtx::instance().get_smem_max(device);
+}
+
 void prepare_ctx(int device)
 {
     DevCtx::instance().get_num_sms(device);
     DevCtx::instance().get_cc(device);
+    DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import multiprocessing
+import torch
 from multiprocessing import Process, Pipe
 from multiprocessing.reduction import ForkingPickler
 from ..util import find_free_port
@@ -305,16 +306,9 @@ class Model_TPMixin:
 
     def tp_cpu_cache_store(self, cache_ids: list[int], slot: int, page_index: int):
         """
-        Copy a cache page out to system RAM on every rank, stored under slot. Returns the number of stores that
-        had to pin memory synchronously, summed over ranks, since that stall happens out of sight of the main
-        process.
+        Copy a cache page out to system RAM on every rank, stored under slot
         """
-        cold = self.tp_worker_dispatch_wait_multi(
-            self.active_devices,
-            mp_cpu_cache_store,
-            (cache_ids, slot, page_index)
-        )
-        return sum(cold)
+        self.tp_dispatch_all(mp_cpu_cache_store, (cache_ids, slot, page_index))
 
 
     def tp_cpu_cache_fetch(self, cache_ids: list[int], slot: int, page_index: int):
@@ -347,13 +341,15 @@ class Model_TPMixin:
         return r
 
 
-    def tp_dispatch_lm_head_argmax(self, args):
+    def tp_dispatch_lm_head_argmax(self, args, return_max: bool = False):
         """
         Compute argmax over a tensor-parallel sharded LM head.
 
         Each device that owns a non-empty LM-head slice computes local maximum values and vocabulary indices for
         its shard. The partial maxima are gathered to the output device, where the final winner is selected and the
-        global token index is returned.
+        global token index is returned. With return_max, the winning logit value comes back alongside (the same
+        value the layer-split path exports as draft confidence); it is already on the output device from the
+        gather, so this adds no transfer or synchronization.
 
         Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating, runs after
         the spawned workers have been sent their local argmax command.
@@ -368,9 +364,9 @@ class Model_TPMixin:
             v, i = self.tp_worker_dispatch_single(
                 self.tp_output_device,
                 mp_model_forward_lm_head_argmax,
-                args + (ad[self.tp_output_device], None, None)
+                args + (ad[self.tp_output_device], None, None, self.config.vocab_size)
             )
-            return i
+            return (i, v) if return_max else i
 
         gd = sorted(set(ad.keys()) | {self.tp_output_device})
         ldims = [1 if d in ad else 0 for d in gd]
@@ -381,7 +377,7 @@ class Model_TPMixin:
                 self.tp_worker_dispatch(
                     device,
                     mp_model_forward_lm_head_argmax,
-                    args + (ad.get(device, -1), gd, ldims)
+                    args + (ad.get(device, -1), gd, ldims, self.config.vocab_size)
                 )
                 dispatched.append(device)
 
@@ -405,9 +401,61 @@ class Model_TPMixin:
             p += ldim
         vals = torch.stack(vals, dim = -1)
         inds = torch.stack(inds, dim = -1)
-        winner = vals.argmax(dim = -1)
-        argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        winner = vals.argmax(dim = -1, keepdim = True)
+        argmax = inds.gather(-1, winner).squeeze(-1)
+        if return_max:
+            return argmax, vals.gather(-1, winner).squeeze(-1)
         return argmax
+
+
+    def tp_dispatch_lm_head_topk(self, args, top_k: int, scale: float = 1.0, softcap: float = 0.0):
+        """
+        Per-row top-k over a tensor-parallel sharded LM head, for drafters that need more than the argmax
+        (DFlash2's selector walks the top-k candidates). Each shard takes its local top-k, scaled and
+        softcapped as the selector would, the k candidates per shard are gathered to the output device
+        (k values and k ids per shard, the same small gather as the argmax partials) and merged there to the
+        global top-k. Returns (scores, ids) of shape (..., top_k), unsorted, on the output device.
+
+        Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating,
+        runs after the spawned workers have been sent their command.
+        """
+        head_key = self.modules[self.logit_layer_idx].key
+        ad = {}
+        for device in self.active_devices:
+            a, b, _ = self.plan[device][head_key]
+            if b > a:
+                ad[device] = a
+        vocab = self.config.vocab_size
+
+        if len(ad) == 1 and self.tp_output_device in ad:
+            return self.tp_worker_dispatch_single(
+                self.tp_output_device,
+                mp_model_forward_lm_head_topk,
+                args + (ad[self.tp_output_device], None, None, vocab, top_k, scale, softcap)
+            )
+
+        gd = sorted(set(ad.keys()) | {self.tp_output_device})
+        ldims = [top_k if d in ad else 0 for d in gd]
+
+        dispatched = []
+        for device in self.active_devices:
+            if device in gd:
+                self.tp_worker_dispatch(
+                    device,
+                    mp_model_forward_lm_head_topk,
+                    args + (ad.get(device, -1), gd, ldims, vocab, top_k, scale, softcap)
+                )
+                dispatched.append(device)
+
+        out = None
+        for device in dispatched:
+            r = self.tp_worker_result(device)
+            if device == self.tp_output_device:
+                out = r
+        assert out is not None, "TP logic error"
+        all_v, all_i = out
+        v, idx = torch.topk(all_v, top_k, dim = -1, sorted = False)
+        return v, all_i.gather(-1, idx)
 
 
     # def tp_dispatch_lm_head_argmax_old(self, args):
@@ -467,6 +515,18 @@ class Model_TPMixin:
         # main process before child workers have received their commands.
         active_devices.remove(self.tp_output_device)
         active_devices.append(self.tp_output_device)
+
+        # Fix a TP crash on gfx1100: a loading thread's first CUDA call, made mid-load,
+        # can hang the ROCm runtime (no PCIe atomics). Warm the thread's per-device state up front,
+        # leaving the current device as it was
+        torch.cuda.init()
+        current = torch.cuda.current_device()
+        for d in active_devices:
+            torch.cuda.set_device(d)
+            w = torch.zeros(1, device = torch.device("cuda", d))
+            torch.cuda.synchronize(d)
+            del w
+        torch.cuda.set_device(current)
 
         # Create TP context
         self.active_devices = active_devices
@@ -537,7 +597,7 @@ class Model_TPMixin:
                 progress.update(idx + 1)
 
             # Append final gather layer
-            if last_module.caps["logits_output"]:
+            if last_module.caps.get("logits_output"):
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
 
             # Final callback, 100% loaded
@@ -580,6 +640,8 @@ class Model_TPMixin:
             "positions",
             "position_ids",
             "recurrent_slots",
+            "recurrent_slots_scan",
+            "recurrent_slots_scan_in",
             "inv_freq",
             "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
         ]:
@@ -652,7 +714,11 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        # Warmup passes run without collectives (see Model.warmup), so the CPU reduce helper
+        # stays out of it: it would sit waiting for reduce jobs nobody pushes
+        warmup = bool(params.get("tp_warmup"))
+        if not warmup:
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
@@ -672,7 +738,8 @@ class Model_TPMixin:
         out = self.tp_worker_result(self.tp_output_device)
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if not warmup:
+            self.tp_pending_acks.append(-1)
         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
         # params dict in place, so holding args alone would not keep their shared storages alive
         self.tp_pending_refs = (args, params.get("recurrent_states"))

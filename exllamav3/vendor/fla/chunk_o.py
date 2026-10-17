@@ -11,12 +11,8 @@ import triton
 import triton.language as tl
 from .index import prepare_chunk_indices
 from .op import exp2
-from .utils import IS_NVIDIA_HOPPER
 from .utils import autotune_cache_kwargs
-from .utils import check_shared_mem
-
-BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
-NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+from .utils import autotune
 
 
 @triton.heuristics({
@@ -24,12 +20,19 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
+@autotune(
+    configs=lambda dev: [
         triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
+    ] + ([
+        # sm_75 (Turing, 64 KB smem): the configs above don't fit at num_stages >= 2, so the
+        # autotuner falls back to the tiny (32,32,w2) tile. These fit and are ~15x faster
+        # (measured 24.6 ms -> 1.4 ms per GDN layer at T=1792 on a 2080 Ti)
+        triton.Config({'BK': 16, 'BV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=1),
+    ] if not dev.shared_mem('ada') else []),
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )

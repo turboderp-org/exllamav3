@@ -119,7 +119,6 @@ class Step3_7Config(Config):
         self.vision.base_grid = self.vision.image_size // self.vision.patch_size
 
         self.projector_bias = self.read_cfg(bool, "projector_bias", False)
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
         self.im_start_token = self.read_cfg(str, "im_start_token", "<im_start>")
         self.im_end_token = self.read_cfg(str, "im_end_token", "<im_end>")
         self.im_patch_token = self.read_cfg(str, "im_patch_token", "<im_patch>")

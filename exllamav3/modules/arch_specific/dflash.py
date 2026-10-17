@@ -10,6 +10,9 @@ from ...util.tensor import get_for_device, to2
 
 class DFlashInputLayer(Module):
 
+    # Class-level so it also exists on instances built without __init__ (tests)
+    mask_embedding = None
+
     def __init__(
         self,
         config: Config,
@@ -24,6 +27,8 @@ class DFlashInputLayer(Module):
         qmap: str | None = None,
         key_aux_norms: str | None = None,
         num_aux_norms: int = 0,
+        input_embedding_scale: float = 1.0,
+        key_mask_embedding: str | None = None,
     ):
         super().__init__(config, key, None)
         self.module_name = "DFlashInputLayer"
@@ -69,6 +74,11 @@ class DFlashInputLayer(Module):
                 self.register_submodule(aux_norm)
 
         self.mask_token_id = mask_token_id
+        self.input_embedding_scale = input_embedding_scale
+
+        # Optional learned vector for the mask positions, for drafters whose mask_token_id has no
+        # trained row in the target's embedding table
+        self.key_mask_embedding = key_mask_embedding
 
         # Populated by attach_to()
         self.attached_model = None
@@ -83,6 +93,16 @@ class DFlashInputLayer(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        if self.key_mask_embedding:
+            self.mask_embedding = self.config.stc.get_tensor(
+                self.key_mask_embedding, device, allow_bf16 = True, no_defer = True
+            ).view(-1)
+
+
+    @override
+    def unload(self):
+        self.mask_embedding = None
+        super().unload()
 
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
@@ -103,4 +123,9 @@ class DFlashInputLayer(Module):
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
+        if self.input_embedding_scale != 1.0:
+            x = x * self.input_embedding_scale
+        if self.mask_embedding is not None:
+            # The trailing native_draft_len - 1 positions are the mask tokens
+            x[:, -(self.native_draft_len - 1):, :] = self.mask_embedding.to(x.dtype)
         return x

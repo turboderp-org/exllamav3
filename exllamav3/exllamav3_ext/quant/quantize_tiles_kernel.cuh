@@ -14,6 +14,25 @@
 #include "../util.cuh"
 #include "codebook.cuh"
 
+// Smallest K whose two cost arrays (2 * (65536 >> K) halves) are kept in shared memory; below it they live in
+// the caller's global scratch. RDNA's 64 KB of LDS per workgroup cannot hold K = 2's arrays next to the tile
+#if defined(USE_ROCM)
+    #define QT_SHARED_COSTS_MIN_K 3
+#else
+    #define QT_SHARED_COSTS_MIN_K 2
+#endif
+
+// Shared-memory layout of the dense kernels. CUDA keeps the measured layout (input tile staged in
+// shared, separate argmin scratch, then the cost arrays). ROCm keeps only the cost arrays in shared:
+// at K = 1 and 2 they fill the 64 KB LDS limit of RDNA workgroups exactly, so the input tile is read
+// from global (1 KB, L1/L2-resident) and the cross-warp argmin scratch aliases the costs, which are
+// dead by argmin/backward time. The algorithm is the same in both layouts.
+#if defined(USE_ROCM)
+#define QT_OPTIMIZED_COSTS_ONLY 1
+#else
+#define QT_OPTIMIZED_COSTS_ONLY 0
+#endif
+
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
@@ -40,6 +59,19 @@ __host__ __device__ constexpr int qt_min_blocks(int K, int arch)
     return K == 6 ? 1 : 1024 / qt_num_threads(K, arch);
 }
 
+// Unsigned warp minimum (packed cost / rank keys)
+__device__ __forceinline__ uint32_t qt_warp_min(uint32_t value)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(0xffffffff, value);
+#else
+    #pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        value = min(value, __shfl_xor_sync(0xffffffff, value, offset));
+    return value;
+#endif
+}
+
 template <int K, int cb, int L = 256>
 __global__ __launch_bounds__(qt_num_threads(K, QT_ARCH), qt_min_blocks(K, QT_ARCH))
 void quantize_tiles_kernel
@@ -48,7 +80,8 @@ void quantize_tiles_kernel
     float* __restrict__ output_tiles_ptr,
     uint16_t* __restrict__ output_indices_ptr,
     half* __restrict__ temp_costs_ptr,
-    uint16_t* __restrict__ temp_edges_ptr
+    uint16_t* __restrict__ temp_edges_ptr,
+    const half2* __restrict__ lut
 )
 {
     extern __shared__ uint8_t shbuf[];
@@ -65,14 +98,14 @@ void quantize_tiles_kernel
     const float* input_tile = input_tiles_ptr + L * tile_idx;
     float* output_tile = output_tiles_ptr + L * tile_idx;
     uint16_t* output_indices = output_indices_ptr + L * tile_idx;
-    uint16_t* temp_edges = temp_edges_ptr + L * edges * tile_idx;
+    uint16_t* temp_edges = temp_edges_ptr + (size_t) L * edges * tile_idx;
 
     half* sh_input_tile = (half*) sh; sh += L * sizeof(half);
     half* sh_min = (half*) sh; sh += 32 * sizeof(half);
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
     half* sh_temp_costs = (half*) sh;
-    half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+    half* temp_costs = K >= QT_SHARED_COSTS_MIN_K ? sh_temp_costs : temp_costs_ptr + (size_t) 2 * edges * tile_idx;
     half* temp_costs_inc = temp_costs + edges;
 
     for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
@@ -163,8 +196,13 @@ void quantize_tiles_kernel
             }
 
             reinterpret_cast<half2*>(temp_costs)[out_edge_idx >> 1] = min_err2;
-            temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge0;
-            temp_edges[edges * ri + out_edge_idx + 1] = (uint16_t) min_in_edge1;
+            // The first pass only traces back to position 0, so its history for the rolled second half
+            // (ri >= L / 2) is never read
+            if (pre_state >= 0 || ri < L / 2)
+            {
+                temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge0;
+                temp_edges[edges * ri + out_edge_idx + 1] = (uint16_t) min_in_edge1;
+            }
         }
         __syncthreads();
 
@@ -243,8 +281,13 @@ void quantize_tiles_kernel
                 }
 
                 reinterpret_cast<half2*>(temp_costs)[out_edge_idx >> 1] = min_err2;
-                temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge0;
-                temp_edges[edges * ri + out_edge_idx + 1] = (uint16_t) min_in_edge1;
+                // The first pass only traces back to position 0, so its history for the rolled second half
+                // (ri >= L / 2) is never read
+                if (pre_state >= 0 || ri < L / 2)
+                {
+                    temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge0;
+                    temp_edges[edges * ri + out_edge_idx + 1] = (uint16_t) min_in_edge1;
+                }
             }
             __syncthreads();
         }
@@ -252,57 +295,31 @@ void quantize_tiles_kernel
 
     auto argmin_cost = [&]()
     {
-        // Preserve the historical 1024-thread tie-breaking order.
-        half local_min0 = H_INF;
-        half local_min1 = H_INF;
-        int local_idx0 = -1;
-        int local_idx1 = -1;
-        for (int e = thread; e < edges; e += 2 * NT)
+        // forward leaves the final step's costs in temp_costs (backward starts at that step). The
+        // rank makes the tie order independent of the block size: bit-reversed warp, then
+        // bit-reversed lane, then increasing 1024-state stripe, i.e. the historical 512-thread
+        // reduction order. Every cost is a nonnegative half, so packed unsigned minima order them
+        uint32_t best = 0x7c00ffffu;
+        for (int e = thread; e < edges; e += NT)
         {
-            half v = temp_costs_inc[e];
-            if (__hlt(v, local_min0)) { local_min0 = v; local_idx0 = e; }
+            unsigned v = e & 1023;
+            unsigned rank = ((__brev(v >> 5) >> 27) << 10) | ((__brev(v & 31) >> 27) << 5) | (e >> 10);
+            unsigned key = ((uint32_t) __half_as_ushort(temp_costs[e]) << 16) | rank;
+            best = min(best, key);
         }
-        for (int e = thread + NT; e < edges; e += 2 * NT)
-        {
-            half v = temp_costs_inc[e];
-            if (__hlt(v, local_min1)) { local_min1 = v; local_idx1 = e; }
-        }
-
-        const int lane_id = thread & 31;
-        const int warp_id = thread >> 5;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-        {
-            half other_min0 = __shfl_down_sync(0xffffffff, local_min0, offset);
-            int other_idx0 = __shfl_down_sync(0xffffffff, local_idx0, offset);
-            if (__hlt(other_min0, local_min0)) { local_min0 = other_min0; local_idx0 = other_idx0; }
-            half other_min1 = __shfl_down_sync(0xffffffff, local_min1, offset);
-            int other_idx1 = __shfl_down_sync(0xffffffff, local_idx1, offset);
-            if (__hlt(other_min1, local_min1)) { local_min1 = other_min1; local_idx1 = other_idx1; }
-        }
-        sh_min[warp_id] = local_min0;
-        sh_idx[warp_id] = local_idx0;
-        sh_min[NW + warp_id] = local_min1;
-        sh_idx[NW + warp_id] = local_idx1;
+        best = qt_warp_min(best);
+        if ((thread & 31) == 0)
+            ((uint32_t*) sh_idx)[thread >> 5] = best;
         __syncthreads();
-
-        int local_idx = 0;
-        if (warp_id == 0)
+        if (thread < 32)
         {
-            half local_min = lane_id < 2 * NW ? sh_min[lane_id] : H_INF;
-            local_idx = lane_id < 2 * NW ? sh_idx[lane_id] : -1;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-            {
-                half other_min = __shfl_down_sync(0xffffffff, local_min, offset);
-                int other_idx = __shfl_down_sync(0xffffffff, local_idx, offset);
-                if (__hlt(other_min, local_min)) { local_min = other_min; local_idx = other_idx; }
-            }
+            best = thread < NW ? ((uint32_t*) sh_idx)[thread] : 0x7c00ffffu;
+            best = qt_warp_min(best);
         }
-        // If every cost is inf/NaN (degenerate input), no comparison fires and the index remains
-        // the initial -1; backward would then read temp_edges out of bounds. Return a valid edge
-        // instead: the output is garbage for garbage input, but stays in bounds.
-        return local_idx < 0 ? 0 : local_idx;
+        unsigned rank = best & 65535;
+        unsigned v = ((__brev(rank >> 10) >> 27) << 5) | (__brev((rank >> 5) & 31) >> 27);
+        // Every cost inf/NaN (degenerate input): return a valid edge so backward stays in bounds
+        return best >= 0x7c000000u ? 0 : (int) (((rank & 31) << 10) | v);
     };
 
     auto backward = [&](int roll, bool write, int edge)

@@ -1,6 +1,33 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <cuda_runtime.h>
+
+// Deterministic int8 router projection (routing_gemm.cu)
+bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, const at::Tensor& scores);
+void routing_gemm_det_(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor& scores, cudaStream_t stream);
+void routing_gemm_det(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, at::Tensor scores);
+void det_quant_weight(const at::Tensor& w, at::Tensor w_i8, at::Tensor w_s);
+void det_math_test(const at::Tensor& x, at::Tensor y);
+
+void routing_ds3_group
+(
+    const at::Tensor& scores,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor topk_indices,
+    at::Tensor topk_weights,
+    const float scaling_factor,
+    const int act_fn,
+    const int n_group,
+    const int topk_group
+);
+
+void routing_gemv_f32
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate_t,
+    at::Tensor scores
+);
 
 void routing_ds3_nogroup
 (
@@ -13,6 +40,9 @@ void routing_ds3_nogroup
     const float scaling_factor,
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn
+,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 );
 
 void routing_ds3_nogroup_logits
@@ -70,6 +100,9 @@ void routing_sel_norm
     const float scaling_factor,
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn
+,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 );
 
 void routing_std
@@ -82,6 +115,9 @@ void routing_std
     const c10::optional<at::Tensor>& per_expert_scale,
     const c10::optional<at::Tensor>& gate_t,
     const c10::optional<at::Tensor>& bias
+,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 );
 
 void routing_std_logits
