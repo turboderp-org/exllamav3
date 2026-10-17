@@ -30,15 +30,22 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
     uint8_t* temp_edges = reinterpret_cast<uint8_t*>(temp_edges_ptr) + (int64_t)history_bytes * tile_idx;
 
     extern __shared__ uint8_t shbuf[];
-    // Shared memory holds only the cost arrays: at K = 2 the two of them fill 64 KB exactly, which is the
-    // LDS limit on AMD GPUs. The cross-warp argmin scratch aliases the costs (dead by argmin/backward
-    // time) and the 256-element input tile is read from global (1 KB, L1/L2-resident) instead of being
-    // staged in shared. The algorithm is unchanged.
+#if QT_OPTIMIZED_COSTS_ONLY
     half* temp_costs = reinterpret_cast<half*>(shbuf);
     int* sh_idx = reinterpret_cast<int*>(temp_costs);
+    auto in_w = [&](int idx) { return __float2half_rn(__ldg(input_tile + idx)); };
+#else
+    half* sh_input_tile = reinterpret_cast<half*>(shbuf);
+    // Retain the measured shared-memory layout, including the unused half-minimum area.
+    int* sh_idx = reinterpret_cast<int*>(shbuf + L * sizeof(half) + 64);
+    half* temp_costs = reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
+    for (int i = thread; i < L; i += NT)
+        sh_input_tile[i] = __float2half_rn(input_tile[i]);
+    __syncthreads();
+    auto in_w = [&](int idx) { return sh_input_tile[idx]; };
+#endif
     // K=1 stages the next costs in registers, then overwrites this single shared buffer.
     half* temp_costs_inc = temp_costs + (K == 1 ? 0 : edges);
-    auto in_w = [&](int idx) { return __float2half_rn(__ldg(input_tile + idx)); };
     auto ring = [&](int i, int roll)
     {
         int ri = i + roll;
@@ -58,7 +65,9 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
             best = min(best, key);
         }
         best = qt_warp_min(best);
+#if QT_OPTIMIZED_COSTS_ONLY
         __syncthreads();   // every cost read must finish before the scratch aliases temp_costs
+#endif
         if ((thread & 31) == 0)
             ((uint32_t*)sh_idx)[thread >> 5] = best;
         __syncthreads();

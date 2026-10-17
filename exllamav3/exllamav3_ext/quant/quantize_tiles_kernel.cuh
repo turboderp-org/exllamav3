@@ -22,6 +22,17 @@
     #define QT_SHARED_COSTS_MIN_K 2
 #endif
 
+// Shared-memory layout of the dense kernels. CUDA keeps the measured layout (input tile staged in
+// shared, separate argmin scratch, then the cost arrays). ROCm keeps only the cost arrays in shared:
+// at K = 1 and 2 they fill the 64 KB LDS limit of RDNA workgroups exactly, so the input tile is read
+// from global (1 KB, L1/L2-resident) and the cross-warp argmin scratch aliases the costs, which are
+// dead by argmin/backward time. The algorithm is the same in both layouts.
+#if defined(USE_ROCM)
+#define QT_OPTIMIZED_COSTS_ONLY 1
+#else
+#define QT_OPTIMIZED_COSTS_ONLY 0
+#endif
+
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
