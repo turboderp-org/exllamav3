@@ -102,7 +102,8 @@ required. Paged caches and the sliding-window masks are retained.
 
 Cache-only tokens/s excludes the final prompt forward and token selection.
 Prompt-to-first-token includes that work. Neither is end-to-end speech latency.
-See the [README measurements](../README.md#e4b-on-orin-nano) for exact boundaries.
+See the [fork's published measurements](https://github.com/cortexist/exllamav3/blob/879a7f2b23852a77ccc5483675ee0c9500456ff2/README.md#e4b-on-orin-nano)
+for exact boundaries.
 
 ## Optional FP16 prefill-weight cache
 
@@ -143,7 +144,8 @@ print(f"Extra FP16 weights: {used / 1024**2:.1f} MiB")
 
 Use the same model/cache with the ordinary `Generator` afterwards. Increasing
 the budget consumes unified system RAM and may leave less room for other
-applications. The README reports both uncached and explicitly budgeted results.
+applications. The [published measurements](https://github.com/cortexist/exllamav3/blob/879a7f2b23852a77ccc5483675ee0c9500456ff2/README.md#e4b-on-orin-nano)
+report both uncached and explicitly budgeted results.
 Initialization/reconstruction time is outside the warm throughput measurements.
 
 Original-basis reconstruction folds the Hadamard transforms into FP16 weights,
