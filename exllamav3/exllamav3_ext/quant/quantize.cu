@@ -97,9 +97,10 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
         return env[0] == '1';
 #if defined(USE_ROCM)
     // HIP's major is the gfx generation (major == 12 would read as sm_120 on RDNA4), so RDNA gets its own
-    // rule: the dense specializations win at K = 3, 4, 5 and 8; K = 1 and 2 do not fit 64 KB of LDS, and
-    // K = 6 and 7 run faster on the generic kernel
-    return K == 3 || K == 4 || K == 5 || K == 8;
+    // rule: the dense specializations win at K = 2, 3, 4, 5 and 8; K = 6 and 7 run faster on the generic kernel.
+    // K = 2 fits the 64 KB LDS limit because the optimized kernel keeps only its two cost arrays in shared
+    // memory (input tile read from global, argmin scratch aliased into the costs).
+    return K == 2 || K == 3 || K == 4 || K == 5 || K == 8;
 #endif
     if (major == 12) return true;
     if (major == 8 && minor == 9)
@@ -127,7 +128,10 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
     const int edges = 65536 >> K;
     const int cost_arrays = optimized ? (K == 1 ? 1 : 2) : (K >= QT_SHARED_COSTS_MIN_K ? 2 : 0);
-    const int shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
+    // Optimized kernels keep only the cost arrays in shared (input tile from global, argmin scratch
+    // aliased into the costs); the generic kernels keep their original shared layout.
+    const int shmem = cost_arrays * edges * sizeof(half)
+        + (optimized ? 0 : L * sizeof(half) + 64 + 128);
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
