@@ -956,6 +956,9 @@ def capture_module_parallel(
                     "capture": captures[t_idx],
                     "capture_sens": captures_sens[t_idx],
                     "activate_all_experts": model.calibration_all_experts,
+                    # with every expert active the output is discarded (references are rerun with
+                    # normal routing below), so block-sparse layers may skip computing it
+                    "capture_only": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
                 if slicing:
@@ -1412,6 +1415,10 @@ def main(args, job_state):
                                     "capture": capture_H,
                                     "capture_sens": capture_sens,
                                     "activate_all_experts": model.calibration_all_experts,
+                                    # with every expert active the output is discarded (references
+                                    # are rerun with normal routing below), so block-sparse layers
+                                    # may skip computing it
+                                    "capture_only": model.calibration_all_experts,
                                     "input_ids": original_input_ids[i],
                                 }
                                 if aff_store is not None:
