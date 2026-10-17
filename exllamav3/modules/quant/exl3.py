@@ -1,7 +1,8 @@
 from __future__ import annotations
+from functools import lru_cache
 import torch
 from ...model.config import Config
-from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n
+from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
@@ -12,6 +13,26 @@ MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+
+
+@lru_cache
+def colmajor_gather_index(device) -> torch.Tensor:
+    """
+    The reconstruct kernels decode every trellis in the sm80 tile order, so for a colmajor tensor they put
+    position p's value at tile element perm80[p] instead of permcol[p]. Gathering each tile with this index moves
+    the values to their true elements.
+    """
+    perm80 = tensor_core_perm(device, "sm80").long()
+    permcol = tensor_core_perm(device, "colmajor").long()
+    return perm80[torch.argsort(permcol)]
+
+
+def fix_colmajor_tiles_(w: torch.Tensor):
+    k, n = w.shape
+    t = w.view(k // 16, 16, n // 16, 16).permute(0, 2, 1, 3).reshape(k // 16, n // 16, 256)
+    t = t[..., colmajor_gather_index(w.device)]
+    w.copy_(t.view(k // 16, n // 16, 16, 16).permute(0, 2, 1, 3).reshape(k, n))
+
 
 class LinearEXL3:
 
@@ -33,7 +54,8 @@ class LinearEXL3:
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
         transformers_fix: bool = False,
-        key: str | None = None
+        key: str | None = None,
+        tile_order: torch.Tensor | None = None,
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -80,10 +102,15 @@ class LinearEXL3:
         self.mul1 = self.mul1_tensor is not None
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
+        # colmajor tensors (written for other engines) only decode through reconstruct + tile gather; the
+        # GEMV/BC kernels read the sm80 order directly, so there is no BC object for them
+        self.tile_order_tensor = tile_order
+        self.colmajor = tile_order is not None
+
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
-        self.bc = ext.BC_LinearEXL3(
+        self.bc = None if self.colmajor else ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
             self.svh,
@@ -112,6 +139,7 @@ class LinearEXL3:
                 ("bias", self.bias),
                 ("mcg", self.mcg_tensor),
                 ("mul1", self.mul1_tensor),
+                ("tile_order", self.tile_order_tensor),
             ] if tensor is not None
         }
 
@@ -134,7 +162,7 @@ class LinearEXL3:
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
 
-        reconstruct = params.get("reconstruct")
+        reconstruct = params.get("reconstruct") or self.colmajor
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
@@ -186,7 +214,7 @@ class LinearEXL3:
 
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
         # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
-        use_fused = self._fused_reconstruct and rows >= 1024
+        use_fused = self._fused_reconstruct and rows >= 1024 and not self.colmajor
 
         if use_fused:
             xh = x
@@ -229,6 +257,8 @@ class LinearEXL3:
             ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         else:
             ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+        if self.colmajor:
+            fix_colmajor_tiles_(w)
 
     def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
