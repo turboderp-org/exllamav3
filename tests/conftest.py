@@ -46,7 +46,7 @@ os.environ["PYTHONPATH"] = os.pathsep.join([REPO_DIR, TESTS_DIR] + [p for p in o
 
 from testlib import env
 from testlib.models import Registry
-_SKIP_DIRS = {"testlib", "__pycache__", "__disk_lru_cache__", ".pytest_cache", ".benchmarks", "_retired"}
+_SKIP_DIRS = {"models", "testlib", "__pycache__", "__disk_lru_cache__", ".pytest_cache", ".benchmarks", "_retired"}
 
 
 def pytest_addoption(parser):

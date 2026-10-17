@@ -112,25 +112,25 @@ inline void scale_store_row_avx512(float* out, const float* row, float su, const
     }
 }
 
-template <int bits, int cb>
+template <int bits, int cb, bool hb = false>
 inline void decode_tile(const uint16_t* packed_tile, float* sub, const std::array<uint16_t, 256>& perm)
 {
     for (int t = 0; t < 256; ++t)
     {
-        const uint16_t s = decode_state_scalar<bits>(packed_tile, t);
+        const uint16_t s = exl3_common::decode_state_scalar<bits, hb>(packed_tile, t);
         sub[perm[t]] = decode_3inst<cb>(s);
     }
 }
 
-template <int bits>
+template <int bits, bool hb = false>
 inline void decode_tile_cb(const uint16_t* packed_tile, float* sub, int cb_index,
                            const std::array<uint16_t, 256>& perm)
 {
     switch (cb_index)
     {
-        case 1: decode_tile<bits, 1>(packed_tile, sub, perm); break;
-        case 2: decode_tile<bits, 2>(packed_tile, sub, perm); break;
-        default: decode_tile<bits, 0>(packed_tile, sub, perm); break;
+        case 1: decode_tile<bits, 1, hb>(packed_tile, sub, perm); break;
+        case 2: decode_tile<bits, 2, hb>(packed_tile, sub, perm); break;
+        default: decode_tile<bits, 0, hb>(packed_tile, sub, perm); break;
     }
 }
 
@@ -144,6 +144,7 @@ struct ReconParams
     int packed_blocks_n;
     int n_block_offset;
     int K;
+    bool half;
     int cb_index;
     bool avx2;
     bool avx512;
@@ -184,9 +185,9 @@ void reconstruct_run(const ReconParams& rp, OutT* p_out)
 
                     switch (rp.K)
                     {
-                        case 1: decode_tile_cb<1>(tile_ptr, sub, rp.cb_index, perm); break;
-                        case 2: decode_tile_cb<2>(tile_ptr, sub, rp.cb_index, perm); break;
-                        case 3: decode_tile_cb<3>(tile_ptr, sub, rp.cb_index, perm); break;
+                        case 1: if (rp.half) decode_tile_cb<1, true>(tile_ptr, sub, rp.cb_index, perm); else decode_tile_cb<1>(tile_ptr, sub, rp.cb_index, perm); break;
+                        case 2: if (rp.half) decode_tile_cb<2, true>(tile_ptr, sub, rp.cb_index, perm); else decode_tile_cb<2>(tile_ptr, sub, rp.cb_index, perm); break;
+                        case 3: if (rp.half) decode_tile_cb<3, true>(tile_ptr, sub, rp.cb_index, perm); else decode_tile_cb<3>(tile_ptr, sub, rp.cb_index, perm); break;
                         case 4: decode_tile_cb<4>(tile_ptr, sub, rp.cb_index, perm); break;
                         case 5: decode_tile_cb<5>(tile_ptr, sub, rp.cb_index, perm); break;
                         case 6: decode_tile_cb<6>(tile_ptr, sub, rp.cb_index, perm); break;
@@ -257,7 +258,7 @@ void reconstruct_had_slice_cpu
     at::Tensor packed,
     at::Tensor suh,
     at::Tensor svh,
-    int64_t K,
+    float K,
     bool mcg,
     bool mul1,
     int64_t n_offset
@@ -272,8 +273,11 @@ void reconstruct_had_slice_cpu
     TORCH_CHECK(svh.scalar_type() == at::kHalf, "svh must be fp16");
     TORCH_CHECK(packed.dim() == 3 && unpacked.dim() == 2, "unexpected tensor ranks");
     TORCH_CHECK(unpacked.size(0) == packed.size(0) * 16, "shape mismatch: unpacked dim0 vs packed dim0");
-    TORCH_CHECK(packed.size(2) == 256 * K / 16, "packed dim2 must be K*16");
-    TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8");
+    const int bits = static_cast<int>(K);
+    const bool half = (K - bits) == 0.5;
+    TORCH_CHECK(bits >= 1 && bits <= 8, "K must be in 1..8");
+    TORCH_CHECK(!half || (mul1 && bits <= 3), "half-integer bitrates require mul1 and K <= 3");
+    TORCH_CHECK(packed.size(2) == 16 * bits + (half ? 8 : 0), "packed dim2 must match K");
 
     if (unpacked.numel() == 0)
         return;
@@ -294,11 +298,12 @@ void reconstruct_had_slice_cpu
     rp.n_dim = static_cast<int>(unpacked.size(1));
     rp.packed_blocks_n = static_cast<int>(packed.size(1));
     rp.n_block_offset = static_cast<int>(n_offset / 16);
-    rp.K = static_cast<int>(K);
+    rp.K = bits;
+    rp.half = half;
     rp.cb_index = mul1 ? 2 : (mcg ? 1 : 0);
     rp.avx2 = !force_scalar();
     rp.avx512 = rp.avx2 && exl3_moe_cpu_has_avx512();
-    rp.tile_words = static_cast<size_t>(K) * 16;
+    rp.tile_words = static_cast<size_t>(bits) * 16 + (half ? 8 : 0);
 
     if (unpacked.scalar_type() == at::kFloat)
         reconstruct_run(rp, unpacked.data_ptr<float>());

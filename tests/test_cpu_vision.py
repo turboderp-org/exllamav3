@@ -240,7 +240,7 @@ def test_attn_dispatch_cpu_cache_unsupported():
 
 
 # ------------------------------------------------------------------------------------------------
-# reconstruct_had_slice_cpu vs CUDA reference: every K, all codebooks, full and sliced
+# reconstruct_had_slice_cpu vs CUDA reference: integer and half-integer rates, all codebooks, full and sliced
 # ------------------------------------------------------------------------------------------------
 
 RECONSTRUCT_CASES = [
@@ -253,6 +253,9 @@ RECONSTRUCT_CASES = [
     (128, 128, 8, False, False),
     (256, 256, 6, True, False),
     (256, 256, 7, False, True),
+    (256, 128, 1.5, False, True),
+    (256, 128, 2.5, False, True),
+    (256, 128, 3.5, False, True),
 ]
 
 
@@ -261,8 +264,9 @@ RECONSTRUCT_CASES = [
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.float32], ids=["half", "float"])
 def test_reconstruct_cpu_vs_cuda(k_dim, n_dim, K, mcg, mul1, out_dtype):
     torch.manual_seed(k_dim * 7 + n_dim + K)
+    tile_words = int(16 * K)
     trellis = torch.randint(
-        0, 65536, (k_dim // 16, n_dim // 16, 256 * K // 16),
+        0, 65536, (k_dim // 16, n_dim // 16, tile_words),
         dtype = torch.int32, device = DEVICE,
     ).to(torch.short)
     suh = torch.sign(torch.randn(k_dim, device = DEVICE)).half()

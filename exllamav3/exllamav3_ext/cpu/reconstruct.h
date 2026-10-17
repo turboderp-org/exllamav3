@@ -16,7 +16,7 @@ void reconstruct_had_slice_cpu
     at::Tensor packed,      // [k/16, n_blocks, K*16] int16, CPU, contiguous
     at::Tensor suh,         // [k] fp16
     at::Tensor svh,         // [requested_n] fp16, pre-offset by caller for slices
-    int64_t K,
+    float K,                 // integer or half-integer bitrate
     bool mcg,
     bool mul1,
     int64_t n_offset        // column offset into the full matrix, multiple of 128
