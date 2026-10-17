@@ -365,7 +365,10 @@ void ngram_dequant_kernel
     float a = 0.0f;
     if (aux)
     {
+        // The loader validates the bias row count against the head count; the bound here keeps a
+        // bad head id from reading outside aux regardless (issue #525)
         int head = heads ? heads[r] : r % num_heads;
+        head = max(0, min(head, num_heads - 1));
         a = __half2float(aux[(size_t) head * dim + i]);
     }
 

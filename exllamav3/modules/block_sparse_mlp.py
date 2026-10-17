@@ -828,6 +828,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.device,
                 no_defer = True,
             )
+            # The table's values become expert indices in the routing kernels (issue #526): a
+            # checkpoint value outside the expert range must fail here, not in the kernel
+            if self.tid2eid.numel():
+                lo, hi = int(self.tid2eid.min()), int(self.tid2eid.max())
+                if lo < 0 or hi >= self.num_experts:
+                    raise ValueError(f"{self.key}.{self.tid2eid_key}: expert ids span [{lo}, {hi}], "
+                                     f"outside the {self.num_experts} routed experts")
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
