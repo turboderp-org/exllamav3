@@ -302,7 +302,7 @@ class DeepseekV41Model(Model):
         self.caps.update({
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
-            "supports_tp": False,
+            "supports_tp": True,
             "prefill_pipeline": True,
             "can_resume_quant": False,
         })
