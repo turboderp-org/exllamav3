@@ -107,6 +107,7 @@ class Config(ABC):
         directory: str,
         model_classes: dict,
         layer_map: list[int] | str | None = None,
+        config_key: str | None = None,
         **kwargs,
     ):
         """
@@ -143,6 +144,16 @@ class Config(ABC):
         assert arch == self.arch_string, \
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
+
+        # Some multimodal wrappers keep the language model's HF config in a named sub-dict.
+        # The wrapper architecture is still checked above, while architecture-specific parsers
+        # can read model dimensions and layer layouts from the nested language-model config.
+        if config_key is not None:
+            assert config_key in self.config_dict, \
+                f"Missing {config_key!r} in {self.config_filename}"
+            # Keep wrapper-level token IDs and shared generation settings available while
+            # using the nested config as the source of language-model dimensions.
+            self.config_dict = {**self.config_dict[config_key], **self.config_dict}
 
         # Collect all .safetensors files in directory
         self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
