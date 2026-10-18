@@ -223,6 +223,8 @@ class NGramEmbedding(Module):
                 "out_dtype": self.out_dtype,
             },
             "table": self.table.export(self.config.stc),
+            # DeepSeek-V4.1: FP8 rows with an E8M0 scale table beside them, streamed the same way
+            "scale": self.scale.export(self.config.stc) if self.scale is not None else None,
             "quantized": self.K is not None,
             "head_offsets": producer.send(self.head_offsets),
             "head_vocab_sizes": producer.send(self.head_vocab_sizes),
@@ -238,6 +240,7 @@ class NGramEmbedding(Module):
         module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = True)
         module.device = device
         module._set_table(RowTable.from_export(exported["table"]), exported["quantized"])
+        module.scale = RowTable.from_export(exported["scale"]) if exported.get("scale") is not None else None
         module.head_offsets = consumer.recv(exported["head_offsets"], cuda = False).long().contiguous()
         module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"], cuda = False).long().contiguous()
         module.layer_multipliers = consumer.recv(exported["layer_multipliers"], cuda = False).long().contiguous()
