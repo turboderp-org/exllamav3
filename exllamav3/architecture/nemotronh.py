@@ -72,6 +72,17 @@ class NemotronHConfig(Config):
         self.n_groups = self.read_cfg(int, "n_groups", no_default)
         self.conv_kernel = self.read_cfg(int, "conv_kernel", 4)
         self.time_step_limit = self.read_cfg(list, "time_step_limit", [0.0, float("inf")])
+        # Hugging Face serializes non-finite config floats as tagged objects. Restore these
+        # values before passing the limits to the native Mamba2 backend.
+        special_floats = {
+            "Infinity": float("inf"),
+            "-Infinity": -float("inf"),
+            "NaN": float("nan"),
+        }
+        self.time_step_limit = [
+            special_floats.get(value.get("__float__"), value) if isinstance(value, dict) else value
+            for value in self.time_step_limit
+        ]
         self.assert_cfg(str, "mamba_hidden_act", "silu", True)
 
         # MLP params
