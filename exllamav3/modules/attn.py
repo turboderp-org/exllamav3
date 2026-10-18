@@ -987,6 +987,10 @@ class Attention(Module):
         """QSA modules need the indexer side planes on their cache layer: map the requested
         K/V layer type to its planes-carrying variant (fp16 or quantized)."""
         if self.qsa_indexer is None:
+            from ..cache.stream import stream_cache_layer_type
+            mapped = stream_cache_layer_type(self, default, kwargs)
+            if mapped is not None:
+                return mapped
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
@@ -1047,6 +1051,9 @@ class Attention(Module):
             return
         layer, quant = found
         from ..cache.qsa import QSAPlanes
+        from ..cache.stream import StreamLayer
+        if isinstance(layer, StreamLayer):
+            return   # streaming layers allocate their own bounded working set
 
         # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
         # as fp16 K/V in a per-call transient of one fixed size, the pool. The (1, chunk)-at-
@@ -1166,7 +1173,32 @@ class Attention(Module):
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
-        if qsa_sparse:
+        # KV streaming: the history lives mostly in pinned host memory; the streaming layer's
+        # chunked driver writes the new rows resident, walks the placements with the patched
+        # paged-attention kernels and reduces the partials in KV order
+        from ..cache import CacheLayer as _CL
+        from ..cache.stream import StreamLayer
+        stream_layer = None
+        if cache is not None:
+            _l = cache if isinstance(cache, _CL) else \
+                cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+            if isinstance(_l, StreamLayer):
+                stream_layer = _l
+        if stream_layer is not None:
+            cs_host = params.get("cache_seqlens")
+            bt_host = params.get("block_table")
+            o = stream_layer.stream_attn(
+                q, k, v, cache_seqlens, block_table,
+                host_seqlens = cs_host if isinstance(cs_host, torch.Tensor) and
+                               cs_host.device.type == "cpu" else None,
+                host_block_table = bt_host if isinstance(bt_host, torch.Tensor) and
+                                   bt_host.device.type == "cpu" else None,
+                causal = causal,
+                sm_scale = self.sm_scale,
+                sinks = self.sinks,
+                non_causal_spans = non_causal_spans,
+            )
+        elif qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
             o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:

@@ -82,6 +82,7 @@ enum GraphedParams
     GP_attn_num_pages,
     GP_attn_split_len,
     GP_attn_num_splits,
+    GP_attn_slot_stride,
 
     GP_copy2d_src,
     GP_copy2d_dst,

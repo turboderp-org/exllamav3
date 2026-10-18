@@ -254,6 +254,81 @@ order. flash-attn is an optional dependency; when it is not installed, this swit
 FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
 attention sinks); this switch exists for A/B comparison.
 
+## KV cache streaming
+
+`EXL3_KV_STREAM=1` rebuilds a model's full-attention layers as *streaming* cache layers
+(`exllamav3/cache/stream.py`; design and implementation notes in `doc/kv_streaming.md`): the
+authoritative K/V history lives in a pinned host mirror, only the newest `R` pages of each layer
+stay on the GPU as a resident window, and the remaining history is read back through one small
+ring shared by all the streaming layers as attention walks the KV span in placement chunks (the
+patched flash-decoding split and prefill kernels take a KV range and a partial-slot range, and one
+combine reduces the partials in KV order). It is meant for hybrid models whose growing KV is what
+keeps a long context from fitting in VRAM (Qwen3.5/3.8-class, full attention every N layers):
+those layers stream, the linear/recurrent ones keep their bounded state, and the whole history
+fitting in the window copies nothing. If it fits, streaming is a no-op against the stock path.
+
+Only CUDA, `bsz 1`, causal, full-attention layers with a plain `fp16` or quantized cache qualify,
+and only when the layer's decode path is the stock one (no sliding window, logit softcap,
+`cu_seqlens` batching or asymmetric V head dims; TP is excluded). Ineligible attention modules
+keep their regular cache layer with a one-line warning naming the reason. A streaming layer in a
+cache that is also tiered (the CPU page cache) is refused, since the mirror already holds the full
+history, and the graph-captured decode path (`EXL3_BC_ATTN`) declines streaming layers, so their
+attention always runs through the chunked driver. Quantized layers stream the packed pages *and*
+their scales, so an 8-bit cache halves the PCIe traffic of an fp16 one. Results match the stock
+path up to kernel determinism (the accumulation order differs only in how the history is
+re-split); `tests/cache/test_kv_stream.py` checks the driver against the stock wrappers per
+placement, and `tests/e2e/test_kv_stream.py` checks whole models against their own noise floor.
+
+The placement policy is resolved once per model load, when the cache layers are constructed; all
+of the variables below must be set before loading. The ring is shared per (device, component
+shape), so its size is a per-device budget rather than a per-layer one.
+
+### `EXL3_KV_STREAM` (default: `0`)
+
+Enable streaming cache layers. Set to `1` before loading.
+
+### `EXL3_KV_STREAM_MIRROR` (default: auto)
+
+Host mirror budget, in bytes with a suffix (`8G`, `512M`). Reserved: the mirror is allocated for
+the model's full logical cache capacity (so a capped capacity is a follow-up change, not what this
+does), and a budget below that warns at load. The mirror is the authoritative copy of the whole
+history, in pinned (page-locked) host memory; budget it like the KV cache itself.
+
+### `EXL3_KV_STREAM_RESIDENT` (default: auto = `min(capacity, 16)` pages)
+
+Resident window size: the newest `R` pages of each streaming layer stay on the GPU (`token page i`
+lives in slot `i % R`), everything older is streamed. Pages (`12`, `12p`) or a byte budget
+(`1G`, divided by the layer's per-page bytes). `0` is raised to `1`; values above the cache
+capacity are clamped. This is the capacity-versus-speed dial: it bounds GPU bytes per streaming
+layer at `R + S * C` pages, and the streamed fraction of the history is what crosses PCIe on
+every step. A missing value (or `auto`) keeps the whole history resident for caches up to 16 pages
+(4k tokens at `PAGE_SIZE` 256) and streams beyond, which is a no-op for short contexts.
+
+### `EXL3_KV_STREAM_RING` (default: `64`)
+
+Ring size in pages, shared by every streaming layer on a device. The ring is `S` slots of `C`
+pages, `S = min(EXL3_KV_STREAM_PREFETCH, ring pages)` and `C = ring pages // S`. Larger rings
+copy in fewer, larger chunks (less per-chunk launch overhead, fewer combine inputs, but a coarser
+split grid per launch); the default keeps a streamed history of a few thousand tokens in one
+chunk, with enough ring pages for the prefetch depth to overlap the copies.
+
+### `EXL3_KV_STREAM_PREFETCH` (default: `2`)
+
+Ring slots read ahead: how many chunk H2Ds may be in flight while the compute stream consumes an
+earlier one (double buffering at `2`; `1` means the next chunk's copy starts only after the
+current one is consumed). Values above the ring page count are clamped.
+
+### `EXL3_KV_STREAM_SERIAL` (default: `0`)
+
+Serialized debug mode: no copy stream at all, every H2D/D2H runs inline on the compute stream in
+program order. Same results, no overlap. This is the mode to bisect a suspected event-ordering
+bug against (the default overlapped mode is the intended one).
+
+### `EXL3_KV_STREAM_TRACE` (default: `0`)
+
+Print chunk/slot/event transitions as they happen: the per-cache placement summary at load, table
+rebuilds, epoch changes, the chunk walk of every attention call. Very verbose; per-step debugging.
+
 ## EXL3 GEMM / GEMV
 
 ### `EXL3_GEMV` (default: `1`)

@@ -73,6 +73,23 @@ class CacheLayer(ABC):
     def copy_page(self, source: CacheLayer, from_page: int, to_page: int, num_tokens: int):
         pass
 
+    def rotate_pages(self, order_cpu: torch.Tensor):
+        """
+        Permute the layer's page-major tensors with ext.cache_rotate semantics: an int sequence
+        of (dst, src) index pairs where -1 stands for a temp page. Called by PageTable.defrag
+        with the defrag rotation; streaming layers override this to rotate their host mirror.
+        """
+        from exllamav3.ext import exllamav3_ext as ext
+        device, order = None, None
+        for t in self.get_tensors():
+            if t is None:
+                continue
+            if device != t.device:
+                device = t.device
+                order = order_cpu.to(device)
+            buffer = torch.empty(t[0].shape, device = t.device, dtype = t.dtype)
+            ext.cache_rotate(t, order, buffer)
+
     @abstractmethod
     def get_tensors(self):
         pass
@@ -311,6 +328,16 @@ class Cache:
                 dst.copy_page(src, from_page, to_page, num_tokens)
         else:
             self.model.tp_cache_page_copy(id(self), from_page, to_page, num_tokens)
+
+
+    def rotate_pages(self, order_cpu: torch.Tensor):
+        """
+        Permute every paged layer's pages according to the defrag rotation (ext.cache_rotate
+        semantics: (dst, src) pairs, -1 = temp). Streaming layers rotate their host mirror and
+        invalidate their GPU working set instead of rotating device tensors.
+        """
+        for layer in self.layers.values():
+            layer.rotate_pages(order_cpu)
 
 
     def get_all_tensors(self):

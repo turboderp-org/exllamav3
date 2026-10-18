@@ -902,7 +902,11 @@ def _paged_attn_decode_split_kernel(
     split_len,           # runtime: derived from the block-table bound, changes as it grows
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits,          # runtime: the grid may be launched wider (graph path); extra splits idle
-    sinks,               # last runtime arg: the BC launch appends it after the patched ints
+    sinks,               # BC launch appends it after the patched ints (all launches pass it)
+    kv_base,             # runtime: first kv position this launch reads (streaming chunks; 0 = start)
+    kv_end,              # runtime: one past the last kv position (0 = the live sequence end)
+    slot_base,           # runtime: first partial-store slot of this launch (streaming step order)
+    slot_stride,         # runtime: partial-store stride between programs (= step's total slots)
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
@@ -952,6 +956,13 @@ def _paged_attn_decode_split_kernel(
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
     q_abs = total_k_len - q_len + row_q
 
+    # Upper bound on the kv positions this launch reads: the sequence end, narrowed to the
+    # streaming chunk's span when the caller passes one (kv_end == 0: no bound). A range that
+    # ends up empty (chunk entirely below the causal floor, or past the sequence) runs no tiles
+    # and stores -inf/0 partials, which the combine weights by zero
+    n_bound = total_k_len
+    if kv_end > 0:
+        n_bound = tl.minimum(n_bound, kv_end)
     if WINDOW_LEFT >= 0:
         # Sliding-window layers only need keys >= (first query position - window): split that range, not the whole
         # sequence, across the programs. Splitting the sequence and skipping the tiles below the window leaves the
@@ -961,10 +972,10 @@ def _paged_attn_decode_split_kernel(
         w_lo = (w_lo // BLOCK_N) * BLOCK_N
         w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
         n_start = w_lo + split * w_span
-        n_end = tl.minimum(n_start + w_span, total_k_len)
+        n_end = tl.minimum(n_start + w_span, n_bound)
     else:
-        n_start = split * split_len
-        n_end = tl.minimum(n_start + split_len, total_k_len)
+        n_start = kv_base + split * split_len
+        n_end = tl.minimum(n_start + split_len, n_bound)
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
@@ -1037,9 +1048,11 @@ def _paged_attn_decode_split_kernel(
         tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
     else:
         if split < num_splits:
-            po_base = (pid * num_splits + split) * BLOCK_ROWS * HD_PAD
+            # slot_stride == num_splits and slot_base == 0 on the stock paths; streaming launches
+            # pick the slot base to chain several launches into one combine's split order
+            po_base = (pid * slot_stride + slot_base + split) * BLOCK_ROWS * HD_PAD
             tl.store(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :], acc)
-            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+            ml_base = (pid * slot_stride + slot_base + split) * BLOCK_ROWS * 2
             tl.store(partial_ml + ml_base + rows * 2, m)
             tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
@@ -1287,6 +1300,7 @@ def paged_attn_triton_decode(
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
             split_len, num_pages_per_seq, splits, sinks,
+            0, 0, 0, splits,          # kv_base, kv_end, slot_base, slot_stride (stock: full range)
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
@@ -1504,6 +1518,10 @@ def _paged_attn_prefill_kernel(
     k_new,
     v_new,
     sinks,
+    kv_base,             # runtime: first kv position this launch reads (streaming chunks; 0 = start)
+    kv_end,              # runtime: one past the last kv position (0 = the sequence end)
+    slot_base,           # runtime: first partial-store slot of this launch
+    slot_stride,         # runtime: partial-store stride between programs (= step's total slots)
     num_splits,          # runtime: only enters the split-span arithmetic; IS_SPLIT gates the code
     IS_SPLIT: tl.constexpr,   # num_splits > 1: store partials for the combine pass
     NEW_KV: tl.constexpr,     # 0: all kv in cache; 1: kv >= cache_seqlens[b] read from k_new/v_new;
@@ -1590,6 +1608,14 @@ def _paged_attn_prefill_kernel(
         s_lo = n_lo
         s_hi = n_hi
 
+    # Streaming: clamp the range to this launch's chunk (kv_end == 0: no bound). A chunk
+    # entirely outside [n_lo, n_hi) leaves an empty range: no tiles run and the -inf/0
+    # partials weigh zero in the combine
+    if kv_base > 0:
+        s_lo = tl.maximum(s_lo, kv_base)
+    if kv_end > 0:
+        s_hi = tl.minimum(s_hi, kv_end)
+
     if NEW_KV > 0:
         # Base pointers for the direct-kv source: absolute kv index n >= past addresses row
         # (n - past) of the (bsz, kv_append_len, kvh, hd) tensors
@@ -1662,11 +1688,13 @@ def _paged_attn_prefill_kernel(
         )
 
     if IS_SPLIT:
-        # partial_o offsets reach programs * num_splits * BLOCK_M * head_dim: widen
+        # partial_o offsets reach programs * total_slots * BLOCK_M * head_dim: widen.
+        # slot_stride == num_splits and slot_base == 0 on the stock paths; streaming launches
+        # chain several launches into one combine's split order through them
         if WIDE_INDEX:
-            pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
+            pid_lin = ((pid_m * tl.num_programs(1) + bh) * slot_stride + slot_base + split).to(tl.int64)
         else:
-            pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
+            pid_lin = (pid_m * tl.num_programs(1) + bh) * slot_stride + slot_base + split
         po_base = pid_lin * BLOCK_M * HD_PAD
         tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * HD_PAD + offs_d[None, :], acc)
         ml_base = pid_lin * BLOCK_M * 2
@@ -2049,6 +2077,7 @@ def paged_attn_triton_prefill(
             q, k_cache, v_cache, block_table, cache_seqlens, out,
             partial_o, partial_ml, k_scales, v_scales, h32,
             k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
+            0, 0, 0, splits,          # kv_base, kv_end, slot_base, slot_stride (stock: full range)
             splits, splits > 1, new_kv_mode, qck, qcv,
             q_len, kv_append_len, n_q_heads, n_kv_heads,
             num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
@@ -2457,3 +2486,345 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         max_kv_len=args.max_kv_len,
         staging_pages=args.staging_pages,
     )
+
+
+# --- KV streaming: bounded-span launches --------------------------------------------------------
+#
+# The streaming cache (cache/stream.py) walks the kv history of one step in chunks: streamed pages
+# live in a ring (shared across layers), the resident window is addressed directly, and each launch
+# covers a bounded kv span of one placement. The stock split / prefill kernels take four extra
+# runtime arguments for this (kv_base, kv_end, slot_base, slot_stride): the launch reads only
+# [kv_base, kv_end) and stores its partials at its own slot range of a persistent buffer. One
+# combine at the end of the walk reduces the slots in kv order, which is the same reduction order
+# the stock in-launch splits produce, so streaming is numerically a no-op against the resident
+# path up to kernel determinism.
+#
+# The geometry classes below own the per-shape launch state (row layout, tile config, combine
+# subtiles). Their tile picks are cached process-wide by smem.pick_config; the classes add only
+# cheap per-step arithmetic, so the driver can create them per call if it wants to.
+
+class PagedAttnStreamDecode:
+    """Per-shape launch geometry for the streaming decode chunk walk: the stock flash-decoding
+    split kernel, one launch per placement span, partials chained by slot."""
+
+    def __init__(self, q: torch.Tensor, n_kv_heads: int, qc: tuple | None,
+                 block_n: int | None = None, num_warps: int | None = None,
+                 num_stages: int | None = None):
+        bsz, q_len, n_q_heads, head_dim = q.shape
+        self.bsz, self.q_len = bsz, q_len
+        self.n_q_heads, self.n_kv_heads, self.head_dim = n_q_heads, n_kv_heads, head_dim
+        self.hd_pad = triton.next_power_of_2(head_dim)
+        self.qc = qc
+        group_size = n_q_heads // n_kv_heads
+        self.block_rows, self.h_blocks = decode_row_layout(q_len, group_size, self.hd_pad)
+        self.programs = bsz * n_kv_heads * self.h_blocks
+        cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, self.hd_pad)
+        self.num_warps = num_warps or cfg_warps
+        self.num_stages = num_stages or cfg_stages
+        self.candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
+        self.rows_sub, self.d_sub = combine_subtiles(self.block_rows, self.hd_pad)
+        self.block_n = None
+
+    def partial_numel(self, total_slots: int) -> tuple[int, int]:
+        """(partial_o, partial_ml) element counts needed for a step with this many slots"""
+        return (self.programs * total_slots * self.block_rows * self.hd_pad,
+                self.programs * total_slots * self.block_rows * 2)
+
+    def launch(
+        self,
+        q: torch.Tensor,
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        partial_o: torch.Tensor,
+        partial_ml: torch.Tensor,
+        kv_base: int,
+        kv_end: int,
+        slot_base: int,
+        total_slots: int,
+        num_splits: int,
+        split_len: int,
+        causal: bool,
+        softmax_scale: float,
+        sinks: torch.Tensor | None = None,
+        final: bool = False,
+        n_kv_heads_override: int | None = None,
+        k_scales: torch.Tensor | None = None,
+        v_scales: torch.Tensor | None = None,
+    ):
+        """One split-kernel launch over kv [kv_base, kv_end); stores at slots
+        [slot_base, slot_base + num_splits). final: this launch is the whole step (writes out).
+        Quantized caches: k_scales/v_scales must belong to the same placement as k_cache/v_cache."""
+        page_size = k_cache.shape[1]
+        n_kv_heads = self.n_kv_heads if self.qc is None else n_kv_heads_override
+        if final:
+            assert total_slots == 1 and num_splits == 1 and kv_base == 0
+        sinks, has_sinks = _prep_sinks(sinks, self.n_q_heads, q)
+        if self.qc is not None:
+            qck, qcv = self.qc[2], self.qc[3]
+            k_scales = self.qc[0] if k_scales is None else k_scales
+            v_scales = self.qc[1] if v_scales is None else v_scales
+            h32 = _get_h32(q.device)
+        else:
+            k_scales = v_scales = h32 = q
+            qck = qcv = 0
+        num_pages_per_seq = block_table.shape[1]
+
+        def args_for(bn):
+            return (
+                q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+                k_scales, v_scales, h32,
+                int(split_len), num_pages_per_seq, int(num_splits), sinks,
+                int(kv_base), int(kv_end), int(slot_base), int(total_slots),
+                qck, qcv, self.q_len, 0, self.n_q_heads, n_kv_heads,
+                page_size, self.head_dim, self.hd_pad, float(softmax_scale),
+                bool(causal), -1, -1, 0.0,
+                bool(final), has_sinks, self.block_rows, bn,
+            )
+
+        with torch.cuda.device(q.device):
+            if self.block_n is None:
+                pick_key = (
+                    self.head_dim, self.hd_pad, qck, qcv, self.q_len, self.block_rows, self.h_blocks,
+                    bool(causal), has_sinks, self.num_warps, self.num_stages, self.candidates[0],
+                    bool(final), kv_base > 0 or kv_end > 0,
+                )
+                self.block_n = pick_config(
+                    q.device, "paged_attn_decode_stream", pick_key, self.candidates,
+                    lambda bn: shared_bytes(_paged_attn_decode_split_kernel, args_for(bn),
+                                            num_warps = self.num_warps, num_stages = self.num_stages),
+                )
+            _paged_attn_decode_split_kernel[(self.programs, num_splits)](
+                *args_for(self.block_n), num_warps = self.num_warps, num_stages = self.num_stages,
+            )
+
+    def combine(
+        self,
+        partial_o: torch.Tensor,
+        partial_ml: torch.Tensor,
+        out: torch.Tensor,
+        num_splits: int,
+        dummy: torch.Tensor,
+        sinks: torch.Tensor | None = None,
+    ):
+        """Reduce the step's slots in order (num_splits = the step's total slots)"""
+        if num_splits <= 1:
+            return
+        sinks, has_sinks = _prep_sinks(sinks, self.n_q_heads, dummy)
+        qcv = self.qc[3] if self.qc is not None else 0
+        h32 = _get_h32(dummy.device) if qcv > 0 else dummy
+        _paged_attn_decode_combine_kernel[
+            (self.programs, (self.block_rows // self.rows_sub) * (self.hd_pad // self.d_sub))
+        ](
+            partial_o, partial_ml, out, h32,
+            num_splits, sinks,
+            qcv, has_sinks, self.q_len, self.n_q_heads, self.n_kv_heads, self.head_dim,
+            self.hd_pad, self.head_dim, self.block_rows, self.rows_sub, self.d_sub,
+            num_warps = 4, num_stages = 1,
+        )
+
+
+class PagedAttnStreamPrefill:
+    """Per-shape launch geometry for the streaming prefill chunk walk: the stock paged prefill
+    kernel over a bounded kv span, partials chained by slot and reduced by the prefill combine."""
+
+    def __init__(self, q: torch.Tensor, n_kv_heads: int, qc: tuple | None,
+                 block_m: int | None = None, block_n: int | None = None,
+                 num_warps: int | None = None, num_stages: int | None = None):
+        bsz, q_len, n_q_heads, head_dim = q.shape
+        self.bsz, self.q_len = bsz, q_len
+        self.n_q_heads, self.n_kv_heads, self.head_dim = n_q_heads, n_kv_heads, head_dim
+        self.hd_pad = triton.next_power_of_2(head_dim)
+        self.qc = qc
+        self.page_size = 256
+
+        # Tile configs by head_dim, sized for ~100 KB of smem (same table as the stock wrapper)
+        blackwell = not ROCM and torch.cuda.get_device_capability(q.device)[0] >= 10
+        if self.hd_pad <= 128:
+            cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
+        elif self.hd_pad <= 256:
+            cfg = (64, 32, 4, 2)
+        else:
+            cfg = (32, 16, 4, 2)
+        if ROCM:
+            if self.hd_pad <= 128:
+                cfg = (128, 32, 8, 2)
+            elif self.hd_pad <= 256 and qc is None:
+                if q_len >= 128:
+                    cfg = (128, 32, 8, 2 if gfx_arch(q.device) == "gfx1100" else 1)
+                else:
+                    cfg = (64, 32, 8, 1)
+        if not ROCM and torch.cuda.get_device_capability(q.device)[0] < 8:
+            cfg = (16, 32, 8, 2) if self.hd_pad == 256 else (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
+        if qc is not None and block_n is None:
+            bn = max(16, min(128, 16384 // self.hd_pad))
+            if self.hd_pad >= 256 and qc[2] + qc[3] >= 13 and bn > 16:
+                bn //= 2
+            cfg = (cfg[0], bn, cfg[2], cfg[3])
+        forced = (block_m, block_n, num_warps, num_stages)
+        stock = tuple(f if f is not None else c for f, c in zip(forced, cfg))
+        self.num_stages_forced = forced[3] is not None
+        self.candidates = [stock] if any(f is not None for f in forced) else tile_ladder(*stock)
+        self.cfg = None
+        self.block_m = self.block_n = None
+        # Probe operands for the tile pick (the partials' shapes do not affect the footprint)
+        self._probe = torch.empty(8, dtype = torch.float32, device = q.device)
+
+    def partial_numel(self, q_blocks: int, total_slots: int) -> tuple[int, int]:
+        # q_blocks from the picked config; conservative callers pass the worst case (block_m = 16)
+        return (q_blocks * self.bsz * self.n_q_heads * total_slots * self.block_m * self.hd_pad,
+                q_blocks * self.bsz * self.n_q_heads * total_slots * self.block_m * 2)
+
+    def ensure_config(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        causal: bool,
+        n_kv_heads_override: int | None = None,
+    ):
+        """Pick and cache the tile config (probes with the real kernel arguments; the partial
+        arguments are placeholders, their shapes do not enter the footprint)"""
+        if self.cfg is not None:
+            return
+        n_kv_heads = self.n_kv_heads if self.qc is None else n_kv_heads_override
+        if self.qc is not None:
+            k_scales, v_scales, qck, qcv = self.qc
+            h32 = _get_h32(q.device)
+        else:
+            k_scales = v_scales = h32 = q
+            qck = qcv = 0
+
+        def args_for(cfg):
+            block_m, block_n, num_warps, num_stages = cfg
+            q_blocks = triton.cdiv(self.q_len, block_m)
+            wide_index = max(
+                self.bsz * self.q_len * self.n_q_heads * self.head_dim,
+                q_blocks * self.bsz * self.n_q_heads * block_m * self.hd_pad,
+            ) >= 1 << 31
+            return (
+                q, k_cache, v_cache, block_table, cache_seqlens, q,
+                self._probe, self._probe, k_scales, v_scales, h32,
+                q, q, None,
+                0, 0, 0, 0,
+                1, False, 0, qck, qcv,
+                self.q_len, 0, self.n_q_heads, n_kv_heads,
+                block_table.shape[1], self.page_size, self.head_dim, self.hd_pad, 1.0,
+                bool(causal), -1, -1, False, False, float(0.0), False, wide_index, block_m, block_n,
+            )
+
+        with torch.cuda.device(q.device):
+            pick_key = (self.head_dim, self.hd_pad, qck, qcv, bool(causal), False, stock_key(self.candidates))
+            self.cfg = pick_config(q.device, "paged_attn_prefill_stream", pick_key, self.candidates,
+                                   lambda cfg: shared_bytes(_paged_attn_prefill_kernel, args_for(cfg),
+                                                            num_warps = cfg[2], num_stages = cfg[3]))
+        self.block_m, self.block_n = self.cfg[0], self.cfg[1]
+
+    def launch(
+        self,
+        q: torch.Tensor,
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        partial_o: torch.Tensor,
+        partial_ml: torch.Tensor,
+        kv_append_len: int,
+        kv_base: int,
+        kv_end: int,
+        slot_base: int,
+        total_slots: int,
+        num_splits: int,
+        causal: bool,
+        softmax_scale: float,
+        sinks: torch.Tensor | None = None,
+        final: bool = False,
+        n_kv_heads_override: int | None = None,
+        k_scales: torch.Tensor | None = None,
+        v_scales: torch.Tensor | None = None,
+    ):
+        assert self.cfg is not None, "PagedAttnStreamPrefill.ensure_config() must run first"
+        block_m, block_n, num_warps, num_stages = self.cfg
+        n_kv_heads = self.n_kv_heads if self.qc is None else n_kv_heads_override
+        sinks, has_sinks = _prep_sinks(sinks, self.n_q_heads, q)
+        if self.qc is not None:
+            qck, qcv = self.qc[2], self.qc[3]
+            k_scales = self.qc[0] if k_scales is None else k_scales
+            v_scales = self.qc[1] if v_scales is None else v_scales
+            h32 = _get_h32(q.device)
+        else:
+            k_scales = v_scales = h32 = q
+            qck = qcv = 0
+        q_blocks = triton.cdiv(self.q_len, block_m)
+        wide_index = max(
+            self.bsz * self.q_len * self.n_q_heads * self.head_dim,
+            q_blocks * self.bsz * self.n_q_heads * total_slots * block_m * self.hd_pad,
+        ) >= 1 << 31
+        args = (
+            q, k_cache, v_cache, block_table, cache_seqlens, out,
+            partial_o, partial_ml, k_scales, v_scales, h32,
+            q, q, sinks,
+            int(kv_base), int(kv_end), int(slot_base), int(total_slots),
+            int(num_splits), not final, 0, qck, qcv,
+            self.q_len, int(kv_append_len), self.n_q_heads, n_kv_heads,
+            block_table.shape[1], self.page_size, self.head_dim, self.hd_pad, float(softmax_scale),
+            bool(causal), -1, -1, False, False, float(0.0),
+            has_sinks, wide_index, block_m, block_n,
+        )
+
+        def launch_sp(ns):
+            _paged_attn_prefill_kernel[(q_blocks, self.bsz * self.n_q_heads, num_splits)](
+                *args, num_warps = num_warps, num_stages = ns)
+
+        with torch.cuda.device(q.device):
+            if self.qc is not None and not self.num_stages_forced:
+                if _qc_prefill_ns_env:
+                    launch_sp(_qc_prefill_ns_env)
+                    return q_blocks
+                if self.q_len >= 256:
+                    key = (q.device.index, self.head_dim, qck, qcv, block_m, block_n, num_warps,
+                           bool(causal), False, False, has_sinks)
+                    ns = _qc_prefill_ns_cache.get(key)
+                    if ns is None:
+                        ns = _pick_qc_prefill_num_stages(key, launch_sp)
+                    launch_sp(ns)
+                    return q_blocks
+            launch_sp(num_stages)
+        return q_blocks
+
+    def combine(
+        self,
+        partial_o: torch.Tensor,
+        partial_ml: torch.Tensor,
+        out: torch.Tensor,
+        num_splits: int,
+        dummy: torch.Tensor,
+        sinks: torch.Tensor | None = None,
+        q_blocks: int | None = None,
+    ):
+        if num_splits <= 1:
+            return
+        block_m = self.cfg[0]
+        q_blocks = q_blocks if q_blocks is not None else triton.cdiv(self.q_len, block_m)
+        sinks, has_sinks = _prep_sinks(sinks, self.n_q_heads, dummy)
+        qcv = self.qc[3] if self.qc is not None else 0
+        h32 = _get_h32(dummy.device) if qcv > 0 else dummy
+        wide_index = max(
+            self.bsz * self.q_len * self.n_q_heads * self.head_dim,
+            q_blocks * self.bsz * self.n_q_heads * num_splits * block_m * self.hd_pad,
+        ) >= 1 << 31
+        _paged_attn_prefill_combine_kernel[(q_blocks, self.bsz * self.n_q_heads)](
+            partial_o, partial_ml, out, h32, sinks,
+            num_splits, qcv, has_sinks, self.q_len, self.n_q_heads, self.head_dim, self.hd_pad,
+            wide_index, block_m,
+            num_warps = 8, num_stages = 1,
+        )
+
+
+def stock_key(candidates) -> tuple:
+    return tuple(tuple(c) for c in candidates)

@@ -73,6 +73,16 @@ class CPUPageCache:
             else:
                 local_caches.append(cache)
 
+        # Streaming cache layers (EXL3_KV_STREAM=1) are host-authoritative: the device tensors are
+        # a bounded working set, not a page pool, so a second host tier is meaningless here
+        from ..cache.stream import StreamLayer
+        for cache in local_caches:
+            for layer in cache.layers.values():
+                if isinstance(layer, StreamLayer):
+                    raise NotImplementedError(
+                        "KV streaming (EXL3_KV_STREAM=1) cannot be combined with the CPU page "
+                        "cache tier: the streaming mirror already holds the full history")
+
         self.tp_groups = list(tp_groups.values())
         self.tp = bool(self.tp_groups)
 

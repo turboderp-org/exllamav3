@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-from functools import lru_cache
 import heapq
 import torch
 import hashlib
@@ -13,7 +12,6 @@ from ..constants import PAGE_SIZE
 from collections import deque, defaultdict
 from itertools import pairwise
 from ..util.tensor import SeqTensor
-from exllamav3.ext import exllamav3_ext as ext
 import time
 from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
@@ -1037,14 +1035,6 @@ class PageTable:
 
         # Rotate pages
         all_rotations_cpu = torch.tensor(all_rotations, dtype = torch.int)
-        @lru_cache
-        def get_all_rotations(device):
-            nonlocal all_rotations_cpu
-            return all_rotations_cpu.to(device)
-
-        @lru_cache
-        def get_buffer(shape, device, dtype):
-            return torch.empty(shape, device = device, dtype = dtype)
 
         # Every cache that shares this page table's block tables must move in lockstep
         caches = [self.cache]
@@ -1057,10 +1047,7 @@ class PageTable:
             if c.model.loaded_tp:
                 c.model.tp_rotate_cache_pages(id(c), all_rotations_cpu)
             else:
-                for cache in c.get_all_tensors():
-                    buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
-                    all_rotations = get_all_rotations(cache.device)
-                    ext.cache_rotate(cache, all_rotations, buffer)
+                c.rotate_pages(all_rotations_cpu)
 
         # Write new page indices
         for page in self.all_pages:

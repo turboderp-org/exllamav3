@@ -788,6 +788,11 @@ void BC_Attention::run_gr
             (void*) (intptr_t) (int) block_table.size(1),
             (void*) (intptr_t) num_splits,
             (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
+            // Streaming gears, stock values here: full kv range, slot index == split index
+            (void*) (intptr_t) 0,    // kv_base
+            (void*) (intptr_t) 0,    // kv_end
+            (void*) (intptr_t) 0,    // slot_base
+            (void*) (intptr_t) num_splits,   // slot_stride
         };
         // Launched at the split cap so the captured grid never changes; splits at or above the
         // live count exit without storing
@@ -799,6 +804,7 @@ void BC_Attention::run_gr
             graph->record_param(s.k_split->handle(), GP_attn_split_len, 11, 4);
             graph->record_param(s.k_split->handle(), GP_attn_num_pages, 12, 4);
             graph->record_param(s.k_split->handle(), GP_attn_num_splits, 13, 4);
+            graph->record_param(s.k_split->handle(), GP_attn_slot_stride, 18, 4);
             graph->record_param(s.k_split->handle(), GP_end, 0);
         }
     }
@@ -1015,6 +1021,7 @@ void BC_Attention::run
         params.emplace_back(GP_attn_split_len, (void*) (uintptr_t) split_len);
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
+        params.emplace_back(GP_attn_slot_stride, (void*) (uintptr_t) num_splits);  // split kernel, stock stride
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
     }
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();

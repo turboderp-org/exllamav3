@@ -123,6 +123,11 @@ def attn_dispatch(
         assert block_table is not None
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
+        from ...cache.stream import StreamLayer
+        if isinstance(layer, StreamLayer):
+            raise RuntimeError(
+                "Streaming cache layers (EXL3_KV_STREAM=1) run attention through their chunked "
+                "driver; this attention implementation does not support them")
         if (
             _qc_attn and
             isinstance(layer, CacheLayer_quant) and
