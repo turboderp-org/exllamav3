@@ -37,6 +37,7 @@ def read_lfm2_layer_types(config: Config, num_layers: int) -> list[str]:
 
 class Lfm2Config(Config):
     arch_string = "Lfm2ForCausalLM"
+    config_key = None
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class Lfm2Config(Config):
         super().__init__(
             directory,
             {"text": Lfm2Model},
+            config_key = self.config_key,
             **kwargs,
         )
 

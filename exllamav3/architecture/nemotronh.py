@@ -9,7 +9,7 @@ from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.file import read_dict
 from ..tokenizer import MMEmbedding, Tokenizer
-from ..modules.arch_specific.nemotronh_omni import NemotronHOmniPatchEmbedder, NemotronHOmniPixelShuffle
+from ..modules.arch_specific.nemotronh_omni import NemotronHOmniPatchEmbedder
 from .mm_processing.nemotronh_omni import (
     nemotronh_omni_image_grid,
     nemotronh_omni_video_grid,
@@ -21,6 +21,7 @@ from .mm_processing.nemotronh_omni import (
 from ..modules import (
     RMSNorm,
     LayerNorm,
+    PixelUnshuffle,
     Embedding,
     TransformerBlock,
     Attention,
@@ -521,12 +522,12 @@ class NemotronHOmniVisionModel(Model):
             ]
 
         self.modules += [
-            NemotronHOmniPixelShuffle(
+            PixelUnshuffle(
                 config = config,
                 key = f"{key_prefix}.pixel_shuffle",
+                factor = self.merge_size,
                 num_prefix_tokens = v.num_prefix_tokens,
-                merge_size = self.merge_size,
-                ps_version = config.ps_version,
+                legacy_order = config.ps_version == "v1",
             ),
             RMSNorm(
                 config = config,
