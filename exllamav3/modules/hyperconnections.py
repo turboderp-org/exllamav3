@@ -198,6 +198,8 @@ class HyperConnection(Module):
         if pend is not None:
             hc_flush(params)
         post, comb, y = self._mix_unfused(streams, params)
+        if self.carry_pre and "quant_preserve" in params:
+            params["quant_preserve"]["hc_pre"] = params["hc_pre"]
         return post, comb, y, False
 
     def _mix_unfused(self, streams: torch.Tensor, params: dict):
