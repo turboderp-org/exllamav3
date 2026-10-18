@@ -175,8 +175,17 @@ class SS_Fused(SS_Base):
     keeps a top segment of the same ordering. The threshold is found from a deterministic
     fixed-point histogram of the logits (counts for top-K, exp-mass for top-P, normalized over
     the top-K-truncated set), with boundary buckets refined to 1/32768 nat -- finer than fp16
-    ULP, so the kept set matches the exact sort-based truncation for fp16 logits. Tokens tied
-    exactly at a cutoff are all kept rather than truncated in sort order.
+    ULP, so the kept set matches the exact sort-based truncation for fp16 logits, except at ties
+    and in the far tail:
+
+    - top-K: tokens tied exactly at the cutoff are all kept rather than truncated in sort order.
+      Tokens 32 nats or more below the max (at the filter temperature, relative weight below
+      e^-32) are not ordered: when the cutoff falls among them they are dropped, so fewer than
+      top_k tokens remain.
+    - top-P: the token crossing the cumulative mass is included. When it is tied with other
+      tokens, all of the ties stay eligible but are down-weighted together to the number of them
+      the sort-order cumulative sum would pass through, so the sample picks uniformly among them
+      instead of in sort order.
 
     Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
     Gumbel noise stream for a given rand_u32, up to rounding at exact ties).
@@ -458,8 +467,8 @@ class SS_TopK(SS_Base):
 
 class SS_TopP(SS_Base):
     """
-    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remaining tokens
+    Identify the smallest set of top tokens with a cumulative probability of at least P (the token whose
+    probability crosses P is included), mask out all remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
@@ -468,8 +477,9 @@ class SS_TopP(SS_Base):
     def run(self, state: SamplingState):
         match state.state:
             case SS.PROBS_N_S:
+                # Keep each token whose preceding mass is still short of P
                 cumsum = state.probs.cumsum(dim = -1)
-                mask = cumsum <= self.top_p
+                mask = (cumsum - state.probs) < self.top_p
                 state.probs[..., 1:] *= mask[..., 1:]
                 state.state = SS.PROBS_S
             case _:
@@ -934,18 +944,23 @@ class SS_DRY(SS_Base):
     match_length is the length of the longest context suffix whose earlier repetition the token
     would continue. The matching semantics and the float32 exponent clamp follow llama.cpp's
     llama_sampler_dry_apply (ported to koboldcpp-derived runtimes by pi6am; the scheme was
-    designed by p-e-w), with two divergences: sequence breakers are single tokens, where
-    llama.cpp additionally builds multi-token restart sequences from partially overlapping
-    tokens, and match lengths are capped at 2048, so where allowed_length plus llama.cpp's
-    exponent clamp exceeds 2048 (dry_base below ~1.044 at the default allowed_length) a verbatim
-    repeat longer than the cap is penalized as a 2048-token repeat. The parameter surface
-    follows exllamav2, including dry_range = 0 meaning the whole context. exllamav2's own DRY is
-    a different algorithm (an occurrence-counting trie), so outputs are not expected to match it.
+    designed by p-e-w), with two divergences:
+
+    - sequence breakers are single tokens, where llama.cpp additionally builds multi-token
+      restart sequences from partially overlapping tokens;
+    - the match scan stops where the penalty stops changing, at allowed_length plus llama.cpp's
+      exponent clamp. For dry_base so close to 1 that llama.cpp applies no clamp (at most
+      1.000001) it stops at 2048 tokens instead, so a longer verbatim repeat is penalized as a
+      2048-token one; at those bases the penalty grows by at most 0.2% per further 2048 tokens.
+
+    The parameter surface follows exllamav2, including dry_range = 0 meaning the whole context.
+    exllamav2's own DRY is a different algorithm (an occurrence-counting trie), so outputs are not
+    expected to match it.
 
     One kernel launch per sampled token (ext.dry_penalty) on the logits device; past_ids are
     uploaded first if they live on the host. The scan is O(window) comparisons per token for
-    ordinary text and at most O(window * min(allowed_length + clamp, 2048)) for a context that
-    is one long verbatim repeat.
+    ordinary text and at most O(window * min(window, scan limit)) for a context that is one long
+    verbatim repeat, where the scan limit is allowed_length plus the clamp (2048 without one).
     """
     def __init__(
         self,

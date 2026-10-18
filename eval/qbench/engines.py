@@ -24,6 +24,22 @@ import torch
 from exllamav3.util.memory import free_mem
 from exllamav3.util.progress import ProgressBar
 
+
+class _Options(dict):
+    """Model options with a record of which keys the backend actually read, so open_backend
+    can echo the settings in force and flag options that no code path consumed"""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.used = set()
+    def get(self, key, default = None):
+        self.used.add(key)
+        return super().get(key, default)
+    def __getitem__(self, key):
+        self.used.add(key)
+        return super().__getitem__(key)
+    def unused(self):
+        return [k for k in self if k not in self.used]
+
 # Substrings identifying MoE router gate matrices per naming scheme (2D but excluded: tiny and
 # stored unquantized in some formats but quantized in others)
 HF_ROUTER_KEYS = (".mlp.gate.weight", ".block_sparse_moe.gate.weight", ".router.weight", ".feed_forward.gate.weight")
@@ -45,6 +61,11 @@ class Exl3Backend:
         self.config.override_dynamic_seq_len(max_len)
         self.model = Model.from_config(self.config)
         self.info = None
+        self.settings = {
+            "architecture": getattr(self.config, "architecture", None),
+            "max_len": max_len,
+            "module_streamed": True,
+        }
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
         from exllamav3.modules import Linear
@@ -171,11 +192,14 @@ class TransformersBackend:
             # so results are the checkpoint's weight fidelity under bf16 compute
             self.ct_bits = None
             self.dequant_scaled = False
+            self.scale_block = ()
+            self.quant_desc = "none (checkpoint dtype)"
             qcfg = getattr(config, "quantization_config", None)
             if qcfg is not None:
                 def q_get(key, default = None):
                     return qcfg.get(key, default) if isinstance(qcfg, dict) else getattr(qcfg, key, default)
                 qm = q_get("quant_method")
+                self.quant_desc = f"{qm} {q_get('format') or ''}".strip()
                 if qm == "compressed-tensors":
                     fmt = q_get("format")
                     assert fmt in ("pack-quantized", "mixed-precision", "nvfp4-pack-quantized", "float-quantized"), \
@@ -195,6 +219,8 @@ class TransformersBackend:
                     # AutoFP8/DeepSeek-style: fp8-e4m3 weights with blockwise (typically
                     # 128x128) weight_scale_inv, unquantized modules stay plain bf16
                     self.dequant_scaled = True
+                    self.scale_block = tuple(q_get("weight_block_size", None) or ())
+                    self.quant_desc = f"fp8 e4m3, scale blocks {'x'.join(map(str, self.scale_block)) or '128x128 (default)'}"
                 elif qm == "mxfp4":
                     # gpt-oss-style: MoE expert tensors stored as <name>_blocks (packed fp4
                     # e2m1 pairs) + <name>_scales (e8m0); resolved per-tensor by sidecar
@@ -207,13 +233,20 @@ class TransformersBackend:
             # are not in the shards) materialized with their init values
             with init_empty_weights(include_buffers = False):
                 try:
-                    self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
+                    # Eager attention unless the project says otherwise: it is the reference arithmetic
+                    # (fp32 softmax, explicit causal mask), and remote-code sdpa paths are not always
+                    # causal (Ling 3.1's bundled modeling runs sdpa without a mask)
+                    self.model = AutoModelForCausalLM.from_config(
+                        config, dtype = dtype, trust_remote_code = trc,
+                        attn_implementation = options.get("attn_implementation", "eager"))
                 except ValueError:
                     # Multimodal wrappers not registered under CausalLM (Mistral3/Mistral4):
                     # the ConditionalGeneration class computes text-only logits fine, and the
                     # never-forwarded vision tower simply stays on meta
                     from transformers import AutoModelForImageTextToText
-                    self.model = AutoModelForImageTextToText.from_config(config, dtype = dtype, trust_remote_code = trc)
+                    self.model = AutoModelForImageTextToText.from_config(
+                        config, dtype = dtype, trust_remote_code = trc,
+                        attn_implementation = options.get("attn_implementation", "eager"))
             self.model.eval()
 
             # The streamed head skips the CausalLM wrapper's forward, so post-head transforms
@@ -381,6 +414,24 @@ class TransformersBackend:
                 )
             self.model.eval()
 
+        self.settings = {
+            "dtype": str(dtype).replace("torch.", ""),
+            "streaming": self.streaming,
+            "trust_remote_code": options.get("trust_remote_code", True),
+            # Requested vs what transformers actually installed on the model config
+            "attn_implementation": f"{options.get('attn_implementation', 'eager' if self.streaming else 'default')}"
+                                   f" (model: {getattr(self.model.config, '_attn_implementation', '?')})",
+        }
+        if self.streaming:
+            self.settings["dequant"] = self.quant_desc
+        else:
+            self.settings["device_map"] = options.get("device_map", "auto")
+        if self.w4a4_sim:
+            self.settings["w4a4_sim"] = True
+        self.settings["modeling"] = self._modeling_source(source)
+        import transformers
+        self.settings["transformers"] = transformers.__version__
+
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
         # In streaming mode, bits come from the checkpoint's actual stored bytes (including
         # quantization metadata like scales), so quantized formats report their true bitrate.
@@ -454,14 +505,20 @@ class TransformersBackend:
         }
 
     def _decoder_layers(self):
-        best = None
-        for m in self.model.modules():
-            if isinstance(m, torch.nn.ModuleList) and len(m) >= 4:
-                if len(set(type(c) for c in m)) == 1 and (best is None or len(m) > len(best)):
-                    best = m
-        if best is None:
+        """The decoder layer list: the largest ModuleList that no other candidate ModuleList
+        contains. Per-expert MoE implementations (Ling) hold a ModuleList of hundreds of
+        experts inside every layer, which would win on size alone; the layer list is the
+        outermost one. Mixed child types are allowed (Ling appends its MTP layer to the list)"""
+        lists = [m for m in self.model.modules() if isinstance(m, torch.nn.ModuleList) and len(m) >= 4]
+        inner = set()
+        for m in lists:
+            for sub in m.modules():
+                if sub is not m and isinstance(sub, torch.nn.ModuleList):
+                    inner.add(id(sub))
+        outer = [m for m in lists if id(m) not in inner]
+        if not outer:
             raise RuntimeError("Could not locate decoder layer list for noise injection")
-        return best
+        return max(outer, key = len)
 
     def _noise_hooks(self, noise_eps):
         gens = {}
@@ -526,6 +583,26 @@ class TransformersBackend:
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
+    def _modeling_source(self, source):
+        """Where the model class came from: the transformers module, or for remote code the
+        cached copy, checked against the same-named file in the model directory so a patched
+        modeling file can be confirmed to be the one in use"""
+        import inspect, hashlib
+        cls = type(self.model)
+        try:
+            path = inspect.getsourcefile(cls)
+        except TypeError:
+            path = None
+        if not path:
+            return cls.__module__
+        if cls.__module__.startswith("transformers."):
+            return f"{cls.__module__}.{cls.__name__}"
+        local = os.path.join(source, os.path.basename(path))
+        if os.path.isfile(local):
+            same = hashlib.sha256(open(path, "rb").read()).digest() == hashlib.sha256(open(local, "rb").read()).digest()
+            return f"{local} ({'in use' if same else 'DIFFERS from the loaded copy ' + path})"
+        return path
+
     def _scale_float(self, s):
         """Scale sidecar to fp32. E8M0 exponent bytes (DeepSeek-V4 ue8m0, stored as uint8 or
         torch.float8_e8m0fnu) decode as 2^(byte - 127); everything else casts directly."""
@@ -562,7 +639,18 @@ class TransformersBackend:
                 assert si.ndim == w.ndim, f"{name}: scale rank {si.ndim} vs weight rank {w.ndim}"
                 for d in range(w.ndim):
                     if si.shape[d] != w.shape[d]:
-                        bs = (w.shape[d] + si.shape[d] - 1) // si.shape[d]
+                        if w.shape[d] % si.shape[d] == 0:
+                            bs = w.shape[d] // si.shape[d]
+                        else:
+                            # The dimension ends in a partial block (Ling's 576-row
+                            # kv_a_proj_with_mqa under a 5-row grid), so the ratio is not
+                            # the block size: take it from the checkpoint's block shape
+                            # (last dims), else the DeepSeek 128 default, and check coverage
+                            blk = self.scale_block[d - (w.ndim - len(self.scale_block))] \
+                                if 0 <= d - (w.ndim - len(self.scale_block)) < len(self.scale_block) else 128
+                            bs = int(blk)
+                            assert (w.shape[d] + bs - 1) // bs == si.shape[d], \
+                                f"{name}: {si.shape[d]} scale blocks of {bs} do not cover dim {d} of {tuple(w.shape)}"
                         si = si.repeat_interleave(bs, dim = d).narrow(d, 0, w.shape[d])
             return w.float() * si
         scale = self._read_shard(f"{name}_scale").float()
@@ -1153,6 +1241,13 @@ class LlamaCppBackend:
             split_mode = split_modes[options.get("split_mode", "layer")],
             main_gpu = options.get("main_gpu", 0),
         )
+        self.settings = {
+            "n_ctx": max_len,
+            "n_gpu_layers": options.get("n_gpu_layers", 999),
+            "split_mode": options.get("split_mode", "layer"),
+            "main_gpu": options.get("main_gpu", 0),
+            "llama_cpp": getattr(llama_cpp, "__version__", "?"),
+        }
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
@@ -1182,4 +1277,12 @@ def open_backend(mspec: dict, max_len: int, device: torch.device):
     if engine not in ENGINES:
         raise ValueError(f"Unknown engine: {engine} (available: {', '.join(ENGINES)})")
     print(f" -- Loading ({engine}): {mspec['source']}")
-    return ENGINES[engine](mspec["source"], max_len, device, mspec.get("options", {}))
+    options = _Options(mspec.get("options", {}) or {})
+    backend = ENGINES[engine](mspec["source"], max_len, device, options)
+    # Echo the settings in force (defaults included) so a project can be checked against what
+    # the backend actually applied, and flag options no code path read
+    for k, v in getattr(backend, "settings", {}).items():
+        print(f"      {k}: {v}")
+    if options.unused():
+        print(f"      ignored options (not used by the {engine} engine): {', '.join(options.unused())}")
+    return backend

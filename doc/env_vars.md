@@ -21,6 +21,18 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 
 ## Attention
 
+### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
+
+Whether the decode paths capture their kernel sequences into device graphs and replay them. With
+`0` every graphed site (attention, MLA, GDN, the MLP and block-sparse decode kernels) runs the same
+C++ launch sequence eagerly on each call, kernels and order unchanged, so the switch changes only
+host submission. On CUDA replay is a few percent faster at decode. On ROCm the HIP runtime launches a
+graph node no faster than a plain kernel, the measured difference is within noise, and every
+instantiated graph exec reserves a 2 MB device-side kernel-argument pool that grows with each
+parameter update until the exec is destroyed (an open HIP runtime issue); a speculative-decoding
+server holds hundreds of execs, so disabling graphs there also frees over a gigabyte of VRAM.
+Set `EXL3_GRAPHS=1` on ROCm to test the graph path.
+
 ### `EXL3_BC_ATTN` (default: `1`)
 
 Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
@@ -170,21 +182,42 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
-  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
-  pass, so the space is reserved at load time rather than discovered at the first long prefill.
-  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  a per-call transient of one fixed size, the full cache at batch size 1
+  (`2 * max_num_tokens * num_kv_heads * head_dim` fp16 elements; QSA layers use their bounded
+  dense window instead), so the allocator sees the same request on every prefill chunk rather
+  than a size that grows with the context. The autosplit measuring pass budgets it, so the
+  space is accounted for at load time; loads with an explicit split map it at the first long
+  prefill. For very large caches this is the tradeoff to weigh against `0` (e.g. ~4 GB at
   1M tokens with 8 kv heads of dim 128).
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
-### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`, `9` on Turing)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
-over long contexts at low cache bitrates). Tuning/testing knob.
+over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
+below) every prefill chunk stages. Tuning/testing knob.
+
+### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+
+Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
+dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
+dequantization of a quantized cache, or the fp16 cache's own pages, viewed where they are
+consecutive and gathered otherwise, then PyTorch's memory-efficient SDPA per KV group (its
+cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions for sm_75, so the
+Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
+kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
+`1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
+off on Turing.
+
+### `EXL3_FA75` (default: on for sm_75, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
+`mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
+its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
@@ -284,6 +317,24 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
+
+Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels
+use a plain launch with a software device barrier, so every block of a grid must be resident at
+once; the autotuner sizes its candidate grids from `hipOccupancyMaxActiveBlocksPerMultiprocessor`,
+whose per-target resource accounting is not reliable (gfx1150 reports more blocks per WGP than its
+LDS holds for these kernels, and the barrier then deadlocks with the GPU at 100%). The default
+clamps grids to one block per WGP, which is what the API returns anyway for the regular shapes on
+gfx1100 and gfx1201. Set higher to allow more blocks per WGP, or `0` to trust the API. The fused
+MoE kernel has its own bound (`EXL3_ROCM_MOE_BPS=1` forces one block per WGP there).
+
+### `EXL3_DEBUG_AUTOTUNE` (default: unset)
+
+Print every GEMM autotune candidate (shape, LDS, blocks per WGP before and after the clamp, grid)
+and synchronize after each probe and measurement launch, naming it first, so a launch that never
+completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
+launches.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
@@ -294,11 +345,12 @@ samplers, optionally preceded by repetition/presence/frequency penalties) run as
 kernels working directly in logit space, instead of the step-by-step softmax/sort pipeline.
 Collapsed temperature/min-P stacks sample the same token as the uncollapsed reference for the
 same seed, up to float rounding at exact ties; top-K/top-P stacks keep the same token set as
-the sort-based reference (ties at the exact cutoff are all kept) but draw their Gumbel noise by
-token id rather than sorted position, so individual seeds map to different samples from the
-same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
-design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
-reference implementation.
+the sort-based reference, except for ties at the exact cutoff (top-K keeps all of them, top-P
+keeps all of them at the combined weight of the ties the cumulative sum reaches), but draw
+their Gumbel noise by token id rather than sorted position, so individual seeds map to different
+samples from the same distribution. Stacks the collapse does not recognize fall back to the
+step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
+against the reference implementation.
 
 ## CPU MoE offload
 
@@ -326,7 +378,7 @@ Fallback value for when `-mcl` is not set.
 Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
 `draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
 
-### `EXL3_MOE_CPU_THREADS` (default: `cpu_count // 2`)
+### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
 
@@ -415,17 +467,20 @@ testing. Read once per process (parent and worker independently).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
-Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
-load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
-(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
-leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
-(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
-and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+Repack the CPU worker's expert trellis copies into a packed layout at load, so each GEMV band
+streams sequentially from DRAM instead of in short strided runs. The layout is per kernel tier
+(rule: `exl3_moe_cpu_swizzle_group`): the AVX-512 tiers (`vbmi`, `bw`, `vnni`) band output tiles
+in groups of 8, except K8 tensors, which route to the dword kernel and stay native (+45-75%
+cold decode GEMV throughput on a 7960X, reaching the sequential-read roofline). The `avx2` tier
+bands integer rates in groups of 2 and additionally repacks each tile's 32-bit words into the
+"planar" order (dword `w` moves to `8 * (w % bits) + w / bits`): under the tensor-core tile
+permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
+collapses to a single `vpermd` instead of walking the tile's registers, which removes the
+rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
+tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
+tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -540,9 +595,10 @@ recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice part
 products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
 models is reproducible as well.
 
-### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
+### `EXL3_MOE_PINNED_ARENA` (default: `0`)
 
-Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
+Default for `Config.infer_params.moe_cpu_pinned_arena` (`-mcpa` / `--moe_cpu_pinned_arena` in
+`model_init`). Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
 and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down trellis tensors out as
 one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs an expert's block
 straight out of the arena on the copy stream instead of having the worker's stager thread
@@ -559,7 +615,39 @@ preallocated with `fallocate` and then page-locked by the parent, so neither the
 nor the later collapse pass can convert them (on the default `never` the CPU kernels run on 4K
 pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
 pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
-when it is created, or the load fails naming the chunk.
+when it is created, or the load fails naming the chunk. Page-locked memory is budgeted by the
+driver on some platforms (WDDM and WSL2 allow about half of RAM per process, shared with the
+pinned KV tiers): when registering a chunk fails for lack of it, the chunks already registered
+keep the DMA path and the experts in the rest of the arena stream through the staged path, with
+one notice at load.
+
+### `EXL3_MOE_CPU_PROMOTE` (default: `4`)
+
+Spare GPU expert slots per layer for promote-on-miss in `--moe_cpu_split` mode with the pinned
+arena (`EXL3_MOE_PINNED_ARENA=1`); `0` keeps the periodic swap sweep instead. Each decode step, a
+routed expert the CPU worker had to compute is copied from the arena into a free spare slot on a
+side stream, and once the copy has landed the placement map sends later routes to the GPU; the
+least-used resident that was not routed goes the other way into the worker slot the promotion
+freed, so the resident set follows the conversation token by token instead of once per sweep, and
+no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
+promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
+start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
+step's bookkeeping cost every 128 steps.
+
+Both dynamic modes save each layer's decayed expert selection counts to
+`~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
+directory and the expert count) every 4096 decode steps and on unload, and the next load of the same
+model permutes the experts hottest first from that profile, so the GPU slice starts with the frequent
+experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
+what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
+(an explicit stats file in the same per-layer format) takes precedence.
+
+### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
+
+Debug: after every landed transfer, read the expert back and compare it with the checkpoint (a
+promotion's GPU slot tensors; a demotion's packed arena bytes and aux copies). Synchronizes and
+reads the checkpoint per transfer, so it is for short runs.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
@@ -639,19 +727,16 @@ fp16 input of the down projection, as in the per-expert path). `EXL3_MOE_BATCH_R
 covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
 `EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
 
-### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
+### `EXL3_MOE_RECON_TILES` (default: `0`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
 
-Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
-fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
-the SM count the strided-batched kernel is much faster (PRO 6000, `k = 2048`: `n = 768` runs
-1.45x faster batched at `m = 1024` and 2.9x at `m = 256`, `n = 1792` breaks even at
-`m = 1024`), while above it the batched cuBLAS kernels are 10-15% slower than the single-GEMM
-ones, and the padded slabs cost traffic that grows with the rows. `EXL3_MOE_RECON_TILES` is
-that tile budget: an expert stays on the per-expert path once its narrowest projection
-(`min(intermediate, hidden)`) would span more tiles, i.e. above `TILES * 16384 / n_min` rows
-(1365 rows for `n = 768`, 512 for `n = 2048`). Measured at 8k tokens on a PRO 6000: lfm2.5
-(`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
-Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
+Tuning for the batched reconstruct tier. By default every expert above the fused kernel's row
+capacity joins the tier, up to the padded-row budget per group (`EXL3_MOE_RECON_ROWS`): the
+tier's one reconstruct and one library GEMM per projection over a slab beat the per-expert path
+(a reconstruct, three GEMMs and a gather and scatter per expert) at every row count, including
+the experts a large chunk piles thousands of rows onto, on both the full-rate and the half-rate
+fp32-accumulate GPUs. `EXL3_MOE_RECON_TILES` restores the earlier limit, a budget of output tiles
+(`m/128 * n/128`) above which an expert's GEMM was assumed to fill the GPU on its own and the
+expert stayed on the per-expert path; `0` batches
 every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
 knobs: experts per group; `EXL3_MOE_RECON_PAD`, the padded-to-real row ratio a group may reach
 before the planner starts a new one (groups fill largest expert first, so this splits only
@@ -679,14 +764,49 @@ so the default is only a safety net against a wedged worker; raise it on very sl
 ### `EXL3_MOE_CPU_PIN` (default: `1`)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
-SMT siblings last, instead of leaving placement to the OS scheduler. On an SMT host, unpinned
-placement is a real source of run-to-run throughput variance, two workers can land on the same
-physical core (contending for its execution resources) on one run and not the next; measured on
-a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s run to run,
-pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
-to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
-own balancing across other processes. Falls back to no pinning if the CPU topology can't be
-read.
+SMT siblings last, instead of leaving placement to the OS scheduler. Two workers sharing a
+physical core, or a worker sharing one with the host's threads, becomes the straggler at every
+per-phase barrier of a job. A floating pool depends on the scheduler keeping that layout apart
+on its own; that works on some hosts and loses a large share of decode throughput on others
+(hosts with small L3 domains, VM guests), while the pinned layout can only lose to whatever
+else lands on its cores, so pinning is the default on every platform. `0` lets the workers
+float, which can be worth testing on a host that also runs other work; the reserved host core
+(`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
+topology can't be read.
+
+### `EXL3_MOE_CPU_SPREAD` (default: `0`)
+
+Linux only. Set to `1` to order physical worker cores round-robin across L3 cache domains
+before assigning SMT siblings. With fewer workers than physical cores, this avoids placing
+the whole pool on the first one or two CCDs. It works with `-mct` / `EXL3_MOE_CPU_THREADS`
+and the existing worker pinning; the reserved host cores follow the same ordering. The
+default retains CPU-ID order. Unreadable L3 topology falls back to that default order.
+
+On a 24-core Threadripper 7960X, LFM2.5-8B split decode (`-mcs 16 -mcpa`) measured about
+240 tok/s with `EXL3_MOE_CPU_SPREAD=1 -mct 12`, versus 222–225 tok/s with the default 23
+workers and 232 tok/s with 12 workers in the default order. Full offload was approximately
+unchanged with the spread 12-worker pool. These are workload-specific measurements, not an
+automatic thread-count recommendation. This changes CPU affinity only, not NUMA memory
+placement; benchmark it with the actual model and allocation policy on multi-socket hosts.
+
+### `EXL3_MOE_HOST_CORES` (default: `1`)
+
+Physical cores kept free of worker threads and reserved for the host process. The pool runs one
+compute thread per physical core; the parent process (the thread driving the forward, CUDA's
+driver threads, an API server's executor threads) is otherwise free to land on a worker's logical
+processor, where a pinned worker cannot move away and a floating one is only moved after the
+damage, so it becomes the straggler at every per-phase barrier. The default worker count leaves
+this many cores free, and once the worker has started the host process is confined to them (both
+SMT siblings), whether or not the workers are pinned. If an explicit thread count
+covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
+shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
+(Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host
+unpinned, 30–36 tok/s with a reserved core. The placement is planned once per process, from the
+first worker started; workers spawned later (draft model, reload) restore the original mask before
+pinning. `0` disables the reservation and the pinning. Windows applies the mask process-wide
+(single processor group only; boxes with more than 64 logical processors are left unpinned with a
+notice); Linux pins every current thread, and later threads inherit it. Never fails a load: OS
+errors print a notice and leave the host unpinned.
 
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
@@ -842,6 +962,14 @@ Print a line (once per process) when the fp16 all-reduce wire first activates. A
 for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
 comparison is only meaningful if the fp16-wire run actually used it.
 
+### `EXL3_TP_REDUCE_MAX_ISA` (default: unset, auto-detect)
+
+`avx`, `avx2` or `avx512`: cap the CPU all-reduce of the native tensor-parallel backend at a
+lower instruction-set tier than the CPU supports, for exercising the lower tiers on a newer
+machine. The tiers compute the same sums (the AVX tier does its 16-bit moves on 128-bit lanes and
+its adds on 256-bit floats; the fp16 wire needs F16C on every tier). Plain AVX is the floor: a CPU
+without it must use the NCCL backend.
+
 ### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
 
 Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce
@@ -903,7 +1031,10 @@ supports it (CUDA 12.8 and later). Compression is applied to the finished images
 themselves are identical either way. `0` disables it, which may be needed to run a locally built
 extension on a driver that predates compressed images. `require` makes the build fail when nvcc
 does not offer the option instead of silently building uncompressed; the release wheels are built
-this way. Not used for ROCm builds.
+this way.
+
+On ROCm the device code objects are compressed with hipcc's `--offload-compress` (`0` disables it);
+the wheels carry one code object per RDNA family and would be several times larger without it.
 
 ### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
 

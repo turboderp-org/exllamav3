@@ -101,10 +101,14 @@ class ModuleRunner:
                 mod.unload()
                 g_tensor_cache.drop_all()
 
-    def rows(self, mod, states, capture=None, consume=None):
+    def rows(self, mod, states, capture=None, consume=None, ids=None):
+        """ids: the rows' token ids, passed as params["input_ids"] (PLE layers read the token
+        context from there; without it they run on a dummy all-zero history)"""
         outputs = []
         for r, state in enumerate(states):
             params = {} if capture is None else {"capture": capture}
+            if ids is not None:
+                params["input_ids"] = ids[r]
             x = mod.prepare_for_device(state.clone(), params)
             x = mod.forward(x, params)
             if consume is None:
@@ -329,6 +333,7 @@ def main(args):
         ids = list(get_test_tokens(tokenizer, total_rows, args.length).split(1))
     rows = ids[:args.rows]
     cap_states = ids[args.rows:] if args.shaped else None
+    cap_ids = cap_states
 
     mods = model.modules
     num_mods = len(mods)
@@ -354,7 +359,7 @@ def main(args):
         kld_sum = 0.0
         out_states = []
         for r, state in enumerate(states):
-            params = {}
+            params = {"input_ids": rows[r]}
             x = state.clone() if state.is_floating_point() else state
             for i in range(start_idx, num_mods):
                 mod = mods[i]
@@ -387,13 +392,13 @@ def main(args):
                 boundary[i] = states
                 with runner.loaded(i) as mod:
                     states = runner.rows(
-                        mod, states,
+                        mod, states, ids = rows,
                         consume=(lambda r, x: logits.append(x.half().to("cpu", copy=True)))
                         if i == num_mods - 1 else None,
                     )
             return boundary, logits
         for ids_row in rows:
-            params = {}
+            params = {"input_ids": ids_row}
             x = ids_row
             for i in range(num_mods):
                 mod = mods[i]
@@ -620,8 +625,10 @@ def main(args):
         is a dict (shared across rows). Resident mode only."""
         nonlocal cap_states
         new_states = []
-        for st in cap_states:
-            params = {} if capture is None else {"capture": capture}
+        for st, cap_row in zip(cap_states, cap_ids):
+            params = {"input_ids": cap_row}
+            if capture is not None:
+                params["capture"] = capture
             x = mods[top_idx].prepare_for_device(st, params)
             x = mods[top_idx].forward(x, params)
             # Retaining the final module's outputs would hold full-vocab logits for every
@@ -739,7 +746,7 @@ def main(args):
                         (None, mean KL) on the last module"""
                         scores = []
                         out = runner.rows(
-                            mod, states,
+                            mod, states, ids = rows,
                             consume = (lambda r, x: scores.append(row_kld(r, x))) if last_mod else None,
                         )
                         return (None, sum(scores) / len(scores)) if last_mod else (out, None)
@@ -747,7 +754,7 @@ def main(args):
                     shaping = {}
                     if need_cap:
                         capture = {} if spawn else None
-                        cap_states = runner.rows(mod, cap_states, capture = capture,
+                        cap_states = runner.rows(mod, cap_states, capture = capture, ids = cap_ids,
                                                  consume = (lambda r, x: None) if last_mod else None)
                         cap_idx += 1
                         if spawn:

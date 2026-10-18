@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 
 def find_nvcc(cuda_home: str | None = None) -> list[str] | None:
@@ -101,8 +102,14 @@ def hip_cflags(debug: bool = False) -> list[str]:
 
     -fgpu-flush-denormals-to-zero matches the fp32 flush-to-zero that --use_fast_math gives the CUDA build,
     which the deterministic kernels need to agree with it bit for bit (det_gemm.cuh).
+
+    The device code objects are stored compressed (--offload-compress, the counterpart of nvcc's
+    --compress-mode) unless EXLLAMA_EXT_COMPRESS=0: a wheel carrying every RDNA family would otherwise be
+    several times the size of a single-target build.
     """
     flags = ["-O3", "-Wno-register", "-DHIPBLAS_USE_HIP_HALF", "-fgpu-flush-denormals-to-zero"]
+    if os.environ.get("EXLLAMA_EXT_COMPRESS", "1") != "0":
+        flags += ["--offload-compress"]
     if debug:
         flags += ["-g"]
     return flags
@@ -122,11 +129,27 @@ def use_rocm_sdk_devel(cpp_extension) -> None:
     if cpp_extension.ROCM_HOME and has_libs(cpp_extension.ROCM_HOME):
         return
     spec = importlib.util.find_spec("_rocm_sdk_devel")
-    if spec is None or spec.origin is None:
-        return
-    devel = os.path.dirname(os.path.realpath(spec.origin))
-    if has_libs(devel):
-        cpp_extension.ROCM_HOME = devel
+    if spec is not None and spec.origin is not None:
+        devel = os.path.dirname(os.path.realpath(spec.origin))
+        if has_libs(devel):
+            cpp_extension.ROCM_HOME = devel
+            return
+    # Current SDK wheels ship their development tree as an archive. The SDK CLI expands it
+    # and returns its root; the expanded package name can vary by SDK version and platform.
+    # The expansion is a one-time write of the whole tree into site-packages, hence the notice;
+    # a failing CLI (unwritable site-packages, a broken SDK install) leaves torch's root in
+    # place, and the build then reports the missing headers itself
+    if importlib.util.find_spec("rocm_sdk_devel") is not None:
+        print(" -- Locating the ROCm SDK development files (expanding them on first use)", flush = True)
+        try:
+            devel = subprocess.check_output(
+                [sys.executable, "-m", "rocm_sdk", "path", "--root"], text = True
+            ).strip()
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f" !! ROCm SDK development files not found ({e}); run `rocm-sdk init` or set ROCM_HOME", flush = True)
+            return
+        if has_libs(devel):
+            cpp_extension.ROCM_HOME = devel
 
 
 def hip_compiler_wrapper() -> str | None:

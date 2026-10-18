@@ -111,7 +111,13 @@ class NGramEmbedding(Module):
         self.layer_multipliers = get(names["multipliers"]).long().contiguous()
         bias = get(names["bias"], optional = True) if "bias" in names else None
         self.head_bias = bias.half().contiguous().to(self.device) if bias is not None else None
-        assert self.head_offsets.shape[0] == self.num_heads
+        assert self.head_offsets.shape[0] == self.num_heads, \
+            f"{self.key}: head_offsets holds {self.head_offsets.shape[0]} rows for {self.num_heads} heads"
+        # The dequant kernel indexes the bias by the per-row head id, which is bounded by the head
+        # count the config implies; the tensor's own row count has to match or a malformed
+        # checkpoint reads past it (issue #525)
+        assert self.head_bias is None or self.head_bias.shape[0] == self.num_heads, \
+            f"{self.key}: head_bias holds {self.head_bias.shape[0]} rows for {self.num_heads} heads"
         # These were buffered reads of the table file. On Windows a buffered file object (even a
         # closed one, for a few seconds) throttles the unbuffered row gathers on the same file, so
         # release the loader's handle now rather than at the end of the load

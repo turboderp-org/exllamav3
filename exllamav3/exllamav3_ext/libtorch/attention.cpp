@@ -697,7 +697,14 @@ void BC_Attention::run_gr
                 graph->record_param(s.k_qsa_fewq->handle(), GP_end, 0);
             }
         }
-        dsa_topk_gr(s.qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
+        // Eager calls scan only the freshly scored [0, t_scan): the static's tail can hold
+        // scores from an earlier, longer sequence. Graphs patch the scan width per replay
+        const at::Tensor qsa_scores = graph ? s.qsa_scores : s.qsa_scores.narrow(1, 0, t_scan);
+        // See BC_MLAttention::run_gr: the eager pass has to allocate the split top-k workspace the captured
+        // full-width scan will use
+        if (!graph)
+            dsa_topk_prepare(s.qsa_scores, (int) s.qsa_pool_idx.size(1));
+        dsa_topk_gr(qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
         {
             std::vector<void*> args =
             {
@@ -870,8 +877,9 @@ void BC_Attention::run
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;
@@ -880,9 +888,9 @@ void BC_Attention::run
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
         s.runs = 2;
     }
 

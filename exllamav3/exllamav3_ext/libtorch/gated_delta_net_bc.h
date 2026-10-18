@@ -127,7 +127,9 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("norm"),
     py::arg("beta_scale")
 )
-.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure)
+.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure,
+    py::arg("bsz"), py::arg("seqlen"), py::arg("history"), py::arg("stage_key") = 0)
+.def("set_stage_key", &BC_GatedDeltaNetSplit::set_stage_key)
 .def("configure_slot_kda", &BC_GatedDeltaNetSplit::configure_slot_kda,
     py::arg("bsz"),
     py::arg("seqlen"),
@@ -164,7 +166,9 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("z_xh"),
     py::arg("o_xh")
 )
-.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN)
+.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN,
+    py::arg("x"), py::arg("y"), py::arg("conv_state"), py::arg("recurrent_state"), py::arg("slots"),
+    py::arg("slots_scan"), py::arg("history"), py::arg("slots_in") = py::none())
 .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
     py::arg("ptrs_trellis"),
     py::arg("ptrs_suh"),
@@ -216,7 +220,9 @@ py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
     py::arg("padded_out"),
     py::arg("dt_first") = 0
 )
-.def("needs_configure", &BC_Mamba2::needs_configure)
+.def("needs_configure", &BC_Mamba2::needs_configure,
+    py::arg("bsz"), py::arg("seqlen"), py::arg("history"), py::arg("stage_key") = 0)
+.def("set_stage_key", &BC_Mamba2::set_stage_key)
 .def("configure_slot", &BC_Mamba2::configure_slot,
     py::arg("bsz"),
     py::arg("seqlen"),
@@ -234,4 +240,6 @@ py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
     py::arg("in_xh"),
     py::arg("o_xh")
 )
-.def("run_bszN", &BC_Mamba2::run_bszN);
+.def("run_bszN", &BC_Mamba2::run_bszN,
+    py::arg("x"), py::arg("y"), py::arg("conv_state"), py::arg("recurrent_state"), py::arg("slots"),
+    py::arg("slots_scan"), py::arg("history"), py::arg("slots_in") = py::none());

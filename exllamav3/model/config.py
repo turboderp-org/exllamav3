@@ -47,8 +47,13 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Pinned expert arena for the CPU worker: the worker's expert weights live in
+        # shared chunks the parent maps and page-locks, so streamed prefill DMAs expert blocks
+        # straight out of the arena and the per-layer split can promote experts into spare GPU
+        # slots on the fly (see moe_cpu_host.MoeCpuTuning). EXL3_MOE_PINNED_ARENA is the default
+        self.moe_cpu_pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
         self.moe_cpu_component = "text"
-        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
+        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)
         self.moe_cpu_threads = None
         self.draft_moe_cpu_threads = None
@@ -102,6 +107,7 @@ class Config(ABC):
         directory: str,
         model_classes: dict,
         layer_map: list[int] | str | None = None,
+        config_key: str | None = None,
         **kwargs,
     ):
         """
@@ -139,6 +145,16 @@ class Config(ABC):
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
 
+        # Some multimodal wrappers keep the language model's HF config in a named sub-dict.
+        # The wrapper architecture is still checked above, while architecture-specific parsers
+        # can read model dimensions and layer layouts from the nested language-model config.
+        if config_key is not None:
+            assert config_key in self.config_dict, \
+                f"Missing {config_key!r} in {self.config_filename}"
+            # Keep wrapper-level token IDs and shared generation settings available while
+            # using the nested config as the source of language-model dimensions.
+            self.config_dict = {**self.config_dict[config_key], **self.config_dict}
+
         # Collect all .safetensors files in directory
         self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
 
@@ -146,6 +162,8 @@ class Config(ABC):
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
         self.eos_token_id = self.read_cfg([int, list], ["eos_token_id", "text_config->eos_token_id"], None)
         self.pad_token_id = self.read_cfg(int, ["pad_token_id", "text_config->pad_token_id"], None)
+        # Placeholder token a multimodal prompt carries in place of each image (older configs: image_token_index)
+        self.image_token_id = self.read_cfg(int, ["image_token_id", "image_token_index"], None)
         self.vocab_size = self.read_cfg(int, ["vocab_size", "text_config->vocab_size"], None)
         if isinstance(self.eos_token_id, list):
             self.eos_token_id_list = self.eos_token_id

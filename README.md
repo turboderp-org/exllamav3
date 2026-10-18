@@ -183,57 +183,59 @@ python examples/chat.py -h
 
 ## Architecture support
 
-| Model family                                     | HF architecture | Multimodal | Notes |
-|--------------------------------------------------| --- | :---: | --- |
-| **AFM**                                          | `ArceeForCausalLM` |  |  |
-| **AfMoE**                                        | `AfmoeForCausalLM` |  |  |
-| **Apertus**                                      | `ApertursForCausalLM` |  |  |
-| **Command-R** etc.                               | `CohereForCausalLM` |  |  |
-| **Command-A**, **Command-R+** etc.               | `Cohere2ForCausalLM` |  |  |
-| **DeciLM**, **Nemotron**                         | `DeciLMForCausalLM` |  |  |
-| **Deepseek V3**                                  | `DeepseekV3ForCausalLM` |  |  |
-| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` | ✓ |  |
-| **dots.llm1**                                    | `Dots1ForCausalLM` |  | |
-| **ERNIE 4.5**                                    | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM` |  |  |
-| **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
-| **Gemma 2**                                      | `Gemma2ForCausalLM` |  |  |
-| **Gemma 3**                                      | `Gemma3ForCausalLM`<br>`Gemma3ForConditionalGeneration` | ✓ |  |
-| **Gemma 4**                                      | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration` | ✓ | E2B/E4B unsupported |
-| **GLM 4**, **GLM 4.6**, etc.                     | `Glm4ForCausalLM`<br>`Glm4MoeForCausalLM` |  |  |
-| **GLM 4.1V**, **GLM 4.5V**                       | `Glm4vForConditionalGeneration`<br>`Glm4vMoeForConditionalGeneration` | ✓ |  |
-| **GLM 4.7 Flash**                                | `Glm4MoeLiteForCausalLM` |  |  |
-| **GLM 5.2**                                      | `GlmMoeDsaForCausalLM` |  |  |
-| **GLM 5.3-Flash**                                | `Glm5NextForConditionalGeneration` | ✓ |  |
-| **GPT-OSS**                                      | `GptOssForCausalLM` |  |  |
-| **HyperCLOVAX**                                  | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM` | ✓ |  |
-| **Hy3**                                          | `HYV3ForCausalLM` |  |  |
-| **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
-| **Kimi Linear**                                  | `KimiLinearForCausalLM` |  |  |
-| **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
-| **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
-| **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
-| **MiMo-RL**                                      | `MiMoForCausalLM` |  |  |
-| **MiMo-V2.6-Flash**                              | `MiMoV2ForCausalLM` | ✓ | no audio |
-| **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
-| **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
-| **Mixtral**                                      | `MixtralForCausalLM` |  |  |
-| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM` |  |  |
-| **Olmo 3.1**                                     | `Olmo3ForCausalLM` |  |  |
-| **Olmo-Hybrid**                                  | `OlmoHybridForCausalLM` |  |  |
-| **Phi3**, **Phi4**                               | `Phi3ForCausalLM` |  |  |
-| **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL**        | `Qwen2ForCausalLM`<br>`Qwen2_5_VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3**                                       | `Qwen3ForCausalLM`<br>`Qwen3MoeForCausalLM` |  |  |
-| **Qwen 3-Next**                                  | `Qwen3NextForCausalLM` |  |  |
-| **Qwen 3-VL**                                    | `Qwen3VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3-VL MoE**                                | `Qwen3VLMoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5**                                     | `Qwen3_5ForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5 MoE**                                 | `Qwen3_5MoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.8-Flash-Next**                          | `Qwen4ExpForConditionalGeneration` | ✓ |  |
-| **Seed-OSS**                                     | `SeedOssForCausalLM` |  |  |
-| **SmolLM**                                       | `SmolLM3ForCausalLM` |  |  |
-| **SolarOpen**                                    | `SolarOpenForCausalLM` |  |  |
-| **Step 3.5 Flash**                               | `Step3p5ForCausalLM` |  |  |
-| **Step 3.7 Flash**                               | `Step3p7ForConditionalGeneration` | ✓ |  |
+| Model family                                      | HF architecture                                                               | Multimodal | Notes                 |
+|---------------------------------------------------|-------------------------------------------------------------------------------|:----------:|-----------------------|
+| **AFM**                                           | `ArceeForCausalLM`                                                            |            |                       |
+| **AfMoE**                                         | `AfmoeForCausalLM`                                                            |            |                       |
+| **Apertus**                                       | `ApertursForCausalLM`                                                         |            |                       |
+| **Command-R** etc.                                | `CohereForCausalLM`                                                           |            |                       |
+| **Command-A**, **Command-R+** etc.                | `Cohere2ForCausalLM`                                                          |            |                       |
+| **DeciLM**, **Nemotron**                          | `DeciLMForCausalLM`                                                           |            |                       |
+| **Deepseek V3**                                   | `DeepseekV3ForCausalLM`                                                       |            |                       |
+| **Deepseek V4**                                   | `DeepseekV4ForCausalLM`                                                       |     ✓     |                       |
+| **dots.llm1**                                     | `Dots1ForCausalLM`                                                            |            |                       |
+| **ERNIE 4.5**                                     | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM`                           |            |                       |
+| **EXAONE 4.0**                                    | `Exaone4ForCausalLM`                                                          |            |                       |
+| **Gemma 2**                                       | `Gemma2ForCausalLM`                                                           |            |                       |
+| **Gemma 3**                                       | `Gemma3ForCausalLM`<br>`Gemma3ForConditionalGeneration`                       |     ✓     |                       |
+| **Gemma 4**                                       | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration`   |     ✓     | E2B/E4B unsupported   |
+| **GLM 4**, **GLM 4.6**, etc.                      | `Glm4ForCausalLM`<br>`Glm4MoeForCausalLM`                                     |            |                       |
+| **GLM 4.1V**, **GLM 4.5V**                        | `Glm4vForConditionalGeneration`<br>`Glm4vMoeForConditionalGeneration`         |     ✓     |                       |
+| **GLM 4.7 Flash**                                 | `Glm4MoeLiteForCausalLM`                                                      |            |                       |
+| **GLM 5.2**                                       | `GlmMoeDsaForCausalLM`                                                        |            |                       |
+| **GLM 5.3-Flash**                                 | `Glm5NextForConditionalGeneration`                                            |     ✓     |                       |
+| **GPT-OSS**                                       | `GptOssForCausalLM`                                                           |            |                       |
+| **HyperCLOVAX**                                   | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM`                          |     ✓     |                       |
+| **Hy3**                                           | `HYV3ForCausalLM`                                                             |            |                       |
+| **IQuest-Coder**                                  | `IQuestCoderForCausalLM`                                                      |            |                       |
+| **Kimi Linear**                                   | `KimiLinearForCausalLM`                                                       |            |                       |
+| **Ling 3.x**                                      | `BailingMoeV3ForCausalLM`                                                     |            |                       |
+| **Laguna 2.1**                                    | `LagunaForCausalLM`                                                           |            |                       |
+| **LFM 2.5**, **LFM2.5-VL**                        | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM`<br>`Lfm2VlForConditionalGeneration` |     ✓     |                       |
+| **Llama 1/2/3**,**3.1-Nemotron** etc.             | `LlamaForCausalLM`                                                            |            |                       |
+| **MiMo-RL**                                       | `MiMoForCausalLM`                                                             |            |                       |
+| **MiMo-V2.6-Flash**                               | `MiMoV2ForCausalLM`                                                           |     ✓     | no audio              |
+| **MiniMax-M2**                                    | `MiniMaxM2ForCausalLM`                                                        |            |                       |
+| **Mistral**, **Ministral 3**, **Mistral-4** etc.  | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration`                    |     ✓     |                       |
+| **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
+| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
+| **Nemotron 3.5 Bolt**                             | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
+| **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
+| **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |
+| **Phi3**, **Phi4**                                | `Phi3ForCausalLM`                                                             |            |                       |
+| **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL**         | `Qwen2ForCausalLM`<br>`Qwen2_5_VLForConditionalGeneration`                    |     ✓     |                       |
+| **Qwen 3**                                        | `Qwen3ForCausalLM`<br>`Qwen3MoeForCausalLM`                                   |            |                       |
+| **Qwen 3-Next**                                   | `Qwen3NextForCausalLM`                                                        |            |                       |
+| **Qwen 3-VL**                                     | `Qwen3VLForConditionalGeneration`                                             |     ✓     |                       |
+| **Qwen 3-VL MoE**                                 | `Qwen3VLMoeForConditionalGeneration`                                          |     ✓     |                       |
+| **Qwen 3.5**                                      | `Qwen3_5ForConditionalGeneration`                                             |     ✓     |                       |
+| **Qwen 3.5 MoE**                                  | `Qwen3_5MoeForConditionalGeneration`                                          |     ✓     |                       |
+| **Qwen 3.8-Flash-Next**                           | `Qwen4ExpForConditionalGeneration`                                            |     ✓     |                       |
+| **Seed-OSS**                                      | `SeedOssForCausalLM`                                                          |            |                       |
+| **SmolLM**                                        | `SmolLM3ForCausalLM`                                                          |            |                       |
+| **SolarOpen**                                     | `SolarOpenForCausalLM`                                                        |            |                       |
+| **Step 3.5 Flash**                                | `Step3p5ForCausalLM`                                                          |            |                       |
+| **Step 3.7 Flash**                                | `Step3p7ForConditionalGeneration`                                             |     ✓     |                       |
 
 Always adding more, stay tuned.
 

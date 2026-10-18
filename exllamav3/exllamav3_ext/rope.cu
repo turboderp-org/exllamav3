@@ -73,14 +73,16 @@ void rope_kernel
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * attn_factor;
-            cos = __cosf(fr * pf) * attn_factor;
+            sincos_accurate(fr * pf, &sin, &cos);
+            sin *= attn_factor;
+            cos *= attn_factor;
         }
         else
         {
             float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * attn_factor;
-            cos = __cosf(fr) * attn_factor;
+            sincos_accurate(fr, &sin, &cos);
+            sin *= attn_factor;
+            cos *= attn_factor;
         }
     };
 
@@ -330,13 +332,20 @@ void rope_gr
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE_OPT(k, kHalf);
+    TORCH_CHECK_DIM(q, 4);
+    TORCH_CHECK_DIM_OPT(k, 4);
+    TORCH_CHECK(k.has_value() == out_k.has_value(), "rope: k and out_k must be given together");
+
     int bsz = q.size(0);
     int seq_len = q.size(1);
     int num_heads_q = q.size(2);
     int q_head_stride = q.stride(2);
     int k_head_stride = k.has_value() ? (int) k.value().stride(2) : 0;
     TORCH_CHECK(q.stride(3) == 1, "rope: q innermost dim must be dense");
-    TORCH_CHECK(out_q.strides() == q.strides(), "rope: out_q must share q's layout");
+    TORCH_CHECK(out_q.dtype() == q.dtype() && out_q.sizes() == q.sizes() && out_q.strides() == q.strides(),
+                "rope: out_q must share q's dtype, shape and layout");
     int num_heads_k = 0;
     int head_dim = q.size(3);
     int partial_head_dim = inv_freq.size(-1) * 2;
@@ -345,31 +354,37 @@ void rope_gr
     TORCH_CHECK(rotate_dims == 1 || head_dim == partial_head_dim * rotate_dims, "rotate_dims is inconsistent with inv_freq and head_dim");
     TORCH_CHECK(rotate_offset >= 0 && rotate_offset + partial_head_dim * rotate_dims <= head_dim,
                 "rotate_offset out of range");
+    TORCH_CHECK(head_dim % 2 == 0, "rope: head_dim must be even");
+    // One thread per pair, one head per thread row, block capped at MAX_NUM_THREADS threads
+    TORCH_CHECK(head_dim <= 2 * MAX_NUM_THREADS, "rope: head_dim must be at most 2048");
+    TORCH_CHECK(rope_mode == ROPESTYLE_GPTJ || rope_mode == ROPESTYLE_NEOX, "rope: invalid rope_mode");
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
     const half* k_ptr = (const half*) OPTPTR(k);
     half* out_k_ptr = (half*) OPTPTR(out_k);
-    TORCH_CHECK_DTYPE(q, kHalf);
-    TORCH_CHECK_DTYPE_OPT(k, kHalf);
-    TORCH_CHECK_DIM(q, 4);
-    TORCH_CHECK_DIM_OPT(k, 4);
 
-    if (k_ptr)
+    if (k.has_value())
     {
         num_heads_k = k.value().size(2);
         TORCH_CHECK(k.value().size(0) == bsz, "k is incorrect shape");
         TORCH_CHECK(k.value().size(1) == seq_len, "k is incorrect shape");
         TORCH_CHECK(k.value().size(3) == head_dim, "k is incorrect shape");
+        TORCH_CHECK(k.value().stride(3) == 1, "rope: k innermost dim must be dense");
+        TORCH_CHECK(out_k.value().dtype() == k.value().dtype() && out_k.value().sizes() == k.value().sizes() &&
+                    out_k.value().strides() == k.value().strides(), "rope: out_k must share k's dtype, shape and layout");
     }
 
     const float* inv_freq_ptr = (const float*) inv_freq.data_ptr();
     TORCH_CHECK_DTYPE(inv_freq, kFloat);
+    TORCH_CHECK(inv_freq.is_contiguous(), "rope: inv_freq must be contiguous");
     bool inv_freq_table = false;
     if (inv_freq.dim() > 1)
     {
         TORCH_CHECK(inv_freq.dim() >= 2 && inv_freq.dim() <= 3, "inv_freq table must be 2-D or 3-D");
         // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
+        // Batch row b reads table b: a 2-D table is a single batch row
+        TORCH_CHECK(bsz <= (inv_freq.dim() == 3 ? inv_freq.size(0) : 1), "rope: inv_freq table has fewer batch rows than q");
         inv_freq_table = true;
         inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
     }
@@ -401,25 +416,22 @@ void rope_gr
     void* k_norm_ptr = (void*) OPTPTR(k_norm);
     bool norm_fp16 = true;
     bool norm_bf16 = false;
-    if (q_norm_ptr)
+    // The kernel normalizes k heads only when q heads are, and then reads k_norm unguarded
+    TORCH_CHECK(q_norm.has_value() || !k_norm.has_value(), "rope: k_norm requires q_norm");
+    TORCH_CHECK(!q_norm.has_value() || !k.has_value() || k_norm.has_value(), "rope: q_norm with k requires k_norm");
+    if (q_norm.has_value())
     {
+        TORCH_CHECK(head_dim > 0, "rope: q/k norm over an empty head_dim");
         TORCH_CHECK_DIM(q_norm.value(), 1);
         TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
         norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
         norm_fp16 = q_norm.value().dtype() == at::kHalf;
-        if (k_norm_ptr)
+        if (k_norm.has_value())
+        {
             TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
+            TORCH_CHECK(k_norm.value().dim() == 1 && k_norm.value().size(0) == head_dim, "k_norm is incorrect size");
+        }
     }
-
-    int warps = CEIL_DIVIDE(head_dim / 2, 32);
-    int thr = warps * 32;
-    int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
-    // Enough z-blocks that each covers one head-group iteration; scale down when the
-    // token-level grid already fills the device
-    int head_groups = CEIL_DIVIDE(num_heads_q + num_heads_k, parallel_heads);
-    if (seq_len * bsz >= 32) head_groups = 1;
-    dim3 blocks(seq_len, bsz, head_groups);
-    dim3 threads(thr, parallel_heads);
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \
                  seq_len, num_heads_q, num_heads_k, head_dim, q_head_stride, k_head_stride, partial_head_dim, position, positions_ptr, \
@@ -445,6 +457,19 @@ void rope_gr
         else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
     }
     TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
+
+    // Nothing to rotate: no tokens, no heads or zero-width heads
+    if (!bsz || !seq_len || !(num_heads_q + num_heads_k) || !head_dim) return;
+
+    int warps = CEIL_DIVIDE(head_dim / 2, 32);
+    int thr = warps * 32;
+    int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
+    // Enough z-blocks that each covers one head-group iteration; scale down when the
+    // token-level grid already fills the device
+    int head_groups = CEIL_DIVIDE(num_heads_q + num_heads_k, parallel_heads);
+    if (seq_len * bsz >= 32) head_groups = 1;
+    dim3 blocks(seq_len, bsz, head_groups);
+    dim3 threads(thr, parallel_heads);
 
     void* kernel_args[] = { ARGPTRS };
     cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
@@ -504,6 +529,18 @@ int64_t gen_mrope_pos_ids
     const std::vector<std::tuple<int64_t, int64_t, int64_t>> &grids
 )
 {
+    TORCH_CHECK(merge_size > 0, "gen_mrope_pos_ids: merge_size must be positive");
+    TORCH_CHECK(grids.size() == spans.size(), "gen_mrope_pos_ids: spans and grids must pair up");
+    for (size_t j = 0; j < spans.size(); ++j)
+    {
+        // A non-empty span takes its positions from the grid, which then can't be empty
+        bool empty_span = std::get<1>(spans[j]) <= std::get<0>(spans[j]);
+        TORCH_CHECK(empty_span || (std::get<0>(grids[j]) > 0 &&
+                                   std::get<1>(grids[j]) / merge_size > 0 &&
+                                   std::get<2>(grids[j]) / merge_size > 0),
+                    "gen_mrope_pos_ids: empty grid for a non-empty embedding span");
+    }
+
     int max_length = mrope_pos_ids.size(1);
     int in_length = ids.size(0);
 

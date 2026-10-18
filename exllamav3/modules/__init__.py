@@ -18,4 +18,5 @@ from .hyperconnections import HyperConnection, ExpandStreams, HyperHead, GatedRe
 from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv
 from .pos_embedding import PosEmbedding
+from .pixel_unshuffle import PixelUnshuffle
 from .gather import OutputGather

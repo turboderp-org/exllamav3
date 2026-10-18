@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <ATen/Tensor.h>
+#include <c10/util/Optional.h>
 
 // Persistent-worker handoff for CPU-offloaded MoE experts (pattern follows the native TP
 // backend's CPU-assisted all-reduce: pinned shared-memory flags, GPU-side publish/wait kernels,
@@ -17,9 +19,9 @@
 //     u32 jobs_tail     @ 256  parent producer index (job ring)
 //     u32 jobs_head     @ 320  child consumer index
 //     MoeJob ring       @ 384  MOE_JOB_RING entries
-//     u32 data_ready[]  @ SLOT_FLAGS_OFFSET       per slot, stride 64: GPU publishes job seq
-//     u32 done[]        @ SLOT_FLAGS_OFFSET + 64*MOE_MAX_SLOTS, stride 64: child publishes seq
-//     u32 consumed[]    @ SLOT_FLAGS_OFFSET + 2*64*MOE_MAX_SLOTS, stride 64: the collecting
+//     flag data_ready[] @ SLOT_FLAGS_OFFSET       per slot, stride 64: GPU publishes job seq
+//     flag done[]       @ SLOT_FLAGS_OFFSET + 64*MOE_MAX_SLOTS, stride 64: child publishes seq
+//     flag consumed[]   @ SLOT_FLAGS_OFFSET + 2*64*MOE_MAX_SLOTS, stride 64: the collecting
 //                         device's stream publishes seq after reading the slot output back.
 //                         Slot reuse waits on this, not done: with offloaded layers spread
 //                         over multiple GPUs, the next tenant's issue runs on a different
@@ -34,6 +36,20 @@
 // memcpys and the data_ready publish for that seq, so the child always sees the descriptor
 // before it can see the data flag. Sequence numbers increase monotonically from 1; slot reuse is
 // safe because the GPU stream serializes on the wait kernel of the oldest outstanding job.
+//
+// Flag width: the GPU waits for a flag to reach a sequence number with a stream memory operation.
+// CUDA's 32-bit wait compares cyclically ((int32_t)(*addr - value) >= 0), so 32-bit flags may wrap.
+// HIP's compares as plain unsigned >=, which a wrapped 32-bit flag would satisfy early, so ROCm
+// builds use 64-bit flags that never wrap. Either way each flag owns a 64-byte line, and the job
+// descriptor carries the sequence number as two 32-bit halves. CPU-side waits compare the low
+// halves cyclically, which is exact for any width.
+#if defined(USE_ROCM)
+#define MOE_FLAG_BITS 64
+typedef uint64_t moe_flag_t;
+#else
+#define MOE_FLAG_BITS 32
+typedef uint32_t moe_flag_t;
+#endif
 
 #define MOE_JOB_RING 256
 #define MOE_MAX_SLOTS 8
@@ -68,7 +84,7 @@ struct MoeJob
     uint32_t kind;
     uint32_t prev_seq;   // stage: pinned_free value to wait for before overwriting the slot
     uint32_t experts[MOE_JOB_MAX_EXPERTS];
-    uint32_t _pad;
+    uint32_t seq_hi;     // high 32 bits of seq (published in full on 64-bit flags)
 };
 
 #define MOE_CTRL_JOBS_OFFSET 384
@@ -93,6 +109,23 @@ struct MoeJob
 // only -- these ops are only ever issued from the process enqueueing the GPU work).
 void exl3_moe_flag_write(uintptr_t flag, int64_t value);
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag);
+
+// Fused split-path handoff (see moe_handoff.cu): the job descriptor, the slot's consumed wait,
+// the issue kernel and the data_ready flag in one call; the done wait, the collect kernel and the
+// consumed flag in the other
+bool exl3_moe_split_issue_fused
+(
+    uintptr_t shm_base, int64_t seq, int64_t layer, int64_t rows, int64_t topk, int64_t slot, int64_t prev_seq,
+    at::Tensor sel, const c10::optional<at::Tensor>& map, const c10::optional<at::Tensor>& hist,
+    const at::Tensor& y, const at::Tensor& w, int64_t h_sel_ptr, int64_t h_x_ptr, int64_t h_w_ptr,
+    at::Tensor dev_count, int64_t hi, int64_t first_cpu,
+    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag
+);
+void exl3_moe_split_collect_fused
+(
+    at::Tensor final_out, int64_t h_out_ptr, const at::Tensor& dev_count, int64_t slot, int64_t ho,
+    uintptr_t done_flag, int64_t seq, uintptr_t consumed_flag, uintptr_t abort_flag
+);
 void exl3_moe_cpu_set_memops(bool enabled);
 
 // Child worker loop: consumes jobs until quit is set. Layer indices in job descriptors refer to

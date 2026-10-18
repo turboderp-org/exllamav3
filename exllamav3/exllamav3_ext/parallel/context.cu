@@ -1,3 +1,4 @@
+#include <cstring>
 #include <cuda_fp16.h>
 #include "context.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -10,12 +11,13 @@ void pg_init_context(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
 
     ctx_ptr->sync_timeout = 0;
-    ctx_ptr->barrier_epoch = 1;
+    memset(ctx_ptr->sync_timeout_name, 0, sizeof(ctx_ptr->sync_timeout_name));
     ctx_ptr->broadcast_ll_epoch = 1;
 
     for (int i = 0; i < MAX_DEVICES; ++i)
     {
-        ctx_ptr->barrier_epoch_device[i] = 0;
+        ctx_ptr->barrier_arrive[i] = 0;
+        ctx_ptr->barrier_release[i] = 0;
         ctx_ptr->broadcast_stage_device[i] = 0;
         ctx_ptr->broadcast_ll_sequence_device[i] = 0;
         ctx_ptr->reduce_stage_produced[i] = 0;
@@ -41,6 +43,12 @@ void pg_check_timeout(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
     if (ctx_ptr->sync_timeout)
     {
-        TORCH_CHECK(false, "Synchronization timeout");
+        #if defined(USE_ROCM)
+            const char* name = ctx_ptr->sync_timeout_name;
+            TORCH_CHECK(false, "Synchronization timeout in kernel: ",
+                        name[0] ? name : "<unknown>");
+        #else
+            TORCH_CHECK(false, "Synchronization timeout");
+        #endif
     }
 }

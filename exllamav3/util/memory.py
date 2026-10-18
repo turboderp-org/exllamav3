@@ -647,9 +647,10 @@ def _how_to_raise_memlock() -> str:
 def prepare_host_lock(nbytes: int, what: str):
     """Before loading data that will be mlock()ed: make sure the process may lock another `nbytes`, raising the soft
     RLIMIT_MEMLOCK up to the hard limit if needed, so a refusal costs nothing instead of a whole load"""
-    import os, resource
+    import os
     if os.name == "nt":
         raise RuntimeError(f"{what}: locking host memory is not supported on Windows")
+    import resource
     try:
         with open("/proc/self/status") as f:
             for line in f:

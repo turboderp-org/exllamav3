@@ -154,9 +154,15 @@ class Linear(Module):
         ss = scale_inv.shape
         if len(ss) > 0:
             assert len(ws) == len(ss) == 2
-            assert all(w == s * 128 for w, s in zip(ws, ss))
-            weight = weight.view(ss[0], 128, ss[1], 128)
-            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            assert all(s == (w + 127) // 128 for w, s in zip(ws, ss)), \
+                f"fp8 scale grid {tuple(ss)} does not cover a {tuple(ws)} weight in 128x128 blocks"
+            if all(w == s * 128 for w, s in zip(ws, ss)):
+                weight = weight.view(ss[0], 128, ss[1], 128)
+                scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            else:
+                # A dimension that is not a multiple of 128 ends in a partial block (Ling's MTP
+                # head gate: 64 rows); expand the grid over whole blocks and crop
+                scale_inv = scale_inv.repeat_interleave(128, 0)[:ws[0]].repeat_interleave(128, 1)[:, :ws[1]]
         weight = weight.float() * scale_inv
         return weight.view(ws).half()
 
@@ -194,7 +200,12 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
-                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
+                weight = []
+                for k in key:
+                    # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
+                    w = self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True)
+                    scale_inv = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    weight.append(self.apply_fp8_scales_inv_(w, scale_inv) if scale_inv is not None else w)
                 bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None

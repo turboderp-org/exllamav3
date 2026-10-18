@@ -1,13 +1,28 @@
 from __future__ import annotations
 import torch
 import numpy as np
-from multiprocessing import shared_memory
+from multiprocessing import shared_memory, resource_tracker
+import sys
 import uuid
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
 from ..util.shm import check_shm_capacity
 
 DEFAULT_BUFFER_SIZE = 2 * 1024 ** 3
 MAX_CACHE_PER_PROCESS = 4 * 1024**3
+
+def _open_shm(name: str) -> shared_memory.SharedMemory:
+    """
+    Open an existing shared-memory segment by name without registering it with this process's resource
+    tracker: the creating process owns the segment and unlinks it, so a consumer handle must not count as a
+    leak when the consumer exits (Python 3.13 has a flag for this; earlier versions register in the
+    constructor and have to be told to forget)
+    """
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(name = name, track = False)
+    shm = shared_memory.SharedMemory(name = name)
+    resource_tracker.unregister(shm._name, "shared_memory")
+    return shm
+
 
 _torch_dtypes = {
     "torch.uint8": torch.uint8,
@@ -64,6 +79,8 @@ class SMProducer:
         self.buf = np.ndarray((self.buffer_size,), dtype = np.uint8, buffer = self.shm.buf)
         self.buf_is_pinned = False
         self.next_offset = 0
+        # Segments created for tensors that did not fit in the arena, alive until the next clear()
+        self.overflow: list[shared_memory.SharedMemory] = []
 
         # Pre-touch buffer to avoid page faults later
         self.buf[: self.buffer_size: 4096] = 0
@@ -86,7 +103,18 @@ class SMProducer:
         Copy a tensor into shared memory and return a compact import descriptor.
 
         Small metadata describes whether the payload is absent, already cached by the consumer, stored in this
-        arena at a byte offset, or exported through torch's slower share_memory_ fallback when the arena is full.
+        arena at a byte offset, or stored in an overflow segment created for it because the arena is full.
+
+        There is deliberately no fallback to torch's own storage sharing (tensor.share_memory_() pickled over the
+        pipe). torch's file_system strategy keeps a refcount inside the segment that is balanced per pickle: the
+        sender increfs once when it pickles, each receiver decrefs once when it rebuilds, and each receiver's
+        close() decrements again. A command pickled once and sent to several ranks therefore loses a reference
+        per extra rank, and the segment is unlinked as soon as two ranks have finished with it, while the main
+        process still owns the tensor and ranks that are behind (one is mid-decode while a prefill arrives) have
+        not opened it yet: "unable to open shared memory object ... No such file or directory" in every late
+        worker (issue #530, image embeddings larger than the arena). Overflow segments are owned by this producer
+        like the arena is, and released by clear() once the forward's acks are in, so a rank can be arbitrarily
+        late within a forward and still find its data.
         """
 
         # None tensor
@@ -99,56 +127,69 @@ class SMProducer:
         nbytes = tensor.element_size() * tensor.numel()
         nbytes_align = (nbytes + 127) // 128 * 128
 
-        # Fall back on slow sharing if buffer too small
-        if self.next_offset + nbytes_align >= self.buffer_size:
-            tensor.share_memory_()
+        # Cache: a tensor the consumers already hold is sent by reference only
+        if nbytes > MAX_CACHE_PER_PROCESS:
+            cache_id = None
+        if cache_id is not None and cache_id in self.cached_cpu_tensors:
             return {
-                "method": "share_memory",
-                "shared_tensor": tensor,
+                "method": "cached",
+                "cache_id": cache_id,
             }
 
-        # Allocate space
-        offset = self.next_offset
-        self.next_offset += nbytes_align
+        # Destination: the arena, or a segment of its own when the arena cannot hold it
+        if self.next_offset + nbytes_align < self.buffer_size:
+            offset = self.next_offset
+            self.next_offset += nbytes_align
+            dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = self.shm.buf, offset = offset)
+            desc = {
+                "method": "buffer",
+                "offset": offset,
+                "nbytes": nbytes,
+            }
+        else:
+            check_shm_capacity(nbytes, f"A tensor-parallel transfer of {nbytes / 2**20:.1f} MiB (larger than the arena)")
+            segment = shared_memory.SharedMemory(create = True, size = max(nbytes, 1), name = uuid.uuid4().hex)
+            self.overflow.append(segment)
+            dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf)
+            desc = {
+                "method": "overflow",
+                "shm_name": segment.name,
+                "nbytes": nbytes,
+            }
 
-        # Copy to shared buffer
+        # Copy to shared memory
         tensor_d = tensor.view((1,)) if len(tensor.shape) == 0 else tensor
         t_cpu = tensor_d.cpu().contiguous()
         src = t_cpu.view(torch.uint8).numpy().view(np.uint8).ravel()
-        dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = self.shm.buf, offset = offset)
         np.copyto(dst, src, casting = "no")
 
-        # Cache
-        if nbytes > MAX_CACHE_PER_PROCESS:
-            cache_id = None
-
         if cache_id is not None:
-            if cache_id in self.cached_cpu_tensors:
-                # print("sending cache ref:", cache_id)
-                return {
-                    "method": "cached",
-                    "cache_id": cache_id,
-                }
             _cache_insert(self, cache_id, tensor)
-            # print("caching send:", cache_id)
 
-        # Data is now buffered in shared memory space, store metadata and offset
-        return {
-            "method": "buffer",
-            "offset": offset,
-            "nbytes": nbytes,
+        desc.update({
             "dtype": str(tensor.dtype),
             "shape": tuple(tensor.shape),
-            "cache_id": cache_id
-        }
+            "cache_id": cache_id,
+        })
+        return desc
 
     def clear(self):
         """
-        Reset the arena write pointer so subsequent sends can reuse the buffer.
+        Reset the arena write pointer so subsequent sends can reuse the buffer, and release the overflow
+        segments of the last round. Called before the next forward's sends, after the previous forward's acks
+        have been drained, so every consumer has copied its data out by now.
         """
         self.next_offset = 0
+        self._release_overflow()
+
+    def _release_overflow(self):
+        for segment in self.overflow:
+            segment.close()
+            segment.unlink()
+        self.overflow = []
 
     def close(self):
+        self._release_overflow()
         self.shm.close()
         self.shm.unlink()
 
@@ -227,9 +268,11 @@ class SMConsumer:
         """
         Reconstruct a tensor from a producer descriptor.
 
-        The descriptor may refer to None, a cached CPU tensor, a torch shared-memory fallback tensor, or a byte
-        range in the shared arena. Optional slicing is applied before the final clone or CUDA copy, which lets TP
-        workers import only their shard of a larger exported tensor.
+        The descriptor may refer to None, a cached CPU tensor, a byte range in the shared arena, or an overflow
+        segment of its own. Optional slicing is applied before the final clone or CUDA copy, which lets TP
+        workers import only their shard of a larger exported tensor. Shared memory is only ever viewed here and
+        copied out before returning: the producer reuses the arena and unlinks the overflow segments once the
+        forward is acknowledged.
         """
 
         if cuda:
@@ -249,36 +292,43 @@ class SMConsumer:
             assert not cuda, "Cannot share cached tensor for CUDA"
             return self.cached_cpu_tensors[cache_id]
 
-        # Fallback method
-        if method == "share_memory":
-            tensor = imp["shared_tensor"]
-
-        # Construct Torch tensor in shared memory
+        # View the bytes in place: the arena, or the overflow segment made for this tensor
+        nbytes = imp["nbytes"]
+        dtype = _torch_dtypes[imp["dtype"]]
+        shape = imp["shape"]
+        segment = None
+        if method == "overflow":
+            segment = _open_shm(imp["shm_name"])
+            flat = torch.as_tensor(np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf))
+            pinned = False
         else:
-            offset = imp["offset"]
-            nbytes = imp["nbytes"]
-            dtype = _torch_dtypes[imp["dtype"]]
-            shape = imp["shape"]
-            tensor = self.arena.narrow(0, offset, nbytes).view(dtype).view(shape)
-            if cache_id is not None:
-                # print("caching recv:", cache_id)
-                assert not cuda, "Cannot share cached tensor for CUDA"
-                _cache_insert(self, cache_id, tensor.clone(memory_format = torch.contiguous_format))
+            flat = self.arena.narrow(0, imp["offset"], nbytes)
+            pinned = self.pin_memory
+        tensor = flat.view(dtype).view(shape)
+        if cache_id is not None:
+            # print("caching recv:", cache_id)
+            assert not cuda, "Cannot share cached tensor for CUDA"
+            _cache_insert(self, cache_id, tensor.clone(memory_format = torch.contiguous_format))
 
         # Slice before cloning
         if slice_dim is not None:
             tensor = tensor.narrow(slice_dim, first, last - first)
 
-        # Move to GPU or clone to unshared memory
+        # Move to GPU or clone to unshared memory. Only the arena is pinned, so only it can be copied
+        # asynchronously; an overflow segment is unmapped as soon as the copy is done
         if cuda:
             tensor = tensor.to(
                 self.device,
-                non_blocking = self.pin_memory,
+                non_blocking = pinned,
                 copy = True,
                 memory_format = torch.contiguous_format
             )
-        elif imp["method"] != "share_memory" or not tensor.is_contiguous():
+        else:
             tensor = tensor.clone(memory_format = torch.contiguous_format)
+
+        if segment is not None:
+            del flat
+            segment.close()
 
         return tensor
 

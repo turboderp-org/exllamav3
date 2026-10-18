@@ -78,8 +78,8 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
 # for itself on the (rank-identical) residual stream instead of receiving the selection by
 # broadcast from the output rank: two collectives per MoE layer per token fewer. Every router in
-# use is on those paths; the grouped DS3 router (n_group > 1, not supported by any loadable
-# architecture) is still torch-composed and would keep the broadcast
+# use is on those paths except the grouped DS3 router (n_group > 1, Ling 3.x), which is still
+# torch-composed (fp32 logits) and keeps the broadcast
 _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
 _routing_check_stats = {}
 
@@ -828,6 +828,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.device,
                 no_defer = True,
             )
+            # The table's values become expert indices in the routing kernels (issue #526): a
+            # checkpoint value outside the expert range must fail here, not in the kernel
+            if self.tid2eid.numel():
+                lo, hi = int(self.tid2eid.min()), int(self.tid2eid.max())
+                if lo < 0 or hi >= self.num_experts:
+                    raise ValueError(f"{self.key}.{self.tid2eid_key}: expert ids span [{lo}, {hi}], "
+                                     f"outside the {self.num_experts} routed experts")
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
