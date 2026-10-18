@@ -1,5 +1,8 @@
 from __future__ import annotations
 from typing_extensions import override
+from types import SimpleNamespace
+import json
+import os
 import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
@@ -17,9 +20,12 @@ from ..modules import (
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .nemotronh_mtp import NemotronHMTPModel
+from .nemotronh_omni_vision import NemotronHOmniVisionModel
 
 class NemotronHConfig(Config):
     arch_string = "NemotronHForCausalLM"
+    config_key = None
+    tensor_prefix = ""
 
     def __init__(
         self,
@@ -29,11 +35,27 @@ class NemotronHConfig(Config):
         super().__init__(
             directory,
             {"text": NemotronHModel, "mtp": NemotronHMTPModel},
+            config_key = self.config_key,
             **kwargs
         )
 
         # Layer pattern: M = Mamba2, * = attention, - = MLP, E = MoE
-        self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", no_default)
+        block_configs = self.read_cfg(list, "block_configs", None)
+        if block_configs is not None:
+            block_types = self.read_cfg(list, "layers_block_type", None)
+            if block_types is None:
+                block_types = [layer.get("block_type") for layer in block_configs]
+            layer_types = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
+            try:
+                self.hybrid_override_pattern = "".join(layer_types[t] for t in block_types)
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Unsupported NemotronH block type in {block_types!r}") from exc
+            if len(block_types) != len(block_configs):
+                raise ValueError("NemotronH block_configs and layers_block_type lengths differ")
+            self.layer_moe_configs = block_configs
+        else:
+            self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", no_default)
+            self.layer_moe_configs = None
 
         # Attention params (NoPE: the reference model applies no positional embeddings)
         self.head_dim = self.read_cfg(int, "head_dim", None)
@@ -58,7 +80,7 @@ class NemotronHConfig(Config):
 
         # MoE params (30B-A3B, 120B-A12B): DeepSeek-style sigmoid router with correction bias,
         # non-gated relu2 experts plus one always-on shared expert
-        self.num_experts = self.read_cfg(int, "n_routed_experts", 0)
+        self.num_experts = self.read_cfg(int, "n_routed_experts", self.read_cfg(int, "num_experts", 0))
         self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", 0)
         self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", 0)
         self.shared_expert_intermediate_size = self.read_cfg(int, "moe_shared_expert_intermediate_size", 0)
@@ -102,6 +124,7 @@ def nemotronh_block(
 ) -> TransformerBlock:
     """One block of the hybrid pattern: M = Mamba2, * = attention, - = MLP, E = MoE. Shared by the
     trunk (backbone.layers.N) and the MTP head (mtp.layers.N, mtp_bits)"""
+    layer_moe_config = config.layer_moe_configs[layer_idx] if config.layer_moe_configs else {}
     norm = RMSNorm(
         config = config,
         key = f"{key}.norm",
@@ -187,9 +210,9 @@ def nemotronh_block(
                     config = config,
                     key = f"{key}.mixer",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.moe_intermediate_size,
-                    num_experts = config.num_experts,
-                    num_experts_per_tok = config.num_experts_per_tok,
+                    intermediate_size = layer_moe_config.get("moe_intermediate_size", config.moe_intermediate_size),
+                    num_experts = layer_moe_config.get("n_routed_experts", config.num_experts),
+                    num_experts_per_tok = layer_moe_config.get("num_experts_per_tok", config.num_experts_per_tok),
                     latent_size = config.moe_latent_size,
                     key_latent_in = "fc1_latent_proj" if config.moe_latent_size else None,
                     key_latent_out = "fc2_latent_proj" if config.moe_latent_size else None,
@@ -238,7 +261,7 @@ class NemotronHModel(Model):
         self.modules += [
             Embedding(
                 config = config,
-                key = "backbone.embeddings",
+                key = f"{config.tensor_prefix}backbone.embeddings",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
             )
@@ -248,25 +271,25 @@ class NemotronHModel(Model):
 
         for idx in range(config.num_hidden_layers):
             self.modules.append(nemotronh_block(
-                config, f"backbone.layers.{idx}", idx, config.hybrid_override_pattern[idx]
+                config, f"{config.tensor_prefix}backbone.layers.{idx}", idx, config.hybrid_override_pattern[idx]
             ))
 
         self.last_kv_module_idx = len(self.modules) - 1
 
         head_alt_key = None
-        if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):
-            head_alt_key = "backbone.embeddings"
+        if config.tie_word_embeddings and not self.config.stc.has_tensor(f"{config.tensor_prefix}lm_head"):
+            head_alt_key = f"{config.tensor_prefix}backbone.embeddings"
 
         self.modules += [
             RMSNorm(
                 config = config,
-                key = "backbone.norm_f",
+                key = f"{config.tensor_prefix}backbone.norm_f",
                 rms_norm_eps = config.layer_norm_epsilon,
                 out_dtype = torch.half,
             ),
             Linear(
                 config = config,
-                key = "lm_head",
+                key = f"{config.tensor_prefix}lm_head",
                 qbits_key = "head_bits",
                 alt_key = head_alt_key,
                 in_features = config.hidden_size,
@@ -309,3 +332,60 @@ class NemotronHModel(Model):
         p += f"{prompt}<|im_end|>\n"
         p += f"<|im_start|>assistant\n"
         return p
+
+
+class NemotronHOmniConfig(NemotronHConfig):
+    """Text backbone config for Nemotron 3.5 Omni checkpoints (including Bolt)."""
+
+    arch_string = "NemotronH_Omni_Reasoning_V3"
+    config_key = "llm_config"
+    tensor_prefix = "language_model."
+
+    def __init__(self, directory: str, **kwargs):
+        super().__init__(directory, **kwargs)
+        self.model_classes["text"] = NemotronHOmniModel
+        self.model_classes["vision"] = NemotronHOmniVisionModel
+
+        vision = self.read_cfg(dict, "vision_config", no_default)
+        self.vision = SimpleNamespace(
+            hidden_size = vision["hidden_size"],
+            num_channels = vision.get("num_channels", 3),
+            patch_size = vision["patch_size"],
+            max_img_size = vision["max_img_size"],
+            num_cls_tokens = vision["num_cls_tokens"],
+            num_registers = vision["num_registers"],
+            num_attention_heads = vision["num_attention_heads"],
+            num_hidden_layers = vision["num_hidden_layers"],
+            layer_norm_eps = vision["layer_norm_eps"],
+            mlp_ratio = vision["mlp_ratio"],
+            hidden_act = vision.get("hidden_act", "gelu"),
+            video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2),
+        )
+
+        prep_path = os.path.join(directory, "processor_config.json")
+        if not os.path.exists(prep_path):
+            prep_path = os.path.join(directory, "preprocessor_config.json")
+        with open(prep_path, encoding = "utf8") as f:
+            processor_config = json.load(f)
+        pp = processor_config.get("image_processor", processor_config)
+        self.vision_pp = SimpleNamespace(
+            norm_mean = pp["norm_mean"],
+            norm_std = pp["norm_std"],
+            patch_size = pp.get("patch_size", self.vision.patch_size),
+            min_num_patches = pp["min_num_patches"],
+            max_num_patches = pp["max_num_patches"],
+            max_model_len = pp.get("max_model_len", 16384),
+            video_target_num_patches = pp["video_target_num_patches"],
+        )
+        self.image_token_id = self.read_cfg(int, "img_context_token_id", None)
+        self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
+        self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
+        self.ps_version = self.read_cfg(str, "ps_version", "v2")
+        self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
+
+
+class NemotronHOmniModel(NemotronHModel):
+    config_class = NemotronHOmniConfig
+
+
+NemotronHOmniVisionModel.config_class = NemotronHOmniConfig
