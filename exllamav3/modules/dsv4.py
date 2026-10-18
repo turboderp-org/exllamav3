@@ -314,7 +314,8 @@ class DSV4Compressor:
                 "overlapping": self.overlapping,
             },
             "wkv": self.wkv.tp_export(plan, producer),
-            "wgate": self.wgate.tp_export(plan, producer),
+            # V4.1's compress-rate-1 pool has no gate
+            "wgate": self.wgate.tp_export(plan, producer) if self.wgate is not None else None,
             "norm": self.norm.tp_export(plan, producer),
             "ape": producer.send(self.ape),
         }
@@ -325,7 +326,7 @@ class DSV4Compressor:
         consumer = local_context["consumer"]
         def _imp(name):
             e = exported[name]
-            return e["cls"].tp_import(local_context, e, plan)
+            return e["cls"].tp_import(local_context, e, plan) if e is not None else None
         comp = DSV4Compressor(
             attn,
             qmap = None,
@@ -750,7 +751,8 @@ class DSV4Attention(Module):
                 storage_dev += l.storage_size()
         for comp in (self.compressor, self.indexer):
             if comp is not None:
-                storage_dev += comp.wkv.storage_size() + comp.wgate.storage_size()
+                # A V4.1 layer that reads another layer's pool keeps compressors without weights of their own
+                storage_dev += sum(l.storage_size() for l in (comp.wkv, comp.wgate) if l is not None)
         for rl in self.recurrent_layers:
             storage_dev += rl.storage_size()
         for cl in self.cache_layers:
@@ -807,7 +809,14 @@ class DSV4Attention(Module):
                 "rope_scaling": self.rope_scaling,
                 "rms_norm_eps": self.rms_norm_eps,
                 "out_dtype": self.out_dtype,
+                "kv_source": self.kv_source,
+                "indexer_mode": self.indexer_mode,
+                "q_head_norm": self.q_head_norm,
+                "candidate_mode": self.candidate_mode,
+                "candidate_topk_blocks": self.candidate_topk_blocks,
+                "candidate_block_size": self.candidate_block_size,
             },
+            "kv_owner_key": self.kv_owner.key if self.kv_owner is not None else None,
             "num_q_heads": self.num_q_heads,
             "o_groups": self.o_groups,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -819,6 +828,8 @@ class DSV4Attention(Module):
                 "wo_b",
                 "idx_wq_b",
                 "idx_weights",
+                "idx_wk",
+                "idx_k_norm",
             )},
             "wo_a": [l.tp_export(plan, producer) for l in self.wo_a],
             "sinks": producer.send(self.sinks),
@@ -885,6 +896,15 @@ class DSV4Attention(Module):
             tp_defer_compressors = True,
         )
         module.tp_mode = True
+        # V4.1's pool owner with a full indexer and no indexer compressor keys the indexer from the pool itself;
+        # the constructor makes these only next to a compressor, which TP attaches after construction
+        module.idx_wk = _import("idx_wk")
+        module.idx_k_norm = _import("idx_k_norm")
+        # A layer reading another layer's pool links to that layer's rank-local instance, imported before it
+        owner_key = exported.get("kv_owner_key")
+        if owner_key is not None:
+            module.kv_owner = next((sm for m in local_context["modules"] for sm in m if sm.key == owner_key), None)
+            assert module.kv_owner is not None, f"{key}: no module {owner_key} in this TP worker to read the pool of"
 
         if num_groups:
             consumer = local_context["consumer"]
@@ -931,7 +951,9 @@ class DSV4Attention(Module):
         self.kv_norm_w = self.kv_norm.weight.data
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
         if self.compressor is not None:
-            self.compressor.make_bc(self.inv_freq_compress)
+            # A V4.1 pool owner that keys its indexer from the pool rotates nothing here, as in load()
+            freq = torch.zeros_like(self.inv_freq_compress) if self.idx_wk is not None else self.inv_freq_compress
+            self.compressor.make_bc(freq)
         if self.indexer is not None:
             self.indexer.make_bc(self.inv_freq_compress)
         for rl in self.recurrent_layers:
@@ -1348,8 +1370,9 @@ class DSV4Attention(Module):
         kl = bt = None
         if self.kv_source is not None:
             # In TP workers rs.cache is an opaque id; resolve to this rank's replicated
-            # pool layer before anything dereferences it
-            kl = self.tp_cache_lookup[rsg[0].cache] if self.tp_mode \
+            # pool layer before anything dereferences it (a V4.1 reader's pool is its owner's)
+            owner = self.kv_owner if self.kv_owner is not None else self
+            kl = owner.tp_cache_lookup[rsg[0].cache] if self.tp_mode \
                 else rsg[0].cache.layers[(self.kv_source, layer_instance[1])]
             if "block_table" in params:
                 bt = get_for_device(params, "block_table", self.device)
