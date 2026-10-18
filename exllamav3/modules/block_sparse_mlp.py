@@ -1137,10 +1137,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # discards the capture pass's output and advances the state with the quantized
             # layer): only the experts' input statistics matter. Every expert sees every row in
             # order, so no gather; the down projection only needs its input captured, so no down
-            # matmul, no weighting and no scatter-add. The routed output stays zero
+            # matmul, no weighting and no scatter-add. The routed output stays zero, so not with a
+            # latent MoE, whose latent_out projection is calibrated on that output
             capture_fast = (
                 params.get("capture_only") and params.get("activate_all_experts") and "capture" in params and
-                self.gated and (self.num_local_experts is None or self.num_local_experts == self.num_experts)
+                self.gated and self.latent_out is None and
+                (self.num_local_experts is None or self.num_local_experts == self.num_experts)
             )
             if capture_fast:
                 self._capture_all_experts(y, routing_weights, sens_weights, aff, params)
