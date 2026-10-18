@@ -390,6 +390,14 @@ def trellis_rate(tile_width: int):
     return None
 
 
+def _cpu_expert_supported(stc, key: str) -> bool:
+    """Whether one projection has the complete EXL3 representation used by MoeCpuHost."""
+    tensors = stc.list_tensors(key)
+    if any(key + suffix not in tensors for suffix in (".mul1", ".trellis", ".suh", ".svh")):
+        return False
+    return trellis_rate(tensors[key + ".trellis"]["shape"][-1]) is not None
+
+
 class BlockSparseMLP_CPU:
 
     def _cpu_init_state(self):
@@ -679,6 +687,11 @@ class BlockSparseMLP_CPU:
         cpu = torch.device("cpu")
         experts = self.gates + self.ups + self.downs
 
+        if any(not _cpu_expert_supported(stc, l.key) for l in experts):
+            print(f" !! {self.key}: one or more experts are not in a CPU-supported EXL3 "
+                  "format; CPU offload skipped")
+            return False
+
         # Eligibility probe on the first expert of each projection before fetching bulk data
         probe = ([self.gates[0]] if self.gated else []) + [self.ups[0], self.downs[0]]
         for l in probe:
@@ -801,20 +814,71 @@ class BlockSparseMLP_CPU:
         proceeds with the normal load, which now loads just the GPU slice.
         """
         stc = self.config.stc
-        cpu = torch.device("cpu")
-        first = self.num_experts - split_k
+        self._split_perm = None
+        self._split_seeded = False
+        self._split_saved_lists = (self.gates, self.ups, self.downs)
+        projections = ([self.gates] if self.gated else []) + [self.ups, self.downs]
 
-        # Same eligibility probes as the whole-layer path, on the tail experts
+        # The GPU Linear loader accepts full-precision experts, but the CPU worker needs
+        # EXL3 trellis, mul1, suh, and svh tensors. Keep any expert missing one of these in
+        # the GPU-resident prefix instead of selecting it for the CPU tail.
+        cpu_eligible = [True] * self.num_experts
+        for expert_idx in range(self.num_experts):
+            for linears in projections:
+                key = linears[expert_idx].key
+                if not _cpu_expert_supported(stc, key):
+                    cpu_eligible[expert_idx] = False
+                    break
+
+        # Optional frequency-guided placement (EXL3_MOE_CPU_SPLIT_STATS = JSON of per-layer
+        # selection counts). Saved profiles are in checkpoint expert order. Validate their
+        # length before using them, then sort CPU-compatible experts hot-to-cold.
+        counts = None
+        if not self.tid2eid_key:
+            stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            if stats_path:
+                import json
+                with open(stats_path) as f:
+                    counts = json.load(f).get(self.key)
+                if counts is None:
+                    print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
+            else:
+                counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
+        if counts is not None and len(counts) != self.num_experts:
+            print(f" !! {self.key}: ignoring routing stats with {len(counts)} entries; "
+                  f"expected {self.num_experts}")
+            counts = None
+
+        eligible_count = sum(cpu_eligible)
+        if eligible_count < split_k:
+            print(f" !! {self.key}: only {eligible_count}/{self.num_experts} experts have "
+                  f"EXL3 tensors supported by the CPU worker; reducing CPU split from "
+                  f"{split_k} to {eligible_count}")
+            split_k = eligible_count
+        if split_k <= 0:
+            print(f" !! {self.key}: no CPU-compatible experts available; CPU split skipped")
+            return False
+
+        if counts is not None or eligible_count < self.num_experts:
+            score = counts if counts is not None else [0.0] * self.num_experts
+            # Unsupported experts sort before the CPU-compatible set so they stay in the
+            # GPU head. Within each set, retain the frequency-guided hot-to-cold ordering.
+            perm = sorted(range(self.num_experts), key=lambda e: (cpu_eligible[e], -score[e]))
+            self._split_perm = perm
+            self._split_cpu_eligible = [cpu_eligible[e] for e in perm]
+            if self.gated:
+                self.gates = [self.gates[e] for e in perm]
+            self.ups = [self.ups[e] for e in perm]
+            self.downs = [self.downs[e] for e in perm]
+            self._split_seeded = counts is not None
+        else:
+            self._split_cpu_eligible = cpu_eligible
+
+        first = self.num_experts - split_k
         probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
         for l in probe:
-            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
+            if stc.get_tensor(l.key + ".mul1", torch.device("cpu"), optional=True) is None:
                 print(f" !! {self.key}: experts are not mul1, CPU split skipped")
-                return False
-        def hdr_shape(l):
-            return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-        for l in probe:
-            if trellis_rate(hdr_shape(l)[-1]) is None:
-                print(f" !! {self.key}: unsupported bitrate, CPU split skipped")
                 return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
@@ -825,17 +889,6 @@ class BlockSparseMLP_CPU:
         checks = [bias_keys(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]]
         if any(c is None for c in checks):
             return False
-
-        # Optional frequency-guided placement (EXL3_MOE_CPU_SPLIT_STATS = json of per-layer
-        # selection counts, e.g. from a probe run): permute the expert order hot-to-cold so
-        # the offloaded tail holds the least-selected experts. The router weight rows (and
-        # per-expert routing tensors) are permuted to match after they load, so selection
-        # indices, GPU pointer tables and the worker's key list all live in the same permuted
-        # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
-        # 37.5% uniform, cutting the CPU share per layer ~4.5x
-        self._split_perm = None
-        self._split_seeded = False
-        self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
         # router->slot map applied right after routing decides placement. A swap re-reads
@@ -853,34 +906,12 @@ class BlockSparseMLP_CPU:
         # regular resident: a promotion must beat the least-used resident's count, so a layer
         # whose slots all start empty would have nothing to beat and never promote
         spares = 0
-        if self._split_dynamic and getattr(self.config.infer_params, "moe_cpu_pinned_arena", False):
+        if self._split_dynamic and getattr(self.config.infer_params, "moe_cpu_pinned_arena", False) \
+                and all(self._split_cpu_eligible):
             spares = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE", 4)))
         spares = min(spares, max(0, first - 1))
         self._split_spares = spares
         wfirst = first - spares
-        # Hot/cold placement: an explicit stats file (EXL3_MOE_CPU_SPLIT_STATS) or, failing
-        # that, the profile a previous run of this model saved (save_expert_stats). The expert
-        # lists are permuted hottest first, so the GPU slice holds the frequent experts from
-        # the first token and the worker the rare ones; the dynamic map then starts from there
-        counts = None
-        if not self.tid2eid_key:
-            stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-            if stats_path:
-                import json
-                counts = json.load(open(stats_path)).get(self.key)
-                if counts is None:
-                    print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
-            else:
-                counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
-        if counts is not None and len(counts) == self.num_experts:
-            perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
-            self._split_perm = perm
-            if self.gated:
-                self.gates = [self.gates[e] for e in perm]
-            self.ups = [self.ups[e] for e in perm]
-            self.downs = [self.downs[e] for e in perm]
-            self._split_seeded = True
-
         self.device = torch.device(device)
 
         from ..model.moe_cpu_host import MoeCpuHost
@@ -1010,7 +1041,9 @@ class BlockSparseMLP_CPU:
         # floor, so sweeps become no-ops
         floor = float(os.environ.get("EXL3_MOE_CPU_SWAP_FLOOR", 8.0)) \
             * float(hist.sum()) / self.num_experts
-        head = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) < first]
+        eligible = getattr(self, "_split_cpu_eligible", [True] * self.num_experts)
+        head = [(float(hist[r]), r) for r in range(self.num_experts)
+                if int(mp[r]) < first and eligible[r]]
         tail = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) >= first]
         head.sort()
         tail.sort(reverse = True)

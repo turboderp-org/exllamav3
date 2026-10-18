@@ -380,8 +380,8 @@ class NemotronHModel(Model):
 
 class NemotronHOmniConfig(NemotronHConfig):
     """
-    Nemotron 3.5 Omni checkpoints (Bolt): the NemotronH Puzzle text backbone under llm_config, a
-    C-RADIO vision tower and the mlp1 projector
+    Nemotron 3.5 Omni checkpoints: the NemotronH text backbone under llm_config, with an optional
+    C-RADIO vision tower and mlp1 projector when those weights are present.
     """
 
     arch_string = "NemotronH_Omni_Reasoning_V3"
@@ -391,23 +391,54 @@ class NemotronHOmniConfig(NemotronHConfig):
     def __init__(self, directory: str, **kwargs):
         super().__init__(directory, **kwargs)
         self.model_classes["text"] = NemotronHOmniModel
-        self.model_classes["vision"] = NemotronHOmniVisionModel
-
-        self.vision = read_nemotronh_omni_vision_config(self.read_cfg(dict, "vision_config", no_default))
-        self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
         self.assert_cfg(bool, "vision_final_layernorm", False, True)
 
-        prep_path = os.path.join(directory, "processor_config.json")
-        if not os.path.exists(prep_path):
-            prep_path = os.path.join(directory, "preprocessor_config.json")
-        with open(prep_path, encoding = "utf8") as f:
-            self.vision_pp = read_nemotronh_omni_pp_config(json.load(f))
+        # Some Nemotron 3.5 Super VL EXL3 releases contain only the language model and
+        # MTP head. Detect the actual vision weights instead of assuming that a wrapper
+        # config's vision_config means the tower and projector were included.
+        vision_key = "vision_model.radio_model.model.patch_generator.embedder.weight"
+        projector_key = "mlp1.0.weight"
+        has_vision = self.stc.has_tensor(vision_key)
+        has_projector = self.stc.has_tensor(projector_key)
+        if has_vision != has_projector:
+            raise ValueError(
+                "Incomplete NemotronH Omni vision checkpoint: expected both "
+                f"{vision_key!r} and {projector_key!r}"
+            )
+        self.has_vision = has_vision
+        if has_vision:
+            self.model_classes["vision"] = NemotronHOmniVisionModel
+            self.vision = read_nemotronh_omni_vision_config(
+                self.read_cfg(dict, "vision_config", no_default)
+            )
+            self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
+
+            prep_path = os.path.join(directory, "processor_config.json")
+            if not os.path.exists(prep_path):
+                prep_path = os.path.join(directory, "preprocessor_config.json")
+            with open(prep_path, encoding = "utf8") as f:
+                self.vision_pp = read_nemotronh_omni_pp_config(json.load(f))
+            self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
+            self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
+            self.ps_version = self.read_cfg(str, "ps_version", "v2")
+            self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
+        else:
+            self.model_classes.pop("vision", None)
+            self.vision = None
+            self.vision_pp = None
 
         self.image_token_id = self.read_cfg(int, "img_context_token_id", None)
-        self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
-        self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
-        self.ps_version = self.read_cfg(str, "ps_version", "v2")
-        self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
+
+        quant_configs = [
+            self.config_dict.get("quantization_config"),
+            self.config_dict.get("llm_config", {}).get("quantization_config"),
+        ]
+        for quant in quant_configs:
+            if quant and quant.get("quant_method") not in (None, "exl3"):
+                raise ValueError(
+                    "NemotronH Omni currently supports BF16 or EXL3 weights; "
+                    f"unsupported quantization method {quant.get('quant_method')!r}"
+                )
 
 
 def read_nemotronh_omni_vision_config(config_dict: dict):
