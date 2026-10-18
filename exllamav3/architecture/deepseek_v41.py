@@ -33,6 +33,7 @@ class DeepseekV41Config(Config):
         )
 
         self.hidden_size = self.read_cfg(int, "text_config->hidden_size", no_default)
+        self.tie_word_embeddings = self.read_cfg(bool, "text_config->tie_word_embeddings", False)
         self.num_q_heads = self.read_cfg(int, "text_config->num_attention_heads", no_default)
         self.num_kv_heads = self.read_cfg(int, "text_config->num_key_value_heads", 1)
         assert self.num_kv_heads == 1, "DeepseekV41: expected shared-KV MQA (num_key_value_heads == 1)"
@@ -302,7 +303,7 @@ class DeepseekV41Model(Model):
         self.caps.update({
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
-            "supports_tp": False,
+            "supports_tp": True,
             "prefill_pipeline": True,
             "can_resume_quant": False,
         })
