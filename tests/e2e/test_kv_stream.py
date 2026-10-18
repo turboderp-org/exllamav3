@@ -113,3 +113,75 @@ def test_stream_matches_stock(model_id, model_dir, device, variant, monkeypatch)
                 f"{model_id}: 8-bit cache did not map to the quantized streaming layer"
 
     assert_logits_agree(ref, got, floor, f"{model_id} [{variant}]", abs_median_kl = abs_median_kl)
+
+
+# No resident override: the auto policy fills the free device memory, which for this cache size is
+# well above the whole job, so every page stays resident end to end and decode runs the all-resident
+# graph path (identity block table over the resident window) instead of the chunked walk
+ALL_RESIDENT_ENV = {k: v for k, v in STREAM_ENV.items() if k != "EXL3_KV_STREAM_RESIDENT"}
+
+
+@pytest.mark.parametrize("variant", ["fp16", "q8"])
+def test_stream_all_resident_matches_stock(model_id, model_dir, device, variant, monkeypatch):
+    abs_median_kl = 1e-3 if variant == "fp16" else 5e-3
+    cache_args = ["-cq", "8"] if variant == "q8" else []
+
+    monkeypatch.setenv("EXL3_KV_STREAM", "0")
+    _reset_stream_config()
+    with load_model(model_dir, device, *cache_args, cache_tokens = CACHE_TOKENS) as lm:
+        ids = _long_ids(lm, PROMPT_TOKENS)
+        ref = prefill_decode_logits(lm, ids, DECODE_STEPS)
+        floor = noise_floor(lm, ids, DECODE_STEPS)
+
+    for k, v in ALL_RESIDENT_ENV.items():
+        monkeypatch.setenv(k, v)
+    _reset_stream_config()
+    with load_model(model_dir, device, *cache_args, cache_tokens = CACHE_TOKENS) as lm:
+        streamed = [l for l in lm.cache.layers.values() if isinstance(l, StreamLayer)]
+        if not streamed:
+            pytest.skip(f"{model_id}: no cache layer supports streaming")
+        got = prefill_decode_logits(lm, ids, DECODE_STEPS)
+        for l in streamed:
+            assert l.cfg["R"] is not None and len(l._tok2pool) <= l.cfg["R"], \
+                f"{model_id}: live history ({len(l._tok2pool)} pages) left the window ({l.cfg['R']})"
+            assert l._bc_stream not in (None, False), \
+                f"{model_id}: the all-resident decode path was not taken"
+        if variant == "q8":
+            from exllamav3.cache.stream import CacheLayer_stream_quant
+            assert all(isinstance(l, CacheLayer_stream_quant) for l in streamed), \
+                f"{model_id}: 8-bit cache did not map to the quantized streaming layer"
+
+    assert_logits_agree(ref, got, floor, f"{model_id} [all resident {variant}]",
+                        abs_median_kl = abs_median_kl)
+
+
+def test_stream_transition_matches_stock(model_id, model_dir, device, monkeypatch):
+    """A window that covers the prefill but not the decode tail: the step that overshoots it must hand
+    over from the all-resident graph path to the chunked driver (same layer state, same mirror)."""
+    prompt_tokens = 1024
+    decode_steps = 300
+    env = dict(STREAM_ENV)
+    env["EXL3_KV_STREAM_RESIDENT"] = "3p"      # 768 tokens: resident through the prefill, slides in decode
+
+    monkeypatch.setenv("EXL3_KV_STREAM", "0")
+    _reset_stream_config()
+    with load_model(model_dir, device, cache_tokens = CACHE_TOKENS) as lm:
+        ids = _long_ids(lm, prompt_tokens)
+        ref = prefill_decode_logits(lm, ids, decode_steps)
+        floor = noise_floor(lm, ids, decode_steps)
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    _reset_stream_config()
+    with load_model(model_dir, device, cache_tokens = CACHE_TOKENS) as lm:
+        streamed = [l for l in lm.cache.layers.values() if isinstance(l, StreamLayer)]
+        if not streamed:
+            pytest.skip(f"{model_id}: no cache layer supports streaming")
+        got = prefill_decode_logits(lm, ids, decode_steps)
+        for l in streamed:
+            assert l._bc_stream not in (None, False), \
+                f"{model_id}: the all-resident decode path was never taken"
+            assert len(l._tok2pool) > l.cfg["R"], \
+                f"{model_id}: the window never slid ({len(l._tok2pool)} pages, window {l.cfg['R']})"
+
+    assert_logits_agree(ref, got, floor, f"{model_id} [resident->streamed transition]", abs_median_kl = 1e-3)

@@ -971,6 +971,15 @@ class Attention(Module):
         position = params.get("position", 0)
 
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        from ..cache.stream import StreamLayer
+        if isinstance(layer, StreamLayer):
+            # A streaming layer runs the same graph over its resident window while the whole
+            # history fits in it; the layer owns the identity table, the write bookkeeping and
+            # the mirror publish, and declines when the window slid (returns None)
+            return layer.bc_attn_step(
+                self, x, params, block_table, cache_seqlens, host_seqlens,
+                position, positions, position_ids, inv_freq
+            )
         key = id(layer)
         bca = self.bc_attn.get(key)
         if bca is None:

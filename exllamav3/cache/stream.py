@@ -35,8 +35,10 @@ Environment (doc/env_vars.md):
     EXL3_KV_STREAM_MIRROR     auto    host mirror budget: reserved, not enforced (mirror is
                                       allocated for the full logical capacity; setting a smaller
                                       value warns)
-    EXL3_KV_STREAM_RESIDENT   auto    resident window size: pages ("12") or bytes ("1G"); the
-                                      budget is per full-attention layer, default min(cap, 16)
+    EXL3_KV_STREAM_RESIDENT   auto    resident window size: pages ("12") or bytes ("1G"), per
+                                      full-attention layer. "auto" fills the free device memory at
+                                      first use, keeping a reserve for the ring, the walk partials
+                                      and workspace headroom
     EXL3_KV_STREAM_RING       auto    ring size in pages, shared across layers (default 64)
     EXL3_KV_STREAM_PREFETCH   2       ring slots in flight (chunks read ahead)
     EXL3_KV_STREAM_SERIAL     0       serialized debug mode: one stream, no overlap
@@ -95,18 +97,23 @@ _warned: set = set()
 def _stream_config(cache_id, layer, capacity_pages: int) -> dict:
     cfg = _STREAM_CONF.get(cache_id)
     if cfg is not None:
+        # One call per stream layer of this cache: the auto placement divides the free device
+        # memory between the layers sharing it, so the count must be complete (every layer object
+        # exists once the model is constructed) before the first step resolves the window
+        cfg["n_layers"] += 1
         return cfg
 
     per_page = layer.stream_per_page_bytes()
 
     r_env = os.environ.get("EXL3_KV_STREAM_RESIDENT", "").strip()
     if r_env == "" or r_env.lower() == "auto":
-        R = max(2, min(capacity_pages, 16))
+        R = None                    # resolved at first use from the free device memory
     elif re.fullmatch(r"\d+\s*[pP]?", r_env):
         R = int(re.match(r"\d+", r_env).group(0))
     else:
         R = max(1, _parse_bytes("EXL3_KV_STREAM_RESIDENT", r_env) // per_page)
-    R = max(1, min(R, capacity_pages))
+    if R is not None:
+        R = max(1, min(R, capacity_pages))
 
     ring_pages = _env_int("EXL3_KV_STREAM_RING", 64)
     if ring_pages < 1:
@@ -131,10 +138,11 @@ def _stream_config(cache_id, layer, capacity_pages: int) -> dict:
     trace = os.environ.get("EXL3_KV_STREAM_TRACE", "0") == "1"
 
     cfg = dict(R = R, ring_pages = ring_pages, prefetch = prefetch, S = S, C = C,
-               serial = serial, trace = trace, per_page = per_page)
+               serial = serial, trace = trace, per_page = per_page, n_layers = 1)
     _STREAM_CONF[cache_id] = cfg
     if trace:
-        print(f" [stream] cache {cache_id}: resident {R} pages, ring {ring_pages} pages "
+        r_str = "auto" if R is None else str(R)
+        print(f" [stream] cache {cache_id}: resident {r_str} pages, ring {ring_pages} pages "
               f"(S={S}, C={C}), prefetch {prefetch}, serial {int(serial)}")
     return cfg
 
@@ -256,6 +264,10 @@ class StreamLayer(CacheLayer):
         # Driver state (allocated in alloc())
         self.device = None
         self.mirror = None
+        self._resident_ready = False
+        self._bc_stream = None
+        self._bt_identity = None
+        self._valid_from = None
         self._kt = None
         self._kt_host = None
         self._pub_rows = None
@@ -266,6 +278,7 @@ class StreamLayer(CacheLayer):
         self._tok2pool = None
         self._wrote_upto = -1
         self._pub_event = None
+        self._ev_mark = None
         self._ring = None
         self._geo_dec = None
         self._geo_pre = None
@@ -283,6 +296,9 @@ class StreamLayer(CacheLayer):
     def _alloc_resident(self, device: torch.device):
         raise NotImplementedError
 
+    def _free_resident(self):
+        raise NotImplementedError
+
     def _alloc_mirror(self, device: torch.device):
         raise NotImplementedError
 
@@ -297,7 +313,19 @@ class StreamLayer(CacheLayer):
     @override
     def alloc(self, device: torch.device):
         self.device = device
-        self._alloc_resident(device)
+        self._resident_ready = False
+        self._bc_stream = None
+        self._bt_identity = None
+        self._valid_from = None
+        R = self.cfg["R"]
+        if R is not None:
+            self._alloc_resident(device)
+            self._slot_owner = [None] * R
+            self._resident_ready = True
+        else:
+            # Auto placement: sized from the free device memory at first use (all the model's
+            # layers exist by then, and the weights are on the device)
+            self._slot_owner = None
         self._alloc_mirror(device)
         self._kt_host = torch.zeros((self.capacity_pages,), dtype = torch.int32)
         self._kt = torch.zeros((1, self.capacity_pages), dtype = torch.int32, device = device)
@@ -305,10 +333,10 @@ class StreamLayer(CacheLayer):
         self._stale_pages = set()
         self._table_key = None
         self._epoch = 0
-        self._slot_owner = [None] * self.cfg["R"]
         self._tok2pool = []
         self._wrote_upto = -1
         self._pub_event = None
+        self._ev_mark = None
         self._ring = None
         self._geo_dec = {}
         self._geo_pre = {}
@@ -321,17 +349,57 @@ class StreamLayer(CacheLayer):
     def free(self):
         self.device = None
         self.mirror = None
+        self._bc_stream = None
+        self._bt_identity = None
+        self._resident_ready = False
+        self._free_resident()
         self._kt = self._kt_host = None
         self._pub_rows = None
         self._stale_pages = None
         self._slot_owner = None
         self._tok2pool = None
         self._pub_event = None
+        self._ev_mark = None
         self._ring = None
         self._geo_dec = self._geo_pre = None
         self._part_dec = self._part_pre = None
         self._copy_stream = None
         self._stage = None
+
+    def _auto_resident_pages(self) -> int:
+        """Resident pages that fit the free device memory: everything else about the layer is
+        bounded (ring, walk partials) or transient, so the window takes what is left after a
+        reserve for those."""
+        per_page = self.cfg["per_page"]
+        n_layers = max(1, self.cfg.get("n_layers", 1))
+        free, _ = torch.cuda.mem_get_info(self.device)
+        ring = self.cfg["S"] * self.cfg["C"] * per_page
+        # The decode and prefill walks each keep partial buffers bounded by _PARTIAL_BUDGET per
+        # layer; cap the reserve so models with huge per-page KV cannot starve the window
+        partials = min(2 * n_layers * _PARTIAL_BUDGET, free // 4)
+        slack = max(512 << 20, free // 16)
+        budget = max(0, free - ring - partials - slack)
+        pages = budget // max(1, per_page * n_layers)
+        return int(max(1, min(self.capacity_pages, pages)))
+
+    def _ensure_resident(self):
+        """Allocate the resident window on first use (auto placement resolves its size here)"""
+        if self._resident_ready:
+            return
+        assert self.device is not None, \
+            "streaming cache layer used before the model was loaded (alloc was not called)"
+        if self.cfg["R"] is None:
+            self.cfg["R"] = self._auto_resident_pages()
+            if self.cfg["trace"]:
+                free, _ = torch.cuda.mem_get_info(self.device)
+                print(f" [stream]{self.attention.key if self.attention is not None else ''} "
+                      f"auto resident: {self.cfg['R']} pages "
+                      f"({self.cfg['R'] * self.cfg['per_page'] / 2**20:.0f} MiB/layer, "
+                      f"free {free / 2**30:.1f} GiB, {self.cfg.get('n_layers', 1)} layers)")
+        self._alloc_resident(self.device)
+        self._slot_owner = [None] * self.cfg["R"]
+        self._valid_from = None
+        self._resident_ready = True
 
     # ---- interface surfaces that streaming replaces ----
 
@@ -353,7 +421,9 @@ class StreamLayer(CacheLayer):
 
     @override
     def get_tensors(self):
-        return list(self._resident_tensors().values())
+        if self._resident_ready:
+            return list(self._resident_tensors().values())
+        return []
 
     @override
     def overhead_size(self):
@@ -388,6 +458,7 @@ class StreamLayer(CacheLayer):
         slots whose contents are not known to match the block table's pages. `a` is the append
         start (host value), `L = a + chunk` the sequence length this sub-chunk serves.
         """
+        self._ensure_resident()
         R = self.cfg["R"]
         n_pages = -(-L // PAGE_SIZE)
         window_start = max(0, n_pages - R)
@@ -413,6 +484,12 @@ class StreamLayer(CacheLayer):
                                    idx % R)
             self._kt[0, :n_pages].copy_(vals_dev)
 
+        if self._valid_from is not None and self._valid_from <= window_start:
+            # Every slot in the window was written (or refilled) by this sequence since the last
+            # invalidation and nothing stale came in: no per-page verification needed
+            self._trace(f"table: {n_pages} pages, window [{window_start}, {n_pages}), window valid")
+            return
+
         write_page0 = a // PAGE_SIZE
         stale = self._stale_pages
         n_refill = 0
@@ -432,9 +509,13 @@ class StreamLayer(CacheLayer):
             self._slot_owner[i % R] = (self._epoch, i, p)
             n_refill += 1
         if stale:
+            # The window's pages were verified or refilled above, so their entries can leave the
+            # stale set; only pages outside the window (other cached sequences) stay
+            stale.difference_update(pool[window_start:])
             for p in list(stale):
                 if p not in pool:
                     stale.discard(p)
+        self._valid_from = window_start
         self._trace(f"table: {n_pages} pages, window [{window_start}, {n_pages}), "
                     f"{n_refill} refill(s), epoch={self._epoch}")
 
@@ -450,6 +531,32 @@ class StreamLayer(CacheLayer):
         pool_page = self._tok2pool[token_page]
         for name, t in ring.items():
             t[slot].copy_(self.mirror[name][pool_page], non_blocking = True)
+
+    def _runs(self, p0: int, p1: int):
+        """
+        Split token pages [p0, p1) into runs whose mirror pages and destination slots are both
+        contiguous: one copy per run per component instead of one per page.
+        """
+        runs = []
+        p = p0
+        while p < p1:
+            pool0 = self._tok2pool[p]
+            slot0 = self._table_slot(p)
+            q = p + 1
+            while (q < p1 and self._tok2pool[q] == pool0 + (q - p) and
+                   self._table_slot(q) == slot0 + (q - p)):
+                q += 1
+            runs.append((p, q, pool0, slot0))
+            p = q
+        return runs
+
+    def _copy_pages_to_ring(self, p0: int, p1: int):
+        """H2D pages [p0, p1) into their ring slots, one copy per contiguous run"""
+        ring = self._ring["tensors"]
+        for a, b, pool0, slot0 in self._runs(p0, p1):
+            n = b - a
+            for name, t in ring.items():
+                t[slot0:slot0 + n].copy_(self.mirror[name][pool0:pool0 + n], non_blocking = True)
 
     # ---- publish ----
 
@@ -467,17 +574,36 @@ class StreamLayer(CacheLayer):
             torch.cuda.current_stream().wait_event(self._pub_event)
 
     def _publish_rows(self, a: int, b: int):
-        """D2H rows [a, b) of the just-written pages to the mirror (current stream)"""
+        """
+        D2H rows [a, b) of the just-written pages to the mirror (current stream). Full pages
+        coalesce into contiguous runs; the partial head and tail pages copy on their own.
+        """
         p0 = a // PAGE_SIZE
         p1 = (b - 1) // PAGE_SIZE
         for p in range(p0, p1 + 1):
-            r0 = a - p * PAGE_SIZE if p == p0 else 0
-            r1 = b - p * PAGE_SIZE if p == p1 else PAGE_SIZE
-            r1 = min(r1, PAGE_SIZE)
-            slot = self._table_slot(p)
-            for name, resident in self._resident_tensors().items():
-                self.mirror[name][self._tok2pool[p], r0:r1].copy_(resident[slot, r0:r1], non_blocking = True)
+            r1 = min(b - p * PAGE_SIZE, PAGE_SIZE)
             self._pub_rows[self._tok2pool[p]] = max(self._pub_rows[self._tok2pool[p]], r1)
+        parts = []
+        if p0 == p1:
+            parts.append((p0, p0 + 1, a - p0 * PAGE_SIZE, b - p0 * PAGE_SIZE))
+        else:
+            parts.append((p0, p0 + 1, a - p0 * PAGE_SIZE, PAGE_SIZE))
+            if p1 > p0 + 1:
+                parts.append((p0 + 1, p1, 0, PAGE_SIZE))
+            parts.append((p1, p1 + 1, 0, b - p1 * PAGE_SIZE))
+        resident = self._resident_tensors()
+        for q0, q1, r0, r1 in parts:
+            for s0, s1, pool0, slot0 in self._runs(q0, q1):
+                n = s1 - s0
+                if r0 == 0 and r1 == PAGE_SIZE:
+                    for name, t in resident.items():
+                        self.mirror[name][pool0:pool0 + n].copy_(
+                            t[slot0:slot0 + n], non_blocking = True)
+                else:
+                    for p in range(s0, s1):
+                        for name, t in resident.items():
+                            self.mirror[name][self._tok2pool[p], r0:r1].copy_(
+                                t[self._table_slot(p), r0:r1], non_blocking = True)
 
     def _account_rollback(self, a: int):
         """Rows in [a, previous end) were rejected: forget them in the publication ledger"""
@@ -487,12 +613,8 @@ class StreamLayer(CacheLayer):
             self._pub_rows[p] = min(self._pub_rows[p], max(0, a - p * PAGE_SIZE))
         self._trace(f"rollback to {a}: publication clamped (was {self._wrote_upto})")
 
-    def _write_append(self, k, v, a: int, length: int):
-        """Write rows [a, a + length) into the resident window and publish them"""
-        assert length > 0
-        self._stage.fill_(a)
-        self._write_rows(k, v, a, length)
-        b = a + length
+    def _publish_append(self, a: int, b: int):
+        """Record ownership of the pages a step just wrote and publish their rows to the mirror"""
         for p in range(a // PAGE_SIZE, (b - 1) // PAGE_SIZE + 1):
             slot = self._table_slot(p)
             self._slot_owner[slot] = (self._epoch, p, self._tok2pool[p])
@@ -500,13 +622,29 @@ class StreamLayer(CacheLayer):
             self._publish_rows(a, b)
             self._record_publish_event()
         else:
-            ev = torch.cuda.Event()
+            # Reuse one marker event per layer: a wait snapshots the record that is current when it
+            # is enqueued, so re-recording it on a later step cannot affect earlier waits. One
+            # fewer event object per publish (this runs once per layer per step)
+            ev = self._ev_mark
+            if ev is None:
+                ev = self._ev_mark = torch.cuda.Event()
             ev.record()
             with torch.cuda.stream(self._copy_stream):
                 self._copy_stream.wait_event(ev)
                 self._publish_rows(a, b)
                 self._record_publish_event()
-        self._wrote_upto = max(self._wrote_upto, b)
+        # Plain assignment: a new sequence can start below the previous one's end (the epoch bump
+        # in the driver already invalidated every slot owner). Keeping a stale maximum here would
+        # make the position mismatch persist for the whole sequence and bump the epoch on every
+        # call, which refills the entire resident window every step
+        self._wrote_upto = b
+
+    def _write_append(self, k, v, a: int, length: int):
+        """Write rows [a, a + length) into the resident window and publish them"""
+        assert length > 0
+        self._stage.fill_(a)
+        self._write_rows(k, v, a, length)
+        self._publish_append(a, a + length)
 
     def _record_publish_event(self):
         if self._copy_stream is not None:
@@ -566,19 +704,16 @@ class StreamLayer(CacheLayer):
         C, S = self.cfg["C"], self.cfg["S"]
         s0 = ci * C
         s1 = min(s0 + C, window_start)
-        slot0 = (ci % S) * C
         self._ensure_ring()
         if self._copy_stream is None:
-            for j, p in enumerate(range(s0, s1)):
-                self._copy_page_to_ring(p, slot0 + j)
+            self._copy_pages_to_ring(s0, s1)
             return
         ring = self._ensure_ring()
         cs = self._copy_stream
         if ring["used"][ci % S]:
             cs.wait_event(ring["consumed"][ci % S])
         with torch.cuda.stream(cs):
-            for j, p in enumerate(range(s0, s1)):
-                self._copy_page_to_ring(p, slot0 + j)
+            self._copy_pages_to_ring(s0, s1)
             ring["ready"][ci % S].record()
         ring["used"][ci % S] = True
 
@@ -624,6 +759,7 @@ class StreamLayer(CacheLayer):
         assert self.device is not None, "streaming cache layer is not allocated (model not loaded?)"
         assert non_causal_spans is None, "KV streaming does not support non-causal spans"
         assert causal, "KV streaming does not support non-causal attention"
+        self._ensure_resident()
         bsz, q_len, n_q_heads, head_dim = q.shape
         assert bsz == 1, "KV streaming supports bsz == 1"
         assert n_q_heads == self.num_q_heads and head_dim == self.head_dim
@@ -651,6 +787,7 @@ class StreamLayer(CacheLayer):
         if a != self._wrote_upto:
             self._epoch += 1
             self._slot_owner = [None] * self.cfg["R"]
+            self._valid_from = None
             self._trace(f"epoch {self._epoch} at {a} (last published {self._wrote_upto})")
 
         if sm_scale is None:
@@ -678,6 +815,69 @@ class StreamLayer(CacheLayer):
                                    sinks, nkv_override)
             pos, s0 = b_s, s1
         return out
+
+    def _identity_table(self):
+        """Block table the graph reads over the resident window: slot == token page"""
+        if self._bt_identity is None:
+            self._bt_identity = torch.arange(self.cfg["R"], dtype = torch.int32,
+                                             device = self.device).unsqueeze(0)
+        return self._bt_identity
+
+    @torch.no_grad
+    def bc_attn_step(self, attn, x, params, block_table, cache_seqlens, host_seqlens,
+                     position, positions, position_ids, inv_freq):
+        """
+        All-resident steps run the stock graph path. While the whole live history fits the
+        resident window (so slot == token page for every page) the window is a plain page-major
+        pool, and the stock BC graph reads and appends through the identity block table: same
+        captured C++ call as a regular cache, projections and rope included. The mirror publish
+        is the only streaming-specific work left. Returns None when the step must take the
+        chunked driver instead (window slid, host inputs missing, graph unsupported).
+        """
+        if x.dtype != torch.float16 or x.dim() != 3 or x.shape[0] != 1 or not x.is_contiguous():
+            return None
+        if params.get("causal", True) is not True:
+            # Non-causal callers (draft graphs) are not eligible: the streaming driver asserts
+            # causal outright, so declining keeps the failure loud instead of silently wrong
+            return None
+        self._ensure_resident()
+        if host_seqlens is None:
+            cs_host = params.get("cache_seqlens")
+            if not (isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and
+                    cs_host.numel() >= 1):
+                return None
+            host_seqlens = cs_host
+        host_bt = params.get("block_table")
+        if not (isinstance(host_bt, torch.Tensor) and host_bt.device.type == "cpu" and
+                host_bt.dim() == 2):
+            return None
+        a = int(host_seqlens[0])
+        q_len = x.shape[1]
+        L = a + q_len
+        if a < 0 or q_len < 1 or L > self.cfg["R"] * PAGE_SIZE:
+            return None
+        bca = self._bc_stream
+        if bca is None:
+            from ..modules.attention_fn.bc_attn import build_bc_stream
+            bca = self._bc_stream = (build_bc_stream(attn, self) or False)
+        if bca is False:
+            return None
+
+        self._account_rollback(a)
+        if a != self._wrote_upto:
+            self._epoch += 1
+            self._slot_owner = [None] * self.cfg["R"]
+            self._valid_from = None
+            self._trace(f"epoch {self._epoch} at {a} (bc step, last published {self._wrote_upto})")
+        self._wait_publish()
+        self._ensure_state(host_bt, a, L)
+        # The graph appends rows [a, L) itself, through the identity table (see docstring), and
+        # counts the new tokens as part of the sequence
+        self._stage.fill_(a)
+        y = bca.step(x, self._stage, self._identity_table(), position, positions, position_ids,
+                     inv_freq, causal = True, host_seqlens = None)
+        self._publish_append(a, L)
+        return y
 
     def _walk_decode(self, q, out, L, window_start, sm_scale, sinks, nkv_override):
         from ..modules.attention_fn.triton_paged import PagedAttnStreamDecode
@@ -802,6 +1002,7 @@ class StreamLayer(CacheLayer):
                                           non_blocking = False)
         self._pub_rows[to_page] = num_tokens
         self._stale_pages.add(to_page)
+        self._valid_from = None
 
     def rotate_pages(self, order_cpu: torch.Tensor):
         """
@@ -810,6 +1011,7 @@ class StreamLayer(CacheLayer):
         invalidated: they are refilled from the (rotated) mirror on the next step.
         """
         self._quiesce()
+        self._ensure_resident()
         order = order_cpu.tolist()
         idx = list(range(self.capacity_pages))
         tmp = None
@@ -833,12 +1035,15 @@ class StreamLayer(CacheLayer):
         self._slot_owner = [None] * self.cfg["R"]
         self._table_key = None
         self._stale_pages = set()
+        self._valid_from = None
 
     # ---- accounting ----
 
     @override
     def storage_size(self):
         """GPU bytes (resident window); the mirror lives in pinned host memory"""
+        if not self._resident_ready:
+            return 0
         total = 0
         for t in self._resident_tensors().values():
             total += t.numel() * t.element_size()
@@ -869,6 +1074,10 @@ class CacheLayer_stream(StreamLayer, CacheLayer_fp16):
         sh = (self.cfg["R"], PAGE_SIZE, self.num_kv_heads, self.head_dim)
         self.k = torch.zeros(sh, dtype = torch.half, device = device)
         self.v = torch.zeros(sh, dtype = torch.half, device = device)
+
+    @override
+    def _free_resident(self):
+        self.k = self.v = None
 
     @override
     def _alloc_mirror(self, device):
@@ -909,6 +1118,10 @@ class CacheLayer_stream_quant(StreamLayer, CacheLayer_quant):
         self.qv = torch.zeros((R, PAGE_SIZE, self.qshape_v[2]), dtype = torch.int, device = device)
         self.sk = torch.zeros((R, PAGE_SIZE, self.qshape_s[2]), dtype = torch.half, device = device)
         self.sv = torch.zeros((R, PAGE_SIZE, self.qshape_s[2]), dtype = torch.half, device = device)
+
+    @override
+    def _free_resident(self):
+        self.qk = self.qv = self.sk = self.sv = None
 
     @override
     def _alloc_mirror(self, device):

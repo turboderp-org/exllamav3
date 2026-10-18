@@ -314,15 +314,53 @@ def _clear_stream_env(monkeypatch):
 
 @pytest.mark.nogpu
 def test_stream_config_defaults(monkeypatch):
-    """Auto window: the whole cache stays resident up to 16 pages, and the ring is 64 pages split by the
+    """Auto window: the resident size is deferred to first use (the budget needs the free device memory,
+    which is only meaningful once the weights are loaded), and the ring is 64 pages split by the
     prefetch depth"""
     _clear_stream_env(monkeypatch)
     cfg = _cfg(32)
-    assert (cfg["R"], cfg["ring_pages"], cfg["prefetch"], cfg["S"], cfg["C"]) == (16, 64, 2, 2, 32)
+    assert (cfg["R"], cfg["ring_pages"], cfg["prefetch"], cfg["S"], cfg["C"]) == (None, 64, 2, 2, 32)
     assert cfg["serial"] is False and cfg["trace"] is False
-    assert _cfg(4)["R"] == 4           # clamped to the cache capacity
-    assert _cfg(1)["R"] == 1           # and never 0
-    assert _cfg(64)["R"] == 16         # more capacity does not grow the auto window
+    assert cfg["n_layers"] == 1
+    monkeypatch.setenv("EXL3_KV_STREAM_RESIDENT", "auto")
+    assert _cfg(32)["R"] is None       # spelled out auto is the same policy
+
+
+@pytest.mark.nogpu
+def test_stream_config_counts_layers(monkeypatch):
+    """Auto placement divides the free memory between the layers sharing the cache id, so one config
+    accumulates one count per layer"""
+    _clear_stream_env(monkeypatch)
+    cid = next(_cache_ids)
+    cfg = _cfg(32, cache_id = cid)
+    assert cfg["n_layers"] == 1
+    assert _cfg(32, cache_id = cid)["n_layers"] == 2
+    assert _cfg(32, cache_id = cid) is cfg
+    assert cfg["n_layers"] == 3
+
+
+@pytest.mark.nogpu
+def test_auto_resident_budget(monkeypatch):
+    """Auto placement fills the free device memory: the window gets what is left after the ring, a
+    capped reserve for the walk partials and workspace headroom"""
+    from exllamav3.cache.stream import StreamLayer, _PARTIAL_BUDGET
+    free = 20 << 30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev: (free, 24 << 30))
+    per_page = 1 << 20
+    layer = SimpleNamespace(
+        cfg = dict(per_page = per_page, S = 2, C = 32, n_layers = 4),   # ring: 64 MiB
+        capacity_pages = 1 << 20,
+        device = torch.device("cpu"),
+    )
+    ring = 2 * 32 * per_page
+    partials = min(2 * 4 * _PARTIAL_BUDGET, free // 4)
+    slack = max(512 << 20, free // 16)
+    assert partials == 2 * 4 * _PARTIAL_BUDGET
+    assert StreamLayer._auto_resident_pages(layer) == (free - ring - partials - slack) // (4 * per_page)
+    layer.capacity_pages = 8
+    assert StreamLayer._auto_resident_pages(layer) == 8      # clamped to the cache capacity
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev: (1 << 20, 24 << 30))
+    assert StreamLayer._auto_resident_pages(layer) == 1      # never 0, however tight the budget
 
 
 @pytest.mark.nogpu
@@ -379,7 +417,7 @@ def test_stream_config_mirror_budget_and_flags(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         cfg = _cfg(100, per_page = 1 << 20)
-    assert cfg["R"] == 16
+    assert cfg["ring_pages"] == 64
 
     monkeypatch.setenv("EXL3_KV_STREAM_MIRROR", "8M")
     with pytest.warns(UserWarning, match = "below the full mirror"):

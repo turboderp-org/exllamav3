@@ -233,8 +233,10 @@ steps, never inside a chunk walk.
   norms) and downstream (output projection, gates) is unchanged. The driver delegates to
   `paged_attn_triton_decode`-compatible launches (patched kernels) so tie-in points stay in one place.
 - **BC graph path.** `EXL3_BC_ATTN` captures fixed-shape graphs with cache pointers baked in. Streaming layers
-  decline it initially (`build_bc_attn` returns None for them). A later milestone can capture the chunk loop with
-  static ring addresses and the existing idle-split trick.
+  decline it while the window slides, but as built an all-resident step runs the stock graph over the resident
+  window: slot == token page there, so the window is a plain page-major pool and an identity block table makes
+  the captured kernels address it (see §11). Capturing the chunk walk itself (static ring addresses, idle-split
+  trick) remains the later milestone.
 - **Recurrent/linear layers.** Untouched: `cache/recurrent.py` state is bounded, no pages, no streaming.
 - **Qwen3.5.** Only `full_attention` layers stream. With the default `full_attention_interval = 4` that is a
   quarter of the layers, the same topology class the reference implementation qualifies.
@@ -244,7 +246,7 @@ steps, never inside a chunk walk.
 - MLA / QSA / DSA cache geometries (different packing and access patterns; separate design).
 - Tensor parallelism and multi-GPU.
 - `bsz > 1` and continuous batching (ring shared across sequences; per-sequence chunk walks).
-- The CUDA graph decode path.
+- CUDA graph capture of the chunk walk itself (the all-resident step does run the graph path, see §11).
 - ROCm-specific tuning (Triton and the copy paths should work; bandwidth profiles differ).
 - The vision tower: already CPU-offloaded in this fork and unaffected.
 
@@ -314,7 +316,7 @@ purpose.
 |---|---|---|
 | `EXL3_KV_STREAM` | `0` | Enable streaming cache layers |
 | `EXL3_KV_STREAM_MIRROR` | auto | Host mirror budget (e.g. `8G`). Reserved: the mirror is allocated for the full logical capacity and a smaller budget only warns |
-| `EXL3_KV_STREAM_RESIDENT` | auto | Resident window size, in pages (`12` / `12p`) or bytes (`1G`); per full-attention layer, default `min(capacity, 16)` pages |
+| `EXL3_KV_STREAM_RESIDENT` | auto | Resident window size, in pages (`12` / `12p`) or bytes (`1G`); per full-attention layer. `auto` sizes the window at first use to fill the free device memory (minus the ring, the walk partials and workspace headroom) |
 | `EXL3_KV_STREAM_RING` | `64` | Ring size in pages (shared across layers) |
 | `EXL3_KV_STREAM_PREFETCH` | `2` | Ring slots in flight (double buffering and beyond) |
 | `EXL3_KV_STREAM_SERIAL` | `0` | Serialized debug mode (no copy stream, no overlap) |
@@ -354,6 +356,48 @@ anything else (a new sequence, a rollback, a rotation, a page that changed its p
 and refills it from the mirror before the step's write. Rollbacks move `_wrote_upto` back and bump the epoch, so
 post-rollback reads serve the accepted prefix.
 
+**The published position is exact, not a maximum.** `_wrote_upto` is assigned the end of the appended range, not
+`max(old, new)`: a new sequence can start below the previous one's end (a shorter prompt, prompt-cache reuse,
+rollback), and keeping the stale maximum made the `a != _wrote_upto` test fire on *every* call of that sequence.
+Each call then bumped the epoch and invalidated the whole window, which refilled every resident page from the
+mirror on every layer-step — the all-resident case streamed its whole window over PCIe each step and decoded at a
+quarter of the stock rate. The epoch now changes once per real sequence change, and a step with no table/refill
+work is `O(pages)`-free.
+
+**The window carries a validity marker.** After a full verification scan (owner check + refill), `_valid_from`
+records the lowest verified window page; while it sits at or below the current window start and nothing marked
+pages stale (prompt-cache `copy_page`) or invalidated the epoch, `_ensure_state()` skips the per-page scan
+entirely. Pages a scan verified also leave `_stale_pages`, so a copied prefix that has moved out of the window
+does not force a rescan every step.
+
+**Copies coalesce into runs.** H2D chunk fills and D2H publishes split the page range into runs whose mirror
+pages *and* destination slots are both contiguous, and issue one copy per component per run (`_runs()`), instead
+of one per page. A sequential pool and a sequential block table make a whole chunk one copy per component; the
+partial head/tail pages of a publish keep their own copies.
+
+**All-resident steps run the stock graph path.** While the live history fits the window (`L <= R * PAGE_SIZE`),
+`slot == token page` for every page, so the window *is* a page-major pool and the regular `EXL3_BC_ATTN` graph
+can run over it unchanged: `Attention.bc_attn_step()` delegates to `StreamLayer.bc_attn_step()`, which requires
+the host `cache_seqlens`/`block_table` (the generator always supplies pinned copies; without them it declines
+rather than syncing), runs the same epoch/`_ensure_state`/`_wait_publish` prologue as the eager driver, and
+passes an identity block table (width `R`, built once per layer) so the captured update kernel and split kernels
+address the resident slots. The graph itself appends the new rows, so the driver only publishes them afterwards
+(`_publish_append()`: slot owners + D2H on the copy stream + `_pub_event`), keeping the mirror authoritative.
+`build_bc_stream()` declines modules the stock builder would decline, QSA modules (their side planes are not on a
+streaming layer) and quantized layers with `compand_a != 0` (the captured update kernel hardcodes zero companding).
+Once the window slides the check fails and the chunked driver takes over; the same layer can alternate between
+the two paths across steps.
+
+**Auto placement fills the free device memory.** With `EXL3_KV_STREAM_RESIDENT` unset (or `auto`), the resident
+window is not sized at load: `alloc()` runs before all weights are resident, so the free-memory reading there is
+misleading. `_ensure_resident()` resolves it at first use instead, when every cache layer of the model exists.
+The budget is the free device memory minus the ring (`S * C` pages per layer), minus a per-layer reserve for the
+decode and prefill walk partials (each bounded by 64 MiB, capped at a quarter of the free memory), minus
+`max(512 MiB, free / 16)` of headroom; the remainder buys `budget // (per_page * n_layers)` pages, clamped to the
+cache capacity. `n_layers` is counted by `_stream_config()` as the layers of a cache construct their configs, so
+config memoization does not undercount. The intent is exactly "whatever fits in VRAM stays there": a model whose
+KV exceeds the device streams only the excess, and a context that fits copies nothing.
+
 **Driver state is written device-side and stream-ordered.** The append length reaches the kernels through a
 1-element device tensor (`fill_()`), and the kernel table is built on the device from `torch.arange`/`torch.where`
 (`_kt_host` mirrors it for Python-side lookups only). Pinned staging plus async H2D was the first
@@ -387,16 +431,18 @@ stream as the H2Ds, and `_pub_event` orders the compute stream after the last pu
 publishes from earlier steps).
 
 **Not implemented, and declined loudly rather than silently:** MLA/QSA/DSA geometries, tensor parallelism,
-`bsz > 1`, the CUDA graph decode path, sliding-window layers, logit softcapping, `cu_seqlens` batching,
-asymmetric V head dims, non-causal spans, and the CPU/disk page tiers (a `StreamLayer` in a cache that is also
-tiered raises). ROCm is untested; the copy paths and the Triton kernels are the same code, but the bandwidth
-profiles the design's tuning assumes are not.
+`bsz > 1`, CUDA graph capture of the chunked walk, sliding-window layers, logit softcapping, `cu_seqlens`
+batching, asymmetric V head dims, non-causal spans, and the CPU/disk page tiers (a `StreamLayer` in a cache that
+is also tiered raises). ROCm is untested; the copy paths and the Triton kernels are the same code, but the
+bandwidth profiles the design's tuning assumes are not.
 
 Status of the roadmap in §8: M0, M1 and M2 are done (the resident set is dynamic by construction; copy stream,
 ready/consumed events and prefetch depth are in; serial mode remains as the debug switch). M3 is done: prefill
 walks the history with the bounded-range prefill launches, pages appended during prefill are published like
 decode rows, and prompt-cache reuse works through `copy_page`/`rotate_pages`, which move mirror pages (the page
 hashes that drive reuse are over the prompt tokens, not over the KV image, so hashing is unaffected by where the
-KV lives; the design's worry under "Prompt cache semantics" does not apply). M4 has not been started, and the
-M4 caveat that results need not be bit-identical across different stream configurations applies as documented:
+KV lives; the design's worry under "Prompt cache semantics" does not apply). Of M4, the CUDA-graph variant has
+landed for the all-resident case (the window as a plain pool, identity table, graph append + post-publish; see
+above) and the auto placement policy is in; chunk-walk capture, sliding windows, `bsz > 1` and TP remain. The M4
+caveat that results need not be bit-identical across different stream configurations applies as documented:
 streaming is a placement change rather than a numerics change, but split counts follow the chunking.

@@ -272,16 +272,22 @@ and only when the layer's decode path is the stock one (no sliding window, logit
 `cu_seqlens` batching or asymmetric V head dims; TP is excluded). Ineligible attention modules
 keep their regular cache layer with a one-line warning naming the reason. A streaming layer in a
 cache that is also tiered (the CPU page cache) is refused, since the mirror already holds the full
-history, and the graph-captured decode path (`EXL3_BC_ATTN`) declines streaming layers, so their
-attention always runs through the chunked driver. Quantized layers stream the packed pages *and*
-their scales, so an 8-bit cache halves the PCIe traffic of an fp16 one. Results match the stock
-path up to kernel determinism (the accumulation order differs only in how the history is
-re-split); `tests/cache/test_kv_stream.py` checks the driver against the stock wrappers per
-placement, and `tests/e2e/test_kv_stream.py` checks whole models against their own noise floor.
+history. While the whole live history fits the resident window, decode runs the stock
+graph-captured block (`EXL3_BC_ATTN`) over the window — same captured C++ call as a regular cache,
+with the window read as a plain page-major pool through an identity block table — and only the
+mirror publish remains streaming-specific; once the window slides, attention moves to the chunked
+driver. Quantized layers stream the packed pages *and* their scales, so an 8-bit cache halves the
+PCIe traffic of an fp16 one. Results match the stock path up to kernel determinism (the
+accumulation order differs only in how the history is re-split);
+`tests/cache/test_kv_stream.py` checks the driver against the stock wrappers per placement, and
+`tests/e2e/test_kv_stream.py` checks whole models against their own noise floor, all-resident
+decode included.
 
-The placement policy is resolved once per model load, when the cache layers are constructed; all
-of the variables below must be set before loading. The ring is shared per (device, component
-shape), so its size is a per-device budget rather than a per-layer one.
+Explicit placement values are resolved once per model load, when the cache layers are constructed;
+the `auto` resident window is resolved at first use, because its budget depends on the free device
+memory (which is only meaningful once the weights are loaded). All of the variables below must be
+set before loading. The ring is shared per (device, component shape), so its size is a per-device
+budget rather than a per-layer one.
 
 ### `EXL3_KV_STREAM` (default: `0`)
 
@@ -294,15 +300,21 @@ the model's full logical cache capacity (so a capped capacity is a follow-up cha
 does), and a budget below that warns at load. The mirror is the authoritative copy of the whole
 history, in pinned (page-locked) host memory; budget it like the KV cache itself.
 
-### `EXL3_KV_STREAM_RESIDENT` (default: auto = `min(capacity, 16)` pages)
+### `EXL3_KV_STREAM_RESIDENT` (default: `auto`)
 
 Resident window size: the newest `R` pages of each streaming layer stay on the GPU (`token page i`
 lives in slot `i % R`), everything older is streamed. Pages (`12`, `12p`) or a byte budget
 (`1G`, divided by the layer's per-page bytes). `0` is raised to `1`; values above the cache
 capacity are clamped. This is the capacity-versus-speed dial: it bounds GPU bytes per streaming
 layer at `R + S * C` pages, and the streamed fraction of the history is what crosses PCIe on
-every step. A missing value (or `auto`) keeps the whole history resident for caches up to 16 pages
-(4k tokens at `PAGE_SIZE` 256) and streams beyond, which is a no-op for short contexts.
+every step.
+
+`auto` (the default) sizes the window at first use to fill the free device memory: the whole
+per-page budget of every streaming layer minus the ring, a per-layer reserve for the chunk-walk
+partials, and workspace headroom (`512 MiB`, or a sixteenth of the free memory, whichever is
+larger) goes to the window, so any history that fits in VRAM is kept there and only the excess
+streams. A model whose KV never fits then still streams exactly the overflow, and a short context
+copies nothing. Set a page or byte count to bound the window explicitly instead.
 
 ### `EXL3_KV_STREAM_RING` (default: `64`)
 

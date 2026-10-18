@@ -794,3 +794,33 @@ def build_bc_attn(module, layer):
                      qsa_layer = layer if qsa_idx is not None else None)
     _trace_build(m, bca, "attn")
     return bca
+
+
+def build_bc_stream(module, layer):
+    """
+    Build a BCAttn over a streaming layer's resident window. While the whole live history fits
+    the window, slot == token page for every page, so the window is a plain page-major pool and
+    the stock graph applies unchanged, given an identity block table (the layer owns that table
+    and the mirror publish). Returns None when unsupported.
+    """
+    from ...cache import CacheLayer_quant
+    from ...cache.stream import StreamLayer
+
+    m = module
+    if not (
+        _module_eligible(m) and
+        isinstance(layer, StreamLayer) and
+        layer._resident_ready and
+        # A QSA indexer keeps its side planes on the cache layer, which a streaming layer does
+        # not carry; sparse steps stay on the eager path
+        getattr(m, "qsa_indexer", None) is None and
+        (not isinstance(layer, CacheLayer_quant) or layer.compand_a == 0.0)
+    ):
+        _trace_build(m, None, "stream")
+        return None
+    if isinstance(layer, CacheLayer_quant):
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+    else:
+        bca = BCAttn(m, layer.k, layer.v)
+    _trace_build(m, bca, "stream")
+    return bca
