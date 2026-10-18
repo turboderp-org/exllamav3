@@ -297,6 +297,7 @@ class DeepseekV41Model(Model):
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
+        self.calibration_all_experts = True
 
         self.caps.update({
             "recurrent_states": True,
