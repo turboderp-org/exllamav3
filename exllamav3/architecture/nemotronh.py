@@ -53,22 +53,41 @@ class NemotronHConfig(Config):
         )
 
         # Layer pattern: M = Mamba2, * = attention, - = MLP, E = MoE
+        layer_types = {
+            "mamba": "M",
+            "linear_attention": "M",
+            "attention": "*",
+            "full_attention": "*",
+            "mlp": "-",
+            "moe": "E",
+        }
+
+        def block_pattern(block_types, key):
+            if not isinstance(block_types, list):
+                raise ValueError(f"Expected {key} to be a list of block types")
+            try:
+                return "".join(layer_types[block_type] for block_type in block_types)
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Unsupported {key} block types: {block_types!r}") from exc
+
         block_configs = self.read_cfg(list, "block_configs", None)
-        if block_configs is not None:
-            block_types = self.read_cfg(list, "layers_block_type", None)
+        block_types = self.read_cfg(list, "layers_block_type", None)
+        if block_configs is not None or block_types is not None:
             if block_types is None:
                 block_types = [layer.get("block_type") for layer in block_configs]
-            layer_types = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
-            try:
-                self.hybrid_override_pattern = "".join(layer_types[t] for t in block_types)
-            except (KeyError, TypeError) as exc:
-                raise ValueError(f"Unsupported NemotronH block type in {block_types!r}") from exc
-            if len(block_types) != len(block_configs):
+            self.hybrid_override_pattern = block_pattern(block_types, "layers_block_type")
+            if block_configs is not None and len(block_types) != len(block_configs):
                 raise ValueError("NemotronH block_configs and layers_block_type lengths differ")
             self.layer_moe_configs = block_configs
         else:
-            self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", no_default)
+            self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", None)
+            if self.hybrid_override_pattern is None:
+                raise ValueError("NemotronH config requires block_configs, layers_block_type, or hybrid_override_pattern")
             self.layer_moe_configs = None
+
+        declared_pattern = self.read_cfg(str, "hybrid_override_pattern", None)
+        if declared_pattern is not None and declared_pattern != self.hybrid_override_pattern:
+            raise ValueError("Conflicting layers_block_type and hybrid_override_pattern")
 
         # Attention params (NoPE: the reference model applies no positional embeddings)
         self.head_dim = self.read_cfg(int, "head_dim", None)
@@ -124,9 +143,17 @@ class NemotronHConfig(Config):
         # the mtp.* namespace. The component only exists when the tensors are present (a quant made
         # before MTP support gets them from util/convert_mtp.py)
         self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
-        self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", "")
+        mtp_block_types = self.read_cfg(list, "mtp_layers_block_type", None)
+        self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", None)
+        if mtp_block_types is not None:
+            mtp_pattern = block_pattern(mtp_block_types, "mtp_layers_block_type")
+            if self.mtp_hybrid_override_pattern is not None and self.mtp_hybrid_override_pattern != mtp_pattern:
+                raise ValueError("Conflicting mtp_layers_block_type and mtp_hybrid_override_pattern")
+            self.mtp_hybrid_override_pattern = mtp_pattern
+        elif self.mtp_hybrid_override_pattern is None:
+            self.mtp_hybrid_override_pattern = ""
         if self.num_mtp_layers == 0 or not any(
-            self.stc.has_tensor(f"mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
+            self.stc.has_tensor(f"{self.tensor_prefix}mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
         ):
             del self.model_classes["mtp"]
 
@@ -441,7 +468,8 @@ class NemotronHOmniVisionModel(Model):
     def get_additional_compiled_tensors(config: NemotronHOmniConfig) -> dict:
         return (
             config.stc.list_tensors(prefix = "vision_model.") |
-            config.stc.list_tensors(prefix = "mlp1.")
+            config.stc.list_tensors(prefix = "mlp1.") |
+            config.stc.list_tensors(prefix = "vision_projector.vision_final_layernorm.")
         )
 
     def __init__(
@@ -520,6 +548,14 @@ class NemotronHOmniVisionModel(Model):
                     ),
                 )
             ]
+
+        if config.stc.has_tensor("vision_projector.vision_final_layernorm.weight"):
+            self.modules.append(LayerNorm(
+                config = config,
+                key = "vision_projector.vision_final_layernorm",
+                layernorm_eps = v.layer_norm_eps,
+                out_dtype = torch.half,
+            ))
 
         self.modules += [
             PixelUnshuffle(

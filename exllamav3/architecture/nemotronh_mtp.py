@@ -39,12 +39,14 @@ class NemotronHMTPModel(Model):
         assert pattern and "M" not in pattern, \
             f"NemotronH MTP: unsupported mtp_hybrid_override_pattern {pattern!r}"
 
+        mtp_layers_key = f"{config.tensor_prefix}mtp.layers"
+
         self.input_layer = Qwen3_5MTPInputLayer(
             config = config,
-            key = "mtp.layers.0.input",
-            key_pre_fc_norm_hidden = "mtp.layers.0.hnorm",
-            key_pre_fc_norm_embedding = "mtp.layers.0.enorm",
-            key_fc = "mtp.layers.0.eh_proj",
+            key = f"{mtp_layers_key}.0.input",
+            key_pre_fc_norm_hidden = f"{mtp_layers_key}.0.hnorm",
+            key_pre_fc_norm_embedding = f"{mtp_layers_key}.0.enorm",
+            key_fc = f"{mtp_layers_key}.0.eh_proj",
             hidden_size = config.hidden_size,
             rms_norm_eps = config.layer_norm_epsilon,
             native_draft_len = 1,
@@ -57,14 +59,14 @@ class NemotronHMTPModel(Model):
 
         for idx, block_type in enumerate(pattern):
             self.modules.append(nemotronh_block(
-                config, f"mtp.layers.{idx}", idx, block_type, qbits_key = "mtp_bits"
+                config, f"{mtp_layers_key}.{idx}", idx, block_type, qbits_key = "mtp_bits"
             ))
 
         self.last_kv_module_idx = len(self.modules) - 1
 
         self.final_norm = RMSNorm(
             config = config,
-            key = f"mtp.layers.{len(pattern) - 1}.final_layernorm",
+            key = f"{mtp_layers_key}.{len(pattern) - 1}.final_layernorm",
             rms_norm_eps = config.layer_norm_epsilon,
             out_dtype = torch.half,
         )
