@@ -4,10 +4,23 @@ from types import SimpleNamespace
 import json
 import os
 import torch
+from PIL import Image
 from ..model.config import Config, no_default
 from ..model.model import Model
+from ..util.file import read_dict
+from ..tokenizer import MMEmbedding, Tokenizer
+from ..modules.arch_specific.nemotronh_omni import NemotronHOmniPatchEmbedder, NemotronHOmniPixelShuffle
+from .mm_processing.nemotronh_omni import (
+    nemotronh_omni_image_grid,
+    nemotronh_omni_video_grid,
+    nemotronh_omni_image_to_tensor,
+    nemotronh_omni_patchify,
+    nemotronh_omni_frame_labels,
+    nemotronh_omni_video_retention_mask,
+)
 from ..modules import (
     RMSNorm,
+    LayerNorm,
     Embedding,
     TransformerBlock,
     Attention,
@@ -20,7 +33,6 @@ from ..modules import (
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .nemotronh_mtp import NemotronHMTPModel
-from .nemotronh_omni_vision import NemotronHOmniVisionModel
 
 class NemotronHConfig(Config):
     arch_string = "NemotronHForCausalLM"
@@ -71,17 +83,10 @@ class NemotronHConfig(Config):
         self.ssm_state_size = self.read_cfg(int, "ssm_state_size", no_default)
         self.n_groups = self.read_cfg(int, "n_groups", no_default)
         self.conv_kernel = self.read_cfg(int, "conv_kernel", 4)
-        self.time_step_limit = self.read_cfg(list, "time_step_limit", [0.0, float("inf")])
-        # Hugging Face serializes non-finite config floats as tagged objects. Restore these
-        # values before passing the limits to the native Mamba2 backend.
-        special_floats = {
-            "Infinity": float("inf"),
-            "-Infinity": -float("inf"),
-            "NaN": float("nan"),
-        }
+        # Non-finite limits are serialized as {"__float__": "Infinity"} by newer Transformers
         self.time_step_limit = [
-            special_floats.get(value.get("__float__"), value) if isinstance(value, dict) else value
-            for value in self.time_step_limit
+            float(v["__float__"]) if isinstance(v, dict) else v
+            for v in self.read_cfg(list, "time_step_limit", [0.0, float("inf")])
         ]
         self.assert_cfg(str, "mamba_hidden_act", "silu", True)
 
@@ -91,7 +96,7 @@ class NemotronHConfig(Config):
 
         # MoE params (30B-A3B, 120B-A12B): DeepSeek-style sigmoid router with correction bias,
         # non-gated relu2 experts plus one always-on shared expert
-        self.num_experts = self.read_cfg(int, "n_routed_experts", self.read_cfg(int, "num_experts", 0))
+        self.num_experts = self.read_cfg(int, ["n_routed_experts", "num_experts"], 0)
         self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", 0)
         self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", 0)
         self.shared_expert_intermediate_size = self.read_cfg(int, "moe_shared_expert_intermediate_size", 0)
@@ -346,7 +351,10 @@ class NemotronHModel(Model):
 
 
 class NemotronHOmniConfig(NemotronHConfig):
-    """Text backbone config for Nemotron 3.5 Omni checkpoints (including Bolt)."""
+    """
+    Nemotron 3.5 Omni checkpoints (Bolt): the NemotronH Puzzle text backbone under llm_config, a
+    C-RADIO vision tower and the mlp1 projector
+    """
 
     arch_string = "NemotronH_Omni_Reasoning_V3"
     config_key = "llm_config"
@@ -357,37 +365,16 @@ class NemotronHOmniConfig(NemotronHConfig):
         self.model_classes["text"] = NemotronHOmniModel
         self.model_classes["vision"] = NemotronHOmniVisionModel
 
-        vision = self.read_cfg(dict, "vision_config", no_default)
-        self.vision = SimpleNamespace(
-            hidden_size = vision["hidden_size"],
-            num_channels = vision.get("num_channels", 3),
-            patch_size = vision["patch_size"],
-            max_img_size = vision["max_img_size"],
-            num_cls_tokens = vision["num_cls_tokens"],
-            num_registers = vision["num_registers"],
-            num_attention_heads = vision["num_attention_heads"],
-            num_hidden_layers = vision["num_hidden_layers"],
-            layer_norm_eps = vision["layer_norm_eps"],
-            mlp_ratio = vision["mlp_ratio"],
-            hidden_act = vision.get("hidden_act", "gelu"),
-            video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2),
-        )
+        self.vision = read_nemotronh_omni_vision_config(self.read_cfg(dict, "vision_config", no_default))
+        self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
+        self.assert_cfg(bool, "vision_final_layernorm", False, True)
 
         prep_path = os.path.join(directory, "processor_config.json")
         if not os.path.exists(prep_path):
             prep_path = os.path.join(directory, "preprocessor_config.json")
         with open(prep_path, encoding = "utf8") as f:
-            processor_config = json.load(f)
-        pp = processor_config.get("image_processor", processor_config)
-        self.vision_pp = SimpleNamespace(
-            norm_mean = pp["norm_mean"],
-            norm_std = pp["norm_std"],
-            patch_size = pp.get("patch_size", self.vision.patch_size),
-            min_num_patches = pp["min_num_patches"],
-            max_num_patches = pp["max_num_patches"],
-            max_model_len = pp.get("max_model_len", 16384),
-            video_target_num_patches = pp["video_target_num_patches"],
-        )
+            self.vision_pp = read_nemotronh_omni_pp_config(json.load(f))
+
         self.image_token_id = self.read_cfg(int, "img_context_token_id", None)
         self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
         self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
@@ -395,8 +382,331 @@ class NemotronHOmniConfig(NemotronHConfig):
         self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
 
 
+def read_nemotronh_omni_vision_config(config_dict: dict):
+    v = SimpleNamespace(**{
+        k: read_dict(config_dict, t, k, no_default)
+        for k, t in [
+            ("hidden_size", int),
+            ("num_hidden_layers", int),
+            ("num_attention_heads", int),
+            ("patch_size", int),
+            ("max_img_size", int),
+            ("num_cls_tokens", int),
+            ("num_registers", int),
+            ("layer_norm_eps", float),
+            ("mlp_ratio", float),
+        ]
+    })
+    assert read_dict(config_dict, str, "hidden_act", "gelu") == "gelu", \
+        "Expected vision_config->hidden_act to be 'gelu'"
+    v.num_channels = read_dict(config_dict, int, "num_channels", 3)
+    v.head_dim = v.hidden_size // v.num_attention_heads
+    v.intermediate_size = int(v.hidden_size * v.mlp_ratio)
+    v.patch_dim = v.num_channels * v.patch_size ** 2
+    v.num_prefix_tokens = v.num_cls_tokens + v.num_registers
+    v.pos_emb_side = v.max_img_size // v.patch_size
+    return v
+
+
+def read_nemotronh_omni_pp_config(config_dict: dict):
+    ip = read_dict(config_dict, dict, "image_processor", config_dict)
+    pp = SimpleNamespace(**{
+        k: read_dict(ip, t, k, no_default)
+        for k, t in [
+            ("norm_mean", list),
+            ("norm_std", list),
+            ("patch_size", int),
+            ("min_num_patches", int),
+            ("max_num_patches", int),
+            ("video_target_num_patches", int),
+        ]
+    })
+    pp.max_model_len = read_dict(ip, int, "max_model_len", 16384)
+    pp.video_maintain_aspect_ratio = read_dict(ip, bool, "video_maintain_aspect_ratio", True)
+    return pp
+
+
 class NemotronHOmniModel(NemotronHModel):
     config_class = NemotronHOmniConfig
 
 
-NemotronHOmniVisionModel.config_class = NemotronHOmniConfig
+class NemotronHOmniVisionModel(Model):
+    """C-RADIO vision tower and the mlp1 projector, for image and video input"""
+
+    config_class = NemotronHOmniConfig
+
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: NemotronHOmniConfig) -> dict:
+        return (
+            config.stc.list_tensors(prefix = "vision_model.") |
+            config.stc.list_tensors(prefix = "mlp1.")
+        )
+
+    def __init__(
+        self,
+        config: NemotronHOmniConfig,
+        key_prefix: str = "vision_model.radio_model.model",
+        **kwargs
+    ):
+        super().__init__(config, **kwargs)
+        self.config = config
+        self.caps.update({
+            "image_input": True,
+            "video_input": True,
+            "default_vision_bits": 16,
+            "supports_tp": False,
+        })
+        v = config.vision
+        self.merge_size = int(round(1.0 / config.downsample_ratio))
+
+        # Blocks keep an fp32 residual stream; the reference has no LayerScale tensors in the
+        # checkpoint (identity scale) and no final encoder norm
+        self.modules += [
+            NemotronHOmniPatchEmbedder(
+                config = config,
+                key = f"{key_prefix}.patch_generator",
+                hidden_size = v.hidden_size,
+                patch_dim = v.patch_dim,
+                video_patch_dim = v.video_temporal_patch_size * v.patch_dim,
+                table_side = v.pos_emb_side,
+                out_dtype = torch.float,
+            ),
+        ]
+
+        for idx in range(v.num_hidden_layers):
+            key = f"{key_prefix}.blocks.{idx}"
+            self.modules += [
+                TransformerBlock(
+                    config = config,
+                    key = key,
+                    layer_idx = idx,
+                    attn_norm = LayerNorm(
+                        config = config,
+                        key = f"{key}.norm1",
+                        layernorm_eps = v.layer_norm_eps,
+                    ),
+                    attn = Attention(
+                        config = config,
+                        key = f"{key}.attn",
+                        layer_idx = idx,
+                        hidden_size = v.hidden_size,
+                        head_dim = v.head_dim,
+                        num_q_heads = v.num_attention_heads,
+                        num_kv_heads = v.num_attention_heads,
+                        rope_settings = None,
+                        key_fused_qkv = "qkv",
+                        key_o = "proj",
+                        qmap = "block.attn",
+                        out_dtype = torch.float,
+                    ),
+                    mlp_norm = LayerNorm(
+                        config = config,
+                        key = f"{key}.norm2",
+                        layernorm_eps = v.layer_norm_eps,
+                    ),
+                    mlp = MLP(
+                        config = config,
+                        key = f"{key}.mlp",
+                        hidden_size = v.hidden_size,
+                        intermediate_size = v.intermediate_size,
+                        key_up = "fc1",
+                        key_down = "fc2",
+                        activation_fn = "gelu_exact",
+                        qmap = "block.mlp",
+                        out_dtype = torch.float,
+                        pad_to = 1,
+                    ),
+                )
+            ]
+
+        self.modules += [
+            NemotronHOmniPixelShuffle(
+                config = config,
+                key = f"{key_prefix}.pixel_shuffle",
+                num_prefix_tokens = v.num_prefix_tokens,
+                merge_size = self.merge_size,
+                ps_version = config.ps_version,
+            ),
+            RMSNorm(
+                config = config,
+                key = "mlp1.0",
+                rms_norm_eps = 1e-5,
+                out_dtype = torch.half,
+            ),
+            MLP(
+                config = config,
+                key = "mlp1",
+                hidden_size = v.hidden_size * self.merge_size ** 2,
+                intermediate_size = config.projector_hidden_size,
+                key_up = "1",
+                key_down = "3",
+                activation_fn = "relu2",
+                out_size = config.hidden_size,
+                qmap = "block.mlp",
+                out_dtype = torch.half,
+                pad_to = 1,
+            ),
+        ]
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        return input_ids
+
+
+    def probe_grid(self) -> tuple[int, int]:
+        # Largest square grid within the patch budget, a multiple of the merge size on each side
+        side = int(self.config.vision_pp.max_num_patches ** 0.5) // self.merge_size * self.merge_size
+        return side, side
+
+
+    def default_load_shape_dtype(self, chunk_size):
+        rows, cols = self.probe_grid()
+        return (1, rows * cols, self.config.vision.patch_dim), torch.half
+
+
+    def default_load_params(self, max_chunk_size):
+        return self.make_vision_params(self.probe_grid())
+
+
+    def make_vision_params(self, grid_hw: tuple, video: bool = False) -> dict:
+        return {
+            "causal": False,
+            "grid_hw": grid_hw,
+            "video": video,
+        }
+
+
+    def preprocess(
+        self,
+        image: Image.Image,
+        video: bool = False,
+    ) -> (torch.Tensor, tuple, tuple):
+        """
+        Returns the normalized (3, H, W) pixel tensor, the resize target (width, height) and the
+        patch grid (rows, cols). Video frames use the fixed-budget grid, images the dynamic one.
+        """
+        pp = self.config.vision_pp
+        if video:
+            rows, cols = nemotronh_omni_video_grid(
+                image.size,
+                pp.video_target_num_patches,
+                self.merge_size,
+                pp.video_maintain_aspect_ratio,
+            )
+        else:
+            budget = (pp.max_model_len - 4) * self.merge_size ** 2
+            budget = min(max(budget, pp.min_num_patches), pp.max_num_patches)
+            rows, cols = nemotronh_omni_image_grid(
+                image.size,
+                pp.patch_size,
+                budget,
+                pp.min_num_patches,
+                self.merge_size,
+            )
+        size = (rows * pp.patch_size, cols * pp.patch_size)
+        pixels = nemotronh_omni_image_to_tensor(image, size, pp.norm_mean, pp.norm_std)
+        return pixels, (size[1], size[0]), (rows, cols)
+
+
+    def get_image_embeddings(
+        self,
+        tokenizer: Tokenizer,
+        image: Image.Image | list[Image.Image],
+        text_alias: str | None = None,
+    ):
+        if isinstance(image, list):
+            assert text_alias is None, "Cannot apply a single alias to a list of images"
+            return [self.get_image_embeddings(tokenizer, i) for i in image]
+
+        pixels, prep_image_size, grid_hw = self.preprocess(image)
+        patches = nemotronh_omni_patchify(pixels.unsqueeze(0), self.config.vision.patch_size)
+        embedding_tensor = self.forward(
+            patches.half(),
+            params = self.make_vision_params(grid_hw),
+        ).cpu()
+
+        id_start = tokenizer.single_id("<img>")
+        id_end = tokenizer.single_id("</img>")
+        token_string = torch.tensor([[id_start] + [-1] * embedding_tensor.shape[1] + [id_end]], dtype = torch.long)
+
+        mme = MMEmbedding(
+            embeddings = embedding_tensor[0],
+            text_alias = text_alias,
+            token_string = token_string,
+        )
+        mme.metadata.update({
+            "original_size": image.size,
+            "preprocessed_size": prep_image_size,
+            "model_architecture": self.config.architecture,
+            "media_type": "image",
+        })
+        return mme
+
+
+    def get_video_embeddings(
+        self,
+        tokenizer: Tokenizer,
+        frames: list[Image.Image],
+        fps: float | None = None,
+        frame_indices: list[int] | None = None,
+        text_alias: str | None = None,
+    ):
+        """
+        Embed sampled video frames. Frames are packed into temporal patches (tubelets) of
+        video_temporal_patch_size, the last one padded by repeating the final frame, and each
+        tubelet becomes its own <img>...</img> block preceded by the frame label the reference
+        processor writes ("Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.50 seconds: ").
+        Timestamps need `fps` (the source frame rate) and, when the frames were subsampled, the
+        `frame_indices` they were taken from. Efficient video sampling then prunes the tokens least
+        changed from the previous tubelet, so blocks after the first are typically shorter.
+        """
+        if not frames:
+            raise ValueError("Video input requires at least one frame")
+        if len({frame.size for frame in frames}) != 1:
+            raise ValueError("All video frames must have the same dimensions")
+
+        v = self.config.vision
+        temporal = v.video_temporal_patch_size
+        prepared = [self.preprocess(frame, video = True) for frame in frames]
+        prep_image_size, grid_hw = prepared[0][1], prepared[0][2]
+        pixels = torch.stack([p[0] for p in prepared])
+        if pixels.shape[0] % temporal:
+            pixels = torch.cat((pixels, pixels[-1:].expand(temporal - pixels.shape[0] % temporal, -1, -1, -1)))
+        tubelets = pixels.reshape(-1, temporal * 3, pixels.shape[-2], pixels.shape[-1])
+        patches = nemotronh_omni_patchify(tubelets, v.patch_size)
+
+        embedding_tensor = self.forward(
+            patches.half(),
+            params = self.make_vision_params(grid_hw, video = True),
+        ).cpu()
+        rows, cols = grid_hw[0] // self.merge_size, grid_hw[1] // self.merge_size
+        embedding_tensor = embedding_tensor.reshape(-1, rows, cols, embedding_tensor.shape[-1])
+
+        keep_mask = nemotronh_omni_video_retention_mask(embedding_tensor, self.config.video_pruning_rate)
+        counts = keep_mask.sum(dim = 1).tolist()
+        embedding_tensor = embedding_tensor.reshape(-1, rows * cols, embedding_tensor.shape[-1])[keep_mask]
+
+        id_start = tokenizer.single_id("<img>")
+        id_end = tokenizer.single_id("</img>")
+        labels = nemotronh_omni_frame_labels(len(frames), temporal, fps, frame_indices)
+        token_ids = []
+        for g, (label, count) in enumerate(zip(labels, counts)):
+            token_ids += tokenizer.encode(("\n" if g > 0 else "") + label)[0].tolist()
+            token_ids += [id_start] + [-1] * count + [id_end]
+        token_string = torch.tensor([token_ids], dtype = torch.long)
+
+        mme = MMEmbedding(
+            embeddings = embedding_tensor,
+            text_alias = text_alias,
+            token_string = token_string,
+        )
+        mme.metadata.update({
+            "original_size": frames[0].size,
+            "preprocessed_size": prep_image_size,
+            "frame_count": len(frames),
+            "model_architecture": self.config.architecture,
+            "media_type": "video",
+        })
+        return mme
