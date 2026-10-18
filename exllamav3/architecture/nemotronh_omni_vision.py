@@ -42,6 +42,11 @@ class RadioPatchEmbedding(Module):
         self.cls_register_token = None
 
     @override
+    def optimizer_targets(self):
+        # The RADIO tower is loaded in full precision and is not a quantization target.
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         self.position_embedding = self.config.stc.get_tensor(
@@ -114,6 +119,10 @@ class RadioPatchShuffle(Module):
         self.num_prefix_tokens = num_prefix_tokens
         self.ratio = ratio
         self.version = version
+
+    @override
+    def optimizer_targets(self):
+        return []
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
