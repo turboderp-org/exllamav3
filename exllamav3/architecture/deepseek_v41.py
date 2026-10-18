@@ -304,6 +304,7 @@ class DeepseekV41Model(Model):
             "default_recurrent_checkpoint_interval": 2048,
             "supports_tp": False,
             "prefill_pipeline": True,
+            "can_resume_quant": False,
         })
         from ..cache.dsa import DSV4State
         self.recurrent_state_cls = DSV4State

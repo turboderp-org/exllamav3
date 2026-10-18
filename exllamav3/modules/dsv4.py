@@ -1182,6 +1182,8 @@ class DSV4Attention(Module):
             indices = None
             k_len = 0
             sh = params.setdefault("dsv4_shared", {}).setdefault(b, {})
+            if "quant_preserve" in params:
+                params["quant_preserve"]["dsv4_shared"] = params["dsv4_shared"]
             if self.idx_wk is not None:
                 stage = torch.empty((cap, hd), dtype = torch.half, device = device)
                 self.compressor.forward_fused(x[b:b + 1], params, ring_kv, ring_gate, None, stage, None, 0)
