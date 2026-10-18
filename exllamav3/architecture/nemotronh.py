@@ -97,7 +97,7 @@ class NemotronHConfig(Config):
         self.layer_norm_epsilon = self.read_cfg(float, "layer_norm_epsilon", no_default)
 
         # Layers
-        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", len(self.hybrid_override_pattern))
         assert len(self.hybrid_override_pattern) == self.num_hidden_layers, \
             "hybrid_override_pattern length does not match num_hidden_layers"
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
