@@ -1374,7 +1374,7 @@ class Job:
         return new_pages
 
 
-    def prefill(self, results: list):
+    def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
 
@@ -1382,6 +1382,9 @@ class Job:
         sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
         model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
         recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+
+        chunk_size, when given, bounds the forward pass of this call below the generator's max_chunk_size (prompt
+        ingestion alongside generating jobs). The cached-page skip still covers the full max_chunk_size window.
         """
 
         if self.time_first_prefill is None:
@@ -1427,6 +1430,11 @@ class Job:
                 if page.kv_position == PAGE_SIZE:
                     prefill_end = local_idx * PAGE_SIZE
                     break
+
+            # A reduced chunk bounds the forward pass only, after the cached pages were skipped over the full
+            # window above, so a job resuming a cached prompt still walks it at the usual rate
+            if chunk_size is not None:
+                prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue
@@ -1752,20 +1760,28 @@ class Job:
         """
         Return whether the current sequence position should stash a recurrent checkpoint.
 
-        Checkpoints are measured from the end of the cached K/V prefix so restored pages and recurrent state stay in
-        sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
-        interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
-        interval.
+        Checkpoints sit on page boundaries, spaced at least the checkpoint interval apart: a position qualifies
+        once it is the interval or more past the previous checkpoint, or past the end of the cached K/V prefix
+        (which a restored state matches) while there is none. Positions are not required to fall on a fixed grid,
+        so prefill chunks may vary in size. An explicit interval overrides the normal policy; otherwise prefill
+        uses the coarser prompt-ingestion interval until it nears the generation boundary, where it switches to
+        the normal recurrent checkpoint interval.
         """
         seq = self.sequences[0]
-        prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
+        if seq_pos % PAGE_SIZE:
+            return False
         if override_interval:
             return seq_pos % override_interval == 0
-        elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+        prompt_len = len(seq.sequence_ids) - 1
+        if seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
+            interval = self.generator.recurrent_checkpoint_interval
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            interval = self.generator.recurrent_checkpoint_interval_pp
+        anchor = self.last_recurrent_checkpoint_pos
+        if anchor is None:
+            anchor = self.cached_pages * PAGE_SIZE
+        return seq_pos - anchor >= interval
 
 
     def mm_exact_spans(self, seq):
