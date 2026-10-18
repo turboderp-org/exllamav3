@@ -390,12 +390,21 @@ def trellis_rate(tile_width: int):
     return None
 
 
-def _cpu_expert_supported(stc, key: str) -> bool:
-    """Whether one projection has the complete EXL3 representation used by MoeCpuHost."""
+def cpu_moe_matrix_kind(stc, key: str) -> str | None:
+    """Return the CPU worker representation accepted for one expert projection."""
     tensors = stc.list_tensors(key)
-    if any(key + suffix not in tensors for suffix in (".mul1", ".trellis", ".suh", ".svh")):
-        return False
-    return trellis_rate(tensors[key + ".trellis"]["shape"][-1]) is not None
+    trellis = tensors.get(key + ".trellis")
+    if trellis is not None:
+        if all(key + suffix in tensors for suffix in (".mul1", ".suh", ".svh")) \
+                and trellis_rate(trellis["shape"][-1]) is not None:
+            return "exl3"
+        return None
+    weight = tensors.get(key + ".weight")
+    if weight is not None and weight["dtype"] in ("torch.bfloat16", "torch.float16"):
+        shape = weight["shape"]
+        if len(shape) == 2 and shape[0] % 128 == 0 and shape[1] % 128 == 0:
+            return "dense"
+    return None
 
 
 class BlockSparseMLP_CPU:
@@ -684,27 +693,12 @@ class BlockSparseMLP_CPU:
         biases), in which case the caller falls back to the normal path.
         """
         stc = self.config.stc
-        cpu = torch.device("cpu")
         experts = self.gates + self.ups + self.downs
-
-        if any(not _cpu_expert_supported(stc, l.key) for l in experts):
-            print(f" !! {self.key}: one or more experts are not in a CPU-supported EXL3 "
-                  "format; CPU offload skipped")
+        projections = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+        if any(cpu_moe_matrix_kind(stc, l.key) is None for ls in projections for l in ls):
+            print(f" !! {self.key}: an expert projection uses a format unsupported by the CPU worker; "
+                  "CPU offload skipped")
             return False
-
-        # Eligibility probe on the first expert of each projection before fetching bulk data
-        probe = ([self.gates[0]] if self.gated else []) + [self.ups[0], self.downs[0]]
-        for l in probe:
-            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
-                print(f" !! {self.key}: experts are not mul1, CPU offload skipped")
-                return False
-
-        def hdr_shape(l):
-            return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-        for l in probe:
-            if trellis_rate(hdr_shape(l)[-1]) is None:
-                print(f" !! {self.key}: unsupported bitrate, CPU offload skipped")
-                return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
             if any(has) and not all(has):
@@ -761,12 +755,18 @@ class BlockSparseMLP_CPU:
             hosts[comp] = host
         self.cpu_host = host
         self.cpu_component = comp
-        def dims_of(l):
-            s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-            return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
-        gd = dims_of(self.gates[0]) if self.gated else None
-        ud = dims_of(self.ups[0])
-        dd = dims_of(self.downs[0])
+        def dims_of(ls):
+            for l in ls:
+                tensors = stc.list_tensors(l.key)
+                tr = tensors.get(l.key + ".trellis")
+                if tr is not None:
+                    s = tr["shape"]
+                    return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
+            s = stc.list_tensors(ls[0].key)[ls[0].key + ".weight"]["shape"]
+            return (s[1], s[0], 1)
+        gd = dims_of(self.gates) if self.gated else None
+        ud = dims_of(self.ups)
+        dd = dims_of(self.downs)
         hi, ho = ud[0], dd[1]
 
         # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
@@ -774,16 +774,16 @@ class BlockSparseMLP_CPU:
         def fetch_aux(ls, suffix, optional = False):
             out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
                                   float2half = True) for l in ls]
-            return out if not optional or out[0] is not None else None
+            return out if not optional or any(t is not None for t in out) else None
         aux = dict(
-            suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
-            suh_d = fetch_aux(self.downs, ".suh"), svh_d = fetch_aux(self.downs, ".svh"),
+            suh_u = fetch_aux(self.ups, ".suh", True), svh_u = fetch_aux(self.ups, ".svh", True),
+            suh_d = fetch_aux(self.downs, ".suh", True), svh_d = fetch_aux(self.downs, ".svh", True),
             bias_u = fetch_aux(self.ups, ".bias", True),
             bias_d = fetch_aux(self.downs, ".bias", True),
         )
         if self.gated:
-            aux["suh_g"] = fetch_aux(self.gates, ".suh")
-            aux["svh_g"] = fetch_aux(self.gates, ".svh")
+            aux["suh_g"] = fetch_aux(self.gates, ".suh", True)
+            aux["svh_g"] = fetch_aux(self.gates, ".svh", True)
             aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
 
         self.cpu_layer_idx = host.register_layer(
@@ -797,6 +797,8 @@ class BlockSparseMLP_CPU:
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
             interm_fp32 = self.interm_dtype == torch.float,
+            streamable = [all(cpu_moe_matrix_kind(stc, ls[e].key) == "exl3" for ls in projections)
+                          for e in range(self.num_experts)],
         )
         self.cpu_offload = True
         print(f" -- CPU-offloaded experts (worker): {self.key}")
@@ -819,14 +821,12 @@ class BlockSparseMLP_CPU:
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         projections = ([self.gates] if self.gated else []) + [self.ups, self.downs]
 
-        # The GPU Linear loader accepts full-precision experts, but the CPU worker needs
-        # EXL3 trellis, mul1, suh, and svh tensors. Keep any expert missing one of these in
-        # the GPU-resident prefix instead of selecting it for the CPU tail.
+        # Keep formats unsupported by both CPU representations in the GPU-resident prefix.
         cpu_eligible = [True] * self.num_experts
         for expert_idx in range(self.num_experts):
             for linears in projections:
                 key = linears[expert_idx].key
-                if not _cpu_expert_supported(stc, key):
+                if cpu_moe_matrix_kind(stc, key) is None:
                     cpu_eligible[expert_idx] = False
                     break
 
@@ -852,7 +852,7 @@ class BlockSparseMLP_CPU:
         eligible_count = sum(cpu_eligible)
         if eligible_count < split_k:
             print(f" !! {self.key}: only {eligible_count}/{self.num_experts} experts have "
-                  f"EXL3 tensors supported by the CPU worker; reducing CPU split from "
+                  f"weights supported by the CPU worker; reducing CPU split from "
                   f"{split_k} to {eligible_count}")
             split_k = eligible_count
         if split_k <= 0:
@@ -875,11 +875,6 @@ class BlockSparseMLP_CPU:
             self._split_cpu_eligible = cpu_eligible
 
         first = self.num_experts - split_k
-        probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
-        for l in probe:
-            if stc.get_tensor(l.key + ".mul1", torch.device("cpu"), optional=True) is None:
-                print(f" !! {self.key}: experts are not mul1, CPU split skipped")
-                return False
         def bias_keys(ls):
             has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
             if any(has) and not all(has):
@@ -895,8 +890,10 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
+        all_exl3 = all(cpu_moe_matrix_kind(stc, l.key) == "exl3"
+                       for ls in projections for l in ls)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
+            and not self.tid2eid_key and all_exl3
         # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 4, 0 off): with
         # the pinned arena the parent moves experts between the GPU slots and the worker's arena
         # by DMA, so a routed expert the CPU had to compute can take a spare GPU slot for the
@@ -927,27 +924,33 @@ class BlockSparseMLP_CPU:
         self.cpu_host = host
         self.cpu_component = comp
 
-        def dims_of(l):
-            s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-            return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
-        gd = dims_of(self.gates[first]) if self.gated else None
-        ud = dims_of(self.ups[first])
-        dd = dims_of(self.downs[first])
+        def dims_of(ls):
+            for l in ls:
+                tensors = stc.list_tensors(l.key)
+                tr = tensors.get(l.key + ".trellis")
+                if tr is not None:
+                    s = tr["shape"]
+                    return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
+            s = stc.list_tensors(ls[0].key)[ls[0].key + ".weight"]["shape"]
+            return (s[1], s[0], 1)
+        gd = dims_of(self.gates[first:]) if self.gated else None
+        ud = dims_of(self.ups[first:])
+        dd = dims_of(self.downs[first:])
         hi, ho = ud[0], dd[1]
 
         def fetch_aux(ls, suffix, optional = False):
             out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
                                   float2half = True) for l in ls[wfirst:]]
-            return out if not optional or out[0] is not None else None
+            return out if not optional or any(t is not None for t in out) else None
         aux = dict(
-            suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
-            suh_d = fetch_aux(self.downs, ".suh"), svh_d = fetch_aux(self.downs, ".svh"),
+            suh_u = fetch_aux(self.ups, ".suh", True), svh_u = fetch_aux(self.ups, ".svh", True),
+            suh_d = fetch_aux(self.downs, ".suh", True), svh_d = fetch_aux(self.downs, ".svh", True),
             bias_u = fetch_aux(self.ups, ".bias", True),
             bias_d = fetch_aux(self.downs, ".bias", True),
         )
         if self.gated:
-            aux["suh_g"] = fetch_aux(self.gates, ".suh")
-            aux["svh_g"] = fetch_aux(self.gates, ".svh")
+            aux["suh_g"] = fetch_aux(self.gates, ".suh", True)
+            aux["svh_g"] = fetch_aux(self.gates, ".svh", True)
             aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
 
         self.cpu_layer_idx = host.register_layer(
@@ -961,6 +964,8 @@ class BlockSparseMLP_CPU:
             proj_dims = dict(g = gd, u = ud, d = dd),
             aux = aux,
             interm_fp32 = self.interm_dtype == torch.float,
+            streamable = [all(cpu_moe_matrix_kind(stc, ls[e].key) == "exl3" for ls in projections)
+                          for e in range(wfirst, self.num_experts)],
         )
 
         self._split_wfirst = wfirst

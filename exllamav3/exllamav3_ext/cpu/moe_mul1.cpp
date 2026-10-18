@@ -2718,6 +2718,40 @@ inline void run_rows(const MoeCpuMatrix& mat, const PreparedIn& p, float* tout, 
     run_tiles(mat, rest, tout + static_cast<size_t>(MAX_M) * mat.n, p.rows - MAX_M, tn0, tn1);
 }
 
+inline float dense_weight_value(const MoeCpuMatrix& mat, size_t i)
+{
+    if (mat.dense_type == 2) return static_cast<float>(reinterpret_cast<const at::BFloat16*>(mat.dense)[i]);
+    return half_to_float(reinterpret_cast<const at::Half*>(mat.dense)[i]);
+}
+
+// Dense fallback for a small number of full-precision EXL3 MoE experts. We keep the checkpoint
+// matrix in its native [out, in] orientation and accumulate in FP32. The normal EXL3 experts
+// continue to use the fused integer-dot kernels below.
+inline void run_dense_rows(const MoeCpuMatrix& mat, const void* input, bool input_float,
+                           int rows, int input_stride, float* output, int tn0, int tn1,
+                           const int* row_ids = nullptr)
+{
+    for (int r = 0; r < rows; ++r)
+    {
+        const size_t input_row = static_cast<size_t>(row_ids ? row_ids[r] : r) * input_stride;
+        const at::Half* xh = input_float ? nullptr : static_cast<const at::Half*>(input) + input_row;
+        const float* xf = input_float ? static_cast<const float*>(input) + input_row : nullptr;
+        float* y = output + static_cast<size_t>(r) * mat.n;
+        for (int col = tn0 * 16; col < tn1 * 16; ++col)
+        {
+            const size_t woff = static_cast<size_t>(col) * mat.k;
+            float sum = 0.0f;
+            for (int k = 0; k < mat.k; ++k)
+            {
+                const float xv = input_float ? xf[k] : half_to_float(xh[k]);
+                sum = std::fma(dense_weight_value(mat, woff + k), xv, sum);
+            }
+            if (mat.bias) sum += half_to_float(mat.bias[col]);
+            y[col] = sum;
+        }
+    }
+}
+
 // GEMV rows back to token rows, columns [c0, c1) of n: the two rows of a wide token add up
 inline void fold_rows(float* tout, const PreparedIn& p, int m, int n, int c0, int c1)
 {
@@ -2804,11 +2838,12 @@ void decode_gu_block(ForwardCtx& c, int j, int block)
     const bool gated = !L.gates.empty();
     float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
     float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
-    if (gated) transform_out_block(L.gates[e], g, block);
-    transform_out_block(L.ups[e], u, block);
+    if (gated && !L.gates[e].dense) transform_out_block(L.gates[e], g, block);
+    if (!L.ups[e].dense) transform_out_block(L.ups[e], u, block);
     apply_activation(L, g + block, u + block, 128);
     const float* a = gated ? g : u;
-    prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + block, 128);
+    if (!L.downs[e].dense)
+        prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + block, 128);
 }
 
 // Down block complete for every chunk: output transform and routing-weighted accumulate, chunks
@@ -2824,13 +2859,13 @@ void decode_out_block(ForwardCtx& c, int block, bool fold)
         const Chunk& ch = c.chunks[j];
         const MoeCpuMatrix& mat = L.downs[ch.expert];
         float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
-        if (fold) fold_rows(d, c.prep_d[j], ch.m, H, block, block + 128);
+        if (fold && !mat.dense) fold_rows(d, c.prep_d[j], ch.m, H, block, block + 128);
         // Normally m == 1 here; retain repeated selections of the same expert
         // too, which the raw API groups into a multi-row chunk.
         for (int r = 0; r < ch.m; ++r)
         {
             float* v = d + static_cast<size_t>(r) * H;
-            transform_out_block(mat, v, block);
+            if (!mat.dense) transform_out_block(mat, v, block);
             for (int col = 0; col < 128; ++col)
                 c.out[block + col] += ch.weight[r] * v[block + col];
         }
@@ -2856,8 +2891,11 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
-                PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
+                if (!mat.dense)
+                {
+                    PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                    prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
+                }
             }
             break;
         }
@@ -2871,9 +2909,16 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
-                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_SLOTS * I;
-                run_rows(mat, p, tout, t0, t1);
+                if (mat.dense)
+                {
+                    run_dense_rows(mat, c.x, false, ch.m, H, tout, t0, t1, ch.token);
+                }
+                else
+                {
+                    const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                    run_rows(mat, p, tout, t0, t1);
+                }
             });
             break;
         }
@@ -2889,16 +2934,25 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
                 if (gated)
                 {
-                    fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
-                    transform_out(L.gates[ch.expert], g, ch.m);
+                    const MoeCpuMatrix& gm = L.gates[ch.expert];
+                    if (!gm.dense)
+                    {
+                        fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
+                        transform_out(gm, g, ch.m);
+                    }
                 }
-                fold_rows(u, c.prep_u[j], ch.m, I, 0, I);
-                transform_out(L.ups[ch.expert], u, ch.m);
+                const MoeCpuMatrix& um = L.ups[ch.expert];
+                if (!um.dense)
+                {
+                    fold_rows(u, c.prep_u[j], ch.m, I, 0, I);
+                    transform_out(um, u, ch.m);
+                }
                 const size_t count = static_cast<size_t>(ch.m) * I;
                 float* a = gated ? g : u;
                 apply_activation(L, g, u, count);
                 static const int idx4[MAX_M] = {0, 1, 2, 3};   // (token rows, after the fold)
-                prepare_rows(L.downs[ch.expert], nullptr, a, I, idx4, ch.m, c.prep_d[j]);
+                if (!L.downs[ch.expert].dense)
+                    prepare_rows(L.downs[ch.expert], nullptr, a, I, idx4, ch.m, c.prep_d[j]);
             }
             break;
         }
@@ -2910,7 +2964,15 @@ void forward_phase(void* vctx, int worker, int num_workers)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
-                run_rows(L.downs[ch.expert], c.prep_d[j], tout, t0, t1);
+                const MoeCpuMatrix& mat = L.downs[ch.expert];
+                if (mat.dense)
+                {
+                    const float* a = L.gates.empty()
+                        ? c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I
+                        : c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
+                    run_dense_rows(mat, a, true, ch.m, I, tout, t0, t1);
+                }
+                else run_rows(mat, c.prep_d[j], tout, t0, t1);
             });
             break;
         }
@@ -2933,8 +2995,12 @@ void forward_phase(void* vctx, int worker, int num_workers)
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
                 float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
-                fold_rows(d, c.prep_d[j], ch.m, H, 0, H);
-                transform_out(L.downs[ch.expert], d, ch.m);
+                const MoeCpuMatrix& mat = L.downs[ch.expert];
+                if (!mat.dense)
+                {
+                    fold_rows(d, c.prep_d[j], ch.m, H, 0, H);
+                    transform_out(mat, d, ch.m);
+                }
             }
             break;
         }
@@ -3211,22 +3277,39 @@ static MoeCpuMatrix make_matrix
 )
 {
     TORCH_CHECK(trellis.device().is_cpu() && trellis.is_contiguous(), "trellis must be contiguous CPU");
-    TORCH_CHECK(trellis.dim() == 3, "trellis must be [k/16, n/16, 16K], 16K + 8 at a half-integer rate");
     MoeCpuMatrix m;
-    m.trellis = reinterpret_cast<const uint16_t*>(trellis.data_ptr());
-    m.suh = reinterpret_cast<const at::Half*>(suh.data_ptr());
-    m.svh = reinterpret_cast<const at::Half*>(svh.data_ptr());
     m.bias = bias ? reinterpret_cast<const at::Half*>(bias->data_ptr()) : nullptr;
-    m.k = static_cast<int>(trellis.size(0)) * 16;
-    m.n = static_cast<int>(trellis.size(1)) * 16;
-    const int tile_w = static_cast<int>(trellis.size(2));
-    m.bits = tile_w / 16;
-    m.hb = tile_w % 16 == 8 ? 1 : 0;
-    TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
-    // The caller repacks each tensor with the group exl3_moe_cpu_swizzle_group returns for
-    // this matrix's rate; apply the same rule here so the flag matches the bytes per tensor
-    m.swz = swizzled && exl3_moe_cpu_swizzle_group(tile_w / 16.0) ? 1 : 0;
-    TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
+    if (trellis.dim() == 2)
+    {
+        // Dense checkpoints store PyTorch Linear weights as [out, in]. They don't use the
+        // EXL3 Hadamard transforms; the raw matrix is multiplied directly by the input.
+        TORCH_CHECK(trellis.scalar_type() == at::kBFloat16 || trellis.scalar_type() == at::kHalf,
+                    "dense CPU MoE weights must be BF16 or FP16");
+        m.dense = trellis.data_ptr();
+        m.dense_type = trellis.scalar_type() == at::kBFloat16 ? 2 : 1;
+        m.k = static_cast<int>(trellis.size(1));
+        m.n = static_cast<int>(trellis.size(0));
+        m.trellis = nullptr;
+        m.suh = nullptr;
+        m.svh = nullptr;
+    }
+    else
+    {
+        TORCH_CHECK(trellis.dim() == 3, "weight must be dense [n, k] or EXL3 [k/16, n/16, 16K]");
+        m.trellis = reinterpret_cast<const uint16_t*>(trellis.data_ptr());
+        m.suh = reinterpret_cast<const at::Half*>(suh.data_ptr());
+        m.svh = reinterpret_cast<const at::Half*>(svh.data_ptr());
+        m.k = static_cast<int>(trellis.size(0)) * 16;
+        m.n = static_cast<int>(trellis.size(1)) * 16;
+        const int tile_w = static_cast<int>(trellis.size(2));
+        m.bits = tile_w / 16;
+        m.hb = tile_w % 16 == 8 ? 1 : 0;
+        TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
+        // The caller repacks each tensor with the group exl3_moe_cpu_swizzle_group returns for
+        // this matrix's rate; apply the same rule here so the flag matches the bytes per tensor
+        m.swz = swizzled && exl3_moe_cpu_swizzle_group(tile_w / 16.0) ? 1 : 0;
+        TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
+    }
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
     TORCH_CHECK(m.k > 0 && m.n > 0, "CPU MoE: empty expert weight dimension");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
@@ -3461,7 +3544,11 @@ void exl3_moe_cpu_forward_raw(
 
     // Single-token decode runs as two dispatches (decode_phase). The five-phase schedule
     // remains for the scalar tier and for repeated selections of one expert (multi-row chunks)
-    bool decode = rows == 1 && g_isa != Isa::Scalar;
+    bool dense_selected = false;
+    for (const Chunk& ch : ctx.chunks)
+        dense_selected = dense_selected || layer->ups[ch.expert].dense || layer->downs[ch.expert].dense
+            || (!layer->gates.empty() && layer->gates[ch.expert].dense);
+    bool decode = rows == 1 && g_isa != Isa::Scalar && !dense_selected;
     for (const Chunk& ch : ctx.chunks) decode = decode && ch.m == 1;
     if (decode)
     {

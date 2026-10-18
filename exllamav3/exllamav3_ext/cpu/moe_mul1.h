@@ -17,7 +17,9 @@
 
 struct MoeCpuMatrix
 {
-    const uint16_t* trellis;
+    const uint16_t* trellis = nullptr;
+    const void* dense = nullptr; // optional dense [n, k] tensor (FP16 or BF16)
+    int dense_type = 0;       // 0 = EXL3, 1 = FP16, 2 = BF16
     const at::Half* suh;
     const at::Half* svh;
     const at::Half* bias;   // nullable; added after the output transform
