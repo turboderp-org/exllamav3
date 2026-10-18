@@ -162,6 +162,12 @@ class SMProducer:
         t_cpu = tensor_d.cpu().contiguous()
         src = t_cpu.view(torch.uint8).numpy().view(np.uint8).ravel()
         np.copyto(dst, src, casting = "no")
+        if desc["method"] == "overflow" and sys.platform != "win32":
+            # The segment stays reachable by name until clear() unlinks it, so the handle is not needed past the
+            # copy: one held per tensor ran a large module's export out of file descriptors. (On Windows a named
+            # mapping only lives while a handle to it is open)
+            del dst
+            segment.close()
 
         if cache_id is not None:
             _cache_insert(self, cache_id, tensor)
