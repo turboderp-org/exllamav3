@@ -300,6 +300,7 @@ class HyperConnection(Module):
                 "sinkhorn_iters": self.sinkhorn_iters,
                 "hc_eps": self.hc_eps,
                 "rms_norm_eps": self.rms_eps,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -791,6 +792,7 @@ class HyperHead(Module):
                 "hc_eps": self.hc_eps,
                 # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
                 "mean": self.mean,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
