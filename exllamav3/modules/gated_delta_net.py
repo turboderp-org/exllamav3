@@ -1310,7 +1310,11 @@ class GatedDeltaNet(Module):
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
             not spec_step and
             not has_runtime_lora(self.qkv_proj, self.z_proj, self.b_proj,
-                                 self.a_proj, self.o_proj)
+                                 self.a_proj, self.o_proj,
+                                 # KDA: the graph also embeds the forget/output gate
+                                 # projections (kda_fa_t .. kda_gb_t, base weights only)
+                                 self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj,
+                                 self.f_proj, self.g_proj)
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):

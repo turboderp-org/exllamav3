@@ -289,8 +289,11 @@ def _isolated_expert_profiles(tmp_path_factory):
     # later loads from them. Tests must neither depend on the user's profiles (a settled profile changes which
     # experts the promote placement has to move, and whether it moves any) nor leave their own behind. (Not via
     # XDG_CACHE_HOME: torch's extension build root follows it too, and would rebuild the extension per session)
-    import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
-    bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
+    # Importing the module builds the extension, which a CPU-only box (the training suites' home)
+    # cannot do; the CPU expert split needs a device anyway, so the isolation only matters with one
+    if env.cuda_available():
+        import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
+        bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
     yield
 
 
