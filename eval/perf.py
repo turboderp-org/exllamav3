@@ -1,11 +1,13 @@
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.misc import Timer, cuda_sync_active
 from exllamav3.util.file import disk_lru_cache
+from exllamav3.util.expert_jitter import expert_jitter_strength, expert_jitter_layout, expert_jitter_offsets
 from exllamav3 import model_init
 import torch
 import argparse
+import random
 
 # ANSI codes
 ESC = "\u001b"
@@ -107,6 +109,7 @@ def measure_prefill(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
                     }
+                    params.update(args.expert_jitter_params)
                     model.prefill(workload_ids(start + ids_offset, end - start), params)
                 cuda_sync_active()
                 if is_recurrent:
@@ -141,6 +144,16 @@ def measure_generate(args, model, cache, warmup = False):
                     recurrent = [cache.get_test_state(length)] if is_recurrent else None
                     torch.cuda.synchronize()
                     with Timer() as t:
+                        jitter_params = args.expert_jitter_params
+                        if jitter_params:
+                            # Each repetition models a new assistant turn. Include matrix generation and
+                            # its first device upload in decode timing; reuse it for every token in this turn.
+                            jitter_params = {
+                                "expert_jitter_offsets": expert_jitter_offsets(
+                                    args.expert_jitter, random.Random(),
+                                    args.expert_jitter_params["expert_jitter_offsets"].numel()),
+                                "expert_jitter_layout": args.expert_jitter_params["expert_jitter_layout"],
+                            }
                         for i in range(100 // seqlen):
                             params = {
                                 "attn_mode": "flash_attn",
@@ -149,6 +162,7 @@ def measure_generate(args, model, cache, warmup = False):
                                 "batch_shape": (1, max(length + 256, 256)),
                                 "recurrent_states": recurrent
                             }
+                            params.update(jitter_params)
                             logits = model.forward(workload_ids(ids_offset + length + i, seqlen), params)
                             sample = torch.argmax(logits)
                             sample = sample.cpu()  # force sync
@@ -187,11 +201,19 @@ def main(args):
         print(f" !! max_length cannot exceed cache size, limiting to {args.max_length}")
 
     model, config, cache, tokenizer = model_init.init(args)
+    args.expert_jitter_params = {}
+    if args.expert_jitter > 1:
+        layout, size = expert_jitter_layout(model)
+        offsets = expert_jitter_offsets(args.expert_jitter, random.Random(), size)
+        if offsets is not None:
+            args.expert_jitter_params = {"expert_jitter_offsets": offsets, "expert_jitter_layout": layout}
     load_workload_ids(tokenizer, args.max_length + 512)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
     print(f" -- Chunk size: {args.chunk_size}")
+    if args.expert_jitter > 1:
+        print(f" -- Expert jitter: {args.expert_jitter}")
     print()
 
     if not args.skip_prefill:
@@ -228,5 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     parser.add_argument("-sd", "--spec_dec", action = "store_true", help = "Test spec-decode seqlens 1..4")
+    parser.add_argument("-ej", "--expert_jitter", type = expert_jitter_strength, default = 1.0,
+                        help = "Expert jitter strength >= 1 (default: 1, disabled); fresh matrix per decode repetition, generated inside its timer")
     _args = parser.parse_args()
     main(_args)

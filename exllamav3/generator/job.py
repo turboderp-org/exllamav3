@@ -16,6 +16,7 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
+from ..util.expert_jitter import expert_jitter_strength, expert_jitter_offsets
 
 
 class NonFiniteLogits(RuntimeError):
@@ -72,6 +73,7 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        expert_jitter: float = 1.0,
         **kwargs
     ):
         """
@@ -99,6 +101,11 @@ class Job:
 
         :param seed:
             RNG seed (determinism is not guaranteed)
+
+        :param expert_jitter:
+            Expert routing preference strength, finite and >= 1. Once per request, factors drawn from
+            [1/J, J] become fixed logit offsets log(factor). 1 disables jitter. Applies only to newly
+            computed target-model states; prefix cache reuse is unchanged.
 
         :param stop_conditions:
             List of strings and/or token IDs that will trigger the EOS condition. If a stop condition is
@@ -227,6 +234,8 @@ class Job:
         self.rng = rq_state.get("rng")
         if self.rng is None:
             self.rng = random.Random() if seed is None else random.Random(seed)
+        self.expert_jitter = expert_jitter_strength(expert_jitter)
+        self.expert_jitter_offsets = rq_state.get("expert_jitter_offsets")
         self.orig_max_rq_tokens = max_rq_tokens
         self.max_rq_tokens = max_rq_tokens
 
@@ -1207,6 +1216,7 @@ class Job:
 
         rq_state = {
             "rng": self.rng,
+            "expert_jitter_offsets": self.expert_jitter_offsets,
             "stop_strings": self.stop_strings,
             "stop_tokens": self.stop_tokens,
             "stop_strings_utf32_buffer": self.stop_strings_utf32_buffer,
@@ -1254,6 +1264,7 @@ class Job:
             max_rq_tokens = self.orig_max_rq_tokens,
             stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
+            expert_jitter = self.expert_jitter,
         )
 
         rq_job.prepare_for_queue(generator, serial_number, rq = True)
@@ -1275,6 +1286,12 @@ class Job:
         self.generator = generator
         self.pagetable = generator.pagetable
         self.skips = 0
+
+        if self.expert_jitter > 1:
+            generator.prepare_expert_jitter_layout()
+        if self.expert_jitter > 1 and self.expert_jitter_offsets is None and generator.expert_jitter_size:
+            self.expert_jitter_offsets = expert_jitter_offsets(
+                self.expert_jitter, self.rng, generator.expert_jitter_size)
 
         # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
         # requeue budget's headroom below so that budget still fits the cache exactly
@@ -1573,6 +1590,8 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
+                if self.expert_jitter_offsets is not None:
+                    params.update(self.generator.expert_jitter_params([self]))
                 if self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
