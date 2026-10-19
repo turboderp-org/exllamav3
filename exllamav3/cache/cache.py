@@ -99,6 +99,7 @@ class Cache:
         layer_type: Type[CacheLayer] | None = None,
         max_batch_size: int = 16,
         max_history: int = 0,
+        recurrent_dtype: torch.dtype = torch.half,
         **kwargs
     ):
         """
@@ -126,6 +127,13 @@ class Cache:
             recurrent models, this should be equal to the number of draft tokens. The recurrent state itself is
             two rows per batch item regardless of this value.
 
+        :param recurrent_dtype:
+            Storage dtype of the recurrent state of GatedDeltaNet and KDA layers: torch.half (default), or
+            torch.float for twice the state pool and checkpoint size. The scans compute in fp32 either way and
+            round once per pass on the store; on these layers fp16 storage moves next-token distributions no more
+            than regrouping a prefill does. Mamba2 layers keep fp32 regardless: their state spans a far wider
+            dynamic range (a quarter of it below fp16's normal range), and the per-step rounding accumulates over
+            a long generation. bf16 is not offered, its 8-bit mantissa is far worse than fp16 here
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 
@@ -170,7 +178,10 @@ class Cache:
         self.recurrent_layers = {}
         for layer in rl:
             for instance in self.model.get_layer_instances(layer.layer_idx):
-                self.recurrent_layers[instance] = layer.layer_state_cls(layer, max_batch_size, max_history, id(self))
+                ls = layer.layer_state_cls(layer, max_batch_size, max_history, id(self))
+                if recurrent_dtype != torch.float and hasattr(ls, "set_state_dtype") and not getattr(layer, "mamba2", False):
+                    ls.set_state_dtype(recurrent_dtype)
+                self.recurrent_layers[instance] = ls
 
         # Attach
         self.recurrent_instances = {}
@@ -329,12 +340,16 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            0,
-            clear = True,
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                0,
+                clear = True,
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def get_test_state(self, position: int):
@@ -344,13 +359,17 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            position,
-            clear = True,
-            test_state = True,
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                position,
+                clear = True,
+                test_state = True,
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def new_from_stashed(self, stashed_state, position):
@@ -359,13 +378,17 @@ class Cache:
         """
         assert len(self.free_list) > 0, "Cannot create new state: no available slots"
         handle = self.free_list.popleft()
-        return self.recurrent_state_cls(
-            self,
-            handle,
-            position,
-            clear = False,
-            stashed = stashed_state
-        )
+        try:
+            return self.recurrent_state_cls(
+                self,
+                handle,
+                position,
+                clear = False,
+                stashed = stashed_state
+            )
+        except BaseException:
+            self.free_list.appendleft(handle)
+            raise
 
 
     def release_state(self, state):

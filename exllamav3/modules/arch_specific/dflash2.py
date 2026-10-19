@@ -366,6 +366,27 @@ class DFlash2Selector(Module):
             if softcap > 0.0:
                 logits = torch.tanh(logits / softcap) * softcap
             unary, cands = torch.topk(logits, self.top_k, dim = -1, sorted = False)
+        return self._walk(hidden, gate, unary, cands, anchor_ids, return_confidence, cuda)
+
+
+    def walk_candidates(
+        self,
+        hidden: torch.Tensor,
+        unary: torch.Tensor,
+        cands: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        return_confidence: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """walk_block from candidates already selected: unary [b, rows, top_k] scores (scaled and
+        softcapped as walk_block would) and cands [b, rows, top_k] vocabulary ids. The tensor-parallel
+        target computes these per shard and merges them, so no full-width logits ever leave the ranks."""
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
+        cuda = ext.HAS_DFLASH2 and hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
+        return self._walk(hidden, gate, unary, cands, anchor_ids.long(), return_confidence, cuda)
+
+
+    def _walk(self, hidden, gate, unary, cands, anchor_ids, return_confidence, cuda):
+        bsz, rows = unary.shape[:2]
         if cuda:
             out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
             conf = torch.empty((bsz, rows + 1), dtype = torch.float, device = hidden.device) if return_confidence else None

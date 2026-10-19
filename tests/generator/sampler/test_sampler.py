@@ -150,7 +150,7 @@ custom_test_cases = [
         ]),
         "input": [[5, 3, 2.5, 1, 4, 2, 1.5]],
         "expect_indices": [[0, 4, 1, 2, 5, 6, 3]],
-        "expect_probs": [[0.79139, 0.20861, 0, 0, 0, 0, 0]],
+        "expect_probs": [[0.75014, 0.19774, 0.05212, 0, 0, 0, 0]],
     },
     {
         "name": "min_p, sample",
@@ -543,14 +543,19 @@ def test_topp(dim: tuple, p, device):
     temperature = 0.6
     logits = rand_logits(dim, device)
 
-    # Reference
+    # Reference. When the prefix ends inside a group of exact ties, the fused sampler keeps the whole
+    # group at the weight of the ties the prefix reaches, spread evenly, where the eager sort path
+    # keeps those ties in arbitrary sort order; both are valid for indistinguishable tokens
     logits_ref = logits.float() / temperature
     probs_ref = torch.softmax(logits_ref, dim = -1)
     sorted_values, sorted_indices = torch.sort(probs_ref, descending = True, dim = 1)
     cumsum = sorted_values.cumsum(dim = -1)
-    mask = cumsum <= p
+    mask = (cumsum - sorted_values) < p
     mask[:, 0] = True
-    sorted_values *= mask
+    last = sorted_values.gather(1, mask.sum(dim = -1, keepdim = True) - 1)
+    group = sorted_values == last
+    share = (group & mask).sum(dim = -1, keepdim = True) / group.sum(dim = -1, keepdim = True)
+    sorted_values = torch.where(group, last * share, sorted_values * mask)
     probs_ref.scatter_(1, sorted_indices, sorted_values)
     probs_ref /= probs_ref.sum(dim = -1, keepdim = True)
 

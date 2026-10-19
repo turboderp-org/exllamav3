@@ -17,6 +17,13 @@ from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
 
+
+class NonFiniteLogits(RuntimeError):
+    """A decode step produced NaN/Inf logits. Almost always a kernel bug (e.g. a miscompiled
+    Triton specialization) rather than bad inputs; the message lists the toggles that A/B the
+    fused decode paths to bisect with."""
+
+
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
 def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | None:
@@ -660,8 +667,8 @@ class Job:
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
         rc = self.generator.recurrent_cache
-        if rc is not None and old_hash in rc and new_hash not in rc:
-            rc[new_hash] = rc.pop(old_hash)
+        if rc is not None:
+            rc.rekey(old_hash, new_hash)
 
         # If another referenced page has the same hash, switch to referencing that instead
         if new_hash in self.pagetable.referenced_pages:
@@ -727,6 +734,19 @@ class Job:
         # assert logits.shape[0] == len(self.sequences)
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
+
+        # Fail fast on NaN/Inf logits: sampling them yields a fixed garbage token (argmax over
+        # NaN is id 0) that can loop, which hides the fault. Checked on the job's first sampled
+        # token only, which costs one sync per job
+        if self.new_tokens < 1:
+            if not bool(torch.isfinite(logits).all()):
+                n_bad = int((~torch.isfinite(logits)).sum())
+                raise NonFiniteLogits(
+                    f"Job {self.identifier!r} (serial {self.serial_number}) produced {n_bad} non-finite "
+                    f"logits at step {self.new_tokens} (tensor {tuple(logits.shape)} on {logits.device}). "
+                    f"This is a kernel bug, not bad sampling settings. A/B the fused decode paths to "
+                    f"bisect: EXL3_BC_MLA=0, EXL3_BC_GDN=0, EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0."
+                )
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
@@ -1047,7 +1067,7 @@ class Job:
                     self.recurrent_state.rewind_to(target)
                 else:
                     stashed = self.find_recurrent_stash(target)
-                    self.recurrent_state.free()
+                    self.free_recurrent_state()
                     if stashed is not None:
                         replay_from = stashed["position"]
                         self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)

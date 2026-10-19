@@ -187,6 +187,7 @@ struct BC_GatedDeltaNetSplit
         // be patched): set on the slot's first eager run, checked before every replay
         int graph_state_size = -1;
         int graph_hist_stride = -1;
+        bool graph_state_half = false;
         // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
         // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
         // another cache reconfigures (and recaptures)
@@ -419,6 +420,7 @@ struct BC_Mamba2
         // Per-slot state geometry snapshot (see BC_GatedDeltaNetSplit::Slot)
         int graph_state_size = -1;
         int graph_hist_stride = -1;
+        bool graph_state_half = false;
         // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
         // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
         // another cache reconfigures (and recaptures)

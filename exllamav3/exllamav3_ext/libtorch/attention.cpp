@@ -700,6 +700,10 @@ void BC_Attention::run_gr
         // Eager calls scan only the freshly scored [0, t_scan): the static's tail can hold
         // scores from an earlier, longer sequence. Graphs patch the scan width per replay
         const at::Tensor qsa_scores = graph ? s.qsa_scores : s.qsa_scores.narrow(1, 0, t_scan);
+        // See BC_MLAttention::run_gr: the eager pass has to allocate the split top-k workspace the captured
+        // full-width scan will use
+        if (!graph)
+            dsa_topk_prepare(s.qsa_scores, (int) s.qsa_pool_idx.size(1));
         dsa_topk_gr(qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
         {
             std::vector<void*> args =

@@ -71,6 +71,9 @@ class RoutingCFG:
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
     gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
     gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
+    gate_tensor_f32: torch.Tensor | None = None       # grouped DS3 router: fp32 gate for multi-row logits, lazy
+    e_score_bias_f32: torch.Tensor | None = None      # grouped DS3 router: fp32 selection bias, lazy
+    router_logits_f32_bsz1: torch.Tensor | None = None   # grouped DS3 router: single-row fp32 logits, lazy
 
 
 def _gate_t(cfg):
@@ -172,8 +175,41 @@ def routing_std_bias(bsz, cfg, y, params):
 
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
+    """Group-limited DS3 routing (n_group > 1): fp32 logits (the reference gate's precision;
+    with hundreds of experts the selection margins sit below fp16 resolution), group scores
+    from each group's two best biased scores, the topk_group best groups eligible, top-K over
+    those, weights from the unbiased scores. Single rows project with the fixed-order fp32
+    GEMV, other row counts with an fp32 matmul; selection and weights run in one kernel
+    (routing_ds3_group). The torch composition stays for the all-experts calibration pass."""
+    if params.get("activate_all_experts"):
+        return _routing_ds3_torch(bsz, cfg, y, params)
+    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
+        cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
+    if bsz == 1:
+        _gate_t(cfg)
+        if cfg.router_logits_f32_bsz1 is None:
+            cfg.router_logits_f32_bsz1 = torch.empty((1, E), dtype = torch.float, device = y.device)
+        logits = cfg.router_logits_f32_bsz1
+        ext.routing_gemv_f32(y.view(-1), cfg.gate_tensor_t, logits.view(-1))
+        selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    else:
+        if cfg.gate_tensor_f32 is None:
+            cfg.gate_tensor_f32 = cfg.gate_tensor.float().contiguous()
+        logits = torch.matmul(y.view(-1, y.shape[-1]).float(), cfg.gate_tensor_f32)
+        _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+    ext.routing_ds3_group(
+        logits, cfg.e_score_bias_f32, selected_experts, routing_weights,
+        cfg.routed_scaling_factor, ROUTING_ACT_SIGMOID, cfg.n_group, cfg.topk_group,
+    )
+    return selected_experts, routing_weights
+
+
+def _routing_ds3_torch(bsz, cfg, y, params):
+    """Torch composition of the group-limited DS3 router (the all-experts calibration pass,
+    and the reference the kernel is tested against)"""
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -193,7 +229,8 @@ def routing_ds3(bsz, cfg, y, params):
         .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
         .reshape(-1, cfg.num_experts)
     )
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    # -inf, not 0: the selection bias can push eligible scores below zero
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,
@@ -205,7 +242,8 @@ def routing_ds3(bsz, cfg, y, params):
     denominator = topk_weights.sum(dim = -1, keepdim = True) + 1e-20
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
-    return topk_indices, topk_weights
+    # half weights, as every other router returns (TP broadcast buffers and the decode kernels)
+    return topk_indices, topk_weights.half()
 
 
 def routing_dots(bsz, cfg, y, params):

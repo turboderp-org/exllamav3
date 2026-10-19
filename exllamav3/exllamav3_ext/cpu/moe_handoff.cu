@@ -1,5 +1,6 @@
 #include "moe_handoff.h"
 #include "moe_mul1.h"
+#include "../routing.cuh"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -120,6 +121,26 @@ MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
 std::atomic<bool> g_memops_enabled { true };
 
+inline uint32_t load_acquire_u32(const uint32_t* p)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    long v = _InterlockedCompareExchange(
+        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(p)), 0L, 0L);
+    return static_cast<uint32_t>(v);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+inline void store_release_u32(uint32_t* p, uint32_t v)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
+#else
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
 } // namespace
 
 void exl3_moe_cpu_set_memops(bool enabled)
@@ -175,6 +196,124 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     );
 }
 
+// ---- fused split issue / collect -----------------------------------------------------------
+//
+// One call per layer per step for each half of the decode handoff, replacing the host-side job
+// descriptor write, ring check and the separate flag-wait / kernel / flag-write calls. The job
+// descriptor goes into the shared ring here (same layout as the Python writer); the flag memops
+// and the kernel are enqueued on the stream of the tensors' device. Returns false without
+// touching anything when the job ring is within its safety margin of overflowing, so the caller
+// can throttle and retry (a long prefill is the only way to get there).
+
+namespace {
+
+inline void flag_write_on(cudaStream_t stream, uintptr_t flag, int64_t value)
+{
+    MemOps& m = memops();
+    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+        && g_memops_ok.load(std::memory_order_relaxed))
+    {
+#if defined(USE_ROCM)
+        if (m.write(stream, (void*) flag, (uint64_t) value, 0) == cudaSuccess) return;
+#else
+        if (m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0) == CUDA_SUCCESS) return;
+#endif
+        g_memops_ok.store(false, std::memory_order_relaxed);
+    }
+    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value));
+}
+
+inline void flag_wait_on(cudaStream_t stream, uintptr_t flag, int64_t value, uintptr_t abort_flag)
+{
+    MemOps& m = memops();
+    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+        && g_memops_ok.load(std::memory_order_relaxed))
+    {
+#if defined(USE_ROCM)
+        if (m.wait(stream, (void*) flag, (uint64_t) value, hipStreamWaitValueGte, ~0ull) == cudaSuccess) return;
+#else
+        if (m.wait((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS) return;
+#endif
+        g_memops_ok.store(false, std::memory_order_relaxed);
+    }
+    moe_flag_wait_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value), reinterpret_cast<uint32_t*>(abort_flag));
+}
+
+} // namespace
+
+bool exl3_moe_split_issue_fused
+(
+    uintptr_t shm_base,
+    int64_t seq,
+    int64_t layer,
+    int64_t rows,
+    int64_t topk,
+    int64_t slot,
+    int64_t prev_seq,
+    at::Tensor sel,
+    const c10::optional<at::Tensor>& map,
+    const c10::optional<at::Tensor>& hist,
+    const at::Tensor& y,
+    const at::Tensor& w,
+    int64_t h_sel_ptr,
+    int64_t h_x_ptr,
+    int64_t h_w_ptr,
+    at::Tensor dev_count,
+    int64_t hi,
+    int64_t first_cpu,
+    uintptr_t data_ready_flag,
+    uintptr_t consumed_flag,
+    uintptr_t abort_flag
+)
+{
+    uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
+    uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
+    uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
+    MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
+    const uint32_t tail = *jobs_tail;
+    if (tail - load_acquire_u32(jobs_head) >= MOE_JOB_RING - 4) return false;
+    // Descriptor first: host-visible before the GPU can publish the data flag
+    MoeJob& job = jobs[tail % MOE_JOB_RING];
+    job.seq = (uint32_t) (seq & 0xFFFFFFFFull);
+    job.seq_hi = (uint32_t) ((uint64_t) seq >> 32);
+    job.layer = (uint32_t) layer;
+    job.rows = (uint32_t) rows;
+    job.topk = (uint32_t) topk;
+    job.slot = (uint32_t) slot;
+    job.kind = MOE_JOB_KIND_COMPUTE_GATED;
+    store_release_u32(jobs_tail, tail + 1);
+
+    const at::cuda::OptionalCUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
+    if (prev_seq) flag_wait_on(stream, consumed_flag, prev_seq, abort_flag);
+    moe_split_issue(sel, map, hist, y, w, h_sel_ptr, h_x_ptr, h_w_ptr, dev_count, slot, hi, first_cpu);
+    flag_write_on(stream, data_ready_flag, seq);
+    return true;
+}
+
+void exl3_moe_split_collect_fused
+(
+    at::Tensor final_out,
+    int64_t h_out_ptr,
+    const at::Tensor& dev_count,
+    int64_t slot,
+    int64_t ho,
+    uintptr_t done_flag,
+    int64_t seq,
+    uintptr_t consumed_flag,
+    uintptr_t abort_flag
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(final_out.get_device()).stream();
+    flag_wait_on(stream, done_flag, seq, abort_flag);
+    moe_split_collect_add(final_out, h_out_ptr, dev_count, slot, ho);
+    // Consumption is published AFTER the readback on this same stream: the slot's next tenant
+    // (possibly issuing from another device) gates on it
+    flag_write_on(stream, consumed_flag, seq);
+}
+
 // ---- child worker loop --------------------------------------------------------------------
 
 namespace {
@@ -187,26 +326,6 @@ inline void cpu_pause_()
     __builtin_ia32_pause();
 #else
     _mm_pause();
-#endif
-}
-
-inline uint32_t load_acquire_u32(const uint32_t* p)
-{
-#if defined(_MSC_VER) && !defined(__clang__)
-    long v = _InterlockedCompareExchange(
-        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(p)), 0L, 0L);
-    return static_cast<uint32_t>(v);
-#else
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
-#endif
-}
-
-inline void store_release_u32(uint32_t* p, uint32_t v)
-{
-#if defined(_MSC_VER) && !defined(__clang__)
-    (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
-#else
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
 #endif
 }
 

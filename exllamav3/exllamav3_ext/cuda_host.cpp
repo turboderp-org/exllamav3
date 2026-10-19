@@ -42,6 +42,16 @@ void cuda_host_unregister(uintptr_t ptr)
     );
 }
 
+void cuda_memcpy_async(uintptr_t dst, uintptr_t src, size_t nbytes, int kind)
+{
+    TORCH_CHECK(kind == 1 || kind == 2, "cuda_memcpy_async: kind must be 1 (host to device) or 2 (device to host)");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaError_t cr = cudaMemcpyAsync(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), nbytes,
+                                     kind == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, stream);
+    consume_error(cr);
+    TORCH_CHECK(cr == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(cr));
+}
+
 uintptr_t cuda_host_get_device_pointer(uintptr_t ptr)
 {
     // Device-side alias of memory registered with cudaHostRegisterMapped. Equal to the host

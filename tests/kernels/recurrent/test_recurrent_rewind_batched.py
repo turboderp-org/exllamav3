@@ -113,7 +113,7 @@ def test_batched_conv_rewind_rejects_large_cdim(device):
 
 # GDNLayerState: the conv job against a torch reference, the replay against a kernel pass over the prefix
 
-def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None):
+def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None, state_dtype = torch.float):
     from exllamav3.modules.gated_delta_net import GDNLayerState
     module = types.SimpleNamespace(
         fdim_qkv = fdim,
@@ -123,7 +123,7 @@ def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None)
         k_head_dim = dk,
         v_head_dim = dv,
     )
-    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0)
+    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0, state_dtype = state_dtype)
     ls.alloc(device)
     ls.conv_state.copy_(torch.randn(ls.conv_state.shape, device = device))
     ls.recurrent_state.normal_()
@@ -158,15 +158,16 @@ def test_gdn_layer_state_conv_job_matches_reference(device, max_history):
         _layer_state(device, 1, 3, 384, 4, 4, 32, 64).rewind_conv_job(0, 3, 4)
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float, torch.half], ids = ["fp32_state", "fp16_state"])
 @pytest.mark.parametrize("max_history", [3, 64])
 @pytest.mark.parametrize("bsz", [1, 3])
 @torch.inference_mode()
-def test_gdn_layer_state_replay(device, max_history, bsz):
+def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype):
     # A speculative pass of max_history + 1 tokens writes its scan inputs into the staged views; every batch row
     # and every prefix then replays to the state a prefix-length pass from the same base row produces
     nk, nv, dk, dv, fdim = 2, 4, 64, 64, 2 * 2 * 64 + 4 * 64
     seqlen = max_history + 1
-    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk)
+    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk, state_dtype = state_dtype)
     conv_out, beta, g = ls.staged_views(bsz, seqlen)
     conv_out.copy_((torch.randn(conv_out.shape, device = device) * 0.25).bfloat16())
     beta.copy_(torch.sigmoid(torch.randn(beta.shape, device = device)).bfloat16())

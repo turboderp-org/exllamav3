@@ -11,6 +11,7 @@
 
 void enable_fast_fp();
 void enable_fast_fp_avx2();
+void enable_fast_fp_avx();
 
 void perform_cpu_reduce
 (
@@ -23,6 +24,17 @@ void perform_cpu_reduce
 );
 
 void perform_cpu_reduce_avx2
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint32_t wire_dtype,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size
+);
+
+// Plain AVX tier (pre-Haswell x86), see all_reduce_cpu_avx2.cpp
+void perform_cpu_reduce_avx
 (
     PGContext* ctx,
     size_t data_size,

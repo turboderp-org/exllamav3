@@ -167,7 +167,9 @@ def gated_delta_rule_fn(
             rows_out, rows_in = chunked_rows()
             core_attn_out = []
             for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-                state = recurrent_state[si, 0].unsqueeze(0) if recurrent_state is not None else None
+                # .float(): the chunk kernels take and return fp32; an fp16 pool is converted on the way in and
+                # by the copy_ on the way out
+                state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
                 core_attn, new_state = _chunked_scan(
                     chunk_kda, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                     state, save_state,
@@ -217,7 +219,7 @@ def gated_delta_rule_fn(
         rows_out, rows_in = chunked_rows()
         core_attn_out = []
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-            state = recurrent_state[si, 0].unsqueeze(0) if recurrent_state is not None else None
+            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                 state, save_state,

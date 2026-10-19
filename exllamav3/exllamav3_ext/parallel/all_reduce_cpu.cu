@@ -94,11 +94,19 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
+    // The first job of a round can be a long time coming: a load that skipped the warmup compiles its
+    // kernels inside the first forward pass, before any collective, and on ROCm that runs to minutes.
+    // Later waits are bounded like the device-side collectives (SYNC_TIMEOUT), since by then a rank
+    // that stops feeding jobs has stopped for good
+    const auto first_wait = std::chrono::seconds(600);
+    const auto in_pass_wait = std::chrono::seconds(SYNC_TIMEOUT * 45);
+    bool first = true;
+
     while (true)
     {
         // The timeout bounds each wait for the next job, not the whole round, which may run for as long as the
         // forward pass that feeds it
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+        const auto deadline = std::chrono::steady_clock::now() + (first ? first_wait : in_pass_wait);
 
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
         // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
@@ -109,7 +117,10 @@ void run_cpu_reduce_jobs
         while (true)
         {
             if (pop_reduce_job(ctx, current_job))
+            {
+                first = false;
                 break;
+            }
             if (++spins < 65536)
             {
                 #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
@@ -124,7 +135,7 @@ void run_cpu_reduce_jobs
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             if (std::chrono::steady_clock::now() > deadline)
             {
-                // After 50 seconds of waiting for the queue to build, something surely crashed
+                // Past the deadline for the queue to build, something surely crashed
                 printf(" ## CPU reduce wait timeout");
                 TORCH_CHECK(false, "CPU reduce wait timeout");
             }
@@ -549,7 +560,7 @@ void pg_all_reduce_cpu
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     pg_check_timeout(ctx);
 
-    TORCH_CHECK(is_avx2_supported(), "AVX2 is required for tensor-parallel inference using native backend");
+    TORCH_CHECK(is_avx_supported(), "AVX is required for tensor-parallel inference using the native backend (use the nccl backend on this CPU)");
 
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);

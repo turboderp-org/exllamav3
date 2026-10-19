@@ -1220,6 +1220,46 @@ class PromptFormat_muse(PromptFormat):
         }
 
 
+class PromptFormat_ling(PromptFormat):
+    description = "Ling 3.x (Bailing V3) format: <role>...</role> turns, 'detailed thinking' switch in the system turn"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # The bundled template renders the system turn with a 'detailed thinking on/off' line, HUMAN and
+        # ASSISTANT turns closed by <|role_end|>, earlier assistant turns with an empty think block (their
+        # reasoning is not preserved), and the generation prompt opening a think block only when thinking is on
+        context = f"<role>SYSTEM</role>{system_prompt}\ndetailed thinking {'on' if think else 'off'}<|role_end|>"
+        for (u, a) in messages:
+            context += f"<role>HUMAN</role>{u}<|role_end|>"
+            context += f"<role>ASSISTANT</role>\n"
+            if a is not None:
+                context += f"<think></think>{a}<|role_end|>"
+            elif not think:
+                context += f"<think></think>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|role_end|>"),
+            tokenizer.single_id("<role>"),
+            """<|role_end|>""",
+        ]
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -1250,4 +1290,5 @@ prompt_formats = {
     "spark": PromptFormat_spark,
     "muse": PromptFormat_muse,
     "mimo": PromptFormat_mimo,
+    "ling": PromptFormat_ling,
 }

@@ -5,6 +5,9 @@ the all-GPU load, through both the prefill path and single-token / batched decod
 Placements:
     layer   --moe_cpu_offload: the routed experts of the first half of the MoE layers run on the CPU
     split   --moe_cpu_split: the tail quarter of every MoE layer's routed experts runs on the CPU
+    promote the split with the pinned arena, so every decode step moves the routed experts the CPU computed into
+            spare GPU slots and the least-used residents out (promote-on-miss); the placement changes under the
+            decode and batched-decode runs
 
 Reference: the same model loaded entirely on the GPU, teacher-forced over the same tokens. The CPU kernels
 quantize activations to int8 and accumulate differently, so agreement is statistical (testlib.e2e.
@@ -35,9 +38,10 @@ def placement_args(model_dir: str, placement: str) -> list[str]:
     tc = cfg.get("text_config", cfg)
     if placement == "layer":
         return ["-mcl", str(max(1, tc["num_hidden_layers"] // 2))]
-    if placement == "split":
+    if placement in ("split", "promote"):
         experts = tc.get("num_experts") or tc.get("n_routed_experts") or tc.get("num_local_experts")
-        return ["-mcs", str(max(1, experts // 4))]
+        # The promote placement needs the worker's arena mapped in this process (pinned arena)
+        return ["-mcs", str(max(1, experts // 4))] + (["-mcpa"] if placement == "promote" else [])
     raise ValueError(placement)
 
 
@@ -72,11 +76,15 @@ def gpu_reference(model_registry, device):
     return get
 
 
-@pytest.mark.parametrize("placement", ["layer", "split"])
+@pytest.mark.parametrize("placement", ["layer", "split", "promote"])
 def test_offload_matches_gpu(model_id, model_dir, placement, device, gpu_reference):
     ref = gpu_reference(model_id)
     with load_model(model_dir, device, *placement_args(model_dir, placement)) as lm:
         got = _run(lm)
+        if placement == "promote":
+            mods = getattr(lm.model.config.infer_params, "moe_cpu_swap_modules", [])
+            moved = sum(getattr(m, "_split_promo_n", 0) for m in mods)
+            assert moved > 0, "promote placement: no expert was promoted during the decode runs"
     floor = ref["floor"]
     assert_logits_agree(ref["forward"], got["forward"], floor, f"{placement} prefill", abs_median_kl = ABS_MEDIAN_KL)
     assert_logits_agree(ref["decode"], got["decode"], floor, f"{placement} decode", abs_median_kl = ABS_MEDIAN_KL)
