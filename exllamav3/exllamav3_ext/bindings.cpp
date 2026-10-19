@@ -114,7 +114,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
-    m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup",
+        py::arg("hidden"), py::arg("gate"), py::arg("scores"), py::arg("bias"),
+        py::arg("topk_indices"), py::arg("topk_weights"), py::arg("scaling_factor"),
+        py::arg("gate_t"), py::arg("act_fn"), py::arg("gate_i8"), py::arg("gate_sb"),
+        py::arg("offsets") = py::none());
     m.def("routing_ds3_group", &routing_ds3_group, "routing_ds3_group");
     m.def("routing_gemv_f32", &routing_gemv_f32, "routing_gemv_f32");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");

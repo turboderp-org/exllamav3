@@ -57,7 +57,8 @@ void routing_ds3_nogroup
     const int act_fn
 ,
     const c10::optional<at::Tensor>& gate_i8,
-    const c10::optional<at::Tensor>& gate_sb
+    const c10::optional<at::Tensor>& gate_sb,
+    const c10::optional<at::Tensor>& offsets
 );
 
 void routing_ds3_nogroup_logits

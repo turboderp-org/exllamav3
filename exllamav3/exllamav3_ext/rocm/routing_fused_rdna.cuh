@@ -23,7 +23,8 @@ void routing_ds3_nogroup_fused_kernel
     const float scaling_factor,
     const int k,
     const int num_experts,
-    const int K
+    const int K,
+    const half* __restrict__ offsets
 )
 {
     extern __shared__ uint32_t rg_sh[];
@@ -57,7 +58,7 @@ void routing_ds3_nogroup_fused_kernel
     __syncthreads();
     for (int e = t; e < num_experts; e += RGW_WARPS * 32)
     {
-        float logit = __half2float(scores[e]);
+        float logit = __half2float(offsets ? __hadd(scores[e], offsets[e]) : scores[e]);
         float act = bias ? routing_act<ACT>(logit) : 0.0f;
         sh_key[e] = bias ? act + __half2float(bias[e]) : logit;
         sh_payload[e] = bias ? act : logit;
@@ -93,7 +94,8 @@ static bool routing_ds3_nogroup_fused_try
     at::Tensor& topk_weights,
     const float scaling_factor,
     const int act_fn,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const half* offsets = nullptr
 )
 {
     if (!gate_t.has_value() || !hidden.is_contiguous() || !gate_t.value().is_contiguous()) return false;
@@ -119,11 +121,11 @@ static bool routing_ds3_nogroup_fused_try
     if (act_fn == ROUTING_ACT_SQRTSP)
         routing_ds3_nogroup_fused_kernel<ROUTING_ACT_SQRTSP, RGW_U><<<grid, block, smem, stream>>>
             (xp, wp, (half*) scores.data_ptr(), bp, (int64_t*) topk_indices.data_ptr(), (half*) topk_weights.data_ptr(),
-             scaling_factor, k, E, K);
+             scaling_factor, k, E, K, offsets);
     else
         routing_ds3_nogroup_fused_kernel<ROUTING_ACT_SIGMOID, RGW_U><<<grid, block, smem, stream>>>
             (xp, wp, (half*) scores.data_ptr(), bp, (int64_t*) topk_indices.data_ptr(), (half*) topk_weights.data_ptr(),
-             scaling_factor, k, E, K);
+             scaling_factor, k, E, K, offsets);
     cuda_check(cudaPeekAtLastError());
     return true;
 }

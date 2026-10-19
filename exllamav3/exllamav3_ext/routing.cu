@@ -976,7 +976,8 @@ void routing_ds3_nogroup
     const c10::optional<at::Tensor>& gate_t,
     const int act_fn,
     const c10::optional<at::Tensor>& gate_i8,
-    const c10::optional<at::Tensor>& gate_sb
+    const c10::optional<at::Tensor>& gate_sb,
+    const c10::optional<at::Tensor>& offsets
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -1007,13 +1008,24 @@ void routing_ds3_nogroup
     TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_ds3_nogroup: hidden and scores row counts differ");
     if (bsz == 0) return;
 
+    if (offsets.has_value())
+    {
+        const auto& o = offsets.value();
+        TORCH_CHECK_DTYPE(o, kHalf);
+        TORCH_CHECK(bsz == 1 && o.sizes() == scores.sizes() && o.is_contiguous() && o.device() == scores.device(),
+                    "routing_ds3_nogroup: offsets require one contiguous row on the scores device");
+    }
+
 #if defined(USE_ROCM)
     // RDNA: bsz 1 router GEMV + top-k in one launch (rocm/routing_fused_rdna.cuh)
-    if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights, scaling_factor, act_fn, stream))
+    if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights, scaling_factor, act_fn, stream,
+                                    (const half*) OPTPTR(offsets)))
         return;
 #endif
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
+
+    if (offsets.has_value()) scores.add_(offsets.value());
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;

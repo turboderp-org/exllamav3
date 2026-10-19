@@ -69,3 +69,27 @@ def test_zero_offset_preserves_biased_routing(device, rows, topk):
     disabled_rows = rows // batch
     assert torch.equal(sel[:disabled_rows], ref_sel[:disabled_rows])
     assert torch.equal(w[:disabled_rows], ref_w[:disabled_rows])
+
+
+@pytest.mark.parametrize("act", [0, 1])  # sigmoid and sqrt(softplus)
+@pytest.mark.parametrize("biased", [False, True])
+def test_single_row_offsets_match_split(device, act, biased):
+    from exllamav3.ext import exllamav3_ext as ext
+    from exllamav3.modules.block_sparse_mlp_routing import _gate_t
+
+    cfg = make_cfg(2048, 32, 4, device)
+    y = torch.randn(1, 2048, device = device).half()
+    offsets = torch.randn(1, 64, device = device).half()[:, 16:48]
+    bias = torch.randn(32, device = device).half() if biased else None
+    scores, sel, weights = cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    _gate_t(cfg)
+    # A transposed gate permits ROCm fusion; omitting it exercises the split fallback.
+    for gate_t in (cfg.gate_tensor_t, None):
+        ext.routing_project(y, cfg.gate_tensor, scores, gate_t, cfg.gate_i8, cfg.gate_sb)
+        scores.add_(offsets)
+        ext.routing_ds3_nogroup_logits(scores, bias, sel, weights, 1.0, True, act)
+        ref_sel, ref_weights = sel.clone(), weights.clone()
+        ext.routing_ds3_nogroup(y, cfg.gate_tensor, scores, bias, sel, weights, 1.0,
+                                gate_t, act, cfg.gate_i8, cfg.gate_sb, offsets)
+        assert torch.equal(sel, ref_sel)
+        assert torch.equal(weights, ref_weights)

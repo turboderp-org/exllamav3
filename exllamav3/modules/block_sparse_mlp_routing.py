@@ -91,7 +91,7 @@ def _gate_t(cfg):
     return cfg.gate_tensor_t
 
 
-def _jitter_logits(bsz, cfg, y, params, key):
+def _jitter_logits(bsz, cfg, y, offsets):
     """Reuse the normal projection, then broadcast each request's layer offsets across its tokens."""
     if bsz == 1:
         logits, selected, weights = cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
@@ -99,20 +99,27 @@ def _jitter_logits(bsz, cfg, y, params, key):
         logits, selected, weights = _routing_buffers(cfg, bsz, y.device)
     _gate_t(cfg)
     ext.routing_project(y, cfg.gate_tensor, logits, cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
-    offsets = get_for_device(params, "expert_jitter_offsets", y.device)
-    start = params["expert_jitter_layout"][key]
-    offsets = offsets[:, start:start + cfg.num_experts]
     logits.view(offsets.shape[0], -1, cfg.num_experts).add_(offsets.unsqueeze(1))
     return logits, selected, weights
 
 
 def routing_jitter(bsz, cfg, y, params, key, router_type):
     """Opt-in logit offsets; selection, activation and normalization use the existing kernels."""
+    start = params["expert_jitter_layout"][key]
+    offsets = get_for_device(params, "expert_jitter_offsets", y.device)[:, start:start + cfg.num_experts]
+    if bsz == 1 and router_type in ("dots", "sqrtsp") and not params.get("activate_all_experts") and \
+            (router_type == "dots" or _vl_rows(cfg, params, bsz, y.device) is None):
+        # Keep the fused projection + selection path; other shapes/backends add offsets after projection.
+        _gate_t(cfg)
+        ext.routing_ds3_nogroup(
+            y, cfg.gate_tensor, cfg.router_logits_bsz1, _esb_h(cfg), cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1, cfg.routed_scaling_factor, cfg.gate_tensor_t,
+            ROUTING_ACT_SIGMOID if router_type == "dots" else ROUTING_ACT_SQRTSP,
+            cfg.gate_i8, cfg.gate_sb, offsets)
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     if router_type == "ds3":
-        start = params["expert_jitter_layout"][key]
-        offsets = get_for_device(params, "expert_jitter_offsets", y.device)[:, start:start + cfg.num_experts]
         return _routing_ds3_torch(bsz, cfg, y, params, offsets)
-    logits, selected, weights = _jitter_logits(bsz, cfg, y, params, key)
+    logits, selected, weights = _jitter_logits(bsz, cfg, y, offsets)
     if params.get("activate_all_experts"):
         if router_type == "std_bias" and cfg.router_bias is not None:
             logits.add_(cfg.router_bias)
