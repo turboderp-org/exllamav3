@@ -183,6 +183,7 @@ def placement_args(text: str, model, draft_model = None, strict: bool = True, wh
         token embedding: on disk; cpu: 16 threads           --embed_disk; --moe_cpu_threads
         layers 20..: all experts on cpu                     --moe_cpu_offload
         layers ..19: 64 experts on cpu                      --moe_cpu_split
+        all layers: tensor parallel                         --tensor_parallel (every gpu, by the gpu limits)
         all draft layers: on gpu 1; gpu 0: draft unused     the same for the draft model, in clauses of their own
 
     'gpu N' is the N-th GPU the loader lists on this machine, from 0, GPUs only. A clause the text does not know
@@ -212,7 +213,7 @@ def placement_args(text: str, model, draft_model = None, strict: bool = True, wh
         m.layer_idx: sm.num_experts for m in model.modules if m.layer_idx in idx
         for sm in m if hasattr(sm, "cpu_offload")
     }
-    gpu, cpu, limits, other, draft, out, notes = {}, {}, {}, None, [], {}, []
+    gpu, cpu, limits, other, draft, out, notes, tp = {}, {}, {}, None, [], {}, [], False
     for clause in re.split(r"[;\n]", text.lower()):
         clause = " ".join(clause.split())
         if not clause:
@@ -257,6 +258,12 @@ def placement_args(text: str, model, draft_model = None, strict: bool = True, wh
                             fail(f"layer {i} has {experts[i]} routed experts, '{setting}' needs fewer")
                         cpu[i] = m[1]
                     continue
+                if setting == "tensor parallel" or setting.startswith("tensor parallel on "):
+                    if which != "all" or setting != "tensor parallel":
+                        fail(f"'{clause}': tensor parallel over some layers or some gpus, the other layers split by "
+                             "layer, is not available yet. Write 'all layers: tensor parallel' (every visible gpu)")
+                    tp = True
+                    continue
                 if not (m := re.fullmatch(r"on gpu ?([0-9]{1,9})", setting)):
                     fail(f"'{setting}' is not valid after '{subject}' (on gpu <n>, all experts on cpu, <n> experts on cpu)")
                 if which == "other":
@@ -286,7 +293,13 @@ def placement_args(text: str, model, draft_model = None, strict: bool = True, wh
             fail(f"cannot read '{clause}'. Clauses: 'layers 0..11: on gpu 0', 'all layers: on gpu 0', "
                  "'other layers: on gpu 1', 'gpu 0: at most 22 GB', 'gpu 1: unused', 'ngram tables: in ram', "
                  "'ngram tables: locked in ram', 'token embedding: on disk', 'cpu: 16 threads', "
-                 "'layers 20..: all experts on cpu', 'layers ..19: 64 experts on cpu'")
+                 "'layers 20..: all experts on cpu', 'layers ..19: 64 experts on cpu', 'all layers: tensor parallel'")
+    if tp:
+        if gpu or other is not None:
+            fail("with 'all layers: tensor parallel' every gpu holds a part of every layer: drop the 'on gpu' clauses")
+        if cpu:
+            fail("experts on the cpu need the layer split, not 'all layers: tensor parallel'")
+        out["tensor_parallel"] = True
     if other is not None:
         if len(gpu) == n:
             fail("'other layers' names no layer, every layer is already on a gpu")
@@ -325,6 +338,9 @@ def placement_args(text: str, model, draft_model = None, strict: bool = True, wh
         notes.append("no draft model is loaded, its clauses are ignored")
     elif draft:
         placed, more = placement_args("; ".join(draft), draft_model, who = "draft ")
+        if "tensor_parallel" in placed:
+            fail("a draft model loads by layers, beside a tensor-parallel model too: "
+                 "write 'all draft layers: on gpu <n>'")
         if "moe_cpu_split" in placed:
             fail("a draft model's experts go to the cpu whole, write 'all experts on cpu'")
         names = {"layers_per_device": "draft_layers_per_device", "gpu_split": "draft_gpu_split",
