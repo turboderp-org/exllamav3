@@ -26,6 +26,15 @@ def load_definitions(path, names, namespace, class_name=None):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
 
 
+def load_constants(path, names, namespace):
+    tree = ast.parse((ROOT / path).read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in names for t in node.targets
+        ):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "constants", "exec"), namespace)
+
+
 def check_weight_slice_transform_and_workspace(start, width):
     torch.manual_seed(123)
     k, n = 256, start + width + 128
@@ -36,6 +45,7 @@ def check_weight_slice_transform_and_workspace(start, width):
         h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
     ns = dict(torch=torch, math=math, had_k=128, had_n=128,
               get_hadamard_dt=lambda dim, device, dtype, scale: h.to(device=device, dtype=dtype) * scale)
+    load_constants("exllamav3/modules/quant/exl3_lib/quantize.py", {"_HAD_MAX_GEMM_ROWS"}, ns)
     load_definitions("exllamav3/modules/quant/exl3_lib/quantize.py",
                      {"preapply_had_l", "preapply_had_r"}, ns)
     left, right = ns["preapply_had_l"], ns["preapply_had_r"]
@@ -58,14 +68,8 @@ def check_weight_slice_transform_and_workspace(start, width):
         return wrapped
 
     # Read the real constants too, so the workspace assertion detects changes.
-    tree = ast.parse((ROOT / "exllamav3/modules/quant/exl3.py").read_text())
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id in
-            {"MAX_WEIGHT_TRANSFORM_SLICE_N", "RECONSTRUCT_SLICE_GRANULARITY_N"}
-            for t in node.targets
-        ):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "constants", "exec"), ns)
+    load_constants("exllamav3/modules/quant/exl3.py",
+                   {"MAX_WEIGHT_TRANSFORM_SLICE_N", "RECONSTRUCT_SLICE_GRANULARITY_N"}, ns)
     ns.update(ext=SimpleNamespace(reconstruct_slice=reconstruct),
               preapply_had_l=track(left), preapply_had_r=track(right))
     load_definitions("exllamav3/modules/quant/exl3.py", {"get_weight_tensor_slice"}, ns, "LinearEXL3")

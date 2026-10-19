@@ -39,6 +39,7 @@ the "is this even real?" question can be answered by a single gradcheck.
 
 from __future__ import annotations
 from typing import Callable, Optional
+import math
 import torch
 import torch.nn as nn
 
@@ -343,6 +344,22 @@ def qlora_linear_forward(
     return EXL3LoRAFunction.apply(x, lora_a, lora_b, bias, scale, weight_fn)
 
 
+def init_lora_a_(t: torch.Tensor, fan_in: int) -> torch.Tensor:
+    """PEFT's LoRA-A init on an A stored as ``[in_features, r]``.
+
+    PEFT stores A as ``[r, in]`` and uses torch's kaiming-uniform init with
+    a=sqrt(5), whose bound is ``1/sqrt(fan_in)`` with fan_in read from dim 1 =
+    ``in``. Our A is transposed, so the same call read fan_in = r and
+    initialised A ``sqrt(in/r)`` too large (8.9x at r=32 on a 2560-wide input),
+    which made the effective update per Adam step that much larger than PEFT's
+    at the same lr (found 2026-10-11, doc/exl3_vs_bnb_qwen35_4b_2026-10-11.md).
+    Explicit bound, independent of storage layout.
+    """
+    bound = 1.0 / math.sqrt(fan_in)
+    with torch.no_grad():
+        return t.uniform_(-bound, bound)
+
+
 class QLoRALinear(nn.Module):
     """
     nn.Module wrapper turning a frozen ExLlamaV3 ``Linear`` into a trainable
@@ -392,8 +409,7 @@ class QLoRALinear(nn.Module):
         # as a no-op and training begins from the exact base model.
         self.lora_a = nn.Parameter(torch.empty(in_features, r, dtype=dtype, device=device))
         self.lora_b = nn.Parameter(torch.zeros(r, out_features, dtype=dtype, device=device))
-        from .native_llama import init_lora_a_
-        init_lora_a_(self.lora_a, in_features)   # PEFT bound 1/sqrt(in), see native_llama
+        init_lora_a_(self.lora_a, in_features)   # PEFT bound 1/sqrt(in)
 
         # Bias from the base layer is frozen (not trained here).
         if bias is not None:

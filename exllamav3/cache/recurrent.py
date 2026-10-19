@@ -286,6 +286,22 @@ class RecurrentCache(OrderedDict):
         return len(stranded)
 
 
+    def clear(self):
+        """
+        Drop every checkpoint and return its buffers to the stash pool; unlike close(), the pool and the cache
+        stay usable. For a whole-cache invalidation: when the model's weights changed (a runtime adapter
+        update) every stashed state is stale.
+        """
+        seen = set()
+        while len(self):
+            _, popped = self.popitem(last = False)
+            if id(popped) in seen:
+                continue
+            seen.add(id(popped))
+            self._release(popped)
+        self.current_size = 0
+
+
     def close(self):
         """
         Drop every checkpoint, return its buffers to the stash pool and release the pool, so the RAM goes

@@ -426,6 +426,27 @@ class CPUPageCache:
         self.metrics["restores"] += 1
         return e
 
+    def clear(self):
+        """
+        Drop every entry and recycle its slot; the arena stays allocated. For a whole-tier invalidation, e.g.
+        when the model's weights changed (a runtime adapter update) and every stored page is stale. Entries
+        still being promoted from disk, or written to it, are waited for first so no slot is recycled under a
+        transfer.
+        """
+        for e in self.entries.values():
+            pending = e.get("pending")
+            if pending is not None:
+                pending.wait()
+        if self.disk_tier is not None:
+            self.disk_tier.flush()
+        self.metrics["evictions"] += len(self.entries)
+        self.entries = {}
+        self.free_slots = deque(range(self.num_slots))
+        self._order.clear()
+        self._order_pops = 0
+        self.slot_events = {}
+
+
     def close(self):
         """
         Drop the cache tensor references and return the pinned memory to the OS. Optional: the same happens

@@ -177,10 +177,20 @@ class StubGenerator:
     """num_remaining_jobs counts down per poll (simulating in-flight jobs
     draining); pagetable records resets."""
 
-    def __init__(self, jobs=0):
+    def __init__(self, jobs=0, cpu_tier=False, recurrent=False, disk=False):
         self.jobs = jobs
-        self.pagetable = types.SimpleNamespace(resets=0)
+        self.pagetable = types.SimpleNamespace(resets=0, cpu_tier=None)
         self.pagetable.reset_page_table = self._reset
+        if cpu_tier:
+            self.pagetable.cpu_tier = types.SimpleNamespace(clears=0)
+            self.pagetable.cpu_tier.clear = lambda: setattr(
+                self.pagetable.cpu_tier, "clears", self.pagetable.cpu_tier.clears + 1)
+        self.recurrent_cache = None
+        if recurrent:
+            self.recurrent_cache = types.SimpleNamespace(clears=0)
+            self.recurrent_cache.clear = lambda: setattr(
+                self.recurrent_cache, "clears", self.recurrent_cache.clears + 1)
+        self.disk_page_cache = object() if disk else None
 
     def _reset(self):
         self.pagetable.resets += 1
@@ -320,6 +330,32 @@ def test_encode_messages():
 # ---------------------------------------------------------------------------
 # Ingest loop
 # ---------------------------------------------------------------------------
+
+def test_attach_generator_invalidates_every_cache_tier():
+    # An adapter update must drop the VRAM page table AND the tiers a page can be
+    # restored from by hash (CPU page tier, recurrent checkpoints): a page restored
+    # from there carries KV computed through the previous adapter.
+    rt = make_rt()
+    gen = StubGenerator(cpu_tier=True, recurrent=True)
+    rt.attach_generator(gen)
+    rt.sync_to_inference()
+    assert gen.pagetable.resets == 1
+    assert gen.pagetable.cpu_tier.clears == 1
+    assert gen.recurrent_cache.clears == 1
+    # Generators without the optional tiers still work (the common case).
+    plain = StubGenerator()
+    rt.attach_generator(plain)
+    rt.sync_to_inference()
+    assert plain.pagetable.resets == 1 and gen.pagetable.resets == 2
+    # A disk tier persists across processes and is keyed by model, not adapter:
+    # refused loudly rather than served stale.
+    try:
+        rt.attach_generator(StubGenerator(disk=True))
+    except ValueError as e:
+        assert "disk cache" in str(e)
+    else:
+        raise AssertionError("generator with a disk cache tier must be refused")
+
 
 def test_ingest_batching_and_callbacks():
     net = StubNet()

@@ -104,7 +104,7 @@ import torch.nn.functional as F
 from . import backbone
 from . import vision
 from . import quant_aware as _qa
-from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction
+from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction, init_lora_a_
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
     DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
@@ -131,21 +131,6 @@ _FLASH_FN = None
 _FLASH_TRIED = False
 
 
-
-def init_lora_a_(t: torch.Tensor, fan_in: int) -> torch.Tensor:
-    """PEFT's LoRA-A init on an A stored as ``[in_features, r]``.
-
-    PEFT stores A as ``[r, in]`` and uses torch's kaiming-uniform init with
-    a=sqrt(5), whose bound is ``1/sqrt(fan_in)`` with fan_in read from dim 1 =
-    ``in``. Our A is transposed, so the same call read fan_in = r and
-    initialised A ``sqrt(in/r)`` too large (8.9x at r=32 on a 2560-wide input),
-    which made the effective update per Adam step that much larger than PEFT's
-    at the same lr (found 2026-10-11, doc/exl3_vs_bnb_qwen35_4b_2026-10-11.md).
-    Explicit bound, independent of storage layout.
-    """
-    bound = 1.0 / math.sqrt(fan_in)
-    with torch.no_grad():
-        return t.uniform_(-bound, bound)
 
 def _flash_attn_func():
     global _FLASH_FN, _FLASH_TRIED

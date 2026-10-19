@@ -35,8 +35,13 @@ KV-cache staleness: after an adapter update, every cached KV entry computed
 THROUGH an adapted k_proj/v_proj is stale. Two supported answers:
 
   1. (default) nuke the cache on every update -- ``attach_generator(gen)``
-     registers ``gen.pagetable.reset_page_table()`` as an update callback, so
-     prefix reuse restarts from nothing and the next requests re-prefill.
+     registers ``invalidate_generator_cache(gen)`` as an update callback: the
+     VRAM page table is reset, and the CPU page tier and the recurrent-state
+     checkpoints behind it are cleared too (pages restored from those by hash
+     would otherwise carry KV computed through the previous adapter), so prefix
+     reuse restarts from nothing and the next requests re-prefill. A generator
+     with a disk cache tier is refused: its pages persist across processes and
+     its fingerprint knows nothing about adapters.
   2. adapt only projections that never enter the cache --
      ``target_modules=["q_proj", "o_proj", "gate_proj", "up_proj",
      "down_proj"]`` -- and register no cache callback. Zero invalidation cost,
@@ -606,13 +611,37 @@ class RealtimeQLoRA:
         went stale)."""
         self._update_callbacks.append(fn)
 
+    @staticmethod
+    def invalidate_generator_cache(generator) -> None:
+        """Drop every cached state the generator could hand a new request:
+        the VRAM page table, the CPU page tier behind it and the recurrent-state
+        checkpoints. All of it was computed through the previous adapter."""
+        pagetable = generator.pagetable
+        pagetable.reset_page_table()
+        recurrent = getattr(generator, "recurrent_cache", None)
+        if recurrent is not None:
+            recurrent.clear()
+        tier = getattr(pagetable, "cpu_tier", None)
+        if tier is not None:
+            tier.clear()
+
     def attach_generator(self, generator) -> None:
-        """Wire a generator in: its page table is reset on every adapter
-        update (the default cache-staleness answer), and ``ingest`` refuses to
-        start while it still has jobs in flight (belt and suspenders under the
-        write lock)."""
+        """Wire a generator in: its cached state (page table, CPU page tier,
+        recurrent checkpoints) is invalidated on every adapter update (the
+        default cache-staleness answer), and ``ingest`` refuses to start while
+        it still has jobs in flight (belt and suspenders under the write lock).
+        A generator with a disk cache tier is refused: pages written there
+        outlive the process and are keyed by model, not adapter, so a later
+        run would restore KV computed through a stale adapter."""
+        if getattr(generator, "disk_page_cache", None) is not None:
+            raise ValueError(
+                "RealtimeQLoRA cannot serve from a generator with a disk cache tier: "
+                "cached pages persist across processes and are not keyed by adapter, "
+                "so an adapter update cannot invalidate them. Build the generator "
+                "without disk_cache_dir."
+            )
         self._generators.append(generator)
-        self.add_update_callback(generator.pagetable.reset_page_table)
+        self.add_update_callback(lambda: self.invalidate_generator_cache(generator))
 
     def attach_aux_models(self, *models) -> None:
         """Register serving-only component models -- a vision tower, an MTP/
