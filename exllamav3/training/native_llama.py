@@ -2845,8 +2845,21 @@ class NativeLlamaQLoRA(nn.Module):
         return self._head_logits(mtp_hidden)
 
     def _head_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        w = self.lm_head_weight_fn()()
-        logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
+        if self.head_vocab_chunk > 0 and self._head_slice is not None:
+            # --head-vocab-chunk: reconstruct the head in vocab-column tiles, as
+            # the chunked CE does, so the full [hidden, vocab] weight + its fp32
+            # upcast is never held at once (~20 GB for a 16k x 128k head).
+            slice_fn, vocab_size, granularity = self._head_slice
+            vc = max(granularity, (self.head_vocab_chunk // granularity) * granularity)
+            parts = []
+            for a in range(0, vocab_size, vc):
+                w = slice_fn(a, min(vc, vocab_size - a))
+                parts.append(backbone.to_device(hidden, w.device).to(w.dtype) @ w)
+                del w
+            logits = torch.cat(parts, dim=-1)
+        else:
+            w = self.lm_head_weight_fn()()
+            logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
         if self.final_softcap:
             logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
         return logits
