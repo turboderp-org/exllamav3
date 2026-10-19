@@ -25,9 +25,10 @@ The layer keeps the stock attention interface out of the loop: `decode_flash_att
 `stream_attn()` when the resolved cache layer is a streaming one, and any other caller that
 reaches a streaming layer through `attn_dispatch` gets a loud error instead of a wrong result.
 
-Supported (MVP): CUDA, bsz 1, causal, full-attention layers with no window and no softcap,
-fp16 and quantized caches. Not supported: MLA/QSA geometries, TP, CUDA graphs, CPU/disk page
-tiers (they raise).
+Supported: CUDA, bsz 1, causal, stock paged attention (full-attention and left-sliding-window
+layers, logit softcapping, asymmetric V), fp16 and quantized caches. Not supported: right-hand
+windows (window_right > 0), MLA/QSA geometries, TP, CUDA graphs over the chunk walk, CPU/disk
+page tiers (they raise).
 
 Environment (doc/env_vars.md):
 
@@ -190,8 +191,9 @@ def stream_cache_layer_type(attn, default, kwargs: dict):
     """
     Map a requested cache layer type to its streaming variant, or return None to leave it alone.
     Only exact fp16/quant layers stream (geometry-specific layers keep their own paths), and only
-    attention modules whose decode path is the stock `Attention.decode_flash_attn` with a plain
-    geometry (no window, no softcap, no cu_seqlens batching, symmetric V) qualify.
+    attention modules whose decode path is the stock `Attention.decode_flash_attn` with plain
+    geometry (no right-hand window, no cu_seqlens batching) qualify. Left sliding windows, logit
+    softcapping and asymmetric V are handled by the chunked driver.
     """
     if not stream_enabled():
         return None
@@ -201,20 +203,12 @@ def stream_cache_layer_type(attn, default, kwargs: dict):
     if getattr(attn, "has_split_cache", False):
         _warn_once("tp", "KV streaming is not supported in tensor-parallel mode")
         return None
-    if attn.sliding_window >= 0 or attn.window_right > 0:
-        _warn_once("window", "KV streaming does not cover sliding-window layers; "
-                             "those layers keep their regular cache")
-        return None
-    if attn.logit_softcapping not in (None, 0.0, 0):
-        _warn_once("softcap", "KV streaming does not cover logit softcapping; "
-                              "those layers keep their regular cache")
+    if attn.window_right > 0:
+        _warn_once("window_right", "KV streaming does not cover right-hand windows; "
+                                   "those layers keep their regular cache")
         return None
     if attn.use_cu_seqlens:
         _warn_once("cu_seqlens", "KV streaming does not cover cu_seqlens batching; "
-                                 "those layers keep their regular cache")
-        return None
-    if attn.v_head_dim != attn.head_dim:
-        _warn_once("v_head_dim", "KV streaming does not cover asymmetric V head dims; "
                                  "those layers keep their regular cache")
         return None
     if default is CacheLayer_quant:
@@ -672,10 +666,12 @@ class StreamLayer(CacheLayer):
         by_programs = max(1, (2 * _sm_count(self.device)) // max(1, programs))
         return int(min(8, by_programs, max(1, triton.cdiv(kv_len, max(1, block_n)))))
 
-    def _plan_chunks(self, L: int, window_start: int, programs: int, block_n: int,
+    def _plan_chunks(self, L: int, window_start: int, kv_lo: int, programs: int, block_n: int,
                      splits_fn, bytes_per_slot: int):
-        """Launch plan: streamed chunks in ascending KV order, then the resident window. The
-        per-chunk split counts are capped so the step's partial buffers stay within budget"""
+        """Launch plan: streamed chunks in ascending KV order, then the resident window. Chunks
+        entirely below `kv_lo` (the earliest key any query row of this step can see) are skipped,
+        including their H2D copies. The per-chunk split counts are capped so the step's partial
+        buffers stay within budget"""
         C = self.cfg["C"]
         n_chunks = -(-window_start // C) if window_start else 0
         n_launches = n_chunks + (1 if L > window_start * PAGE_SIZE else 0)
@@ -687,16 +683,16 @@ class StreamLayer(CacheLayer):
             p1 = min(p0 + C, window_start)
             nb = p0 * PAGE_SIZE
             ne = min(p1 * PAGE_SIZE, L)
-            if ne <= nb:
+            if ne <= nb or ne <= kv_lo:
                 continue
             splits = min(splits_fn(ne - nb, programs, block_n), per_launch_cap)
             plan.append((ci, nb, ne, splits))
-        rb = window_start * PAGE_SIZE
+        rb = max(window_start * PAGE_SIZE, kv_lo)
         if L > rb:
             splits = min(splits_fn(L - rb, programs, block_n), per_launch_cap)
             plan.append((None, rb, L, splits))
         total_slots = sum(e[3] for e in plan)
-        final = len(plan) == 1 and plan[0][3] == 1 and plan[0][1] == 0
+        final = len(plan) == 1 and plan[0][0] is None and plan[0][3] == 1
         return n_chunks, plan, total_slots, final
 
     def _issue_chunk_h2d(self, ci: int, window_start: int):
@@ -750,15 +746,28 @@ class StreamLayer(CacheLayer):
         sm_scale: float | None = None,
         sinks: torch.Tensor | None = None,
         non_causal_spans: list | None = None,
+        window_left: int = -1,
+        window_right: int = -1,
+        softcap: float = 0.0,
     ) -> torch.Tensor:
         """
         Chunked attention over the streamed history. Writes rows [a, a + q_len), walks the KV
         history in placement chunks with the patched split/prefill kernels, and reduces the
         partials in KV order.
+
+        `window_left` < 0 means full attention. A left sliding window only needs the keys
+        [position - window_left, position], so chunks entirely below the earliest row's bound are
+        skipped (no H2D copies); the kernels mask the partial boundary chunk. `softcap` is the
+        logit softcapping value (0.0: none).
         """
         assert self.device is not None, "streaming cache layer is not allocated (model not loaded?)"
         assert non_causal_spans is None, "KV streaming does not support non-causal spans"
         assert causal, "KV streaming does not support non-causal attention"
+        if window_left is None or window_left < 0:
+            window_left, window_right = -1, -1
+        elif window_right is None:
+            window_right = 0
+        softcap = float(softcap or 0.0)
         self._ensure_resident()
         bsz, q_len, n_q_heads, head_dim = q.shape
         assert bsz == 1, "KV streaming supports bsz == 1"
@@ -806,13 +815,16 @@ class StreamLayer(CacheLayer):
             self._ensure_state(host_block_table, pos, b_s)
             self._write_append(k[:, s0:s1], v[:, s0:s1], pos, take)
             window_start = max(0, -(-b_s // PAGE_SIZE) - R)
+            # Earliest key any query row of this step can see (left window): chunks entirely
+            # below it carry no weight and are not copied or launched
+            kv_lo = max(0, pos - window_left) if window_left >= 0 else 0
             self._stage.fill_(b_s)
             if take <= 16:
-                self._walk_decode(q[:, s0:s1], out[:, s0:s1], b_s, window_start, sm_scale,
-                                  sinks, nkv_override)
+                self._walk_decode(q[:, s0:s1], out[:, s0:s1], b_s, window_start, kv_lo, sm_scale,
+                                  sinks, nkv_override, window_left, window_right, softcap)
             else:
-                self._walk_prefill(q[:, s0:s1], out[:, s0:s1], b_s, window_start, sm_scale,
-                                   sinks, nkv_override)
+                self._walk_prefill(q[:, s0:s1], out[:, s0:s1], b_s, window_start, kv_lo, sm_scale,
+                                   sinks, nkv_override, window_left, window_right, softcap)
             pos, s0 = b_s, s1
         return out
 
@@ -879,18 +891,22 @@ class StreamLayer(CacheLayer):
         self._publish_append(a, L)
         return y
 
-    def _walk_decode(self, q, out, L, window_start, sm_scale, sinks, nkv_override):
+    def _walk_decode(self, q, out, L, window_start, kv_lo, sm_scale, sinks, nkv_override,
+                     window_left, window_right, softcap):
         from ..modules.attention_fn.triton_paged import PagedAttnStreamDecode
         q_len = q.shape[1]
-        geo = self._geo_dec.get(q_len)
+        key = (q_len, window_left, window_right, softcap)
+        geo = self._geo_dec.get(key)
         if geo is None:
-            geo = self._geo_dec[q_len] = PagedAttnStreamDecode(q, self.num_kv_heads, self._qc_pair())
+            geo = self._geo_dec[key] = PagedAttnStreamDecode(
+                q, self.num_kv_heads, self._qc_pair(),
+                window_left = window_left, window_right = window_right, softcap = softcap)
         block_n = geo.candidates[0] if geo.candidates else 64
         bytes_per_slot = geo.programs * (geo.block_rows * geo.hd_pad * 4 + geo.block_rows * 8)
         n_chunks, plan, total_slots, final = self._plan_chunks(
-            L, window_start, geo.programs, block_n, self._decode_splits, bytes_per_slot)
-        self._trace(f"decode walk: L={L}, window_start={window_start}, chunks={n_chunks}, "
-                    f"slots={total_slots}, final={final}")
+            L, window_start, kv_lo, geo.programs, block_n, self._decode_splits, bytes_per_slot)
+        self._trace(f"decode walk: L={L}, window_start={window_start}, kv_lo={kv_lo}, "
+                    f"chunks={n_chunks}, slots={total_slots}, final={final}")
         if not final:
             no, nml = geo.partial_numel(total_slots)
             if self._part_dec is None or self._part_dec[2] < no:
@@ -903,15 +919,19 @@ class StreamLayer(CacheLayer):
         self._run_walk(geo, q, out, resident, 0, window_start, plan, total_slots, final,
                        sm_scale, sinks, nkv_override, prefill = False)
 
-    def _walk_prefill(self, q, out, L, window_start, sm_scale, sinks, nkv_override):
+    def _walk_prefill(self, q, out, L, window_start, kv_lo, sm_scale, sinks, nkv_override,
+                      window_left, window_right, softcap):
         from ..modules.attention_fn.triton_paged import PagedAttnStreamPrefill
         q_len = q.shape[1]
-        geo = self._geo_pre.get(q_len)
+        key = (q_len, window_left, window_right, softcap)
+        geo = self._geo_pre.get(key)
         resident = self._resident_tensors()
         kc = resident["k"] if "k" in resident else resident["qk"]
         vc = resident["v"] if "v" in resident else resident["qv"]
         if geo is None:
-            geo = self._geo_pre[q_len] = PagedAttnStreamPrefill(q, self.num_kv_heads, self._qc_pair())
+            geo = self._geo_pre[key] = PagedAttnStreamPrefill(
+                q, self.num_kv_heads, self._qc_pair(),
+                window_left = window_left, window_right = window_right, softcap = softcap)
         geo.ensure_config(q, kc, vc, self._kt, self._stage, True,
                           n_kv_heads_override = nkv_override)
         block_m, block_n = geo.cfg[0], geo.cfg[1]
@@ -919,9 +939,9 @@ class StreamLayer(CacheLayer):
         programs = q_blocks * self.num_q_heads
         bytes_per_slot = programs * (block_m * geo.hd_pad * 4 + block_m * 8)
         n_chunks, plan, total_slots, final = self._plan_chunks(
-            L, window_start, programs, block_n, self._prefill_splits, bytes_per_slot)
-        self._trace(f"prefill walk: L={L}, window_start={window_start}, chunks={n_chunks}, "
-                    f"slots={total_slots}, final={final}")
+            L, window_start, kv_lo, programs, block_n, self._prefill_splits, bytes_per_slot)
+        self._trace(f"prefill walk: L={L}, window_start={window_start}, kv_lo={kv_lo}, "
+                    f"chunks={n_chunks}, slots={total_slots}, final={final}")
         if not final:
             no, nml = geo.partial_numel(q_blocks, total_slots)
             if self._part_pre is None or self._part_pre[2] < no:
@@ -935,16 +955,20 @@ class StreamLayer(CacheLayer):
 
     def _run_walk(self, geo, q, out, resident, kv_append_len, window_start, plan,
                   total_slots, final, sm_scale, sinks, nkv_override, prefill: bool):
-        C, S = self.cfg["C"], self.cfg["S"]
-        n_chunks = sum(1 for e in plan if e[0] is not None)
-        for ci in range(min(S, n_chunks)):
-            self._issue_chunk_h2d(ci, window_start)
-        ring = self._ensure_ring()["tensors"] if n_chunks else None
+        S = self.cfg["S"]
+        # Chunk plan entries keep their page-group indices, which are not contiguous when a
+        # windowed walk skips groups below the visible range: prefetch in plan order, not by
+        # index arithmetic
+        chunk_plan = [e for e in plan if e[0] is not None]
+        for e in chunk_plan[:S]:
+            self._issue_chunk_h2d(e[0], window_start)
+        ring = self._ensure_ring()["tensors"] if chunk_plan else None
         if not final:
             part_o, part_ml = (self._part_pre if prefill else self._part_dec)[:2]
         else:
             part_o = part_ml = q
         slot = 0
+        chunk_pos = 0
         q_blocks = None
         for ci, nb, ne, splits in plan:
             if ci is not None:
@@ -972,9 +996,9 @@ class StreamLayer(CacheLayer):
                 )
             if ci is not None:
                 self._record_chunk_consumed(ci)
-                nxt = ci + S
-                if nxt < n_chunks:
-                    self._issue_chunk_h2d(nxt, window_start)
+                if chunk_pos + S < len(chunk_plan):
+                    self._issue_chunk_h2d(chunk_plan[chunk_pos + S][0], window_start)
+                chunk_pos += 1
             slot += splits
         if not final:
             if prefill:

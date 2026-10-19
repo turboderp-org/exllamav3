@@ -963,17 +963,21 @@ def _paged_attn_decode_split_kernel(
     n_bound = total_k_len
     if kv_end > 0:
         n_bound = tl.minimum(n_bound, kv_end)
-    if WINDOW_LEFT >= 0:
-        # Sliding-window layers only need keys >= (first query position - window): split that range, not the whole
-        # sequence, across the programs. Splitting the sequence and skipping the tiles below the window leaves the
-        # window to the one or two splits that cover it (10x slower at 64K than at 16K for a 2048 window). The
-        # skipped keys carry exactly zero weight, so the result is unchanged
+    if WINDOW_LEFT >= 0 and kv_end <= 0:
+        # Stock single-launch path: sliding-window layers only need keys >= (first query position - window), so
+        # split that range rather than the whole sequence across the programs. Splitting the sequence and
+        # skipping the tiles below the window leaves the window to the one or two splits that cover it (10x
+        # slower at 64K than at 16K for a 2048 window). The skipped keys carry exactly zero weight, so the
+        # result is unchanged
         w_lo = tl.maximum(total_k_len - q_len - WINDOW_LEFT, 0)
         w_lo = (w_lo // BLOCK_N) * BLOCK_N
         w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
         n_start = w_lo + split * w_span
         n_end = tl.minimum(n_start + w_span, n_bound)
     else:
+        # kv_end > 0 marks a streaming launch over an explicit chunk: the driver planned the span and the
+        # window mask below trims it per row. Applying the whole-window split arithmetic here would make
+        # every chunk launch cover the same visible range and double-count it in the combine
         n_start = kv_base + split * split_len
         n_end = tl.minimum(n_start + split_len, n_bound)
 
@@ -2509,12 +2513,16 @@ class PagedAttnStreamDecode:
 
     def __init__(self, q: torch.Tensor, n_kv_heads: int, qc: tuple | None,
                  block_n: int | None = None, num_warps: int | None = None,
-                 num_stages: int | None = None):
+                 num_stages: int | None = None, window_left: int = -1,
+                 window_right: int = -1, softcap: float = 0.0):
         bsz, q_len, n_q_heads, head_dim = q.shape
         self.bsz, self.q_len = bsz, q_len
         self.n_q_heads, self.n_kv_heads, self.head_dim = n_q_heads, n_kv_heads, head_dim
         self.hd_pad = triton.next_power_of_2(head_dim)
         self.qc = qc
+        self.window_left = int(window_left)
+        self.window_right = int(window_right)
+        self.softcap = float(softcap or 0.0)
         group_size = n_q_heads // n_kv_heads
         self.block_rows, self.h_blocks = decode_row_layout(q_len, group_size, self.hd_pad)
         self.programs = bsz * n_kv_heads * self.h_blocks
@@ -2560,7 +2568,7 @@ class PagedAttnStreamDecode:
         page_size = k_cache.shape[1]
         n_kv_heads = self.n_kv_heads if self.qc is None else n_kv_heads_override
         if final:
-            assert total_slots == 1 and num_splits == 1 and kv_base == 0
+            assert total_slots == 1 and num_splits == 1
         sinks, has_sinks = _prep_sinks(sinks, self.n_q_heads, q)
         if self.qc is not None:
             qck, qcv = self.qc[2], self.qc[3]
@@ -2580,7 +2588,7 @@ class PagedAttnStreamDecode:
                 int(kv_base), int(kv_end), int(slot_base), int(total_slots),
                 qck, qcv, self.q_len, 0, self.n_q_heads, n_kv_heads,
                 page_size, self.head_dim, self.hd_pad, float(softmax_scale),
-                bool(causal), -1, -1, 0.0,
+                bool(causal), self.window_left, self.window_right, self.softcap,
                 bool(final), has_sinks, self.block_rows, bn,
             )
 
@@ -2588,7 +2596,8 @@ class PagedAttnStreamDecode:
             if self.block_n is None:
                 pick_key = (
                     self.head_dim, self.hd_pad, qck, qcv, self.q_len, self.block_rows, self.h_blocks,
-                    bool(causal), has_sinks, self.num_warps, self.num_stages, self.candidates[0],
+                    bool(causal), self.window_left >= 0, self.window_right >= 0, self.softcap,
+                    has_sinks, self.num_warps, self.num_stages, self.candidates[0],
                     bool(final), kv_base > 0 or kv_end > 0,
                 )
                 self.block_n = pick_config(
@@ -2632,12 +2641,19 @@ class PagedAttnStreamPrefill:
 
     def __init__(self, q: torch.Tensor, n_kv_heads: int, qc: tuple | None,
                  block_m: int | None = None, block_n: int | None = None,
-                 num_warps: int | None = None, num_stages: int | None = None):
+                 num_warps: int | None = None, num_stages: int | None = None,
+                 window_left: int = -1, window_right: int = -1, softcap: float = 0.0):
         bsz, q_len, n_q_heads, head_dim = q.shape
         self.bsz, self.q_len = bsz, q_len
         self.n_q_heads, self.n_kv_heads, self.head_dim = n_q_heads, n_kv_heads, head_dim
         self.hd_pad = triton.next_power_of_2(head_dim)
         self.qc = qc
+        # Window bounds are runtime kernel arguments; only their presence is a constexpr
+        self.window_left = int(window_left)
+        self.window_right = int(window_right)
+        self.has_window_left = self.window_left >= 0
+        self.has_window_right = self.window_right >= 0
+        self.softcap = float(softcap or 0.0)
         self.page_size = 256
 
         # Tile configs by head_dim, sized for ~100 KB of smem (same table as the stock wrapper)
@@ -2714,11 +2730,13 @@ class PagedAttnStreamPrefill:
                 1, False, 0, qck, qcv,
                 self.q_len, 0, self.n_q_heads, n_kv_heads,
                 block_table.shape[1], self.page_size, self.head_dim, self.hd_pad, 1.0,
-                bool(causal), -1, -1, False, False, float(0.0), False, wide_index, block_m, block_n,
+                bool(causal), self.window_left, self.window_right, self.has_window_left,
+                self.has_window_right, self.softcap, False, wide_index, block_m, block_n,
             )
 
         with torch.cuda.device(q.device):
-            pick_key = (self.head_dim, self.hd_pad, qck, qcv, bool(causal), False, stock_key(self.candidates))
+            pick_key = (self.head_dim, self.hd_pad, qck, qcv, bool(causal), self.has_window_left,
+                        self.has_window_right, self.softcap, False, stock_key(self.candidates))
             self.cfg = pick_config(q.device, "paged_attn_prefill_stream", pick_key, self.candidates,
                                    lambda cfg: shared_bytes(_paged_attn_prefill_kernel, args_for(cfg),
                                                             num_warps = cfg[2], num_stages = cfg[3]))
@@ -2773,7 +2791,8 @@ class PagedAttnStreamPrefill:
             int(num_splits), not final, 0, qck, qcv,
             self.q_len, int(kv_append_len), self.n_q_heads, n_kv_heads,
             block_table.shape[1], self.page_size, self.head_dim, self.hd_pad, float(softmax_scale),
-            bool(causal), -1, -1, False, False, float(0.0),
+            bool(causal), self.window_left, self.window_right, self.has_window_left,
+            self.has_window_right, self.softcap,
             has_sinks, wide_index, block_m, block_n,
         )
 

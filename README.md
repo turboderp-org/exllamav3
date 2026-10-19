@@ -3,13 +3,15 @@
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [KV cache streaming](#kv-cache-streaming) · [Vision offloading](#vision-encoder-offloading) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
 - **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
+- **[Vision offloading](#vision-encoder-offloading)** - Runs the Qwen 3.5 vision encoder on CPU/system RAM, or pins its weights in host memory, freeing VRAM for the language model.
+- **[KV cache streaming](#kv-cache-streaming)** - Keeps long-context KV history in pinned host RAM and streams it through a small shared GPU ring, extending context beyond VRAM.
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
 - **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
 
@@ -272,6 +274,61 @@ ones (70B+) on a single high-end consumer GPU (see the [conversion guide](doc/co
 For more information, see the [**QTIP**](https://arxiv.org/abs/2406.11235) and [**QuIP#**](https://arxiv.org/abs/2402.04396) papers, as well as this 
 [excellent writeup](https://www.together.ai/blog/even-better-even-faster-quantized-llms-with-qtip) on **QTIP** from together.ai.
 
+## KV cache streaming
+
+By default, a model's entire K/V cache must fit in VRAM. With KV cache streaming enabled, the authoritative KV history for the full-attention layers lives in pinned host RAM, while only the newest `R` pages of each layer stay resident on the GPU. Older pages are copied back through a small ring shared by all streaming layers as attention walks the history in chunks, so contexts much larger than VRAM remain usable. Attention still runs on the GPU; the overhead is PCIe traffic over the streamed fraction, not host compute.
+
+The target is hybrid models whose growing KV is what limits context — e.g. Qwen3.5/3.8-class models with full attention every N layers. Only those layers stream; linear/recurrent layers keep their bounded state. fp16 and quantized caches are supported (packed pages and their scales are moved at the cache's bitrate), and decode, prefill and prompt-cache reuse all work through the same placement scheme. If the whole history fits in the resident window, the stock `EXL3_BC_ATTN` path runs over the window and no history is streamed back, so performance stays close to a regular cache.
+
+Enable it in the environment before loading the model:
+
+```sh
+EXL3_KV_STREAM=1 python examples/chat.py -m <input_dir> -mode <prompt_mode>
+```
+
+By default, the resident window is sized at first use to fill the free device memory (minus the ring and workspace headroom), so any KV that fits stays in VRAM and only the overflow streams. To bound it explicitly:
+
+```sh
+EXL3_KV_STREAM=1 EXL3_KV_STREAM_RESIDENT=1G python examples/chat.py ...
+```
+
+The resident window is the speed-versus-capacity dial: a larger window reduces PCIe traffic, while a smaller one leaves more VRAM for weights or a longer context. The remaining settings:
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_KV_STREAM` | `0` | Enable streaming cache layers |
+| `EXL3_KV_STREAM_MIRROR` | auto | Pinned host-mirror budget (`8G`, `512M`). The mirror is allocated for the full logical cache capacity, so a lower budget only warns |
+| `EXL3_KV_STREAM_RESIDENT` | auto | Resident window per streaming layer, in pages (`12`, `12p`) or bytes (`1G`); `auto` fills the free device memory |
+| `EXL3_KV_STREAM_RING` | `64` | Ring size in pages, shared by all streaming layers on a device |
+| `EXL3_KV_STREAM_PREFETCH` | `2` | Ring slots allowed in flight (copy lookahead) |
+| `EXL3_KV_STREAM_SERIAL` | `0` | Serialized debug mode: no copy stream, no overlap |
+| `EXL3_KV_STREAM_TRACE` | `0` | Log chunk/slot/event transitions |
+
+Because the mirror is authoritative, budget roughly the full KV cache size in pinned system RAM in addition to VRAM. Streaming currently requires CUDA and `bsz 1`, and cannot be combined with tensor parallelism or the CPU/disk page tiers. MLA/QSA/DSA caches, right-hand sliding windows, `cu_seqlens` batching and CUDA graph capture of the chunked walk are not supported; left sliding windows, logit softcap and asymmetric V head dims stream normally. Ineligible modules keep their regular cache layer and log a warning.
+
+See the [design and implementation notes](doc/kv_streaming.md) for the memory model and synchronization details, and [doc/env_vars.md](doc/env_vars.md#kv-cache-streaming) for the full variable descriptions.
+
+## Vision encoder offloading
+
+Qwen 3.5's vision encoder (dense and MoE models) can be moved off the GPU independently of the language model. Loading the vision component on the CPU keeps its weights and activations in system RAM and runs the tower on the host, leaving the text model more VRAM for weights and KV:
+
+```python
+from exllamav3 import Config, Model
+
+config = Config.from_directory(model_dir)
+
+vision_model = Model.from_config(config, component = "vision")
+vision_model.load(device = "cpu")
+
+model = Model.from_config(config)
+model.load()
+```
+
+The text model and its KV cache stay on their configured CUDA device; only the resulting image embeddings cross to the GPU. `examples/multimodal.py` exposes the same choice through the module-level `vision_device` setting (`mode = "qwen35"`, `vision_device = "cpu"`). Both fp16 and EXL3-quantized vision towers are supported on this path.
+
+If CPU latency is too high, `EXL3_VISION_PINNED=1` (or `config.infer_params.vision_pinned = True`, set before loading) is a middle ground: the vision component's linear weights stay in pinned host memory and are read through a zero-copy device alias, so the tower still executes on the GPU while its weights no longer occupy VRAM, at the cost of streaming the weights over PCIe during image encoding. `examples/imgdesc.py -vo` enables this mode.
+
+CPU execution is slower than the GPU path, and cached attention is not supported on the CPU. See [CPU vision execution](doc/env_vars.md#cpu-vision-execution) and [`EXL3_VISION_PINNED`](doc/env_vars.md#exl3_vision_pinned) for details.
 
 ## Community
 

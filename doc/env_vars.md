@@ -267,10 +267,12 @@ keeps a long context from fitting in VRAM (Qwen3.5/3.8-class, full attention eve
 those layers stream, the linear/recurrent ones keep their bounded state, and the whole history
 fitting in the window copies nothing. If it fits, streaming is a no-op against the stock path.
 
-Only CUDA, `bsz 1`, causal, full-attention layers with a plain `fp16` or quantized cache qualify,
-and only when the layer's decode path is the stock one (no sliding window, logit softcap,
-`cu_seqlens` batching or asymmetric V head dims; TP is excluded). Ineligible attention modules
-keep their regular cache layer with a one-line warning naming the reason. A streaming layer in a
+Only CUDA, `bsz 1`, causal layers with a plain `fp16` or quantized cache qualify, and only when the
+layer's decode path is the stock one. Left sliding windows, logit softcap and asymmetric V head dims
+stream through the same walk (a windowed driver skips page groups below the visible range and masks the
+boundary chunk); right-hand windows (`window_right > 0`), `cu_seqlens` batching and TP are excluded.
+Ineligible attention modules keep their regular cache layer with a one-line warning naming the reason.
+A streaming layer in a
 cache that is also tiered (the CPU page cache) is refused, since the mirror already holds the full
 history. While the whole live history fits the resident window, decode runs the stock
 graph-captured block (`EXL3_BC_ATTN`) over the window — same captured C++ call as a regular cache,

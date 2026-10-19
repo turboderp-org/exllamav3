@@ -431,10 +431,34 @@ stream as the H2Ds, and `_pub_event` orders the compute stream after the last pu
 publishes from earlier steps).
 
 **Not implemented, and declined loudly rather than silently:** MLA/QSA/DSA geometries, tensor parallelism,
-`bsz > 1`, CUDA graph capture of the chunked walk, sliding-window layers, logit softcapping, `cu_seqlens`
-batching, asymmetric V head dims, non-causal spans, and the CPU/disk page tiers (a `StreamLayer` in a cache that
+`bsz > 1`, CUDA graph capture of the chunked walk, right-hand windows (`window_right > 0`), `cu_seqlens`
+batching, non-causal spans, and the CPU/disk page tiers (a `StreamLayer` in a cache that
 is also tiered raises). ROCm is untested; the copy paths and the Triton kernels are the same code, but the
 bandwidth profiles the design's tuning assumes are not.
+
+**Attention geometry is passed through, not assumed.** Left sliding windows, logit softcapping and asymmetric V
+head dims are carried by the chunked driver:
+
+- *Left window.* The stock split kernel already masks keys below `q - window_left`; its single-launch window
+  arithmetic (split only the visible range) is gated on `kv_end <= 0` so a streaming launch keeps its planned
+  `[kv_base, kv_end)` span instead of re-covering the whole window. The driver computes the earliest key any row
+  of the step can see (`kv_lo = pos - window_left`) and drops chunks ending below it, so pages that fell out of
+  the window are neither copied into the ring nor attended; the boundary chunk is masked per row and the
+  resident launch starts at `max(window_start * PAGE_SIZE, kv_lo)`. Every row then sees at least one key, so a
+  single resident launch with one split can take the direct-write (`final`) path even with a non-zero KV base.
+  Prefill takes the window bounds as runtime arguments with `HAS_WINDOW_LEFT`/`HAS_WINDOW_RIGHT` constexprs. The
+  BC fast path already bakes the module's window constexprs, so the all-resident and chunked steps agree. Chunk
+  plan entries keep their page-group indices, so the prefetch lookahead walks the plan list rather than adding
+  `S` to an index (skipped groups would leave holes).
+- *Softcap.* Threaded as the `SOFTCAP` constexpr into both the split and prefill launches; the combine is
+  unchanged because it reduces `(m, l, o)` partials.
+- *Asymmetric V.* The cache and kernels carry one head dim, with V's unused lanes zero-filled by the projection
+  (the loader pads the rows); streaming allocates `head_dim`-wide output and `project_o` trims it once, as in
+  the stock path. The stream combine keeps `V_DIM = head_dim`; only the BC graph trims inside its own combine
+  into a `v_head_dim`-wide output.
+
+Right-hand windows stay declined: the walk is causal and ordered in KV, and the architectures that set a right
+window are draft/vision towers whose attention modules do not stream anyway.
 
 Status of the roadmap in §8: M0, M1 and M2 are done (the resident set is dynamic by construction; copy stream,
 ready/consumed events and prefetch depth are in; serial mode remains as the debug switch). M3 is done: prefill
@@ -443,6 +467,7 @@ decode rows, and prompt-cache reuse works through `copy_page`/`rotate_pages`, wh
 hashes that drive reuse are over the prompt tokens, not over the KV image, so hashing is unaffected by where the
 KV lives; the design's worry under "Prompt cache semantics" does not apply). Of M4, the CUDA-graph variant has
 landed for the all-resident case (the window as a plain pool, identity table, graph append + post-publish; see
-above) and the auto placement policy is in; chunk-walk capture, sliding windows, `bsz > 1` and TP remain. The M4
+above), the auto placement policy is in, and left sliding windows, logit softcapping and asymmetric V are done;
+chunk-walk capture, `bsz > 1` and TP remain. The M4
 caveat that results need not be bit-identical across different stream configurations applies as documented:
 streaming is a placement change rather than a numerics change, but split counts follow the chunking.

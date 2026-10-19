@@ -17,6 +17,8 @@ placement and bookkeeping path it can take:
       the mirror without going through this layer's write path,
     - sequence reuse and rollback (a shorter follow-up call rewrites the tail of the previous sequence),
     - page rotations (rotate_pages) that invalidate the resident slots and permute the host mirror,
+    - left sliding windows (including launches that start at the window bound) and logit softcapping,
+    - asymmetric V head dims (V rides zero-padded at head_dim, the loader's layout),
     - fp16 and 8-bit caches, and the serial debug mode against the overlapped default.
 
 The reference for the fp16 variants is the stock wrapper writing the same rows into a plain paged pool; for the
@@ -52,11 +54,14 @@ def cs(a: int, device) -> torch.Tensor:
     return torch.tensor([a], dtype = torch.int32, device = device)
 
 
-def synth(total: int, seed: int, device):
-    """(q, k, v) over `total` rows, fp16 on the device"""
+def synth(total: int, seed: int, device, v_head_dim: int = HD):
+    """(q, k, v) over `total` rows, fp16 on the device. Asymmetric V rides at head_dim with the
+    lanes past v_head_dim zero-filled, the layout the loader produces."""
     g = torch.Generator(device = "cpu").manual_seed(seed)
     k = torch.randn(1, total, N_KVH, HD, generator = g, dtype = torch.float32).half().to(device)
     v = torch.randn(1, total, N_KVH, HD, generator = g, dtype = torch.float32).half().to(device)
+    if v_head_dim < HD:
+        v[..., v_head_dim:] = 0
     q = torch.randn(1, total, N_QH, HD, generator = g, dtype = torch.float32).half().to(device)
     return q, k, v
 
@@ -90,9 +95,14 @@ class StockRef:
             self.kc, self.vc = self.layer.qk, self.layer.qv
             self.qc = (self.layer.sk, self.layer.sv, self.layer.k_bits, self.layer.v_bits)
 
-    def attn(self, q, k, v, a: int, length: int, bt, prefill: bool):
+    def attn(self, q, k, v, a: int, length: int, bt, prefill: bool,
+             window_left: int = -1, window_right: int = -1, softcap: float = 0.0):
         """Rows [a, a + length) written into the pool and attended over the whole history [0, a + length)"""
         kwargs = dict(causal = True)
+        if window_left is not None and window_left >= 0:
+            kwargs["window_size"] = (window_left, window_right)
+        if softcap:
+            kwargs["softcap"] = softcap
         if self.layer is not None:
             self.layer.update_kv_direct(cs(a, self.device), bt, k[:, a:a + length].contiguous(),
                                         v[:, a:a + length].contiguous(), length)
@@ -109,7 +119,8 @@ class Case:
 
     def __init__(self, device, monkeypatch, total: int, seed: int, resident: int, ring: int, prefetch: int = 2,
                  kind: str = "fp16", serial: bool = False, pages: int | None = None,
-                 table: torch.Tensor | None = None):
+                 table: torch.Tensor | None = None, window_left: int = -1, window_right: int = -1,
+                 softcap: float = 0.0, v_head_dim: int = HD):
         monkeypatch.setenv("EXL3_KV_STREAM", "1")
         monkeypatch.setenv("EXL3_KV_STREAM_RESIDENT", str(resident))
         monkeypatch.setenv("EXL3_KV_STREAM_RING", str(ring))
@@ -119,7 +130,10 @@ class Case:
         self.total = total
         self.n_pages = -(-total // PAGE_SIZE)
         self.pages = pages if pages is not None else self.n_pages + 4
-        self.q, self.k, self.v = synth(total, seed, device)
+        self.window_left = window_left
+        self.window_right = window_right
+        self.softcap = softcap
+        self.q, self.k, self.v = synth(total, seed, device, v_head_dim = v_head_dim)
         if table is None:
             table = torch.arange(self.pages, dtype = torch.int32)
         self.bt_host = table
@@ -133,12 +147,16 @@ class Case:
             self.q[:, a:a + length], self.k[:, a:a + length], self.v[:, a:a + length],
             cs(a, device), self.bt if bt is None else bt,
             host_seqlens = torch.tensor([a], dtype = torch.int32),
-            host_block_table = self.bt_host if bt_host is None else bt_host)
+            host_block_table = self.bt_host if bt_host is None else bt_host,
+            window_left = self.window_left, window_right = self.window_right,
+            softcap = self.softcap)
 
     def stock(self, a: int, length: int, bt = None, prefill: bool | None = None):
         if prefill is None:
             prefill = length > 16
-        return self.ref.attn(self.q, self.k, self.v, a, length, self.bt if bt is None else bt, prefill)
+        return self.ref.attn(self.q, self.k, self.v, a, length, self.bt if bt is None else bt, prefill,
+                             window_left = self.window_left, window_right = self.window_right,
+                             softcap = self.softcap)
 
 
 def compare(got, ref, tag: str):
@@ -200,6 +218,136 @@ def test_quant_stream_walk_matches_stock(device, monkeypatch, total, probe, resi
     tag = f"total={total} probe={probe} R={resident} ring={ring}"
     compare(got_hist, ref_hist, f"quant hist {tag}")
     compare(got_probe, ref_probe, f"quant probe {tag}")
+
+
+# -------------------------------------------------------------------------------------------------
+# Sliding window, softcap and asymmetric V
+
+WINDOW_CASES = [
+    # total, probe, resident, ring, prefetch, window_left, seed
+    (1200, 1, 2, 4, 2, 300, 71),     # decode probe, window inside the streamed history
+    (1200, 300, 2, 4, 2, 300, 72),   # prefill probe straddling the window boundary
+    (1200, 300, 1, 4, 2, 100, 73),   # window shorter than the resident span: chunks skipped, launch starts at kv_lo
+    (1200, 1, 2, 4, 2, 0, 76),       # single-token window: decode final launch starts at kv_lo
+    (1200, 300, 1, 4, 2, 700, 74),   # window wider than the resident span: boundary chunk + resident
+    (900, 300, 2, 4, 2, 5000, 75),   # window past the whole history: mask is a no-op
+]
+
+
+@pytest.mark.parametrize("total, probe, resident, ring, prefetch, window_left, seed", WINDOW_CASES)
+def test_window_stream_walk_matches_stock(device, monkeypatch, total, probe, resident, ring, prefetch,
+                                          window_left, seed):
+    """Left sliding windows: the kernels mask the boundary chunk, chunks entirely below every query
+    row's lower bound are skipped, and a final launch may start at the window bound rather than 0"""
+    n_hist = total - probe
+    case = Case(device, monkeypatch, total, seed, resident, ring, prefetch, window_left = window_left)
+    got_hist = case.drive(0, n_hist)
+    got_probe = case.drive(n_hist, probe)
+    ref_hist = case.stock(0, n_hist)
+    ref_probe = case.stock(n_hist, probe)
+    tag = f"total={total} probe={probe} R={resident} W={window_left}"
+    compare(got_hist, ref_hist, f"window hist {tag}")
+    compare(got_probe, ref_probe, f"window probe {tag}")
+
+
+SOFTCAP_CASES = [
+    # total, probe, resident, ring, prefetch, softcap, seed
+    (1200, 1, 2, 4, 2, 50.0, 81),
+    (1200, 300, 2, 4, 2, 50.0, 82),
+    (2500, 1, 4, 8, 2, 30.0, 83),
+]
+
+
+@pytest.mark.parametrize("total, probe, resident, ring, prefetch, softcap, seed", SOFTCAP_CASES)
+def test_softcap_stream_walk_matches_stock(device, monkeypatch, total, probe, resident, ring, prefetch,
+                                           softcap, seed):
+    """Softcapping is applied inside the split/prefill launches, so it must survive the chunk walk
+    and the partial reduction unchanged"""
+    n_hist = total - probe
+    case = Case(device, monkeypatch, total, seed, resident, ring, prefetch, softcap = softcap)
+    got_hist = case.drive(0, n_hist)
+    got_probe = case.drive(n_hist, probe)
+    ref_hist = case.stock(0, n_hist)
+    ref_probe = case.stock(n_hist, probe)
+    tag = f"total={total} probe={probe} softcap={softcap}"
+    compare(got_hist, ref_hist, f"softcap hist {tag}")
+    compare(got_probe, ref_probe, f"softcap probe {tag}")
+
+
+@pytest.mark.parametrize("kind, window_left, softcap, v_head_dim, seed", [
+    ("fp16", 300, 50.0, HD, 91),
+    ("q8", 300, 50.0, HD, 92),
+    ("q8", -1, 50.0, 64, 93),
+    ("q8", 300, 0.0, 64, 94),
+])
+def test_window_softcap_quant_and_asymmetric_v(device, monkeypatch, kind, window_left, softcap,
+                                               v_head_dim, seed):
+    """All new geometries together, including the dense UV path: quantized caches carry the packed
+    K/V and their scales through the same windowed/softcapped walk"""
+    total, probe = 1500, 300
+    n_hist = total - probe
+    case = Case(device, monkeypatch, total, seed, 2, 4, 2, kind = kind, window_left = window_left,
+                softcap = softcap, v_head_dim = v_head_dim)
+    got_hist = case.drive(0, n_hist)
+    got_probe = case.drive(n_hist, probe)
+    ref_hist = case.stock(0, n_hist)
+    ref_probe = case.stock(n_hist, probe)
+    tag = f"kind={kind} W={window_left} softcap={softcap} v={v_head_dim}"
+    compare(got_hist, ref_hist, f"combined hist {tag}")
+    compare(got_probe, ref_probe, f"combined probe {tag}")
+
+
+@pytest.mark.nogpu
+def test_stream_layer_gate_matches_supported_geometry(monkeypatch):
+    """The cache-layer mapping accepts stock attention with left windows, softcap and asymmetric V,
+    and declines right-hand windows, TP and varlen batching"""
+    from exllamav3.cache.fp16 import CacheLayer_fp16
+    from exllamav3.cache.quant import CacheLayer_quant
+    from exllamav3.cache.stream import CacheLayer_stream, CacheLayer_stream_quant, stream_cache_layer_type
+    from exllamav3.modules.attn import Attention
+
+    monkeypatch.setenv("EXL3_KV_STREAM", "1")
+
+    class Stub:
+        decode_flash_attn = Attention.decode_flash_attn
+        has_split_cache = False
+        sliding_window = -1
+        window_right = 0
+        use_cu_seqlens = False
+        logit_softcapping = 0.0
+        head_dim = HD
+        v_head_dim = HD
+
+    s = Stub()
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {})[0] is CacheLayer_stream
+    assert stream_cache_layer_type(s, CacheLayer_quant, {})[0] is CacheLayer_stream_quant
+
+    s.sliding_window = 4096
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {})[0] is CacheLayer_stream
+    s.logit_softcapping = 50.0
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {})[0] is CacheLayer_stream
+    s.v_head_dim = 64
+    assert stream_cache_layer_type(s, CacheLayer_quant, {})[0] is CacheLayer_stream_quant
+
+    s.window_right = 1
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {}) is None
+    s.window_right = 0
+    s.has_split_cache = True
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {}) is None
+    s.has_split_cache = False
+    s.use_cu_seqlens = True
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {}) is None
+    s.use_cu_seqlens = False
+
+    # Head-dim divisibility: fp16 needs 8, quantized caches need 32
+    s.v_head_dim = HD
+    s.head_dim = 40
+    s.v_head_dim = 40
+    assert stream_cache_layer_type(s, CacheLayer_fp16, {})[0] is CacheLayer_stream
+    assert stream_cache_layer_type(s, CacheLayer_quant, {}) is None
+    s.head_dim = 32
+    s.v_head_dim = 32
+    assert stream_cache_layer_type(s, CacheLayer_quant, {})[0] is CacheLayer_stream_quant
 
 
 @pytest.mark.parametrize("kind", ["fp16", "q8"])

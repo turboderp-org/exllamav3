@@ -1206,6 +1206,9 @@ class Attention(Module):
                 sm_scale = self.sm_scale,
                 sinks = self.sinks,
                 non_causal_spans = non_causal_spans,
+                window_left = self.sliding_window,
+                window_right = self.window_right,
+                softcap = self.logit_softcapping,
             )
         elif qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
