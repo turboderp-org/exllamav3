@@ -101,7 +101,7 @@ def test_layer_and_token_broadcast(monkeypatch, batch, tokens):
         logits.zero_()
     monkeypatch.setattr(routing, "ext", SimpleNamespace(routing_project = project))
     logits, _, _ = routing._jitter_logits(batch * tokens, cfg,
-                                          torch.zeros(batch * tokens, 16).half(), params, "layer1")
+                                          torch.zeros(batch * tokens, 16).half(), params["expert_jitter_offsets"][:, 3:])
     expected = torch.cat([torch.zeros(1, 4).half() if j is disabled else
                           j.expert_jitter_offsets[:, 3:] for j in jobs]).repeat_interleave(tokens, dim = 0)
     assert torch.equal(logits, expected)
