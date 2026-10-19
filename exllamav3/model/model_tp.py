@@ -644,6 +644,7 @@ class Model_TPMixin:
             "recurrent_slots_scan_in",
             "inv_freq",
             "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
+            "expert_jitter_offsets",
         ]:
             p = params.get(tensor_param)
             if p is not None:

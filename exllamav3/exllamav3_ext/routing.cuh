@@ -29,6 +29,21 @@ void routing_gemv_f32
     at::Tensor scores
 );
 
+// Existing operations exposed separately for transforms of the projected logits.
+void routing_project
+(
+    const at::Tensor& hidden, const at::Tensor& gate, at::Tensor scores,
+    const c10::optional<at::Tensor>& gate_t,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
+);
+
+void routing_sel_norm_logits
+(
+    at::Tensor scores, const at::Tensor& selected, at::Tensor weights,
+    const float scaling_factor, const int act_fn
+);
+
 void routing_ds3_nogroup
 (
     const at::Tensor& hidden,
@@ -126,5 +141,6 @@ void routing_std_logits
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const c10::optional<at::Tensor>& per_expert_scale,
-    const bool use_topk
+    const bool use_topk,
+    const c10::optional<at::Tensor>& bias
 );

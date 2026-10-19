@@ -298,6 +298,43 @@ void routing_gemv
 }
 
 
+void routing_project
+(
+    const at::Tensor& hidden, const at::Tensor& gate, at::Tensor scores,
+    const c10::optional<at::Tensor>& gate_t,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
+)
+{
+    TORCH_CHECK(scores.is_cuda() && hidden.device() == scores.device() && gate.device() == scores.device(),
+                "routing_project: tensors must be on the same GPU");
+    const at::cuda::OptionalCUDAGuard device_guard(scores.device());
+    TORCH_CHECK_DIM(hidden, 2);
+    TORCH_CHECK_DIM(gate, 2);
+    TORCH_CHECK_DIM(scores, 2);
+    TORCH_CHECK_DTYPE(hidden, kHalf);
+    TORCH_CHECK_DTYPE(gate, kHalf);
+    TORCH_CHECK_DTYPE(scores, kHalf);
+    TORCH_CHECK_SHAPES(hidden, 0, scores, 0, 1);
+    TORCH_CHECK_SHAPES(hidden, 1, gate, 0, 1);
+    TORCH_CHECK_SHAPES(gate, 1, scores, 1, 1);
+    TORCH_CHECK(hidden.is_contiguous() && gate.is_contiguous() && scores.is_contiguous(),
+                "routing_project: tensors must be contiguous");
+    TORCH_CHECK_DIM_OPT(gate_t, 2);
+    TORCH_CHECK_DTYPE_OPT(gate_t, kHalf);
+    TORCH_CHECK_SHAPES_OPT(gate_t, 0, scores, 1, 1);
+    TORCH_CHECK_SHAPES_OPT(gate_t, 1, hidden, 1, 1);
+    TORCH_CHECK_DTYPE_OPT(gate_i8, kChar);
+    TORCH_CHECK_DTYPE_OPT(gate_sb, kFloat);
+    for (const auto* opt : {&gate_t, &gate_i8, &gate_sb})
+        TORCH_CHECK(!opt->has_value() || (opt->value().device() == scores.device() && opt->value().is_contiguous()),
+                    "routing_project: optional tensors must be contiguous and on the same GPU");
+    if (scores.numel() == 0) return;
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, at::cuda::getCurrentCUDAStream().stream());
+    cuda_check(cudaPeekAtLastError());
+}
+
+
 template <int ACT>
 __launch_bounds__(MAX_NUM_EXPERTS)
 __global__ void routing_ds3_nogroup_topk_kernel
@@ -1376,6 +1413,40 @@ __global__ void routing_sel_norm_kernel
         weights[row * K + lane] = __float2half_rn(o * scaling_factor / sum);
 }
 
+void routing_sel_norm_logits
+(
+    at::Tensor scores, const at::Tensor& selected, at::Tensor weights,
+    const float scaling_factor, const int act_fn
+)
+{
+    TORCH_CHECK(scores.is_cuda() && selected.device() == scores.device() && weights.device() == scores.device(),
+                "routing_sel_norm_logits: tensors must be on the same GPU");
+    const at::cuda::OptionalCUDAGuard device_guard(scores.device());
+    TORCH_CHECK_DIM(scores, 2);
+    TORCH_CHECK_DIM(selected, 2);
+    TORCH_CHECK_DIM(weights, 2);
+    TORCH_CHECK_DTYPE(scores, kHalf);
+    TORCH_CHECK_DTYPE(selected, kLong);
+    TORCH_CHECK_DTYPE(weights, kHalf);
+    TORCH_CHECK_SHAPES(scores, 0, selected, 0, 1);
+    TORCH_CHECK_SHAPES_FULL(selected, weights);
+    TORCH_CHECK(scores.is_contiguous() && selected.is_contiguous() && weights.is_contiguous(),
+                "routing_sel_norm_logits: tensors must be contiguous");
+    int bsz = scores.size(0), num_experts = scores.size(1), K = selected.size(1);
+    TORCH_CHECK(num_experts > 0 && K > 0 && K <= 32 && K <= num_experts,
+                "routing_sel_norm_logits: invalid expert or selection count");
+    TORCH_CHECK(act_fn == ROUTING_ACT_SIGMOID || act_fn == ROUTING_ACT_SQRTSP,
+                "routing_sel_norm_logits: invalid activation");
+    if (bsz == 0) return;
+    routing_sel_norm_kernel<<<bsz, 32, 0, at::cuda::getCurrentCUDAStream().stream()>>>
+    (
+        (const half*) scores.data_ptr(), (const int64_t*) selected.data_ptr(), (half*) weights.data_ptr(),
+        scaling_factor, num_experts, K, act_fn
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+
 void routing_sel_norm
 (
     const at::Tensor& hidden,
@@ -1509,7 +1580,8 @@ void routing_std_logits
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const c10::optional<at::Tensor>& per_expert_scale,
-    const bool use_topk
+    const bool use_topk,
+    const c10::optional<at::Tensor>& bias
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -1519,6 +1591,12 @@ void routing_std_logits
     TORCH_CHECK_SHAPES(scores, 0, topk_weights, 0, 1);
     TORCH_CHECK_SHAPES(topk_indices, 1, topk_weights, 1, 1);
     TORCH_CHECK_SHAPES_OPT(per_expert_scale, 0, scores, 1, 1);
+    TORCH_CHECK_DIM_OPT(bias, 1);
+    TORCH_CHECK_SHAPES_OPT(bias, 0, scores, 1, 1);
+    TORCH_CHECK_DTYPE_OPT(bias, kHalf);
+    TORCH_CHECK(!bias.has_value() || (bias->device() == scores.device() && bias->is_contiguous()),
+                "routing_std_logits: bias must be contiguous and on the scores device");
+    TORCH_CHECK(use_topk || !bias.has_value(), "routing_std_logits: bias requires use_topk");
     TORCH_CHECK_DTYPE(scores, kHalf);
     TORCH_CHECK_DTYPE(topk_indices, kLong);
     TORCH_CHECK_DTYPE(topk_weights, kHalf);
@@ -1548,7 +1626,7 @@ void routing_std_logits
             (int64_t*) topk_indices.data_ptr(),
             (half*) topk_weights.data_ptr(),
             (const bfloat16*) OPTPTR(per_expert_scale),
-            nullptr,
+            (const half*) OPTPTR(bias),
             num_experts,
             K,
             bsz

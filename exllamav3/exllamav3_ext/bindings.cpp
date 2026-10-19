@@ -119,6 +119,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_gemv_f32", &routing_gemv_f32, "routing_gemv_f32");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+    m.def("routing_project", &routing_project, "routing_project");
+    m.def("routing_sel_norm_logits", &routing_sel_norm_logits, "routing_sel_norm_logits");
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
@@ -145,7 +147,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_gemm_det", &routing_gemm_det, "routing_gemm_det");
     m.def("det_quant_weight", &det_quant_weight, "det_quant_weight");
     m.def("det_math_test", &det_math_test, "det_math_test");
-    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
+    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits",
+        py::arg("scores"), py::arg("topk_indices"), py::arg("topk_weights"),
+        py::arg("per_expert_scale"), py::arg("use_topk"), py::arg("bias") = py::none());
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");

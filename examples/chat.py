@@ -1,6 +1,6 @@
 import sys, os
 from functools import partial
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 from pathlib import Path
@@ -8,6 +8,7 @@ import tempfile
 import webbrowser
 from exllamav3 import Generator, Job, model_init
 from exllamav3.constants import PAGE_SIZE
+from exllamav3.util.expert_jitter import expert_jitter_strength
 from chat_templates import *
 from chat_util import *
 from chat_io import *
@@ -520,6 +521,7 @@ def main(args):
             max_new_tokens =  max_response_tokens,
             stop_conditions = stop_conditions,
             sampler = sampler,
+            expert_jitter = args.expert_jitter,
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
@@ -669,5 +671,7 @@ if __name__ == "__main__":
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
+    parser.add_argument("-ej", "--expert_jitter", type = expert_jitter_strength, default = 1.0,
+                        help = "Expert jitter strength >= 1 (default: 1, disabled); uses each turn's sampling RNG")
     _args = parser.parse_args()
     main(_args)
