@@ -260,7 +260,16 @@ def _numa_decide():
                                "with a readable topology")
         return 0, 0
     n_phys = [int(n) for _, n in orders]
-    tpn = TUNING.numa_threads or max(1, min(n_phys[0] - max(0, TUNING.host_cores), n_phys[1]))
+    hc = max(0, TUNING.host_cores)
+    # Each pool must leave host_cores physical cores free on its own node (the numa host
+    # affinity reserves them on every node), so an explicit EXL3_MOE_CPU_NUMA_THREADS
+    # override may not exceed the ceiling either
+    ceiling = max(1, min(n_phys) - hc)
+    tpn = TUNING.numa_threads or ceiling
+    if tpn > ceiling:
+        print(f" -- CPU MoE worker numa: clamping threads/node {tpn} -> {ceiling} "
+              f"(EXL3_MOE_HOST_CORES={hc} reserved for the host on every node)")
+        tpn = ceiling
     return len(orders), int(tpn)
 
 
@@ -818,7 +827,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             # caller -- first-touch then follows the OMP scheduler, not the intended per-node
             # slices (observed as a stable ~30/70 arena split regardless of every knob).
             # Serial copies run on the pinned caller itself, so the splits place exactly.
-            # Loading is disk-bound anyway; the single-threaded copies cost little
+            # Loading is disk-bound anyway; the single-threaded copies cost little. Restored
+            # once placement completes (runtime installs would otherwise copy single-threaded)
+            _load_threads = torch.get_num_threads()
             torch.set_num_threads(1)
         # Pinned mode: memfd-backed chunks, published to the parent as they are created
         arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None,
@@ -943,6 +954,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             elif msg[0] == "quit":
                 return
 
+        if numa_tpn:
+            # Placement is done: hand the cores back before the worker loop starts
+            torch.set_num_threads(_load_threads)
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
         base = np.frombuffer(shm.buf, dtype = np.uint8).ctypes.data
@@ -1414,17 +1428,26 @@ class MoeCpuHost:
         else:
             print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
         # The worker was spawned before this and pins its own threads; keep the host off them.
-        # NUMA mode: reserve the host core(s) from NODE 0 (where the GPUs and the handoff live);
-        # the pools already leave node 0's last physical cores free (tpn = n_phys0 - host_cores)
+        # NUMA mode: reserve host_cores physical cores at the tail of EVERY node's core order
+        # (each pool leaves them free) and float the host across both nodes. The parent runs
+        # the model, the CUDA launches and the prefill staging -- one core cannot feed the
+        # pools at prefill shapes, and starving it stalls dispatch so the pools idle too.
         if self.numa_tpn:
             try:
-                order0, nphys0 = _numa_topo()[0]
-                host_lps = [order0[nphys0 - 1]]
-                if len(order0) > nphys0 + nphys0 - 1:
-                    host_lps.append(order0[nphys0 + nphys0 - 1])   # the core's SMT sibling, if any
+                hc = max(1, TUNING.host_cores)
+                host_lps = []
+                for order_i, nphys_i in _numa_topo():
+                    take = min(hc, nphys_i)
+                    # Core orders are physical-core-first: [phys..., siblings...]
+                    host_lps.extend(order_i[nphys_i - take:nphys_i])
+                    host_lps.extend(order_i[2 * nphys_i - take:2 * nphys_i])
                 err = apply_process_affinity(host_lps)
-                print(f" -- CPU MoE host affinity: host on LPs {host_lps} "
-                      f"(numa mode: reserved from node 0)" + ("" if err is None else f"; {err}"))
+                print(f" -- CPU MoE host affinity: host on {len(host_lps)} LPs "
+                      f"(numa mode: {hc} core(s) reserved per node)" + ("" if err is None else f"; {err}"))
+                if err is None:
+                    # The intra-op pool was sized for the full machine; match it to the host
+                    # mask or every fat parent-side op (prefill staging) oversubscribes
+                    torch.set_num_threads(max(1, len(host_lps) // 2))
             except Exception as e:
                 print(f" !! CPU MoE host affinity: {e}; host threads left unpinned")
         else:
