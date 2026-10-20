@@ -947,8 +947,9 @@ def _run_main():
                 opt.zero_grad(set_to_none=True)
                 timer.mark("opt")
                 step_loss += loss_val / args.num_iterations
-                if it == 0:
-                    mm = m
+                # Report the LAST pass: on pass 0 the ratio is exactly 1 (old == policy),
+                # so kl/clip_frac from it can never show what mu > 1 actually does
+                mm = m
             timer.end_step()
 
             info = sample["info"]
