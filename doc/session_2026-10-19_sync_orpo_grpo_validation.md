@@ -99,3 +99,18 @@ the training backward; investigate torch SDPA / a Triton backward later only if 
 - `stash@{1}` (on master): the pre-session WIP (`model_init --lora`, `last_turn_only`, mmlu).
 - New yamls: `sync_v163_*`, `orpo_qwen35_9b_love_v1`, `grpo_qwen35_9b_gsm8k_v1`.
 - Run outputs under `out/sync_v163/`, `out/orpo_qwen35_9b_love_v1/`, `out/grpo_qwen35_9b_gsm8k_v1/`.
+
+## 7. Integration branch `integrate/v1.6.3-orpo-grpo-pr174-176` (2026-10-20)
+
+master + sync/v1.6.3 + feat/orpo + feat/grpo (+ reward and infer fixes) + PRs #174, #175, #176,
+merged in that order with no conflicts, plus the conftest stand-in guard (keyed on a missing
+`__spec__`; test_grpo_trainer's stub carries a `__path__`).
+
+- `compileall` clean; the full CPU suite incl. GRPO: **160 passed, 3 skipped**, both with a GPU
+  visible and CPU-only.
+- validate gate on Qwen3.5-9B with `--attn-impl flash`: PASS (8x flash).
+- **Packed training end to end** (`training/experiments/integrate_packed_muse_glimmer.yaml`:
+  Muse-Glimmer-30B 6bpw, semancy v5, v12 recipe, 1 epoch, split across both cards):
+  52x flash, 798 docs -> 152 bfd blocks of 3072 (98.2% filled), 76 steps at 25 s/step,
+  peak 14.5 / 11.5 GB, held-out 2.4816 -> 1.9308 @38 -> **1.8773 @76**. This is the path
+  that raised `No matching attention function` on master.
