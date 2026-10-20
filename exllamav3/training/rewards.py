@@ -72,7 +72,11 @@ def exact_answer(prompts: Sequence, completions: Sequence[str],
         if a is None or (isinstance(a, str) and not a.strip()):
             out.append(None)
             continue
-        out.append(1.0 if _normalize(extract_answer(c)) == _normalize(a) else 0.0)
+        # A reference written GSM8K-style (a worked solution ending in ``#### N``)
+        # or as ``\\boxed{N}`` is reduced to its final answer the same way the
+        # completion is; a bare reference ("18", "Paris", "3/4") is kept verbatim
+        ref = extract_answer(a) if isinstance(a, str) and ("####" in a or _BOXED.search(a)) else a
+        out.append(1.0 if _normalize(extract_answer(c)) == _normalize(ref) else 0.0)
     return out
 
 

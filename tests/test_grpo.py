@@ -318,3 +318,12 @@ if __name__ == "__main__":
     test_builtin_rewards()
     test_sample_completions_exact()
     print("ALL GRPO TESTS PASSED")
+
+
+def test_exact_answer_reduces_worked_reference():
+    # GSM8K rows carry the whole worked solution in `answer`; the reference is
+    # reduced to its final answer like the completion is. Bare references stay.
+    raw = "She makes 9 * 2 = $<<9*2=18>>18 every day.\n#### 18"
+    assert rewards_mod.exact_answer(["q"], ["So the answer is 18."], answer=[raw]) == [1.0]
+    assert rewards_mod.exact_answer(["q"], ["#### 17"], answer=[raw]) == [0.0]
+    assert rewards_mod.exact_answer(["q"], ["x = \\boxed{18}"], answer=["\\boxed{18}"]) == [1.0]
