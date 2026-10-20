@@ -10,7 +10,8 @@ from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
-from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
+from .moe_cpu_affinity import (plan_host_cpus, default_worker_threads, apply_process_affinity,
+                               process_cpus, node_sibling_groups)
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -221,7 +222,12 @@ def _apply_host_affinity(threads: int, host_cores: int):
         print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
         return
     _HOST_ORIG_CPUS = orig
-    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
+    # Scope: the calling thread only (Linux) -- an API server or eval driver carries dozens of
+    # unrelated threads (CUDA driver, executors, torch pools) that must not inherit the 2-4 LP
+    # host mask, and sweeping them onto it is what poisoned every non-worker phase
+    detail = ("process mask: all threads" if os.name == "nt" else
+              "mask applied to 1 thread (the caller); threads it spawns inherit")
+    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]} ({detail})")
 
 
 # memfd_create only ships in CPython when the interpreter was built against glibc >= 2.27; conda
@@ -782,30 +788,71 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
     if cpus is not None:
         # Spawned after the host was confined: drop the inherited host mask, or the pool's
-        # worker pins fail (Windows refuses a thread mask outside the process mask)
+        # worker pins fail (Windows refuses a thread mask outside the process mask). Linux:
+        # this re-binds the calling thread only -- every thread this child spawns from now on
+        # (loader first-touch threads, the pools' workers) inherits the widened mask
         err = apply_process_affinity(cpus)
         if err is not None:
             print(f" !! CPU MoE worker affinity: {err}; worker confined to the host's LPs")
 
     numa_lps = []
+    numa_nphys = []
     if numa_tpn:
         # The pools pin workers per node and the loader first-touches each node's weight
         # slices; both need the process to span every node. numactl confinement is inherited
         # from the parent, so widen it here explicitly
         try:
-            numa_lps = [list(o) for o, _ in cext.exl3_moe_cpu_numa_core_orders()]
+            topo = cext.exl3_moe_cpu_numa_core_orders()
+            numa_lps = [list(o) for o, _ in topo]
+            numa_nphys = [int(n) for _, n in topo]
             all_lps = {lp for lps in numa_lps for lp in lps}
             cur = set(os.sched_getaffinity(0))
             if not all_lps <= cur:
                 err = apply_process_affinity(sorted(all_lps))
                 if err is not None:
                     raise RuntimeError(err)
-                print(f" -- CPU MoE worker numa: process mask widened to {len(all_lps)} LPs "
-                      f"across {len(numa_lps)} nodes (was {len(cur)} LPs)")
+                print(f" -- CPU MoE worker numa: mask widened to {len(all_lps)} LPs across "
+                      f"{len(numa_lps)} nodes on the calling thread (was {len(cur)} LPs)")
         except Exception as e:
             numa_lps = []
+            numa_nphys = []
             print(f" !! CPU MoE worker numa: could not widen the process mask ({e}); "
                   f"node-1 pool and memory placement will be remote")
+
+        # Worker-picker sanity, before anything loads: the kernel's own SMT relation must
+        # partition every node's LPs, leave numa_tpn + host_cores distinct physical cores, and
+        # agree with the extension's core orders. A mis-derived pool would silently double-park
+        # workers on one core (the straggler at every per-phase barrier) -- crash loudly instead
+        if numa_lps:
+            hc = max(1, TUNING.host_cores)
+            try:
+                for i, lps in enumerate(numa_lps):
+                    try:
+                        groups = node_sibling_groups(i)
+                    except Exception as e:
+                        raise RuntimeError(f"node {i}: unreadable SMT topology: {e}") from e
+                    distinct = len(groups)
+                    if distinct != numa_nphys[i]:
+                        raise RuntimeError(
+                            f"node {i}: extension reports {numa_nphys[i]} physical cores, "
+                            f"sysfs SMT groups show {distinct} ({sorted(groups)})")
+                    if numa_tpn + hc > distinct:
+                        raise RuntimeError(
+                            f"node {i}: {distinct} distinct physical cores; pool wants "
+                            f"{numa_tpn} threads + {hc} host core(s) reserved")
+                    in_node = {lp for g in groups.values() for lp in g}
+                    misplaced = sorted(lp for lp in lps[:numa_tpn] if lp not in in_node)
+                    if misplaced:
+                        raise RuntimeError(
+                            f"node {i}: pool LPs {misplaced} are not on node {i} -- "
+                            f"stale exllamav3_ext build (rebuild the extension)")
+                    print(f" -- CPU MoE worker numa: node {i} pool on LPs {lps[:numa_tpn]} "
+                          f"({distinct} cores/node, host reserves "
+                          f"{lps[numa_nphys[i] - hc:numa_nphys[i]]})")
+            except Exception as e:
+                print(f" !! CPU MoE worker numa: bad pool topology: {e}; refusing to start "
+                      f"with a mis-shaped worker pool", flush = True)
+                raise
 
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
@@ -1442,8 +1489,15 @@ class MoeCpuHost:
                     host_lps.extend(order_i[nphys_i - take:nphys_i])
                     host_lps.extend(order_i[2 * nphys_i - take:2 * nphys_i])
                 err = apply_process_affinity(host_lps)
+                # Scope: the calling thread only (Linux) -- the forward-pass driver. The
+                # process's other threads (CUDA driver, API executors, torch pools) stay on
+                # their own masks; sweeping them onto the host LPs starved every non-worker
+                # phase of the process (load, tokenization, API handling)
+                where = ("the process mask (all threads)" if os.name == "nt" else
+                         "1 thread (the caller; threads it spawns inherit)")
                 print(f" -- CPU MoE host affinity: host on {len(host_lps)} LPs "
-                      f"(numa mode: {hc} core(s) reserved per node)" + ("" if err is None else f"; {err}"))
+                      f"(numa mode: {hc} core(s) reserved per node); applied to {where}"
+                      + ("" if err is None else f"; {err}"))
                 if err is None:
                     # The intra-op pool was sized for the full machine; match it to the host
                     # mask or every fat parent-side op (prefill staging) oversubscribes

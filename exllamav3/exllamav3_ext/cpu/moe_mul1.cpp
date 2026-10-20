@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -3218,18 +3219,14 @@ inline size_t numa_block_span_u16(const MoeCpuMatrix& m)
 // read from /sys/devices/system/node/*/cpulist. The LLC-spread option of the single-pool
 // order does not apply here: within one node the banded streams want physical cores first
 // exactly like the default order.
-static std::vector<std::pair<std::vector<int>, int>> numa_node_core_orders_impl()
+static std::vector<std::pair<std::vector<int>, int>> numa_node_core_orders_impl(const char* root = "/sys")
 {
     std::vector<std::pair<std::vector<int>, int>> orders;
-    std::vector<std::vector<int>> node_cpus;
-    for (int node = 0; node < 64; ++node)
+    const std::string sys(root);
+    // "0-3,8" -> [0,1,2,3,8]; sysfs cpu lists, startup-only
+    auto parse_list = [](const std::string& s) -> std::vector<int>
     {
-        std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
-        if (!f) break;
-        std::string s;
-        std::getline(f, s);
-        if (s.empty()) break;
-        std::vector<int> cpus;
+        std::vector<int> out;
         size_t pos = 0;
         while (pos < s.size())
         {
@@ -3237,47 +3234,88 @@ static std::vector<std::pair<std::vector<int>, int>> numa_node_core_orders_impl(
             if (comma == std::string::npos) comma = s.size();
             const int a = std::atoi(s.c_str() + pos);
             const int b = dash != std::string::npos && dash < comma ? std::atoi(s.c_str() + dash + 1) : a;
-            for (int cpu = a; cpu <= b; ++cpu) cpus.push_back(cpu);
+            for (int cpu = a; cpu <= b; ++cpu) out.push_back(cpu);
             pos = comma + 1;
         }
+        return out;
+    };
+    auto refuse = [](const char* what, int a, int b)
+    {
+        printf(" -- CPU MoE numa: ");
+        printf(what, a, b);
+        printf("; numa offload refused\n");
+        fflush(stdout);
+    };
+    std::vector<std::vector<int>> node_cpus;
+    for (int node = 0; node < 64; ++node)
+    {
+        std::ifstream f(sys + "/devices/system/node/node" + std::to_string(node) + "/cpulist");
+        if (!f) break;
+        std::string s;
+        std::getline(f, s);
+        if (s.empty()) break;
+        std::vector<int> cpus = parse_list(s);
         if (!cpus.empty()) node_cpus.push_back(std::move(cpus));
     }
     if (node_cpus.size() < NUMA_NODES) return {};
 
-    const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
-    std::map<int, std::pair<int, int>> topo;   // cpu -> (package, core)
-    for (int cpu = 0; cpu < ncpu; ++cpu)
-    {
-        auto read_int = [&](const char* file) -> int {
-            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
-            int v = -1;
-            f >> v;
-            return v;
-        };
-        const int core_id = read_int("topology/core_id");
-        const int pkg_id = read_int("topology/physical_package_id");
-        if (core_id < 0) return {};   // unreadable topology: refuse rather than misplace
-        topo[cpu] = { pkg_id, core_id };
-    }
-
+    // SMT grouping from thread_siblings_list -- the kernel's own sibling relation. The previous
+    // (package, core_id) key repeats across dies/tiles on some packages and silently collapsed
+    // distinct physical cores (a node "losing" cores; two workers parked on one core as the
+    // straggler at every per-phase barrier). Refuse on anything less than a clean partition of
+    // the node's cpulist into consistent sibling groups.
     for (auto& cpus : node_cpus)
     {
-        std::map<std::pair<int, int>, int> seen;
-        std::vector<int> order, smt;
+        std::map<int, std::vector<int>> groups;      // min sibling LP -> member LPs, cpulist order
+        std::map<int, std::vector<int>> declared;    // min sibling LP -> one member's sibling list
         for (int cpu : cpus)
         {
-            auto it = topo.find(cpu);
-            if (it == topo.end()) continue;
-            if (seen.find(it->second) == seen.end())
+            std::ifstream f(sys + "/devices/system/cpu/cpu" + std::to_string(cpu) +
+                            "/topology/thread_siblings_list");
+            if (!f)
             {
-                seen[it->second] = cpu;
-                order.push_back(cpu);
+                refuse("cpu%d has no readable thread_siblings_list (errno %d)", cpu, errno);
+                return {};
             }
-            else smt.push_back(cpu);
+            std::string s;
+            std::getline(f, s);
+            std::vector<int> sib = parse_list(s);
+            std::sort(sib.begin(), sib.end());
+            sib.erase(std::unique(sib.begin(), sib.end()), sib.end());
+            if (sib.empty() || !std::count(sib.begin(), sib.end(), cpu))
+            {
+                refuse("cpu%d has a malformed sibling list (%d entries)", cpu, (int) sib.size());
+                return {};
+            }
+            const int key = sib[0];
+            auto decl = declared.find(key);
+            if (decl == declared.end())
+            {
+                declared[key] = sib;
+                groups[key] = {};
+            }
+            else if (decl->second != sib)
+            {
+                refuse("cpu%d and cpu%d disagree about their SMT siblings", cpu, decl->second[0]);
+                return {};
+            }
+            for (int s : sib)
+                if (!std::count(cpus.begin(), cpus.end(), s))
+                {
+                    refuse("cpu%d's sibling %d is outside its NUMA node", cpu, s);
+                    return {};
+                }
+            groups[key].push_back(cpu);
+        }
+        std::vector<int> order, smt;
+        for (auto& g : groups)
+        {
+            order.push_back(g.second[0]);   // first member in cpulist order == min sibling == key
+            for (size_t i = 1; i < g.second.size(); ++i) smt.push_back(g.second[i]);
         }
         const int n_phys = static_cast<int>(order.size());
-        order.insert(order.end(), smt.begin(), smt.end());
         if (n_phys < 1) return {};
+        order.insert(order.end(), smt.begin(), smt.end());
         orders.emplace_back(std::move(order), n_phys);
     }
     if (orders.size() < NUMA_NODES) return {};
@@ -3751,6 +3789,11 @@ void exl3_moe_cpu_forward_raw_numa(
         t_node[0] = t_node[1] = std::max(1, static_cast<int>(threads_per_node));
         if (pin_threads_enabled())
         {
+            for (int p = 0; p < NUMA_NODES; ++p)
+                TORCH_CHECK(orders[p].second >= t_node[p],
+                            "exl3 numa: node ", p, " has only ", orders[p].second,
+                            " distinct physical cores (sysfs SMT groups); ", t_node[p],
+                            " pool threads requested -- refusing to double-park workers");
             g_numa_pool[0].core_order = orders[0].first;
             g_numa_pool[1].core_order = orders[1].first;
         }
