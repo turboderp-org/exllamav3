@@ -2367,6 +2367,10 @@ struct Pool
     std::atomic<PoolFn> fn{nullptr};
     void* ctx = nullptr;
     int num_workers = 1;
+    // Helper-pool convention (run_remote/begin_remote): participant indices are 1..nw
+    // inclusive with no caller participant, so the worker at idx == nw must join and ack.
+    // Caller pools (run) are 0..nw-1 with the caller as worker 0 and must not over-ack.
+    bool remote = false;
     static constexpr int DISPATCH_NW_BITS = 16;
     static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
     std::vector<int> core_order;
@@ -2428,7 +2432,7 @@ struct Pool
             // the participating workers have finished. The count travels in the dispatch word
             // itself, so it always belongs to the generation just observed
             const int nw = dispatch_nw(g);
-            if (idx < nw)
+            if (idx < nw || (remote && idx == nw))
             {
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
                 done.fetch_add(1, std::memory_order_release);
@@ -2441,7 +2445,7 @@ struct Pool
     // later dispatch, pinned onto the same cores as the participants (core_order wraps). The
     // worker process uses a single pool size, so this only happens when a process changes
     // its thread count
-    void ensure(int n)
+    void ensure(int n, bool pin_caller = true)
     {
         if (pin_threads_enabled() && core_order.empty()) core_order = physical_core_order().order;
         if (spawned > n - 1)
@@ -2465,7 +2469,10 @@ struct Pool
             ++spawned;
         }
         num_workers = n;
-        pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
+        // The NUMA helper pool has no calling-thread participant (its work is dispatched
+        // remotely by the main pool's caller), so its slot 0 stays whatever the caller last
+        // ran as; only its spawned workers are pinned
+        if (pin_caller) pin_self(0);
     }
 
     // A zero-participant generation wakes parked helpers without a completion barrier or
@@ -2497,6 +2504,47 @@ struct Pool
 #endif
         f(c, 0, n);
         while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n - 1)
+            cpu_pause();
+    }
+
+    // Remote dispatch for the NUMA helper pool: the calling thread takes no part; all n
+    // participants are the pool's own spawned workers (indices 1..n, so the callee observes
+    // worker indices shifted by one -- the numa phase thunks subtract the shift). Returns when
+    // all n participants finished. Must be called under g_pool_mutex like run(), and only
+    // while the pool is idle. n must be >= 1 and <= spawned.
+    void run_remote(PoolFn f, void* c, int n)
+    {
+        ctx = c;
+        fn.store(f, std::memory_order_relaxed);
+        const uint64_t d0 = done.load(std::memory_order_acquire);
+        ++generation;
+        dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
+#ifndef __linux__
+        WakeByAddressAll(&dispatch);
+#endif
+        while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n)
+            cpu_pause();
+    }
+
+    // Overlapped remote dispatch: begin_remote kicks the helper pool without waiting; the
+    // caller runs its own pool's phase concurrently and joins with end_remote before the
+    // next dispatch. Same contract as run_remote otherwise (g_pool_mutex held, pool idle).
+    uint64_t begin_remote(PoolFn f, void* c, int n)
+    {
+        ctx = c;
+        fn.store(f, std::memory_order_relaxed);
+        const uint64_t d0 = done.load(std::memory_order_acquire);
+        ++generation;
+        dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
+#ifndef __linux__
+        WakeByAddressAll(&dispatch);
+#endif
+        return d0;
+    }
+
+    void end_remote(int n, uint64_t d0)
+    {
+        while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n)
             cpu_pause();
     }
 };
@@ -2584,6 +2632,11 @@ struct ForwardCtx
     int units[2] = { 0, 0 };
     PaddedCounter* cursor = nullptr;
 
+    // NUMA batched path: the full-intermediate activation rows the down-input quantization
+    // reads (node p's gate/up halves are gathered here after the activation phase; null on
+    // the single-pool path)
+    float* act_full = nullptr;
+
     int phase = 0;
 };
 
@@ -2599,6 +2652,15 @@ struct ForwardArena
     std::vector<int32_t> partials;
     std::unique_ptr<PaddedCounter[]> cursors;
     size_t num_cursors = 0;
+
+    // NUMA column-split workspaces (exl3_moe_cpu_forward_raw_numa only): a second set of
+    // prep buffers for node 1's pools, node-local packed GEMV outputs, and the
+    // full-intermediate activation rows the down-input quantization reads
+    std::vector<float> tin_g2, tin_u2, tin_d2;
+    std::vector<int32_t> splat_g2, splat_u2, splat_d2;
+    std::vector<int32_t> splat_dup_g2, splat_dup_u2, splat_dup_d2;
+    std::vector<float> tout_g_na, tout_g_nb, tout_u_na, tout_u_nb, tout_d_na, tout_d_nb;
+    std::vector<float> act_full;
 
     static ForwardArena& get()
     {
@@ -3100,6 +3162,924 @@ void decode_phase(void* vctx, int worker, int num_workers)
 } // namespace
 
 static const MoeCpuLayer* get_layer(int64_t handle);
+
+// -------------------------------------------------------------------------------------------
+//   NUMA column-split forward: two node pools over node-local weight halves
+// -------------------------------------------------------------------------------------------
+//
+// On a multi-socket host the single pool leaves every socket but the workers' node idle: the
+// flat unit assignment interleaves (chunk, block) units across all workers regardless of which
+// socket holds the weight bytes, so roughly half of every expert stream crosses UPI and the
+// second socket's memory controllers never pull. This section runs the same arithmetic as the
+// single-pool path, partitioned by node instead:
+//
+//   - Every gate/up matrix is split by 128-column blocks of the intermediate: node 0 computes
+//     the low blocks, node 1 the high ones (the packed band layout keeps each 128-column block
+//     one contiguous byte range, so the views below are pure pointer offsets -- the kernels are
+//     untouched and staging/promotion keep reading the full tensors).
+//   - Every down matrix is split by 128-column blocks of the hidden: node p computes output
+//     columns [off_p, off_p + n_p) over the FULL k, reading the full quantized down input row.
+//     Node output columns are disjoint, so no cross-node reduce exists anywhere.
+//   - Each node has its own pool (pinned to its node's physical-core order) and its own
+//     workspace; the two pools run each phase concurrently and join at the phase boundary (the
+//     caller runs pool 0 and remote-dispatches pool 1 first). The down input row is the one
+//     shared structure: node 0's gate/up blocks fill its low half, node 1's its high half, and
+//     the phase barrier publishes both before the down dispatch.
+//
+// The partition preserves the arithmetic exactly: every down GEMV still covers all of k with
+// the same per-row quantization scale, and per-block results are independent of which worker
+// computes them, so outputs are bitwise identical to exl3_moe_cpu_forward_raw. Per node the
+// trellis traffic halves while both sockets' bandwidth stack, which is the entire point.
+
+constexpr int NUMA_NODES = 2;
+
+Pool g_numa_pool[NUMA_NODES];
+
+struct NumaLayerViews
+{
+    MoeCpuLayer node[NUMA_NODES];
+    bool split = false;   // false = cached fallback marker (layer not splittable)
+};
+
+std::map<int64_t, NumaLayerViews> g_numa_layer_views;
+std::mutex g_numa_views_mutex;
+
+// Byte span of one 128-column block of a packed trellis matrix. The band layouts store whole
+// 128-column blocks contiguously for every swizzle group the banded tiers use (band-8: one band
+// per block; band-2: four), so a block range is one contiguous byte range starting at
+// block0 * span.
+inline size_t numa_block_span_u16(const MoeCpuMatrix& m)
+{
+    return static_cast<size_t>(m.k / 16) * 8 * tile_u16(m.bits, m.hb != 0);
+}
+
+#ifdef __linux__
+// Per-node physical-core-first LP orders (one LP per physical core, then SMT siblings),
+// read from /sys/devices/system/node/*/cpulist. The LLC-spread option of the single-pool
+// order does not apply here: within one node the banded streams want physical cores first
+// exactly like the default order.
+static std::vector<std::pair<std::vector<int>, int>> numa_node_core_orders_impl()
+{
+    std::vector<std::pair<std::vector<int>, int>> orders;
+    std::vector<std::vector<int>> node_cpus;
+    for (int node = 0; node < 64; ++node)
+    {
+        std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+        if (!f) break;
+        std::string s;
+        std::getline(f, s);
+        if (s.empty()) break;
+        std::vector<int> cpus;
+        size_t pos = 0;
+        while (pos < s.size())
+        {
+            size_t dash = s.find('-', pos), comma = s.find(',', pos);
+            if (comma == std::string::npos) comma = s.size();
+            const int a = std::atoi(s.c_str() + pos);
+            const int b = dash != std::string::npos && dash < comma ? std::atoi(s.c_str() + dash + 1) : a;
+            for (int cpu = a; cpu <= b; ++cpu) cpus.push_back(cpu);
+            pos = comma + 1;
+        }
+        if (!cpus.empty()) node_cpus.push_back(std::move(cpus));
+    }
+    if (node_cpus.size() < NUMA_NODES) return {};
+
+    const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
+    std::map<int, std::pair<int, int>> topo;   // cpu -> (package, core)
+    for (int cpu = 0; cpu < ncpu; ++cpu)
+    {
+        auto read_int = [&](const char* file) -> int {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
+            int v = -1;
+            f >> v;
+            return v;
+        };
+        const int core_id = read_int("topology/core_id");
+        const int pkg_id = read_int("topology/physical_package_id");
+        if (core_id < 0) return {};   // unreadable topology: refuse rather than misplace
+        topo[cpu] = { pkg_id, core_id };
+    }
+
+    for (auto& cpus : node_cpus)
+    {
+        std::map<std::pair<int, int>, int> seen;
+        std::vector<int> order, smt;
+        for (int cpu : cpus)
+        {
+            auto it = topo.find(cpu);
+            if (it == topo.end()) continue;
+            if (seen.find(it->second) == seen.end())
+            {
+                seen[it->second] = cpu;
+                order.push_back(cpu);
+            }
+            else smt.push_back(cpu);
+        }
+        const int n_phys = static_cast<int>(order.size());
+        order.insert(order.end(), smt.begin(), smt.end());
+        if (n_phys < 1) return {};
+        orders.emplace_back(std::move(order), n_phys);
+    }
+    if (orders.size() < NUMA_NODES) return {};
+    return orders;
+}
+#else
+static std::vector<std::pair<std::vector<int>, int>> numa_node_core_orders_impl()
+{
+    return {};   // NUMA offload is Linux-only in this version
+}
+#endif
+
+// Build (once) the per-node views of a registered layer. Returns nullptr (with a one-line
+// notice) when the layer cannot be split -- non-banded packed layout (K8, half rates on AVX2,
+// or EXL3_MOE_CPU_SWIZZLE=0) -- and the caller falls back to the single-pool forward for it.
+static const NumaLayerViews* ensure_numa_layer_views(int64_t handle)
+{
+    std::lock_guard<std::mutex> lock(g_numa_views_mutex);
+    auto it = g_numa_layer_views.find(handle);
+    if (it != g_numa_layer_views.end()) return it->second.split ? &it->second : nullptr;
+
+    const MoeCpuLayer* full = get_layer(handle);
+    TORCH_CHECK(full != nullptr, "exl3 numa: bad layer handle");
+    const bool gated = !full->gates.empty();
+
+    const char* why = nullptr;
+    if (g_isa == Isa::Scalar)
+        why = "scalar tier";
+    if (!why)
+    {
+        auto check = [](const std::vector<MoeCpuMatrix>& mats) -> const char*
+        {
+            for (const MoeCpuMatrix& m : mats)
+                if (m.swz != 1) return "a rate with no banded packed layout (K8, or "
+                                      "EXL3_MOE_CPU_SWIZZLE=0)";
+            return nullptr;
+        };
+        if (gated && check(full->gates)) why = check(full->gates);
+        if (!why) why = check(full->ups);
+        if (!why) why = check(full->downs);
+    }
+    if (why)
+    {
+        static std::mutex log_mutex;
+        {
+            std::lock_guard<std::mutex> lm(log_mutex);
+            printf(" -- CPU MoE numa: layer %lld not column-splittable (%s); single-pool fallback\n",
+                   (long long) handle, why);
+            fflush(stdout);
+        }
+        g_numa_layer_views.emplace(handle, NumaLayerViews{});   // split = false: fallback marker
+        return nullptr;
+    }
+
+    NumaLayerViews v;
+    for (int p = 0; p < NUMA_NODES; ++p) v.node[p] = *full;
+    for (int p = 0; p < NUMA_NODES; ++p)
+    {
+        v.node[p].refs.clear();
+        v.node[p].gu_blk_off = 0;
+        v.node[p].d_blk_off = 0;
+    }
+
+    for (int p = 0; p < NUMA_NODES; ++p)
+    {
+        MoeCpuLayer& L = v.node[p];
+        const int nblk0_gu = (L.ups[0].n / 128 + 1) / 2;
+        const int nblk0_d = (L.downs[0].n / 128 + 1) / 2;
+        L.gu_blk_off = p == 0 ? 0 : nblk0_gu;
+        L.d_blk_off = p == 0 ? 0 : nblk0_d;
+
+        auto split_mats = [](std::vector<MoeCpuMatrix>& mats, int p, int nblk0)
+        {
+            for (MoeCpuMatrix& m : mats)
+            {
+                const int nblk = m.n / 128;
+                const int take = p == 0 ? nblk0 : nblk - nblk0;
+                TORCH_CHECK(take > 0, "exl3 numa: empty node slice");
+                const int skip = p == 0 ? 0 : nblk0;
+                m.trellis += static_cast<size_t>(skip) * numa_block_span_u16(m);
+                m.svh += static_cast<size_t>(skip) * 128;
+                if (m.bias) m.bias += static_cast<size_t>(skip) * 128;
+                m.n = take * 128;
+            }
+        };
+        if (gated) split_mats(L.gates, p, nblk0_gu);
+        split_mats(L.ups, p, nblk0_gu);
+        split_mats(L.downs, p, nblk0_d);
+        // suh stays shared: gate/up k (hidden) and down k (intermediate) are read in full by
+        // both nodes
+    }
+
+    auto inserted = g_numa_layer_views.emplace(handle, std::move(v));
+    inserted.first->second.split = true;
+    return &inserted.first->second;
+}
+
+// ---- numa decode (two dispatches, per-node unit spaces) -------------------------------------
+
+// Gate/up block complete on a node view: output transforms, activation, and this block's
+// contribution to the SHARED full-intermediate down input row (the view's gu_blk_off places
+// the block's columns globally; the down suh is indexed globally for the same reason).
+void numa_decode_gu_block(ForwardCtx& c, int j, int block)
+{
+    const MoeCpuLayer& L = *c.layer;
+    const int Ig = L.gates.empty() ? L.ups[0].n : L.gates[0].n;
+    const int e = c.chunks[j].expert;
+    const bool gated = !L.gates.empty();
+    const int goff = L.gu_blk_off * 128;
+    float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * Ig;
+    float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * Ig;
+    if (gated) transform_out_block(L.gates[e], g, block);
+    transform_out_block(L.ups[e], u, block);
+    apply_activation(L, g + block, u + block, 128);
+    const float* a = gated ? g : u;
+    prepare_block_avx2(a + block, false, L.downs[e].suh + goff + block,
+                       c.prep_d[j].tin + goff + block, 128);
+}
+
+// Down block complete for every chunk on a node view: output transform and routing-weighted
+// accumulate into this node's hidden column range (disjoint across nodes).
+void numa_decode_out_block(ForwardCtx& c, int block)
+{
+    const MoeCpuLayer& L = *c.layer;
+    const int Hd = L.downs[0].n;
+    const int H = L.hidden_size;
+    const int ooff = L.d_blk_off * 128;
+    const int nc = static_cast<int>(c.chunks.size());
+    for (int j = 0; j < nc; ++j)
+    {
+        const Chunk& ch = c.chunks[j];
+        const MoeCpuMatrix& mat = L.downs[ch.expert];
+        float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * Hd;
+        for (int r = 0; r < ch.m; ++r)
+        {
+            float* v = d + static_cast<size_t>(r) * Hd;
+            transform_out_block(mat, v, block);
+            float* dst = c.out + static_cast<size_t>(ch.token[r]) * H + ooff + block;
+            for (int col = 0; col < 128; ++col)
+                dst[col] += ch.weight[r] * v[block + col];
+        }
+    }
+}
+
+void numa_decode_phase(ForwardCtx& c, int worker, int num_workers)
+{
+    const MoeCpuLayer& L = *c.layer;
+    const int Ig = L.gates.empty() ? L.ups[0].n : L.gates[0].n;
+    const int Hd = L.downs[0].n;
+    const int I = L.interm_size;   // full: down k and the shared input row
+    const int H = L.hidden_size;   // full: gu k
+    DecodeScratch& s = DecodeScratch::get(H, I);
+
+    const int P = c.parts[c.phase];
+    const int total = c.units[c.phase];
+    PaddedCounter* cur = c.cursor + c.phase * num_workers;
+    auto end_of = [&](int w) { return static_cast<int>(static_cast<int64_t>(total) * (w + 1) / num_workers); };
+    auto claim = [&](int w)
+    {
+        const int e = end_of(w);
+        if (cur[w].v.load(std::memory_order_relaxed) >= e) return -1;
+        const int u = cur[w].v.fetch_add(1, std::memory_order_relaxed);
+        return u < e ? u : -1;
+    };
+    auto run_units = [&](auto&& unit)
+    {
+        for (int u; (u = claim(worker)) >= 0;) unit(u);
+        for (int k = 1; k < num_workers; ++k)
+            for (int u; (u = claim((worker + k) % num_workers)) >= 0;) unit(u);
+    };
+
+    if (c.phase == 0)
+    {
+        const int gu = L.gates.empty() ? 1 : 2;
+        const int nb = Ig / 128;
+        int prep_j[2] = { -1, -1 };
+        run_units([&](int id)
+        {
+            const int gid = id / P;
+            const int j = gid / (nb * gu);
+            const int b = (gid % (nb * gu)) / gu;
+            const bool up = gu == 1 || (gid % gu);
+            const Chunk& ch = c.chunks[j];
+            const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+            PreparedIn& p = up ? s.pu : s.pg;
+            if (prep_j[up] != j)
+            {
+                prepare_rows(mat, c.x, nullptr, H, ch.token, 1, p);
+                prep_j[up] = j;
+            }
+            float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j) * MAX_SLOTS * Ig;
+            if (P == 1)
+                run_rows(mat, p, tout, b * 8, b * 8 + 8);
+            else
+            {
+                const int tk = mat.k / 16;
+                const int part = id % P;
+                const KSlice ks { tk * part / P, tk * (part + 1) / P, b * 8, c.partials + static_cast<size_t>(id) * 256 };
+                run_tiles(mat, p, nullptr, p.rows, b * 8, b * 8 + 8, &ks);
+                if (c.grp_done_gu[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
+                finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, p, tout, Ig, b * 8);
+            }
+            fold_rows(tout, p, 1, Ig, b * 128, b * 128 + 128);
+            if (c.blk_done[j * nb + b].fetch_add(1, std::memory_order_acq_rel) == gu - 1)
+                numa_decode_gu_block(c, j, b * 128);
+        });
+    }
+    else
+    {
+        const int nc = static_cast<int>(c.chunks.size());
+        const int nb = Hd / 128;
+        int prep_j = -1;
+        run_units([&](int id)
+        {
+            const int gid = id / P;
+            const int j = gid / nb;
+            const int b = gid % nb;
+            const Chunk& ch = c.chunks[j];
+            const MoeCpuMatrix& mat = L.downs[ch.expert];
+            if (prep_j != j)
+            {
+                s.pd.tin = c.prep_d[j].tin;
+                s.pd.rows = quantize_row(s.pd.tin, I, s.pd, 0, 0);
+                prep_j = j;
+            }
+            float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * Hd;
+            if (P == 1)
+                run_rows(mat, s.pd, tout, b * 8, b * 8 + 8);
+            else
+            {
+                const int tk = mat.k / 16;
+                const int part = id % P;
+                const KSlice ks { tk * part / P, tk * (part + 1) / P, b * 8, c.partials + static_cast<size_t>(id) * 256 };
+                run_tiles(mat, s.pd, nullptr, s.pd.rows, b * 8, b * 8 + 8, &ks);
+                if (c.grp_done_d[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
+                finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, s.pd, tout, Hd, b * 8);
+            }
+            fold_rows(tout, s.pd, 1, Hd, b * 128, b * 128 + 128);
+            if (c.out_done[b].fetch_add(1, std::memory_order_acq_rel) == nc - 1)
+                numa_decode_out_block(c, b * 128);
+        });
+    }
+}
+
+// ---- numa batched (rows > 1, or one token with repeated experts): seven dispatches ----------
+//
+// Phases 0-1 prepare the gate/up inputs and run the gate/up GEMVs over this node's
+// intermediate slice. Phase 2 folds, transforms and activates the slice (node-local packed
+// buffers) and gathers the activated rows into the full-intermediate act_full. Phase 3
+// quantizes the full down input (identical scale on both nodes -- the numbers match the
+// single-pool path bitwise). Phases 4-6 run the down GEMVs over this node's hidden columns
+// (full k), transform, and accumulate into the node's disjoint output range.
+
+void numa_forward_phase(ForwardCtx& c, int worker, int num_workers)
+{
+    const MoeCpuLayer& L = *c.layer;
+    const int Ig = L.gates.empty() ? L.ups[0].n : L.gates[0].n;
+    const int Hd = L.downs[0].n;
+    const int I = L.interm_size;   // full
+    const int H = L.hidden_size;   // full
+    const int nc = static_cast<int>(c.chunks.size());
+
+    switch (c.phase)
+    {
+        case 0:
+        {
+            const int gu = L.gates.empty() ? 1 : 2;
+            for (int j = worker; j < nc * gu; j += num_workers)
+            {
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+                PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
+            }
+            break;
+        }
+
+        case 1:
+        {
+            const int gu = L.gates.empty() ? 1 : 2;
+            assign_gemvs(worker, num_workers, nc * gu, Ig / 16, [&](int j, int t0, int t1)
+            {
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_SLOTS * Ig;
+                run_rows(mat, p, tout, t0, t1);
+            });
+            break;
+        }
+
+        case 2:
+        {
+            const bool gated = !L.gates.empty();
+            const int goff = L.gu_blk_off * 128;
+            for (int j = worker; j < nc; j += num_workers)
+            {
+                const Chunk& ch = c.chunks[j];
+                const int e = ch.expert;
+                float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * Ig;
+                float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * Ig;
+                if (gated)
+                {
+                    fold_rows(g, c.prep_g[j], ch.m, Ig, 0, Ig);
+                    transform_out(L.gates[e], g, ch.m);
+                }
+                fold_rows(u, c.prep_u[j], ch.m, Ig, 0, Ig);
+                transform_out(L.ups[e], u, ch.m);
+                apply_activation(L, g, u, static_cast<size_t>(ch.m) * Ig);
+                const float* a = gated ? g : u;
+                for (int r = 0; r < ch.m; ++r)
+                    std::memcpy(c.act_full + (static_cast<size_t>(j) * MAX_SLOTS + r) * I + goff,
+                                a + static_cast<size_t>(r) * Ig, static_cast<size_t>(Ig) * sizeof(float));
+            }
+            break;
+        }
+
+        case 3:
+        {
+            static const int idx4[MAX_M] = {0, 1, 2, 3};
+            for (int j = worker; j < nc; j += num_workers)
+            {
+                const Chunk& ch = c.chunks[j];
+                prepare_rows(L.downs[ch.expert], nullptr,
+                             c.act_full + static_cast<size_t>(j) * MAX_SLOTS * I,
+                             I, idx4, ch.m, c.prep_d[j]);
+            }
+            break;
+        }
+
+        case 4:
+        {
+            assign_gemvs(worker, num_workers, nc, Hd / 16, [&](int j, int t0, int t1)
+            {
+                const Chunk& ch = c.chunks[j];
+                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * Hd;
+                run_rows(L.downs[ch.expert], c.prep_d[j], tout, t0, t1);
+            });
+            break;
+        }
+
+        case 5:
+        {
+            for (int j = worker; j < nc; j += num_workers)
+            {
+                const Chunk& ch = c.chunks[j];
+                float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * Hd;
+                fold_rows(d, c.prep_d[j], ch.m, Hd, 0, Hd);
+                transform_out(L.downs[ch.expert], d, ch.m);
+            }
+            break;
+        }
+
+        case 6:
+        {
+            const int c0 = L.d_blk_off * 128;
+            for (int j = 0; j < nc; ++j)
+            {
+                const Chunk& ch = c.chunks[j];
+                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * Hd;
+                for (int r = 0; r < ch.m; ++r)
+                {
+                    float* dst = c.out + static_cast<size_t>(ch.token[r]) * H + c0;
+                    const float* src = d + static_cast<size_t>(r) * Hd;
+                    const float w = ch.weight[r];
+                    for (int col = 0; col < Hd; ++col)
+                        dst[col] += w * src[col];
+                }
+            }
+            break;
+        }
+    }
+}
+
+// Pool thunks: pool 1's participants observe worker indices 1..n (there is no calling-thread
+// worker 0), so the shift maps them to 0..n-1; the per-node participant count travels in the
+// thunk because it is not derivable from num_workers alone.
+struct NumaThunk
+{
+    ForwardCtx* f;
+    int shift;
+    int nw;
+};
+
+void numa_decode_thunk(void* v, int worker, int num_workers)
+{
+    NumaThunk& t = *static_cast<NumaThunk*>(v);
+    const int w = worker - t.shift;
+    if (w < 0 || w >= t.nw) return;
+    numa_decode_phase(*t.f, w, t.nw);
+}
+
+void numa_forward_thunk(void* v, int worker, int num_workers)
+{
+    NumaThunk& t = *static_cast<NumaThunk*>(v);
+    const int w = worker - t.shift;
+    if (w < 0 || w >= t.nw) return;
+    numa_forward_phase(*t.f, w, t.nw);
+}
+
+void exl3_moe_cpu_forward_raw_numa(
+    int64_t handle,
+    const at::Half* x,
+    const int32_t* sel,
+    const at::Half* wts,
+    float* out,
+    int rows,
+    int topk,
+    int threads_per_node
+)
+{
+    const MoeCpuLayer* full = get_layer(handle);
+    const int m_total = rows;
+    const int top_k = topk;
+    const int H = full->hidden_size;
+    const int I = full->interm_size;
+
+    // Chunk grouping: identical to the single-pool path
+    std::vector<Chunk> chunks;
+    {
+        std::vector<std::vector<std::pair<int, float>>> per_expert(full->num_experts);
+        for (int t = 0; t < m_total; ++t)
+            for (int j = 0; j < top_k; ++j)
+            {
+                const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
+                if (e >= 0 && e < full->num_experts)
+                    per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
+            }
+        for (int e = 0; e < full->num_experts; ++e)
+        {
+            auto& lst = per_expert[e];
+            for (size_t i = 0; i < lst.size(); i += MAX_M)
+            {
+                Chunk ch;
+                ch.expert = e;
+                ch.m = static_cast<int>(std::min<size_t>(MAX_M, lst.size() - i));
+                for (int r = 0; r < ch.m; ++r)
+                {
+                    ch.token[r] = lst[i + r].first;
+                    ch.weight[r] = lst[i + r].second;
+                }
+                chunks.push_back(ch);
+            }
+        }
+    }
+    const int nc = static_cast<int>(chunks.size());
+    if (!nc) return;
+
+    const NumaLayerViews* views = ensure_numa_layer_views(handle);
+    if (!views)
+    {
+        // Unsplittable layer (K8 rate / swizzle off / scalar tier): the single pool over both
+        // nodes is the pre-NUMA behavior; the worker process spans both sockets either way
+        exl3_moe_cpu_forward_raw(handle, x, sel, wts, out, rows, topk, 2 * threads_per_node);
+        return;
+    }
+    std::memset(out, 0, static_cast<size_t>(m_total) * H * sizeof(float));
+
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+
+    // Pools (lazily, once per thread-count): pool 0's caller participates as worker 0, pool 1
+    // is remote-dispatched with all participants among its spawned workers
+    static int t_node[NUMA_NODES] = { 0, 0 };
+    if (t_node[0] != threads_per_node)
+    {
+        auto orders = numa_node_core_orders_impl();
+        TORCH_CHECK(orders.size() >= NUMA_NODES,
+                    "exl3 numa: fewer than two NUMA nodes with a readable topology");
+        t_node[0] = t_node[1] = std::max(1, static_cast<int>(threads_per_node));
+        if (pin_threads_enabled())
+        {
+            g_numa_pool[0].core_order = orders[0].first;
+            g_numa_pool[1].core_order = orders[1].first;
+        }
+        g_numa_pool[0].ensure(t_node[0], true);
+        g_numa_pool[1].remote = true;
+        g_numa_pool[1].ensure(t_node[1] + 1, false);
+        g_numa_pool[0].prime();
+        g_numa_pool[1].prime();
+    }
+
+    const int Ig0 = views->node[0].gates.empty() ? views->node[0].ups[0].n : views->node[0].gates[0].n;
+    const int Ig1 = views->node[1].gates.empty() ? views->node[1].ups[0].n : views->node[1].gates[0].n;
+    const int Hd0 = views->node[0].downs[0].n;
+    const int Hd1 = views->node[1].downs[0].n;
+
+    ForwardArena& ar = ForwardArena::get();
+    auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
+
+    ForwardCtx ctx[NUMA_NODES];
+    for (int p = 0; p < NUMA_NODES; ++p)
+    {
+        ForwardCtx& c = ctx[p];
+        c.layer = &views->node[p];
+        c.x = x;
+        c.out = out;
+        c.m_total = m_total;
+        c.chunks = chunks;
+    }
+
+    // Node-local packed gate/up outputs and down outputs
+    grow(ar.tout_g_na, static_cast<size_t>(nc) * MAX_SLOTS * Ig0);
+    grow(ar.tout_g_nb, static_cast<size_t>(nc) * MAX_SLOTS * Ig1);
+    grow(ar.tout_u_na, static_cast<size_t>(nc) * MAX_SLOTS * Ig0);
+    grow(ar.tout_u_nb, static_cast<size_t>(nc) * MAX_SLOTS * Ig1);
+    grow(ar.tout_d_na, static_cast<size_t>(nc) * MAX_SLOTS * Hd0);
+    grow(ar.tout_d_nb, static_cast<size_t>(nc) * MAX_SLOTS * Hd1);
+    ctx[0].tout_g = ar.tout_g_na.data();  ctx[1].tout_g = ar.tout_g_nb.data();
+    ctx[0].tout_u = ar.tout_u_na.data();  ctx[1].tout_u = ar.tout_u_nb.data();
+    ctx[0].tout_d = ar.tout_d_na.data();  ctx[1].tout_d = ar.tout_d_nb.data();
+
+    // Single-token decode runs as two dispatches per node, as in the single-pool path
+    bool decode = rows == 1;
+    for (const Chunk& ch : chunks) decode = decode && ch.m == 1;
+
+    if (decode)
+    {
+        // Shared full-intermediate down input rows: node 0's gate/up blocks fill the low
+        // half, node 1's the high half; both nodes quantize the full row for their down GEMVs
+        grow(ar.tin_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
+
+        // Per-node counter/cursor/partial needs, then one allocation partitioned by node
+        size_t cnt_total = 0, par_total = 0, cur_total = 0;
+        size_t cnt_base[NUMA_NODES] = { 0, 0 }, par_base[NUMA_NODES] = { 0, 0 }, cur_base[NUMA_NODES] = { 0, 0 };
+        size_t num_blk_p[NUMA_NODES], num_grp_gu_p[NUMA_NODES], num_grp_d_p[NUMA_NODES];
+        for (int p = 0; p < NUMA_NODES; ++p)
+        {
+            const MoeCpuLayer& L = views->node[p];
+            const int Ig = p == 0 ? Ig0 : Ig1;
+            const int Hd = p == 0 ? Hd0 : Hd1;
+            const int gu = L.gates.empty() ? 1 : 2;
+            num_blk_p[p] = static_cast<size_t>(nc) * (Ig / 128);
+            num_grp_gu_p[p] = num_blk_p[p] * gu;
+            num_grp_d_p[p] = static_cast<size_t>(nc) * (Hd / 128);
+            cnt_base[p] = cnt_total;
+            cnt_total += num_blk_p[p] + Hd / 128 + num_grp_gu_p[p] + num_grp_d_p[p];
+            par_base[p] = par_total;
+            par_total += std::max(num_grp_gu_p[p], num_grp_d_p[p]) * 4 * 256;
+            cur_base[p] = cur_total;
+            cur_total += 2 * t_node[p];
+        }
+        if (ar.num_counters < cnt_total)
+        {
+            ar.counters.reset(new std::atomic<int>[cnt_total]);
+            ar.num_counters = cnt_total;
+        }
+        if (ar.partials.size() < par_total) ar.partials.resize(par_total);
+        if (ar.num_cursors < cur_total)
+        {
+            ar.cursors.reset(new PaddedCounter[cur_total]);
+            ar.num_cursors = cur_total;
+        }
+        for (int p = 0; p < NUMA_NODES; ++p)
+        {
+            ForwardCtx& c = ctx[p];
+            const MoeCpuLayer& L = *c.layer;
+            const int Hd = p == 0 ? Hd0 : Hd1;
+            c.prep_d.resize(nc);
+            for (int j = 0; j < nc; ++j)
+                c.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I,
+                                nullptr, nullptr, {}, {} };
+
+            const size_t num_blk = num_blk_p[p];
+            const size_t num_grp_gu = num_grp_gu_p[p];
+            const size_t num_grp_d = num_grp_d_p[p];
+            const size_t base_counter = cnt_base[p];
+            const size_t n = num_blk + Hd / 128 + num_grp_gu + num_grp_d;
+            for (size_t i = base_counter; i < base_counter + n; ++i)
+                ar.counters[i].store(0, std::memory_order_relaxed);
+            c.blk_done = ar.counters.get() + base_counter;
+            c.out_done = c.blk_done + num_blk;
+            c.grp_done_gu = c.out_done + Hd / 128;
+            c.grp_done_d = c.grp_done_gu + num_grp_gu;
+
+            const int nw = t_node[p];
+            bool ok_gu = true, ok_d = true;
+            for (const Chunk& ch : chunks)
+            {
+                ok_gu = ok_gu && split_k_ok(L.ups[ch.expert])
+                              && (L.gates.empty() || split_k_ok(L.gates[ch.expert]));
+                ok_d = ok_d && split_k_ok(L.downs[ch.expert]);
+            }
+            c.parts[0] = decode_parts(static_cast<int>(num_grp_gu), nw, ok_gu);
+            c.parts[1] = decode_parts(static_cast<int>(num_grp_d), nw, ok_d);
+            c.units[0] = static_cast<int>(num_grp_gu) * c.parts[0];
+            c.units[1] = static_cast<int>(num_grp_d) * c.parts[1];
+
+            const size_t base_partials = par_base[p];
+            c.partials = ar.partials.data() + base_partials;
+
+            const size_t base_cursor = cur_base[p];
+            for (int ph = 0; ph < 2; ++ph)
+                for (int w = 0; w < nw; ++w)
+                    ar.cursors[base_cursor + ph * nw + w].v.store(
+                        static_cast<int>(static_cast<int64_t>(c.units[ph]) * w / nw),
+                        std::memory_order_relaxed);
+            c.cursor = ar.cursors.get() + base_cursor;
+        }
+    }
+    else
+    {
+        // Batched: per-node gate/up prep (each node prepares every chunk against its own
+        // scratch) and per-node down prep; the full activation rows are gathered into act_full
+        grow(ar.tin_g,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_g,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_dup_g,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.tin_u,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_u,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_dup_u,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.tin_g2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_g2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_dup_g2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.tin_u2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_u2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.splat_dup_u2,  static_cast<size_t>(nc) * MAX_SLOTS * H);
+        grow(ar.tin_d,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.splat_d,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.splat_dup_d,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.tin_d2,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.splat_d2,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.splat_dup_d2,  static_cast<size_t>(nc) * MAX_SLOTS * I);
+        grow(ar.act_full, static_cast<size_t>(nc) * MAX_SLOTS * I);
+
+        for (int p = 0; p < NUMA_NODES; ++p)
+        {
+            ForwardCtx& c = ctx[p];
+            float *tg, *tu, *td;
+            int32_t *sg, *dg, *su, *du, *sd, *dd;
+            if (p == 0)
+            {
+                tg = ar.tin_g.data();  sg = ar.splat_g.data();  dg = ar.splat_dup_g.data();
+                tu = ar.tin_u.data();  su = ar.splat_u.data();  du = ar.splat_dup_u.data();
+                td = ar.tin_d.data();  sd = ar.splat_d.data();  dd = ar.splat_dup_d.data();
+            }
+            else
+            {
+                tg = ar.tin_g2.data(); sg = ar.splat_g2.data(); dg = ar.splat_dup_g2.data();
+                tu = ar.tin_u2.data(); su = ar.splat_u2.data(); du = ar.splat_dup_u2.data();
+                td = ar.tin_d2.data(); sd = ar.splat_d2.data(); dd = ar.splat_dup_d2.data();
+            }
+            c.prep_g.resize(nc); c.prep_u.resize(nc); c.prep_d.resize(nc);
+            for (int j = 0; j < nc; ++j)
+            {
+                c.prep_g[j] = { tg + static_cast<size_t>(j) * MAX_SLOTS * H,
+                                sg + static_cast<size_t>(j) * MAX_SLOTS * H,
+                                dg + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
+                c.prep_u[j] = { tu + static_cast<size_t>(j) * MAX_SLOTS * H,
+                                su + static_cast<size_t>(j) * MAX_SLOTS * H,
+                                du + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
+                c.prep_d[j] = { td + static_cast<size_t>(j) * MAX_SLOTS * I,
+                                sd + static_cast<size_t>(j) * MAX_SLOTS * I,
+                                dd + static_cast<size_t>(j) * MAX_SLOTS * I, {}, {} };
+            }
+            c.act_full = ar.act_full.data();
+        }
+    }
+
+    // Small-job worker cap (see exl3_moe_cpu_forward_raw): applied per node
+    static const int small_cap = [](){
+        const char* e = getenv("EXL3_MOE_CPU_SMALL_WORKERS");
+        return e ? atoi(e) : 0;
+    }();
+    const int n_run = nc <= 2 ? small_cap : 0;
+    const int n0 = (n_run > 0 && n_run < t_node[0]) ? n_run : t_node[0];
+    const int n1 = (n_run > 0 && n_run < t_node[1]) ? n_run : t_node[1];
+
+    // Debug fallback: serialize the per-phase node dispatches (pre-overlap behavior)
+    static const bool numa_serial = [](){
+        const char* e = getenv("EXL3_MOE_NUMA_SERIAL");
+        return e && *e == '1';
+    }();
+
+    const int num_phases = decode ? 2 : 7;
+    static const int batched_slot[7] = { 0, 1, 2, 2, 3, 4, 5 };
+    NumaThunk thunks[NUMA_NODES];
+    auto trellis_numa_bytes = [](const MoeCpuMatrix& m) -> double
+    {
+        return static_cast<double>(m.n / 128) * numa_block_span_u16(m) * 2;
+    };
+
+    const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
+    static double phase_us[6] = {};
+    static double phase_bytes[6] = {};
+    static long prof_jobs = 0;
+
+    for (int phase = 0; phase < num_phases; ++phase)
+    {
+        for (int p = 0; p < NUMA_NODES; ++p) ctx[p].phase = phase;
+        thunks[0] = { &ctx[0], 0, n0 };
+        thunks[1] = { &ctx[1], 1, n1 };
+        const PoolFn phase_fn = decode ? &numa_decode_thunk : &numa_forward_thunk;
+
+        if (prof)
+        {
+            const int slot = decode ? 1 + 2 * phase : batched_slot[phase];
+            double jb = 0;
+            if (slot == 1)
+                for (const Chunk& ch : chunks)
+                    jb += trellis_numa_bytes(full->ups[ch.expert])
+                        + (full->gates.empty() ? 0.0 : trellis_numa_bytes(full->gates[ch.expert]));
+            else if (slot == 3)
+                for (const Chunk& ch : chunks)
+                    jb += trellis_numa_bytes(full->downs[ch.expert]);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (numa_serial)
+            {
+                g_numa_pool[1].run_remote(phase_fn, &thunks[1], n1);
+                g_numa_pool[0].run(phase_fn, &thunks[0], n0);
+            }
+            else
+            {
+                const uint64_t d1 = g_numa_pool[1].begin_remote(phase_fn, &thunks[1], n1);
+                g_numa_pool[0].run(phase_fn, &thunks[0], n0);
+                g_numa_pool[1].end_remote(n1, d1);
+            }
+            phase_us[slot] += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count();
+            phase_bytes[slot] += jb;
+        }
+        else if (numa_serial)
+        {
+            g_numa_pool[1].run_remote(phase_fn, &thunks[1], n1);
+            g_numa_pool[0].run(phase_fn, &thunks[0], n0);
+        }
+        else
+        {
+            const uint64_t d1 = g_numa_pool[1].begin_remote(phase_fn, &thunks[1], n1);
+            g_numa_pool[0].run(phase_fn, &thunks[0], n0);
+            g_numa_pool[1].end_remote(n1, d1);
+        }
+    }
+    if (prof && ++prof_jobs % 512 == 0)
+    {
+        printf(" -- moe_cpu prof numa (%ld jobs, us/job, both nodes): prep_gu %.1f | gemv_gu %.1f (%.1f GB/s)"
+               " | act+prep_d %.1f | gemv_d %.1f (%.1f GB/s) | tf_d/finish %.1f | accum %.1f\n",
+               prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs,
+               phase_bytes[1] / phase_us[1] / 1000.0, phase_us[2] / prof_jobs,
+               phase_us[3] / prof_jobs, phase_bytes[3] / phase_us[3] / 1000.0,
+               phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
+        fflush(stdout);
+    }
+}
+
+std::vector<std::pair<std::vector<int64_t>, int64_t>> exl3_moe_cpu_numa_core_orders()
+{
+    std::vector<std::pair<std::vector<int64_t>, int64_t>> out;
+    for (const auto& o : numa_node_core_orders_impl())
+        out.emplace_back(std::vector<int64_t>(o.first.begin(), o.first.end()),
+                         static_cast<int64_t>(o.second));
+    return out;
+}
+
+void exl3_moe_cpu_forward_numa
+(
+    int64_t handle,
+    const at::Tensor& x,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    at::Tensor& out,
+    int64_t num_threads
+)
+{
+    TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu() && out.device().is_cpu(), "CPU MoE tensors must be on CPU");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && out.scalar_type() == at::kFloat, "dtype mismatch");
+    TORCH_CHECK(weights.scalar_type() == at::kHalf, "weights must be float16");
+    TORCH_CHECK(x.dim() == 2 && selected.dim() == 2 && selected.size(0) == x.size(0) && weights.sizes() == selected.sizes(),
+                "exl3_moe_cpu_forward_numa: x must be (rows, hidden), selected and weights (rows, top_k)");
+    TORCH_CHECK(x.is_contiguous() && selected.is_contiguous() && weights.is_contiguous() && out.is_contiguous(),
+                "exl3_moe_cpu_forward_numa: tensors must be contiguous");
+    const MoeCpuLayer* layer = get_layer(handle);
+    TORCH_CHECK(x.size(1) == layer->hidden_size && out.sizes() == x.sizes(),
+                "exl3_moe_cpu_forward_numa: x and out must be (rows, hidden_size)");
+
+    const int m_total = static_cast<int>(x.size(0));
+    const int top_k = static_cast<int>(selected.size(-1));
+
+    std::vector<int32_t> sel32(static_cast<size_t>(m_total) * top_k);
+    if (selected.scalar_type() == at::kLong)
+    {
+        const int64_t* s = selected.data_ptr<int64_t>();
+        for (size_t i = 0; i < sel32.size(); ++i) sel32[i] = static_cast<int32_t>(s[i]);
+    }
+    else
+    {
+        TORCH_CHECK(selected.scalar_type() == at::kInt, "selected must be int32 or int64");
+        std::memcpy(sel32.data(), selected.data_ptr<int32_t>(), sel32.size() * 4);
+    }
+
+    exl3_moe_cpu_forward_raw_numa
+    (
+        handle,
+        reinterpret_cast<const at::Half*>(x.data_ptr()),
+        sel32.data(),
+        reinterpret_cast<const at::Half*>(weights.data_ptr()),
+        out.data_ptr<float>(),
+        m_total, top_k,
+        static_cast<int>(num_threads)
+    );
+}
+
 
 namespace {
 
@@ -3621,5 +4601,8 @@ int64_t exl3_moe_cpu_make_layer(
     int64_t, double, int64_t) { NO_MOE_CPU(); return 0; }
 void exl3_moe_cpu_free_layer(int64_t) {}
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
+void exl3_moe_cpu_forward_raw_numa(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
+std::vector<std::pair<std::vector<int64_t>, int64_t>> exl3_moe_cpu_numa_core_orders() { return {}; }
+void exl3_moe_cpu_forward_numa(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
 #endif

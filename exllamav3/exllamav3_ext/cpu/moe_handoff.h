@@ -130,6 +130,9 @@ void exl3_moe_cpu_set_memops(bool enabled);
 
 // Child worker loop: consumes jobs until quit is set. Layer indices in job descriptors refer to
 // the registration order of exl3_moe_cpu_make_layer calls made in this (child) process.
+// numa_threads_per_node > 0 routes compute jobs to the NUMA column-split forward (two node
+// pools over node-local weight halves); `threads` is ignored for compute in that case and the
+// per-node count governs. Staging is unaffected either way.
 void exl3_moe_cpu_worker_run
 (
     uintptr_t shm_base,
@@ -143,5 +146,6 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t numa_threads_per_node
 );
