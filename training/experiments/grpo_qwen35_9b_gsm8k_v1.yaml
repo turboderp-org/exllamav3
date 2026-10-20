@@ -1,0 +1,56 @@
+# GRPO box validation for PR #173 (feat/grpo), 2026-10-19. First GPU run of the method.
+# Box list item 2 from the handoff: short run, reward should climb, clip_frac ~0 at mu=1.
+# Qwen3.5-9B 6bpw (the 4B quant is gone from disk); GSM8K from the HF cache.
+model: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw
+out: out/grpo_qwen35_9b_gsm8k_v1
+method: grpo
+parallel: single
+device: cuda:1
+reward:
+  - exact_answer
+num_generations: 8
+prompts_per_step: 4
+batch: 8
+num_iterations: 1
+max_completion_length: 384
+max_prompt_length: 512
+temperature: 1.0
+beta: 0.0
+epsilon: 0.2
+loss_type: dapo
+scale_rewards: group
+rollout_sampler: native
+sampler_cache_tokens: 32768
+r: 32
+alpha: 32.0
+use_rslora: true
+lr: 1.0e-5
+optim: adamw
+scheduler: none
+epochs: 0.0
+steps: 100
+max_grad_norm: 1.0
+# Pre-rendered from the HF cache (openai/gsm8k main): a brevity system prompt asking for
+# '#### <number>' on the last line, bare numeric `answer` column. The raw rows gave the 9B
+# no signal in the self-test: 84% of completions hit the 256-token cap before an answer.
+dataset: out/grpo_qwen35_9b_gsm8k_v1/data/train.jsonl
+dataset_split: train
+prompt_key: prompt
+prompt_format: jinja
+chat_template_file: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw/chat_template.jinja
+template_vars: '{"enable_thinking": false}'
+shuffle: true
+eval_dataset: out/grpo_qwen35_9b_gsm8k_v1/data/test.jsonl
+eval_split: train
+eval_max_samples: 32
+eval_every: 25
+eval_generations: 1
+print_samples: 2
+sample_every: 10
+compute_dtype: bfloat16
+attn_impl: auto
+ce_chunk: 1024
+head_vocab_chunk: 16384
+seed: 43
+run_name: grpo_qwen35_9b_gsm8k_v1
+run_log: qlora_runs.csv
