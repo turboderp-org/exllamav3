@@ -37,7 +37,18 @@ extension (tests/test_chat_turns.py).
 """
 
 SEGMENT_FORMATS = ("mistral", "metharme", "gemma4-nothink", "llama3",
-                   "qwen3.5", "qwen3.5-nothink", "chatml")
+                   "qwen3.5", "qwen3.5-nothink", "chatml", "hy3", "hy3-nothink")
+
+# HunYuan V3 (HYV3ForCausalLM) control tokens. The template writes BOS
+# literally (the model's default_chat_prompt and PromptFormat_hy3 in
+# examples/chat_templates.py both do; the tokenizer's own BOS is the same
+# token, so the encoder's single-BOS normalization collapses any duplicate).
+HY3_BOS = "<｜hy_begin_of_sentence:opensource｜>"
+HY3_USER = "<｜hy_User:opensource｜>"
+HY3_ASSISTANT = "<｜hy_Assistant:opensource｜>"
+HY3_EOS = "<｜hy_eos:opensource｜>"
+HY3_NOTHINK_HEADER = "<｜reasoning_mode:opensource｜>reasoning_effort:no_think"
+HY3_EMPTY_THINK = "<think:opensource></think:opensource>"
 
 AUTO_SINGLE_TURN_HINT = (
     "--prompt-format auto renders single-turn prompts only "
@@ -125,6 +136,7 @@ def make_segment_builder(prompt_format, bos_token="", eos_token=""):
     completion will follow."""
     bos = bos_token or ""
     eos = eos_token or ""
+    head_tail = ""   # text after the system turn, system or not (hy3-nothink)
     if prompt_format == "mistral":
         sys_fmt, user_fmt = "[SYSTEM_PROMPT]{}[/SYSTEM_PROMPT]", "[INST]{}[/INST]"
         asst_open, close, sep = "", eos, ""
@@ -148,6 +160,18 @@ def make_segment_builder(prompt_format, bos_token="", eos_token=""):
         asst_open = "<|im_start|>assistant\n" + nothink
         close, sep = "<|im_end|>", "\n"
         bos = ""   # ChatML formats prepend no BOS (matches format_prompt_and_eot)
+    elif prompt_format in ("hy3", "hy3-nothink"):
+        # HunYuan V3: BOS, the bare system text, then <｜hy_User｜>/<｜hy_Assistant｜>
+        # turn markers with no separators; <｜hy_eos｜> ends a turn. "-nothink"
+        # is PromptFormat_hy3 with thinking off: a reasoning_effort:no_think
+        # header right after the (optional) system text and the think span
+        # pre-closed empty in the masked assistant opener.
+        nothink = prompt_format.endswith("-nothink")
+        bos = HY3_BOS
+        sys_fmt, user_fmt = "{}", HY3_USER + "{}"
+        head_tail = HY3_NOTHINK_HEADER if nothink else ""
+        asst_open = HY3_ASSISTANT + (HY3_EMPTY_THINK if nothink else "")
+        close, sep = HY3_EOS, ""
     else:
         return None
 
@@ -160,6 +184,7 @@ def make_segment_builder(prompt_format, bos_token="", eos_token=""):
         if rest[0]["role"] == "system":
             head += sys_fmt.format(rest[0]["content"])
             rest = rest[1:]
+        head += head_tail
         if head:
             segs.append((head, False))
         after_asst = False   # a supervised close just ended; sep may be owed

@@ -171,7 +171,7 @@ def _run_main():
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
                              "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
-                             "jinja"],
+                             "hy3", "hy3-nothink", "jinja"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -184,6 +184,9 @@ def _run_main():
                          "(= auto for the llama arch). qwen3.5: plain ChatML "
                          "(= auto for qwen3/3.5). qwen3.5-nothink: ChatML with an "
                          "empty <think> block pre-closed in the masked prompt. "
+                         "hy3 / hy3-nothink: HunYuan V3 turns (= auto for the "
+                         "hy_v3 arch), -nothink with the no_think header and an "
+                         "empty think span pre-closed. "
                          "jinja: the model directory's own Jinja chat template "
                          "(see training/chat_jinja.py).")
     ap.add_argument("--chat-template-file", default=None,

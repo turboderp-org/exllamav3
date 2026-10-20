@@ -248,7 +248,8 @@ prompt_format: auto           # chat template the pairs are rendered into. auto 
                               #   empty -- no reasoning trained), llama3, qwen3.5 (plain ChatML; use
                               #   when responses carry their own <think> spans), qwen3.5-nothink
                               #   (empty <think> pre-closed in the masked prompt, matching no-think
-                              #   inference prefill), chatml. Only the response span gets loss
+                              #   inference prefill), chatml, hy3 (HunYuan V3 turns), hy3-nothink
+                              #   (no_think header + empty think span pre-closed). Only the response span gets loss
 clean_text: false             # strip [stage directions]/*actions* + normalize whitespace before
                               #   training. Helps play-script style sets; leave OFF for reasoning /
                               #   code / markdown data, where brackets and structure are content

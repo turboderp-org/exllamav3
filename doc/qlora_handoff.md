@@ -5710,6 +5710,93 @@ mean reward on held-out prompts, higher is better, `--save-best` keeps the best 
    G / lr / seed — reward curves should track; loss values match only at mu=1
    (ratio 1) up to sampler differences.
 
+### Session 62 — HunYuan V3 (`HYV3ForCausalLM`, Hy3-preview / Hy3): accepted by the native forward as-is; `hy3` / `hy3-nothink` chat formats
+
+> 2026-10-20. Branch `claude/busy-davinci-b2qe7j`. Container had no torch
+> and no route to HuggingFace, so only the pure-python chat_turns suite ran;
+> the box list below is the gate.
+
+**The request:** "add support for hy3 training". `hy_v3` is upstream
+exllamav3's HunYuan V3 architecture (`architecture/hy_v3.py`, synced in
+with v1.6.3), so the question was what the training path still lacked.
+
+**What HyV3 is, training-wise:** the GLM-4.5 layout under HunYuan tensor
+names. `Embedding` → N × `TransformerBlock` (`RMSNorm` pre-norms, softmax
+`Attention` with q/k-norm — `qk_norm` defaults true — NEOX RoPE, no
+partial rotary, no attention bias) → `RMSNorm` → `lm_head`. Layer 0 is a
+dense `GatedMLP`; layers ≥ `first_k_dense_replace` (1) are `BlockSparseMLP`
+with `router_type="dots"` (sigmoid scores, `expert_bias` added for the
+top-k selection only, weights normalized over the selected set, times
+`router_scaling_factor` = 2.826), `n_group = topk_group = 1` (the trivial
+grouping the GLM-4.5 session already accepts), and an ungated `GatedMLP`
+shared expert keyed `mlp.shared_mlp`. 192 routed experts, top-8. The
+MTP head (`hy_v3_mtp.py`) is `Qwen3_5MTPInputLayer` (`enorm`/`hnorm`/
+`eh_proj`, constant bias 0) over MoE blocks, consuming the trunk's
+post-final-norm state — the layout `backbone.mtp_layout` reproduces.
+
+**Audit result: nothing in `backbone.py` / `native_llama.py` needed to
+change.** `assert_block_supported` / `_assert_moe_supported` are structural
+(they read norms, router type, scaling, bias, shared expert from the loaded
+modules, never the arch string), and every HyV3 feature is one already
+accepted for GLM-4.5-Air (forward parity validated there, session 56-era).
+Tensor-key differences (`router.gate`, `expert_bias`, `shared_mlp`) are
+absorbed by the inference modules: `BlockSparseMLP` loads them into the
+same `routing_gate` / `e_score_correction_bias` / `shared_experts`
+attributes the training forward reads. LoRA target matching is by leaf
+name (`gate_proj`/`up_proj`/`down_proj` reach the dense MLP and the shared
+expert; `expert_*` opt into the routed experts), and adapters save under
+the real module keys, so PEFT / `LoRA.from_directory` names come out right
+(`model.layers.N.mlp.shared_mlp.gate_proj` etc.).
+
+**Built (chat formats — the one thing that was arch-specific):**
+- `training/chat_turns.py`: `hy3` and `hy3-nothink` segment formats +
+  the `HY3_*` control-token constants. The template (from upstream's
+  `PromptFormat_hy3` in `examples/chat_templates.py` and the model's
+  `default_chat_prompt`): literal
+  `<｜hy_begin_of_sentence:opensource｜>` + bare system text + `<｜hy_User:opensource｜>{u}<｜hy_Assistant:opensource｜>{a}<｜hy_eos:opensource｜>`
+  per turn, no separators. `-nothink` adds
+  `<｜reasoning_mode:opensource｜>reasoning_effort:no_think` right after the
+  (optional) system text — a new `head_tail` slot in the builder, since
+  the header is emitted whether or not there is a system turn — and the
+  empty `<think:opensource></think:opensource>` span in the masked
+  assistant opener. BOS is written literally (as the model's own template
+  does); the tokenizer's BOS is the same token so the single-BOS
+  normalization in `encode_segments` collapses a duplicate.
+- `qlora_train_native.py`: the matching single-turn `format_prompt_and_eot`
+  builders (exact string equivalence with the segment builder is asserted
+  in `tests/test_chat_turns.py`), `turn_end_token` prefers a registered
+  `<｜hy_eos:opensource｜>` for `--prompt-format auto` (after the ChatML /
+  `<|eot_id|>` rules, before the EOS fallback), argparse choices + help.
+  Choice lists in the DDP / pref / GRPO / EBFT trainers, the three YAML
+  templates, `qlora_infer_native.py` help.
+- Tests: `test_chat_turns.py` single-turn equivalence for both formats +
+  `test_multi_turn_hy3` (no separators, header placement without a system
+  turn, masked think span, generation prompt) — 12/12 pass;
+  `test_moe_cpu_offload_rejected_.py::test_hy3_router_accepted` (the Hy3
+  router shape through `_assert_moe_supported`; needs torch, not run here).
+- README: architecture row, prompt-format rows, intro list.
+
+**Box list (the gate — none of this has touched a GPU or a Hy3 quant):**
+1. `qlora_validate_native.py --model $HY3 --compute-dtype bfloat16`, then
+   `--check-backward`. At 299B that is the two-process streamed validate
+   from the GLM-5.3 / DeepSeek-V4 sessions (`EXL3_MOE_CPU_OFFLOAD` oracle
+   with `--save-ref`, then `--stream-experts --load-ref`). Expect the MoE
+   routing-tie signature on the fast-vs-legacy grad gate (as Trinity /
+   GLM-4.5-Air), next-token match on every prompt.
+2. `--inspect 3` with `--prompt-format hy3-nothink` on a chat set: confirm
+   one BOS, the header/think-span placement, and that
+   `<｜hy_eos:opensource｜>` encodes to a single id (if the tokenizer does
+   not register it as an added token, `auto` falls back to EOS — check
+   `turn_end_token`'s pick in the run header).
+3. A 10-step SFT smoke with `--stream-experts --sample-every 0`; then
+   `qlora_infer_native.py --prompt-format hy3-nothink` to see the adapter
+   steer generation.
+4. Optional: `--mtp-targets` on the MTP head (MoE MTP blocks go through the
+   same block plan as the trunk; untested on any MoE MTP so far).
+5. If it passes, promote the README row to "Box-proven".
+
+---
+
 ---
 
 ## 0d. Multi-GPU strategy (rationale)

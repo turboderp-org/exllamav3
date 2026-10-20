@@ -50,6 +50,20 @@ def test_trivial_grouping_accepted():
     _assert_moe_supported("layers.3", m)
 
 
+def test_hy3_router_accepted():
+    # HunYuan V3 (HYV3ForCausalLM) is the same dots router as GLM-4.5 with
+    # its own scaling (config `router_scaling_factor`, 2.826 on Hy3-preview),
+    # the selection bias loaded from `expert_bias` and the trivial grouping.
+    m = _StubMoE()
+    m.router_type = "dots"
+    m.routed_scaling_factor = 2.826
+    m.e_score_correction_bias = object()
+    m.n_group = m.topk_group = 1
+    m.num_experts = m.num_local_experts = 192
+    m.gates = m.ups = m.downs = [object()] * 192
+    _assert_moe_supported("layers.1", m)
+
+
 def test_real_grouping_rejected():
     m = _StubMoE()
     m.router_type = "dots"
