@@ -1071,12 +1071,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         aff = params.get("moe_affinity")
         if aff is not None and params.get("activate_all_experts") and self.routing_gate is not None:
             st = aff["layers"].setdefault(self.key, {"x": [], "p": [], "psum": 0.0, "rows": 0})
-            st["psum"] = st["psum"] + routing_weights.float().sum(0)
+            # sigmoid routers add the selection bias to the all-experts weights, which can go below zero
+            p = routing_weights.clamp_min(0)
+            st["psum"] = st["psum"] + p.float().sum(0)
             st["rows"] += bsz
             keep = (torch.rand(bsz, generator = aff["generator"]) < aff["frac"]).to(y.device)
             if keep.any():
                 st["x"].append(y[keep].half().cpu())
-                st["p"].append(routing_weights[keep].half().cpu())
+                st["p"].append(p[keep].half().cpu())
 
         # Calibration: the experts' output sensitivity is weighted by the routing the model would
         # actually do, which is not the selection in use when every expert is activated

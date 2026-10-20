@@ -638,7 +638,8 @@ class Linear(Module):
                 if "H_aff" not in hd:
                     hd["H_aff"] = torch.zeros_like(hd["H"])
                     hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
-                row_w = row_w.to(torch.float)
+                # a router's selection bias can push an all-experts affinity below zero (sigmoid routers)
+                row_w = row_w.to(torch.float).clamp_min(0)
                 hd["H_aff"].addmm_(x.T, x * row_w.unsqueeze(1))
                 hd["aff_sum"] += row_w.sum()
 
