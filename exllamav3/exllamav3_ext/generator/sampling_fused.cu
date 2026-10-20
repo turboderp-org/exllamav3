@@ -169,10 +169,14 @@ void fs_partial_max_kernel
 // resolves the exact threshold. Top-K refines first, because top-P's target is p times the
 // mass of the top-K-truncated set; the exact target then locates the top-P crossing either
 // inside the already-refined bucket or in an earlier bucket, which gets its own refinement
-// round. For top-P the crossing sub-bucket is dropped, matching the eager rule that the token
-// crossing the cumulative sum is dropped (here together with its exact ties); for top-K the
-// tokens tied at the exact cutoff are all kept, except that a cutoff inside the clamped tail
-// drops the tail.
+// round. For top-P the crossing sub-bucket is kept, matching the eager rule that the token
+// crossing the cumulative sum is included. Its tokens are ties (exact for fp16 logits, within
+// a sub-bucket otherwise), of which the sort-order truncation would keep only the
+// k = ceil(remaining mass / per-token mass) that the cumulative sum passes through; the bin is
+// kept whole but its tokens get ln(k / n) added to the sampling objective, so the bin as a
+// whole weighs as much as k of its tokens and the sample picks uniformly among the ties (a
+// crossing among many ties then cannot widen the kept set by more than one token's weight). For top-K the tokens tied at the exact cutoff are all
+// kept, except that a cutoff inside the clamped tail drops the tail.
 
 #define FS_HIST_RANGE 32.0f
 #define FS_MASS_SCALE 1099511627776.0f  // 2^40
@@ -192,6 +196,9 @@ struct FSCtrl
     unsigned int keep_b;    // kept-set bound: lexicographically (bucket, sub-bucket) <=
     unsigned int keep_s;    //   (keep_b, keep_s), evaluated with the exact binning expression
     unsigned long long target;  // top-P: fixed-point mass target over the kept set
+    unsigned int part_b;    // top-P crossing bin kept in part (part_b = FS_NB if none): its
+    unsigned int part_s;    //   tokens' sampling objective gets part_bias = ln(k / n) added
+    float part_bias;
 };
 
 inline __device__ unsigned long long* fs_hist_mass(uint8_t* hist, int row, int level)
@@ -409,7 +416,7 @@ inline __device__ void fs_scan_1024
 }
 
 // First cumulative-mass position strictly exceeding target (FS_NB if none): the crossing
-// bucket under the drop-the-crossing rule
+// bucket
 inline __device__ int fs_find_crossing
 (
     const unsigned long long* cum_m,
@@ -475,6 +482,28 @@ void fs_select_kernel
         else if (b > 0) bound_min(b - 1, FS_NB - 1);
         else            bound_min(0, 0);  // the top token is always kept (with its exact ties)
     };
+    // Bound from an included top-P crossing bin (b, s) holding n tied tokens of total mass
+    // `mass`, with `rem` of the target still to cover at its start: keep the bin, weighted down
+    // to the k = ceil(rem / (mass / n)) tokens the sort-order cumulative sum passes through. A
+    // target met exactly at the bin's start (rem = 0) needs none of it
+    auto bound_include_crossing = [&](int b, int s, unsigned int n, unsigned long long mass,
+                                      unsigned long long rem)
+    {
+        if (rem == 0)
+        {
+            bound_drop_crossing(b, s);
+            return;
+        }
+        bound_min(b, s);
+        double k = ceil((double) rem * (double) n / (double) mass);
+        k = fmin(fmax(k, 1.0), (double) n);
+        if (k < (double) n)
+        {
+            ctrl->part_b = b;
+            ctrl->part_s = s;
+            ctrl->part_bias = (float) log(k / (double) n);
+        }
+    };
 
     if (phase == 0)
     {
@@ -482,6 +511,9 @@ void fs_select_kernel
         {
             ctrl->keep_b = FS_NB - 1;
             ctrl->keep_s = FS_NB - 1;
+            ctrl->part_b = FS_NB;
+            ctrl->part_s = 0;
+            ctrl->part_bias = 0.0f;
         }
         fs_scan_1024(fs_hist_count(hist, row, 0), fs_hist_mass(hist, row, 0), sh_c, sh_ms, cum_c, cum_m);
         unsigned long long total = cum_m[FS_NB - 1];
@@ -524,7 +556,8 @@ void fs_select_kernel
             int b_p = fs_find_crossing(cum_m, target, FS_NB, &sh_res);
             if (b_p >= FS_NB - 1)
             {
-                // Crossing in the clamped tail bucket (or none): drop at most that bucket
+                // Crossing in the clamped tail bucket (or none): drop at most that bucket, whose
+                // tokens are not ties and weigh next to nothing
                 if (t == 0)
                 {
                     if (b_p == FS_NB - 1) bound_drop_crossing(FS_NB - 1, 0);
@@ -603,6 +636,7 @@ void fs_select_kernel
             {
                 unsigned long long sub_target = target - below;
                 const unsigned long long* g_mass1 = fs_hist_mass(hist, row, 1);
+                const unsigned int* g_cnt1 = fs_hist_count(hist, row, 1);
                 unsigned long long prev = 0, acc = 0;
                 int s_p = FS_NB;
                 for (int s = 0; s < FS_NB; ++s)
@@ -611,7 +645,8 @@ void fs_select_kernel
                     if (prev <= sub_target && acc > sub_target) { s_p = s; break; }
                     prev = acc;
                 }
-                if (s_p < FS_NB) bound_drop_crossing(rb, s_p);
+                if (s_p < FS_NB)
+                    bound_include_crossing(rb, s_p, g_cnt1[s_p], g_mass1[s_p], sub_target - prev);
                 ctrl->status = FS_ST_DONE;
             }
             return;
@@ -643,7 +678,12 @@ void fs_select_kernel
         int s_p = fs_find_crossing(cum_m, sub_target, FS_NB, &sh_res);
         if (t == 0)
         {
-            if (s_p < FS_NB) bound_drop_crossing(rb, s_p);
+            if (s_p < FS_NB)
+            {
+                unsigned long long prev_m = s_p > 0 ? cum_m[s_p - 1] : 0;
+                unsigned int prev_c = s_p > 0 ? cum_c[s_p - 1] : 0;
+                bound_include_crossing(rb, s_p, cum_c[s_p] - prev_c, cum_m[s_p] - prev_m, sub_target - prev_m);
+            }
             ctrl->status = FS_ST_DONE;
         }
         return;
@@ -697,14 +737,17 @@ void fs_partial_argmax_kernel
 
     // Mode 3 keeps elements by their (bucket, sub-bucket) bin, evaluated with the exact
     // expression the histogram passes used, so the kept set matches the select bit-exactly
-    float fs3_m = 0.0f, fs3_scale = 0.0f;
-    unsigned int fs3_kb = 0, fs3_ks = 0;
+    float fs3_m = 0.0f, fs3_scale = 0.0f, fs3_pbias = 0.0f;
+    unsigned int fs3_kb = 0, fs3_ks = 0, fs3_pb = FS_NB, fs3_ps = 0;
     if constexpr (MODE == 3)
     {
         const FSCtrl* ctrl = fs_hist_ctrl((uint8_t*) hist, row);
         fs3_m = ctrl->m;
         fs3_kb = ctrl->keep_b;
         fs3_ks = ctrl->keep_s;
+        fs3_pb = ctrl->part_b;
+        fs3_ps = ctrl->part_s;
+        fs3_pbias = ctrl->part_bias;
         fs3_scale = (float) FS_NB / FS_HIST_RANGE * inv_temp_filter;
         if (filters & FUSED_SAMPLER_F_MINP)
             threshold = fs3_m + minp_log;
@@ -724,20 +767,25 @@ void fs_partial_argmax_kernel
         else
         {
             if (MODE >= 2 && x < threshold) continue;
-            if (MODE == 3 && x != fs3_m)
+            float bias = 0.0f;
+            if (MODE == 3)
             {
-                if (x == FS_NEG_INF) continue;
-                int b, s;
-                fs_bin(x, fs3_m, fs3_scale, b, s);
-                if ((unsigned int) b > fs3_kb ||
-                    ((unsigned int) b == fs3_kb && (unsigned int) s > fs3_ks)) continue;
+                int b = 0, s = 0;
+                if (x != fs3_m)
+                {
+                    if (x == FS_NEG_INF) continue;
+                    fs_bin(x, fs3_m, fs3_scale, b, s);
+                    if ((unsigned int) b > fs3_kb ||
+                        ((unsigned int) b == fs3_kb && (unsigned int) s > fs3_ks)) continue;
+                }
+                if ((unsigned int) b == fs3_pb && (unsigned int) s == fs3_ps) bias = fs3_pbias;
             }
             // Same noise stream as the gumbel_noise_* kernels: Philox keyed on (random, flat
             // index over the batch), independent per element, so skipped elements don't shift
             // anyone else's noise
             curandStatePhilox4_32_10_t rng;
             curand_init(random, (uint64_t) row * dim + i, 0, &rng);
-            v = x * inv_temp + fs_gumbel(curand_uniform(&rng));
+            v = x * inv_temp + fs_gumbel(curand_uniform(&rng)) + bias;
         }
         fs_amax_first(best, v, i);
     }

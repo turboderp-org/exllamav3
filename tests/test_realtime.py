@@ -139,10 +139,15 @@ class StubNet(nn.Module):
     # base, and at -1 + p as the adapted policy: reference == policy at p = 0
     # (DPO's ln-2 anchor holds exactly), and a longer chosen completion makes
     # the DPO gradient push p UP.
-    def compute_logps(self, input_ids, labels, attention_mask=None, chunk=0):
+    def compute_logps(self, input_ids, labels, attention_mask=None, chunk=0,
+                      return_per_token=False):
         self.logps_calls.append((input_ids, labels, attention_mask,
                                  self.adapters_off))
-        counts = (labels[:, 1:] != -100).sum(dim=-1)
+        mask = labels[:, 1:] != -100
+        if return_per_token:
+            per_tok = -1.0 + (0.0 if self.adapters_off else self.p)
+            return per_tok * mask.float(), mask
+        counts = mask.sum(dim=-1)
         base = -counts.float()
         if self.adapters_off:
             return base, counts
@@ -177,10 +182,20 @@ class StubGenerator:
     """num_remaining_jobs counts down per poll (simulating in-flight jobs
     draining); pagetable records resets."""
 
-    def __init__(self, jobs=0):
+    def __init__(self, jobs=0, cpu_tier=False, recurrent=False, disk=False):
         self.jobs = jobs
-        self.pagetable = types.SimpleNamespace(resets=0)
+        self.pagetable = types.SimpleNamespace(resets=0, cpu_tier=None)
         self.pagetable.reset_page_table = self._reset
+        if cpu_tier:
+            self.pagetable.cpu_tier = types.SimpleNamespace(clears=0)
+            self.pagetable.cpu_tier.clear = lambda: setattr(
+                self.pagetable.cpu_tier, "clears", self.pagetable.cpu_tier.clears + 1)
+        self.recurrent_cache = None
+        if recurrent:
+            self.recurrent_cache = types.SimpleNamespace(clears=0)
+            self.recurrent_cache.clear = lambda: setattr(
+                self.recurrent_cache, "clears", self.recurrent_cache.clears + 1)
+        self.disk_page_cache = object() if disk else None
 
     def _reset(self):
         self.pagetable.resets += 1
@@ -320,6 +335,32 @@ def test_encode_messages():
 # ---------------------------------------------------------------------------
 # Ingest loop
 # ---------------------------------------------------------------------------
+
+def test_attach_generator_invalidates_every_cache_tier():
+    # An adapter update must drop the VRAM page table AND the tiers a page can be
+    # restored from by hash (CPU page tier, recurrent checkpoints): a page restored
+    # from there carries KV computed through the previous adapter.
+    rt = make_rt()
+    gen = StubGenerator(cpu_tier=True, recurrent=True)
+    rt.attach_generator(gen)
+    rt.sync_to_inference()
+    assert gen.pagetable.resets == 1
+    assert gen.pagetable.cpu_tier.clears == 1
+    assert gen.recurrent_cache.clears == 1
+    # Generators without the optional tiers still work (the common case).
+    plain = StubGenerator()
+    rt.attach_generator(plain)
+    rt.sync_to_inference()
+    assert plain.pagetable.resets == 1 and gen.pagetable.resets == 2
+    # A disk tier persists across processes and is keyed by model, not adapter:
+    # refused loudly rather than served stale.
+    try:
+        rt.attach_generator(StubGenerator(disk=True))
+    except ValueError as e:
+        assert "disk cache" in str(e)
+    else:
+        raise AssertionError("generator with a disk cache tier must be refused")
+
 
 def test_ingest_batching_and_callbacks():
     net = StubNet()
@@ -905,6 +946,51 @@ def test_ingest_dpo():
     assert stats["steps"] == 1 and abs(stats["dpo"]["loss"] - 25.0) < 1e-4
     assert net.p.item() == 0.0
     print("ingest dpo: OK")
+
+
+def test_ingest_orpo():
+    """pair_objective='orpo': the same pair samples train reference-free.
+    The stub scores every supervised token at -1 + p, so both means are
+    equal, the log odds ratio is 0 and the odds term is the constant
+    beta*ln2 with zero gradient; the NLL term (1 - p) drives p up."""
+    ln2 = math.log(2)
+    pairs = [_pair([1, 2], 3, 1), _pair([1, 3], 3, 1), _pair([1, 4], 3, 1)]
+    for mode in ("full", "completion"):
+        net = StubNet()
+        rt = make_rt(RealtimeConfig(batch_size=2, grad_accum=1, lr=1e-2,
+                                    weight_decay=0.0, beta=0.1,
+                                    pair_objective="orpo", orpo_nll=mode),
+                     net=net)
+        stats = rt.ingest(pairs)
+        assert stats["steps"] == 2 and stats["samples"] == 3
+        assert stats["kto"] is None and not net.seen
+        # one policy forward per micro-batch, never a reference forward
+        assert len(net.logps_calls) == 2
+        assert all(not off for _, _, _, off in net.logps_calls)
+        ids0, labels0, attn0, _ = net.logps_calls[0]
+        assert ids0.shape[0] == 4
+        if mode == "full":
+            # prompt tokens supervised too (only the pad is masked)
+            assert labels0[0].tolist()[:2] == [1, 2]
+            assert (labels0 == -100).sum().item() == (attn0 == 0).sum().item()
+        else:
+            assert labels0[0].tolist()[:2] == [-100, -100]
+        d = stats["dpo"]
+        assert d["pairs"] == 3
+        # first micro-batch at p = 0: loss = NLL 1 + 0.1*ln2; the second ran
+        # after a step, so the pair-weighted mean sits strictly below that
+        assert d["loss"] < 1 + 0.1 * ln2 and d["loss"] > 0.1 * ln2
+        assert net.p.item() > 0
+        assert d["margin"] == 0.0           # equal means -> equal rewards
+        assert stats["supervised_tokens"] == 3 * (3 + 1)
+        assert net.applied == 1
+    # config validation
+    import pytest
+    with pytest.raises(ValueError):
+        RealtimeConfig(pair_objective="simpo")
+    with pytest.raises(ValueError):
+        RealtimeConfig(orpo_nll="prompt")
+    print("ingest orpo: OK")
 
 
 def _row(prompt, comp_len, label):

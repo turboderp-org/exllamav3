@@ -1,12 +1,13 @@
 """
-Preference-optimization losses (DPO / KTO / SimPO) for QLoRA-on-EXL3.
+Preference-optimization losses (DPO / KTO / SimPO / ORPO) for QLoRA-on-EXL3.
 
 Pure-torch loss functions over per-sequence completion log-probabilities, as
 produced by ``NativeLlamaQLoRA.compute_logps`` (policy) and -- for the
 reference-based objectives -- the same call under
 ``NativeLlamaQLoRA.adapters_disabled()`` (the frozen-base reference model --
-the PEFT disable-adapter trick, so no second model is ever loaded). SimPO is
-reference-free: it needs the policy logps and completion token counts only.
+the PEFT disable-adapter trick, so no second model is ever loaded). SimPO and
+ORPO are reference-free: they need the policy logps and completion token
+counts only.
 
 Semantics follow HuggingFace TRL's stable trainers so hyperparameters and
 results transfer directly:
@@ -45,6 +46,7 @@ import torch.nn.functional as F
 
 DPO_LOSS_TYPES = ("sigmoid", "hinge", "ipo")
 KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
+ORPO_NLL_MODES = ("full", "completion")   # what the ORPO SFT term supervises
 
 
 def dpo_loss(
@@ -135,6 +137,55 @@ def simpo_loss(
     chosen_rewards = (beta * chosen_avg).detach()
     rejected_rewards = (beta * rejected_avg).detach()
     return losses, chosen_rewards, rejected_rewards
+
+
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """``log(1 - exp(x))`` for ``x <= 0``, numerically stable (Mächler 2012):
+    ``log(-expm1(x))`` near 0, ``log1p(-exp(x))`` far below. ``x`` is
+    clamped a hair below 0 so an (im)possible exact-1 probability gives a
+    large finite value instead of ``-inf`` and a NaN gradient."""
+    x = x.clamp(max=-1e-7)
+    return torch.where(x < -0.6931471805599453,
+                       torch.log1p(-torch.exp(x)), torch.log(-torch.expm1(x)))
+
+
+def orpo_loss(
+    policy_chosen_logps: torch.Tensor,    # [b] SUMMED completion logps
+    policy_rejected_logps: torch.Tensor,  # [b]
+    chosen_counts: torch.Tensor,          # [b] completion token counts
+    rejected_counts: torch.Tensor,        # [b]
+    beta: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Odds-ratio term of ORPO (Hong et al. 2024, arXiv:2403.07691; TRL
+    ``ORPOTrainer.odds_ratio_loss`` semantics) over paired (chosen, rejected)
+    rows. REFERENCE-FREE.
+
+    With ``P(y|x) = exp(mean per-token logp)`` (the paper's length-normalized
+    probability, eq. 3) and ``odds(y|x) = P / (1 - P)``, the loss is
+
+        L_OR = -beta * log σ( log odds(y_w|x) - log odds(y_l|x) )
+
+    where ``log odds = logp_avg - log(1 - exp(logp_avg))``. ``beta`` is the
+    paper's lambda (0.1 for Mistral, 0.2 Llama-2, 0.25 Phi-2; TRL default
+    0.1). The full ORPO objective is ``NLL(chosen) + L_OR``; the trainer adds
+    the NLL (see ``ORPO_NLL_MODES``).
+
+    Inputs are the SUMMED completion logps and token counts exactly as
+    returned by ``compute_logps``; normalization happens here. Returns
+    ``(losses, chosen_rewards, rejected_rewards, log_odds)``, each ``[b]``:
+    rewards are ``beta * mean-per-token logp`` (TRL's logging convention) and
+    ``log_odds`` the log odds ratio, all detached. Gradient note (paper
+    sec. 4.3): dL_OR scales with ``1 / (1 + odds_w / odds_l)``, so the term
+    goes quiet once chosen is already much more likely than rejected.
+    """
+    chosen_avg = policy_chosen_logps / chosen_counts.clamp(min=1)
+    rejected_avg = policy_rejected_logps / rejected_counts.clamp(min=1)
+    log_odds = ((chosen_avg - rejected_avg)
+                - (log1mexp(chosen_avg) - log1mexp(rejected_avg)))
+    losses = -beta * F.logsigmoid(log_odds)
+    chosen_rewards = (beta * chosen_avg).detach()
+    rejected_rewards = (beta * rejected_avg).detach()
+    return losses, chosen_rewards, rejected_rewards, log_odds.detach()
 
 
 def kto_loss(

@@ -1,0 +1,117 @@
+# 2026-10-20: packed-training proof on the integration branch (PR #174 + v1.6.3 sync + flash_attn
+# restored). v12 semancy recipe, 1 epoch, no checkpoints; the only question is whether packing runs.
+# Muse-Glimmer-30B @ 6.00bpw -- semancy v5 (798 rows), SCRUBBED template, Session 69.
+#
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python training/qlora_train.py --config training/experiments/muse_glimmer_semancy_v12.yaml
+#
+# WHY THIS RUN. In S69 the user blind-judged generations across every semancy
+# checkpoint (out/muse_glimmer_barrage/report.html) and picked v7 checkpoint-160:
+# lr 1e-5, r32/alpha32. v12 reproduces that recipe with the two things we since
+# learned were wrong or useless removed.
+#
+# Derived from v11 (already lr 1e-5, scrubbed, no embed/head) with two changes:
+#   - r/alpha 64 -> 32          (the user's pick; v7's rank)
+#   - epochs     3  -> 2        (v7-160 was end of epoch 2; epoch 3 never won)
+#   - save_best  false -> true  (v11's false left a memorized final adapter at the
+#                                run root, which is confusing to pick from)
+#
+# vs v7 specifically, two deliberate differences:
+#   - lora_embed / lora_head -> FALSE. They trained correctly in v7 (the PiSSA
+#     scale bug was load-side only, and the S69 barrage passed the right 5.65685),
+#     but S62-S64 measured the entire embed+head contribution at 0.0011 nats, with
+#     ~98% of even that coming from the head half. Not worth the VRAM or the
+#     head_vocab_chunk no-op. See science/module_lora_v7/.
+#   - strip_sys_prompt_extras -> TRUE. v7 trained under the stock template, which
+#     injects "reasoning: high" + a knowledge cutoff + TODAY'S DATE into every
+#     system block (S68). v12 scrubs it so the model stops conditioning on a date
+#     that will be wrong at inference.
+#
+# NOTE ON THE SCHEDULE. Shortening to 2 epochs also shortens the cosine: this run
+# anneals to ~0 at step 152, whereas v7's step 160 sat mid-schedule at lr ~2.75e-6
+# and still descending. Epoch 2 here therefore runs COLDER than v7's did. That is
+# usually a good thing (annealed endpoint), but it means step 152 is not a
+# step-for-step replay of v7-160.
+
+model: /mnt/two/weights/Muse-Glimmer-30B-exl3-6.00bpw
+out: out/integrate_packed_muse_glimmer
+
+method: sft
+parallel: split
+split_even: true
+
+# LoRA -- r32/alpha32 + rslora + pissa (the v7 recipe, the user's pick)
+r: 32
+alpha: 32
+use_rslora: true
+init_lora: pissa
+init_svd_niter: 16
+
+# Embedding / LM head: frozen. See the header note.
+lora_embed: false
+lora_head: false
+train_embeddings: false
+train_head: false
+
+# Optimization -- unchanged from v7/v11 except epochs
+lr: 0.00001
+scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.0
+epochs: 1
+batch: 1
+grad_accum: 2              # eff batch 2 blocks
+optim: paged_adamw8bit
+max_grad_norm: 1.0
+
+# Data -- semancy v5, same file every semancy run has used
+dataset: /home/unstable/datasets/semancer_expansion/train_v5.jsonl
+dataset_split: train       # local jsonl loads as split "train"
+messages_key: messages
+shuffle: true
+seq_len: 3072
+pack: true
+pack_algo: bfd             # scrubbed: 152 packed blocks/epoch -> 76 steps/epoch
+
+# Prompt format -- model's own template, with the injected system extras scrubbed
+prompt_format: jinja
+chat_template_file: /mnt/two/weights/Muse-Glimmer-30B-exl3-6.00bpw/chat_template.jinja
+strip_sys_prompt_extras: true
+
+# Trainable modules -- 7 dense projections (vision tower untouched)
+targets:
+  - down_proj
+  - gate_proj
+  - up_proj
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Compute / VRAM. head_vocab_chunk is live again now that the head is frozen
+# (under lora_head it silently became a no-op and cost ~5-7 GB on cuda:1).
+compute_dtype: bfloat16
+attn_impl: flash
+head_vocab_chunk: 16384
+ce_chunk: 1024
+offload_activations: true
+sample_every: 0
+
+# Eval / checkpoints -- 116-row held-out, identical to every prior semancy run.
+# 152 planned steps @ 76/epoch; checkpoint_every 38 == exact half-epoch, so dirs
+# land at 38/76/114/152 and keep_checkpoints 0 retains all four (~11 GB).
+#
+# CAVEAT the user already knows: this eval set was ALSO used to pick v7-160, so
+# its loss numbers are optimistically biased and are NOT the selection criterion
+# here -- the barrage/ear is. Treat eval loss as a divergence alarm only.
+eval_dataset: mala-data/semancy_test.jsonl
+eval_split: train          # local jsonl quirk (S45)
+eval_every: 38
+save_best: false
+checkpoint_every: 0
+keep_checkpoints: 0        # keep every half-epoch checkpoint
+
+# Live monitor -- 127.0.0.1 only; from a remote box: ssh -L 8137:127.0.0.1:8137
+live_report: false
+live_report_port: 8137
+run_name: integrate_packed_muse_glimmer_semancy

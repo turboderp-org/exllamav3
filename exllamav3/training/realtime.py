@@ -35,8 +35,13 @@ KV-cache staleness: after an adapter update, every cached KV entry computed
 THROUGH an adapted k_proj/v_proj is stale. Two supported answers:
 
   1. (default) nuke the cache on every update -- ``attach_generator(gen)``
-     registers ``gen.pagetable.reset_page_table()`` as an update callback, so
-     prefix reuse restarts from nothing and the next requests re-prefill.
+     registers ``invalidate_generator_cache(gen)`` as an update callback: the
+     VRAM page table is reset, and the CPU page tier and the recurrent-state
+     checkpoints behind it are cleared too (pages restored from those by hash
+     would otherwise carry KV computed through the previous adapter), so prefix
+     reuse restarts from nothing and the next requests re-prefill. A generator
+     with a disk cache tier is refused: its pages persist across processes and
+     its fingerprint knows nothing about adapters.
   2. adapt only projections that never enter the cache --
      ``target_modules=["q_proj", "o_proj", "gate_proj", "up_proj",
      "down_proj"]`` -- and register no cache callback. Zero invalidation cost,
@@ -83,7 +88,13 @@ disabled; no second model copy):
     prompt; ``realtime_chat.py`` wires the chat template). ``chosen`` /
     ``rejected`` are completion strings or single-turn assistant message
     lists; ``config.eot_text`` is appended to each. Loss: ``config.dpo_loss``
-    (sigmoid / hinge / ipo) at ``config.beta``, cDPO ``label_smoothing``.
+    (sigmoid / hinge / ipo) at ``config.beta``, cDPO ``label_smoothing`` --
+    or, with ``config.pair_objective = "orpo"``, the reference-free ORPO
+    objective (NLL on chosen + odds-ratio term at ``config.beta`` = the
+    paper's lambda; ``config.orpo_nll`` full / completion picks what the NLL
+    supervises, TRL/axolotl's ``full`` by default). Pairs are then half the
+    cost of DPO (no reference forward) and the stats still land under
+    ``"dpo"`` (they are pairs either way).
   * ``{"prompt": ..., "completion": ..., "label": True/False}`` -- one
     UNPAIRED KTO row (``label`` truthy = desirable). Loss: ``config.kto_loss``
     (kto / apo_zero_unpaired) at ``config.beta`` with
@@ -158,8 +169,8 @@ import torch
 
 from .aux_offload import ModelParker
 from .fused_ce import DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK
-from .preference import (dpo_loss, kto_loss, mismatched_kl_shift,
-                         DPO_LOSS_TYPES, KTO_LOSS_TYPES)
+from .preference import (dpo_loss, kto_loss, orpo_loss, mismatched_kl_shift,
+                         DPO_LOSS_TYPES, KTO_LOSS_TYPES, ORPO_NLL_MODES)
 
 IGNORE_INDEX = -100
 
@@ -300,9 +311,15 @@ class RealtimeConfig:
                                                 # include it)
 
     # -- preference objectives (DPO pairs / KTO rows -- see ingest) --
-    beta: float = 0.1                           # inverse temperature (dpo + kto)
+    beta: float = 0.1                           # inverse temperature (dpo + kto;
+                                                # ORPO's lambda)
+    pair_objective: str = "dpo"                 # dpo | orpo: the loss a
+                                                # prompt+chosen+rejected pair
+                                                # trains (orpo: reference-free)
     dpo_loss: str = "sigmoid"                   # sigmoid | hinge | ipo
     label_smoothing: float = 0.0                # cDPO label-flip prob (sigmoid)
+    orpo_nll: str = "full"                      # full | completion: tokens the
+                                                # ORPO NLL term supervises
     kto_loss: str = "kto"                       # kto | apo_zero_unpaired
     desirable_weight: float = 1.0               # KTO lambda_D (desirable rows)
     undesirable_weight: float = 1.0             # KTO lambda_U (undesirable rows)
@@ -311,6 +328,12 @@ class RealtimeConfig:
         if self.dpo_loss not in DPO_LOSS_TYPES:
             raise ValueError(f"dpo_loss must be one of {DPO_LOSS_TYPES}, "
                              f"got {self.dpo_loss!r}")
+        if self.pair_objective not in ("dpo", "orpo"):
+            raise ValueError(f"pair_objective must be 'dpo' or 'orpo', "
+                             f"got {self.pair_objective!r}")
+        if self.orpo_nll not in ORPO_NLL_MODES:
+            raise ValueError(f"orpo_nll must be one of {ORPO_NLL_MODES}, "
+                             f"got {self.orpo_nll!r}")
         if self.kto_loss not in KTO_LOSS_TYPES:
             raise ValueError(f"kto_loss must be one of {KTO_LOSS_TYPES}, "
                              f"got {self.kto_loss!r}")
@@ -606,13 +629,37 @@ class RealtimeQLoRA:
         went stale)."""
         self._update_callbacks.append(fn)
 
+    @staticmethod
+    def invalidate_generator_cache(generator) -> None:
+        """Drop every cached state the generator could hand a new request:
+        the VRAM page table, the CPU page tier behind it and the recurrent-state
+        checkpoints. All of it was computed through the previous adapter."""
+        pagetable = generator.pagetable
+        pagetable.reset_page_table()
+        recurrent = getattr(generator, "recurrent_cache", None)
+        if recurrent is not None:
+            recurrent.clear()
+        tier = getattr(pagetable, "cpu_tier", None)
+        if tier is not None:
+            tier.clear()
+
     def attach_generator(self, generator) -> None:
-        """Wire a generator in: its page table is reset on every adapter
-        update (the default cache-staleness answer), and ``ingest`` refuses to
-        start while it still has jobs in flight (belt and suspenders under the
-        write lock)."""
+        """Wire a generator in: its cached state (page table, CPU page tier,
+        recurrent checkpoints) is invalidated on every adapter update (the
+        default cache-staleness answer), and ``ingest`` refuses to start while
+        it still has jobs in flight (belt and suspenders under the write lock).
+        A generator with a disk cache tier is refused: pages written there
+        outlive the process and are keyed by model, not adapter, so a later
+        run would restore KV computed through a stale adapter."""
+        if getattr(generator, "disk_page_cache", None) is not None:
+            raise ValueError(
+                "RealtimeQLoRA cannot serve from a generator with a disk cache tier: "
+                "cached pages persist across processes and are not keyed by adapter, "
+                "so an adapter update cannot invalidate them. Build the generator "
+                "without disk_cache_dir."
+            )
         self._generators.append(generator)
-        self.add_update_callback(generator.pagetable.reset_page_table)
+        self.add_update_callback(lambda: self.invalidate_generator_cache(generator))
 
     def attach_aux_models(self, *models) -> None:
         """Register serving-only component models -- a vision tower, an MTP/
@@ -894,7 +941,9 @@ class RealtimeQLoRA:
         n_win = sum(len(mb) for mb in window)
         sup = tok = 0
         for mb in window:
-            if kind == "dpo":
+            if kind == "dpo" and self.config.pair_objective == "orpo":
+                loss, m = self._orpo_batch(mb)
+            elif kind == "dpo":
                 loss, m = self._dpo_batch(mb)
             else:
                 loss, m = self._kto_batch(mb)
@@ -909,17 +958,20 @@ class RealtimeQLoRA:
             tok += m["tot"]
         return sup, tok
 
-    def _logps(self, input_ids, labels, attn, reference: bool = False):
+    def _logps(self, input_ids, labels, attn, reference: bool = False,
+               per_token: bool = False):
         """Per-sequence summed completion logps through the net -- as the
         adapted policy, or (``reference=True``, no grad) as the frozen base
         with the adapters disabled: the reference model for DPO/KTO without
-        a second model copy."""
+        a second model copy. ``per_token=True`` asks for the ``(token_logps,
+        mask)`` form instead (ORPO)."""
+        kw = dict(attention_mask=attn, chunk=DEFAULT_CHUNK)
+        if per_token:
+            kw["return_per_token"] = True
         if not reference:
-            return self.net.compute_logps(input_ids, labels, attention_mask=attn,
-                                          chunk=DEFAULT_CHUNK)
+            return self.net.compute_logps(input_ids, labels, **kw)
         with torch.no_grad(), self.net.adapters_disabled():
-            return self.net.compute_logps(input_ids, labels, attention_mask=attn,
-                                          chunk=DEFAULT_CHUNK)
+            return self.net.compute_logps(input_ids, labels, **kw)
 
     def _dpo_batch(self, batch: Sequence[dict]) -> tuple:
         """Loss + metric sums for one micro-batch of DPO pairs: the 2*b rows
@@ -944,6 +996,41 @@ class RealtimeQLoRA:
             "tot": int(attn.sum()),
         }
         return losses.mean(), metrics
+
+    def _orpo_batch(self, batch: Sequence[dict]) -> tuple:
+        """Loss + metric sums for one micro-batch of pairs under ORPO: one
+        policy forward over the 2*b rows, no reference. Loss = NLL(chosen) +
+        odds-ratio term; ``config.orpo_nll`` decides whether the NLL spans the
+        prompt (``full``: one forward with every non-pad token supervised,
+        per-token logps re-masked for the completion-only odds) or only the
+        chosen completion tokens."""
+        cfg = self.config
+        rows = ([(e["prompt_ids"], e["chosen_ids"]) for e in batch]
+                + [(e["prompt_ids"], e["rejected_ids"]) for e in batch])
+        input_ids, labels, attn = collate(preference_rows(rows), self.pad_id)
+        b = len(batch)
+        cmask = labels[:, 1:] != IGNORE_INDEX
+        if cfg.orpo_nll == "full":
+            full_labels = input_ids.masked_fill(attn == 0, IGNORE_INDEX)
+            tok_logps, fmask = self._logps(input_ids, full_labels, attn,
+                                           per_token=True)
+            cmask = cmask.to(tok_logps.device)
+            pol = (tok_logps * cmask).sum(dim=-1)
+            counts = cmask.sum(dim=-1)
+            fm = fmask[:b]
+            nll = -(tok_logps[:b] * fm).sum() / fm.sum().clamp(min=1)
+        else:
+            pol, counts = self._logps(input_ids, labels, attn)
+            nll = -pol[:b].sum() / counts[:b].sum().clamp(min=1)
+        losses, cr, rr, _ = orpo_loss(pol[:b], pol[b:], counts[:b], counts[b:],
+                                      beta=cfg.beta)
+        metrics = {
+            "margin": (cr - rr).sum().item(),
+            "acc": (cr > rr).float().sum().item(),
+            "sup": int(cmask.sum()),
+            "tot": int(attn.sum()),
+        }
+        return nll + losses.mean(), metrics
 
     def _kto_batch(self, batch: Sequence[dict]) -> tuple:
         """Loss + metric sums for one micro-batch of KTO rows. For the ``kto``

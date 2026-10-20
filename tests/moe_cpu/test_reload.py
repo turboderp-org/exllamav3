@@ -18,8 +18,13 @@ import pytest
 pytestmark = [pytest.mark.models("mul1"), pytest.mark.slow]
 
 SCRIPT = r"""
-import sys, torch
+import sys, os, shutil, tempfile, torch
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator
+import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
+# Each load must see the same (absent) expert profile: the dynamic placement saves one on unload,
+# and a second load seeded from it would place experts differently, which is a legitimate numeric
+# difference, not the stale-state regression this test is after
+bsm_cpu.EXPERT_STATS_DIR = tempfile.mkdtemp()
 from exllamav3.generator.sampler import ArgmaxSampler
 md, device, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 counts = [int(c) for c in sys.argv[4:]]
@@ -42,6 +47,7 @@ for n in counts:
     cache.detach_from_model(model)
     del gen, cache
     model.unload()
+    shutil.rmtree(bsm_cpu.EXPERT_STATS_DIR, ignore_errors = True)
 print("RELOAD_OK" if len(set(outs)) == 1 else "RELOAD_DIFFER " + repr(outs))
 """
 

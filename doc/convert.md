@@ -27,9 +27,17 @@ does.
 
 - **-ngf / --ngram_file *file***: Pre-quantized n-gram table (from `util/convert_ngram.py`) to copy into the output model instead of quantizing the table as part of the job. Overrides `--ngram_bits`.
 
-- **-hq / --hq**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. 
+- **-hq / --hq [N]**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. Each promoted layer's floor rises by the architecture's `select_hq_bits` for that layer; `-hq 2` doubles the promotion (`-hq N` multiplies it by N). 
 
-- **-rcp / --recipe *file***: Per-tensor bitrate recipe (YAML, e.g. from `sc_optimize.py`), used in place of the budgeted allocation from `--bits`/`--head_bits`. More about optimized recipes [here](optimize.md).
+- **-rcp / --recipe *file***: Per-tensor bitrate recipe (YAML, e.g. from `sc_optimize.py`), used in place of the budgeted allocation from `--bits`/`--head_bits`. Keys under `tensors` are exact tensor keys or wildcard patterns (`*`, `?`, `[...]`), resolved top to bottom so a later entry overrides an earlier one for the tensors it matches. Every quantized tensor of the model must be covered, and every entry must match at least one tensor; both are checked before calibration starts. The head and MTP layers take `--head_bits`/`--mtp_bits` (or the recipe's `head_bits`), and `--hq` still promotes the select layers of the MTP head. Without a `target_bpw` in the recipe, pass `--bits` (used for reporting only). Keys starting with `*` must be quoted in YAML:
+  ```yaml
+  target_bpw: 4.0
+  tensors:
+    "*": 4
+    "*.linear_attn.*": 5
+    "*.layers.3.linear_attn.*": 6
+  ```
+  More about optimized recipes [here](optimize.md).
 
 - **-cd / --cal_data *file***: Calibration data file (safetensors with packed token rows, e.g. from `sc_trace.py`) used instead of the bundled corpus mix. 
 

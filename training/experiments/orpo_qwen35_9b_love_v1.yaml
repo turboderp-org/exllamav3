@@ -1,0 +1,48 @@
+# ORPO box validation for PR #172 (feat/orpo), 2026-10-19. First GPU run of the method.
+# Qwen3.5-9B 6bpw on the love pairs (185 rows), reference-free, TRL semantics
+# (orpo_nll: full). SFT-like LR per the method's own guidance; r32 = the love
+# recipe on this family. 93 steps at 2 pairs/step; eval each quarter.
+model: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw
+out: out/orpo_qwen35_9b_love_v1
+method: orpo
+parallel: single
+device: cuda:0
+beta: 0.1
+orpo_nll: full
+r: 32
+alpha: 32
+use_rslora: true
+lr: 2.0e-5
+scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.0
+epochs: 1
+batch: 2                   # 2 pairs = 4 sequences per policy forward
+grad_accum: 1
+max_grad_norm: 1.0
+optim: adamw
+dataset: /home/unstable/datasets/love/love_dpo.jsonl
+dataset_split: train
+prompt_key: prompt
+chosen_key: chosen
+rejected_key: rejected
+shuffle: true
+seq_len: 1024
+prompt_format: jinja
+chat_template_file: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw/chat_template.jinja
+template_vars: '{"enable_thinking": false}'
+strip_sys_prompt_extras: false
+compute_dtype: bfloat16
+attn_impl: auto
+head_vocab_chunk: 16384
+ce_chunk: 1024
+offload_activations: false
+sft_eval_dataset: /home/unstable/datasets/love/love_test_le512.jsonl
+sft_eval_split: train
+sft_eval_messages_key: messages
+eval_every: 23
+checkpoint_every: 0
+keep_checkpoints: 0
+live_report: false
+run_name: orpo_qwen35_9b_love_v1
+run_log: qlora_runs.csv

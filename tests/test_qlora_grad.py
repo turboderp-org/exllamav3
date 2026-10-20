@@ -37,6 +37,7 @@ import sys
 import argparse
 import importlib.util
 import torch
+import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
@@ -159,6 +160,19 @@ def test_module_b_zero_init_is_noop():
     y = mod(x)
     assert torch.allclose(y, x @ weight, atol=1e-9), "B=0 init should be a no-op"
     print("[tier 2] QLoRALinear zero-init no-op PASSED")
+
+
+
+@pytest.fixture
+def model_dir() -> str:
+    """Opt-in real-model tier: EXL3_TEST_MODEL names a quantized EXL3 model directory. Shadows the
+    registry-backed conftest fixture, which needs a model() marker these standalone tests don't carry."""
+    path = os.environ.get("EXL3_TEST_MODEL")
+    if not path:
+        pytest.skip("opt-in: set EXL3_TEST_MODEL to an EXL3 model directory")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    return path
 
 
 def test_real_exl3_layer(model_dir: str):

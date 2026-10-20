@@ -30,15 +30,22 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
     uint8_t* temp_edges = reinterpret_cast<uint8_t*>(temp_edges_ptr) + (int64_t)history_bytes * tile_idx;
 
     extern __shared__ uint8_t shbuf[];
+#if QT_OPTIMIZED_COSTS_ONLY
+    half* temp_costs = reinterpret_cast<half*>(shbuf);
+    int* sh_idx = reinterpret_cast<int*>(temp_costs);
+    auto in_w = [&](int idx) { return __float2half_rn(__ldg(input_tile + idx)); };
+#else
     half* sh_input_tile = reinterpret_cast<half*>(shbuf);
     // Retain the measured shared-memory layout, including the unused half-minimum area.
     int* sh_idx = reinterpret_cast<int*>(shbuf + L * sizeof(half) + 64);
     half* temp_costs = reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
-    // K=1 stages the next costs in registers, then overwrites this single shared buffer.
-    half* temp_costs_inc = temp_costs + (K == 1 ? 0 : edges);
     for (int i = thread; i < L; i += NT)
         sh_input_tile[i] = __float2half_rn(input_tile[i]);
     __syncthreads();
+    auto in_w = [&](int idx) { return sh_input_tile[idx]; };
+#endif
+    // K=1 stages the next costs in registers, then overwrites this single shared buffer.
+    half* temp_costs_inc = temp_costs + (K == 1 ? 0 : edges);
     auto ring = [&](int i, int roll)
     {
         int ri = i + roll;
@@ -58,6 +65,9 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
             best = min(best, key);
         }
         best = qt_warp_min(best);
+#if QT_OPTIMIZED_COSTS_ONLY
+        __syncthreads();   // every cost read must finish before the scratch aliases temp_costs
+#endif
         if ((thread & 31) == 0)
             ((uint32_t*)sh_idx)[thread >> 5] = best;
         __syncthreads();
@@ -132,7 +142,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                 half* t = temp_costs;
                 temp_costs = temp_costs_inc;
                 temp_costs_inc = t;
-                half2 w = __half2half2(sh_input_tile[ri]);
+                half2 w = __half2half2(in_w(ri));
 
                 #pragma unroll
                 for (int j = 0; j < NP; ++j)
@@ -229,7 +239,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                 half* t = temp_costs;
                 temp_costs = temp_costs_inc;
                 temp_costs_inc = t;
-                half2 w = __half2half2(sh_input_tile[ri]);
+                half2 w = __half2half2(in_w(ri));
                 #pragma unroll
                 for (int j = 0; j < NP; ++j)
                 {
@@ -306,7 +316,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                 half* t = temp_costs;
                 temp_costs = temp_costs_inc;
                 temp_costs_inc = t;
-                half2 w = __half2half2(sh_input_tile[ri]);
+                half2 w = __half2half2(in_w(ri));
                 #pragma unroll
                 for (int j = 0; j < NP; ++j)
                 {
@@ -361,7 +371,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
 
             for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * NT)
             {
-                const half2 w2 = __half2half2(sh_input_tile[ri]);
+                const half2 w2 = __half2half2(in_w(ri));
                 int in_edge_idx = out_edge_idx >> K;
                 half2 decoded2;
                 decoded2 = __ldg(lut + ((out_edge_idx) >> 1));
@@ -410,7 +420,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
 
                 for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * NT)
                 {
-                    const half2 w2 = __half2half2(sh_input_tile[ri]);
+                    const half2 w2 = __half2half2(in_w(ri));
                     int in_edge_idx = out_edge_idx >> K;
                     half2 decoded2;
                     decoded2 = __ldg(lut + ((out_edge_idx) >> 1));
@@ -479,7 +489,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                 half* t = temp_costs;
                 temp_costs = temp_costs_inc;
                 temp_costs_inc = t;
-                half2 w = __half2half2(sh_input_tile[ri]);
+                half2 w = __half2half2(in_w(ri));
                 uint32_t owned0[(NP + 31) / 32], owned1[(NP + 31) / 32];
                 #pragma unroll
                 for (int j = 0; j < NP; ++j)

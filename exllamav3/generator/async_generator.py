@@ -26,7 +26,18 @@ class AsyncGenerator:
                 # is notified by enqueue() or close(), so this background task does not spin between requests.
                 async with self.condition:
                     # Wake when the first job arrives or when close() has cancelled the iteration task.
-                    await self.condition.wait_for(lambda: len(self.jobs) > 0 or self.iteration_task.cancelled())
+                    # While idle, continue the disk flush in steps (Generator.idle_work). Each step is short, so a
+                    # new job waits for at most one step
+                    while not (len(self.jobs) > 0 or self.iteration_task.cancelled()):
+                        if self.generator.has_idle_work():
+                            try:
+                                await asyncio.wait_for(self.condition.wait(), timeout = 0.25)
+                            except asyncio.TimeoutError:
+                                pass
+                            if not self.jobs:
+                                self.generator.idle_work()
+                        else:
+                            await self.condition.wait()
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
@@ -49,6 +60,10 @@ class AsyncGenerator:
             # them. The iteration task ends here and the generator is unusable, so record the error and deliver
             # it to any job enqueued later as well, instead of letting those jobs wait forever on a dead loop.
             self.error = e
+            # The cache contents are not known to be correct now: the disk tier must not keep them
+            disk = getattr(self.generator, "disk_page_cache", None)
+            if disk is not None:
+                disk.abort()
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()

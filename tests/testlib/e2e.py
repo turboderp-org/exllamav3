@@ -59,6 +59,8 @@ class LoadedModel:
             dynamic_draft_tokens = a.dynamic_draft,
             draft_confidence = a.draft_confidence,
             cpu_cache_size = int(a.cpu_cache_size * 1024 ** 3),
+            disk_cache_dir = a.disk_cache_dir,
+            disk_cache_size = int(a.disk_cache_size * 1024 ** 3),
             recurrent_cache_size = int(a.recurrent_cache_size * 1024 ** 3),
         )
         opts.update(kwargs)

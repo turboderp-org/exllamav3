@@ -4,6 +4,8 @@
 
 class Graph;
 
+void dsa_topk_prepare(const at::Tensor& scores_static, int k_pad);
+
 void dsa_topk_gr
 (
     const at::Tensor& scores,

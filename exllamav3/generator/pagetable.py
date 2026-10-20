@@ -76,6 +76,10 @@ class CachePage:
     children: list[CachePage]
     longest_chain: int
 
+    # False when a multimodal placeholder id precedes the end of this page's chain: such a chain's hashes are
+    # only meaningful within this process (see Sequence.allocate_pages), so the disk tier does not keep the page
+    persistable: bool = True
+
     def __repr__(self):
         return (
             f"CachePage: idx = {self.page_index}, ref_count = {self.ref_count}, "
@@ -222,6 +226,11 @@ class Sequence:
 
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
+        # First page whose chain holds a placeholder id (the hash chain of page i covers the first (i + 1) pages
+        # of sequence_ids), None if the prompt has none. Placeholder ids are allocated per process, so pages
+        # from here on, generated ones included, are not persistable across processes
+        mm = (seq_ids[0] >= FIRST_MM_EMBEDDING_INDEX).nonzero()
+        self.mm_first_page = int(mm[0]) // PAGE_SIZE if mm.numel() else None
 
         # MTP carry hidden — last hidden state of the previous prefill chunk, used to seed
         # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
@@ -273,8 +282,7 @@ class Sequence:
         if recurrent_cache is not None:
             recurrent_pages = []
             for pi, ph in enumerate(page_hashes):
-                rs = recurrent_cache.get(ph)
-                if rs:
+                if recurrent_cache.has(ph):
                     recurrent_pages.append(pi)
             # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
             # rewrites those pages anyway
@@ -284,15 +292,29 @@ class Sequence:
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
             pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
 
+        # A page's hash fixes its whole chain, so every sequence that claims the page computes the same flag
+        for i, page in enumerate(self.allocated_pages):
+            page.persistable = self.mm_first_page is None or i < self.mm_first_page
+
         # Prepare block index
         self.build_block_index_tensor()
 
-        # If recurrent model, grab cached state for prefix length
+        # If recurrent model, grab cached state for prefix length. has() also counts checkpoints on disk, and a
+        # disk read can fail (for example, a damaged file). Then use the next lower checkpoint. If no checkpoint
+        # is left, start from the beginning. The pages after the resume point stay allocated, and the replay
+        # prefill writes them again, as it does when the page table limits the prefix to the last checkpoint.
         stashed_recurrent_state = None
         if recurrent_cache is not None:
-            if cached_pages > 0:
+            while cached_pages > 0:
                 stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
-                assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
+                if stashed_recurrent_state is not None:
+                    break
+                lower = [pi for pi in recurrent_pages if pi < cached_pages - 1]
+                resume = (max(lower) + 1) if lower else 0
+                pagetable.metrics["alloc_cached_pages"] -= cached_pages - resume
+                pagetable.metrics["alloc_kv_only_pages"] += cached_pages - resume
+                cached_pages = resume
+                self.kv_position = cached_pages * PAGE_SIZE
 
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
 
@@ -340,9 +362,11 @@ class PageTable:
             "evictions": 0,               # unreferenced pages repurposed for new sequences
             "evictions_live": 0,          # of those, complete hashed pages (i.e. lost prompt-cache entries)
             "stashes_stranded": 0,        # live evictions that anchored a recurrent checkpoint, making it unusable
-            "alloc_pages": 0,             # pages claimed by starting jobs
+            "alloc_pages": 0,             # pages claimed by starting jobs, generation budget included
+            "alloc_prompt_pages": 0,      # of those, the complete prompt pages (the ones a cache hit can serve)
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
+            "alloc_disk_pages": 0,        # of those, read from the disk tier (by the prefetch or the allocation)
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
         }
 
@@ -587,16 +611,24 @@ class PageTable:
                 else:
                     op = next_evictable()
                     op.add_ref_clear(self.access_serial, h)
-                    if (
-                        self.cpu_tier is not None and
-                        (restore_limit is None or lp < restore_limit) and
-                        h in self.cpu_tier
-                    ):
-                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial)
-                        op.sequence.copy_(entry["tokens"])
-                        op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
-                        op.kv_position = PAGE_SIZE
-                        self.metrics["alloc_tier_pages"] += 1
+                    tier = self.cpu_tier
+                    if tier is not None and (restore_limit is None or lp < restore_limit):
+                        entry = None
+                        if h in tier:
+                            entry = tier.fetch(h, op.page_index, self.access_serial)
+                        elif tier.disk_tier is not None and tier.disk_tier.has_page(h):
+                            # On disk only: promote into a slot (waiting for the read) and restore from there
+                            if tier.promote(h, self.access_serial, protected_hashes) is not None:
+                                entry = tier.fetch(h, op.page_index, self.access_serial)
+                        if entry is not None:
+                            op.sequence.copy_(entry["tokens"])
+                            op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
+                            op.kv_position = PAGE_SIZE
+                            self.metrics["alloc_tier_pages"] += 1
+                            # A promotion is attributed to the disk the first time it is restored, whether
+                            # the prefetch or this allocation brought it in; from then on it is a tier entry
+                            if entry.pop("from_disk", False):
+                                self.metrics["alloc_disk_pages"] += 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -634,6 +666,7 @@ class PageTable:
             cached_pages = max_recur
 
         self.metrics["alloc_pages"] += len(allocated_pages)
+        self.metrics["alloc_prompt_pages"] += len(page_hashes)
         self.metrics["alloc_cached_pages"] += cached_pages
 
         # Advance cache over prefilled pages
@@ -659,24 +692,29 @@ class PageTable:
     def is_resumable(self, phash: bytes) -> bool:
         """
         Whether a job claiming a prompt that ends in the page identified by phash could resume from it: an
-        unbroken chain of pages down to the root, each either complete in VRAM or restorable from the CPU tier.
-        This is the anchor condition for a recurrent checkpoint stashed under phash.
+        unbroken chain of pages down to the root, each either complete in VRAM or restorable from the CPU or
+        disk tier. This is the anchor condition for a recurrent checkpoint stashed under phash.
         """
         h = phash
         steps = 0
+        tier = self.cpu_tier
+        disk = tier.disk_tier if tier is not None else None
+        limit = self.max_pages + (len(tier) if tier is not None else 0) + (len(disk) if disk is not None else 0)
         while True:
             page = self.get_live_page(h)
             if page is not None:
                 prev = page.prev_hash
-            elif self.cpu_tier is not None and h in self.cpu_tier:
-                prev = self.cpu_tier.entries[h]["prev_hash"]
+            elif tier is not None and h in tier:
+                prev = tier.entries[h]["prev_hash"]
+            elif disk is not None and disk.has_page(h):
+                prev = disk.page_prev_hash(h)
             else:
                 return False
             if prev is None:
                 return True
             h = prev
             steps += 1
-            if steps > self.max_pages + (len(self.cpu_tier) if self.cpu_tier is not None else 0):
+            if steps > limit:
                 return False
 
 

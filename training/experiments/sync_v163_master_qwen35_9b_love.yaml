@@ -1,0 +1,56 @@
+# Sync validation run for the upstream v1.6.3 merge (branch sync/v1.6.3), 2026-10-19.
+# Recipe copied from love_qwen35_4b_exl3_4bpw_fixinit_lr9e5_ev17.yaml; the 4B quant is
+# gone from disk so this runs the 9B 6bpw at batch 2 (98 rows -> 49 steps).
+model: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw
+out: out/sync_v163/train_master_qwen35_9b_love
+method: sft
+parallel: single
+device: cuda:1
+r: 32
+alpha: 32
+use_rslora: true
+lora_dropout: 0.0
+targets:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+lora_embed: false
+lora_head: false
+train_embeddings: false
+train_head: false
+lr: 0.00009
+scheduler: cosine
+warmup_ratio: 0.0
+weight_decay: 0.0
+epochs: 1
+batch: 2
+grad_accum: 1
+optim: adamw
+max_grad_norm: 1.0
+dataset: /home/unstable/datasets/love/love_accepted.jsonl
+dataset_split: train
+messages_key: messages
+shuffle: true
+seq_len: 512
+pack: false                # GDN: no packing
+prompt_format: jinja
+chat_template_file: /mnt/two/weights/Qwen3.5-9B-exl3-6.00bpw/chat_template.jinja
+template_vars: '{"enable_thinking": false}'
+strip_sys_prompt_extras: false
+compute_dtype: bfloat16
+attn_impl: auto
+offload_activations: false
+sample_every: 0
+eval_dataset: /home/unstable/datasets/love/love_test_le512.jsonl
+eval_split: train
+eval_every: 10
+save_best: false
+checkpoint_every: 0
+keep_checkpoints: 0
+live_report: false
+run_name: sync_v163_MASTER_qwen35_9b_love
+run_log: qlora_runs.csv

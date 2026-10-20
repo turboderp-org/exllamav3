@@ -25,7 +25,7 @@ class FakeCacheLayer:
         return self.tensors
 
 
-Page = namedtuple("Page", ["phash", "prev_hash", "page_index", "sequence"])
+Page = namedtuple("Page", ["phash", "prev_hash", "page_index", "sequence", "persistable"], defaults = (True,))
 
 
 def phash(tag: int) -> bytes:

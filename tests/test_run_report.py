@@ -224,7 +224,8 @@ def test_decode_example_docs():
     # plain SFT example: masked prompt prefix + supervised response
     docs = decode_example_docs(tok, {"input_ids": [5, 6, 7, 8],
                                      "labels": [-100, -100, 7, 8]})
-    assert docs == [{"prompt": "t5 t6", "response": "t7 t8",
+    assert docs == [{"segments": [{"text": "t5 t6", "sup": False, "n": 2},
+                                  {"text": "t7 t8", "sup": True, "n": 2}],
                      "n_prompt": 2, "n_sup": 2}]
     # packed block: two docs split on seg_ids; trailing pads (label -100 after
     # the response, inheriting the last doc's seg id) must land in neither span
@@ -233,9 +234,11 @@ def test_decode_example_docs():
         "labels": [-100, 2, 3, -100, 5, 6, -100, -100],
         "seg_ids": [0, 0, 0, 1, 1, 1, 1, 1]})
     assert len(docs) == 2
-    assert docs[0] == {"prompt": "t1", "response": "t2 t3",
+    assert docs[0] == {"segments": [{"text": "t1", "sup": False, "n": 1},
+                                    {"text": "t2 t3", "sup": True, "n": 2}],
                        "n_prompt": 1, "n_sup": 2}
-    assert docs[1] == {"prompt": "t4", "response": "t5 t6",
+    assert docs[1] == {"segments": [{"text": "t4", "sup": False, "n": 1},
+                                    {"text": "t5 t6", "sup": True, "n": 2}],
                        "n_prompt": 1, "n_sup": 2}
     print("  decode_example_docs (plain + packed + pad trim): OK")
 

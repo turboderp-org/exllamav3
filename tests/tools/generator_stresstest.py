@@ -23,7 +23,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 
 prefixes = ["All the numbers: ", "It never ends: ", "Counting forever: "]
-
+prompt_lengths = {}
 
 def is_consecutive_integers(text: str) -> bool:
     numbers = [int(value.strip()) for value in text.split(",")]
@@ -31,6 +31,7 @@ def is_consecutive_integers(text: str) -> bool:
 
 
 def start_new_job(args, generator, tokenizer, suffix, rng):
+    global prompt_lengths
     prefix = rng.choice(prefixes)
     prompt_length = rng.randint(*args.prompt_len)
     prompt = (prefix + suffix)[:prompt_length]
@@ -43,18 +44,21 @@ def start_new_job(args, generator, tokenizer, suffix, rng):
         identifier = prompt,
         max_rq_tokens = args.max_rq_tokens,
     )
+    prompt_lengths[id(job)] = input_ids.shape[-1]
     generator.enqueue(job)
 
 
 def check_result(result, num_pending, num_active, total_tps):
+    global prompt_lengths
     cached_tokens = result["cached_tokens"]
     cached_pages = result["cached_pages"]
     accepted = result.get("accepted_draft_tokens", 0)
     drafted = accepted + result.get("rejected_draft_tokens", 0)
     draft_rate = f"{accepted / drafted:6.1%}" if drafted else "   n/a"
+    uncached_t = prompt_lengths[id(result["job"])] - cached_tokens
     print(
         f"{str(result['job']):20}  pending: {num_pending:3}  active: {num_active:3}  "
-        f"cached_p: {cached_pages:3}  cached_t: {cached_tokens:5}  "
+        f"cached_p: {cached_pages:3}  cached_t: {cached_tokens:5}  uncached_t: {uncached_t:5}  "
         f"draft_acc: {draft_rate}  tps: {total_tps:8.2f}  -  ",
         end = "",
     )
@@ -166,8 +170,12 @@ def run_stress_test(args, generator, tokenizer):
                 completed_serials,
             )
             if last_defrag_serial != generator.pagetable.last_defrag_serial:
-                print(" !! DEFRAG")
+                print(" -- Defrag")
                 last_defrag_serial = generator.pagetable.last_defrag_serial
+
+            if generator.num_active_jobs() == 0:
+                flush_stat = generator.flush_cache_to_disk()
+                print(f" -- Flushing cache to disk: {flush_stat}")
 
         if args.num_jobs is not None and jobs_started >= args.num_jobs:
             if generator.num_remaining_jobs() == 0:
@@ -234,6 +242,8 @@ def main(args):
         num_draft_tokens = args.num_draft_tokens,
         show_visualizer = args.visualize_cache,
         cpu_cache_size = int(args.cpu_cache_size * 1024**3),
+        disk_cache_dir = args.disk_cache_dir,
+        disk_cache_size = int(args.disk_cache_size * 1024**3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024**3),
     )
 

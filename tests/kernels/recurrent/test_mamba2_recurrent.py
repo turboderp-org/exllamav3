@@ -249,17 +249,21 @@ def test_recurrent_mamba2_deterministic(device, history):
         assert torch.equal(o, results[0][0]) and torch.equal(s, results[0][1])
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float, torch.half], ids = ["fp32_state", "fp16_state"])
+@pytest.mark.parametrize("dv", [64, 128])
 @torch.inference_mode()
-def test_recurrent_mamba2_replay_matches_steps(device):
+def test_recurrent_mamba2_replay_matches_steps(device, dv, state_dtype):
     # A speculative pass over seqlen tokens from base rows, then batched_scan_replay (kind 1, Mamba2) over the
     # first n staged tokens of each batch row: the replayed scratch row is bit-identical to the final state of
-    # a pass over only those n tokens, whose outputs also match the full pass position by position
-    nk, nv, dk, dv, bsz, seqlen = 2, 8, 128, 64, 2, 6
+    # a pass over only those n tokens, whose outputs also match the full pass position by position. dv 128 is
+    # the head width where the GDN replay takes its v split, which the Mamba2 kernels do not have
+    nk, nv, dk, bsz, seqlen = 2, 8, 128, 2, 6
     xbc, g, dt, D, state0 = _mamba2_inputs(device, bsz, seqlen, nk, nv, dk, dv, 2 * bsz, seqlen, seed = 3)
+    state0 = state0.to(state_dtype)
     slots = (2 * torch.arange(bsz)).to(torch.int32).to(device)
     full = state0.clone()
     out_full = _mamba2_run(xbc, g, dt, D, full, slots, True, nk, nv, dk, dv)
-    rb = state0.stride(0) * 4
+    rb = state0.stride(0) * state0.element_size()
     for n in range(1, seqlen):
         part = state0.clone()
         out_part = _mamba2_run(xbc[:, :n].contiguous(), g[:, :n].contiguous(), dt[:, :n].contiguous(), D, part,
@@ -269,7 +273,7 @@ def test_recurrent_mamba2_replay_matches_steps(device):
         jobs = [ext.ScanReplayJob(xbc[b].data_ptr(), g[b].data_ptr(), dt[b].data_ptr(),
                                   replayed.data_ptr() + (2 * b + 1) * rb, replayed.data_ptr() + 2 * b * rb,
                                   D.data_ptr(), n) for b in range(bsz)]
-        ext.batched_scan_replay(jobs, torch.device(device).index, 1, nk, nv, dk, dv)
+        ext.batched_scan_replay(jobs, torch.device(device).index, 1, nk, nv, dk, dv, state_dtype == torch.half)
         torch.cuda.synchronize(device)
         assert torch.equal(replayed, part)
 

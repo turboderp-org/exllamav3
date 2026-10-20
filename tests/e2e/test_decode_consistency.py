@@ -20,18 +20,26 @@ pytestmark = [pytest.mark.models(), pytest.mark.slow]
 DECODE_STEPS = 32
 PROMPT_TOKENS = 256
 
-# The 8-bit cache adds its own (small) quantization error on top of the fp16-cache bound
-ABS_MEDIAN_KL = {None: 2e-3, 8: 5e-3}
+# The 8-bit cache adds its own (small) quantization error on top of the fp16-cache bound. The default fp16
+# recurrent state (recurrent models only) rounds the state once per decode step, which stays within that
+# bound; the fp32 state variant checks the other storage dtype
+CACHE_VARIANTS = {
+    "fp16_cache": ([], 2e-3),
+    "q8_cache": (["-cq", "8"], 5e-3),
+    "fp32_state": (["-rs32"], 2e-3),
+}
 
 
-@pytest.mark.parametrize("cache_bits", [None, 8], ids = ["fp16_cache", "q8_cache"])
-def test_decode_matches_forward(model_id, model_dir, cache_bits, device):
-    cache_args = ["-cq", str(cache_bits)] if cache_bits else []
+@pytest.mark.parametrize("variant", list(CACHE_VARIANTS))
+def test_decode_matches_forward(model_id, model_dir, variant, device):
+    cache_args, abs_median_kl = CACHE_VARIANTS[variant]
     with load_model(model_dir, device, *cache_args) as lm:
+        if variant == "fp32_state" and not lm.model.caps.get("recurrent_states"):
+            pytest.skip("fp32 recurrent state: model has no recurrent layers")
         ids = lm.encode(max_tokens = PROMPT_TOKENS)
         full = forward_logits(lm, ids)[0]
         floor = noise_floor(lm, ids, DECODE_STEPS, full)
         got = prefill_decode_logits(lm, ids, DECODE_STEPS)
     ref = full[-(DECODE_STEPS + 1):]
 
-    assert_logits_agree(ref, got, floor, f"{model_id}", abs_median_kl = ABS_MEDIAN_KL[cache_bits])
+    assert_logits_agree(ref, got, floor, f"{model_id}", abs_median_kl = abs_median_kl)

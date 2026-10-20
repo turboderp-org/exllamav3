@@ -283,6 +283,27 @@ def model_dirs(request, model_registry) -> dict[str, str]:
     return {mid: model_registry.get(mid).path for mid in m.args}
 
 
+@pytest.fixture(scope = "session", autouse = True)
+def _isolated_expert_profiles(tmp_path_factory):
+    # The CPU expert split saves per-model expert frequency profiles under the user cache directory and seeds
+    # later loads from them. Tests must neither depend on the user's profiles (a settled profile changes which
+    # experts the promote placement has to move, and whether it moves any) nor leave their own behind. (Not via
+    # XDG_CACHE_HOME: torch's extension build root follows it too, and would rebuild the extension per session)
+    # Importing the module builds the extension, which a CPU-only box (the training suites' home)
+    # cannot do; the CPU expert split needs a device anyway, so the isolation only matters with one
+    # A test module may have installed a stand-in ``exllamav3`` (test_vision_training loads the
+    # training files standalone) before this session fixture runs; the real package cannot be
+    # imported behind it, and those suites do not touch the CPU expert split
+    import sys
+    # (a types.ModuleType stand-in has no __spec__; an imported package always does)
+    _m = sys.modules.get("exllamav3")
+    stand_in = _m is not None and getattr(_m, "__spec__", None) is None
+    if env.cuda_available() and not stand_in:
+        import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
+        bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
+    yield
+
+
 @pytest.fixture(autouse = True)
 def _current_cuda_device(request):
     # Triton and some ext launches follow the *current* device rather than the tensors' device. Make the test

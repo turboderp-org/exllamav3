@@ -6,6 +6,7 @@
 #include "../avx512_target.h"
 #include "../util.h"
 #include <thread>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 
@@ -289,16 +290,164 @@ inline void fp16_add_twosrc_avx2
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Plain AVX tier (Sandy/Ivy Bridge and other pre-Haswell parts): the same arithmetic with the
+// 16-bit <-> 32-bit moves done on 128-bit SSE lanes, since AVX has no 256-bit integer ops. Each
+// bf16 widens to the high half of a 32-bit lane by interleaving with zeros (no shift needed), the
+// adds run on 256-bit floats, and the narrowing shift and pack run per 128-bit half, where
+// packus keeps the element order (no cross-lane fix-up). The fp16 wire uses the 256-bit F16C
+// converts, which only need AVX.
+
+AVX_TARGET
+inline __m256 bf16x8_to_ps_avx(__m128i v8)
+{
+    const __m128i z = _mm_setzero_si128();
+    __m128i lo = _mm_unpacklo_epi16(z, v8);    // elems 0..3 as fp32 bit patterns
+    __m128i hi = _mm_unpackhi_epi16(z, v8);    // elems 4..7
+    __m256 v = _mm256_castps128_ps256(_mm_castsi128_ps(lo));
+    return _mm256_insertf128_ps(v, _mm_castsi128_ps(hi), 1);
+}
+
+AVX_TARGET
+inline __m128i ps_to_bf16x8_avx(__m256 s)
+{
+    const __m128i rnd = _mm_set1_epi32(0x8000);
+    __m128i lo = _mm_castps_si128(_mm256_castps256_ps128(s));
+    __m128i hi = _mm_castps_si128(_mm256_extractf128_ps(s, 1));
+    lo = _mm_srli_epi32(_mm_add_epi32(lo, rnd), 16);
+    hi = _mm_srli_epi32(_mm_add_epi32(hi, rnd), 16);
+    return _mm_packus_epi32(lo, hi);
+}
+
+AVX_TARGET
+inline void do16_avx(uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m128i a_lo16 = _mm_loadu_si128((const __m128i*) ap);
+    __m128i a_hi16 = _mm_loadu_si128((const __m128i*) (ap + 8));
+    __m128i b_lo16 = _mm_loadu_si128((const __m128i*) bp);
+    __m128i b_hi16 = _mm_loadu_si128((const __m128i*) (bp + 8));
+    __m256 s_lo = _mm256_add_ps(bf16x8_to_ps_avx(a_lo16), bf16x8_to_ps_avx(b_lo16));
+    __m256 s_hi = _mm256_add_ps(bf16x8_to_ps_avx(a_hi16), bf16x8_to_ps_avx(b_hi16));
+    _mm_storeu_si128((__m128i*) ap, ps_to_bf16x8_avx(s_lo));
+    _mm_storeu_si128((__m128i*) (ap + 8), ps_to_bf16x8_avx(s_hi));
+}
+
+AVX_TARGET
+inline void bf16_add_inplace_avx(uint16_t* __restrict a, const uint16_t* __restrict b, size_t count)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_avx(a + i, b + i);
+        do16_avx(a + i + 16, b + i + 16);
+    }
+}
+
+AVX_TARGET
+inline void do16_twosrc_avx(uint16_t* __restrict dst, const uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m128i a_lo16 = _mm_loadu_si128((const __m128i*) ap);
+    __m128i a_hi16 = _mm_loadu_si128((const __m128i*) (ap + 8));
+    __m128i b_lo16 = _mm_loadu_si128((const __m128i*) bp);
+    __m128i b_hi16 = _mm_loadu_si128((const __m128i*) (bp + 8));
+    __m256 s_lo = _mm256_add_ps(bf16x8_to_ps_avx(a_lo16), bf16x8_to_ps_avx(b_lo16));
+    __m256 s_hi = _mm256_add_ps(bf16x8_to_ps_avx(a_hi16), bf16x8_to_ps_avx(b_hi16));
+    _mm_storeu_si128((__m128i*) dst, ps_to_bf16x8_avx(s_lo));
+    _mm_storeu_si128((__m128i*) (dst + 8), ps_to_bf16x8_avx(s_hi));
+}
+
+AVX_TARGET
+inline void bf16_add_twosrc_avx(uint16_t* __restrict dst, const uint16_t* __restrict src_a, const uint16_t* __restrict src_b, size_t count)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_twosrc_avx(dst + i, src_a + i, src_b + i);
+        do16_twosrc_avx(dst + i + 16, src_a + i + 16, src_b + i + 16);
+    }
+}
+
+AVX_F16C_TARGET
+inline void do16_fp16_avx(uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m256 a_lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) ap));
+    __m256 a_hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (ap + 8)));
+    __m256 b_lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) bp));
+    __m256 b_hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (bp + 8)));
+    _mm_storeu_si128((__m128i*) ap, _mm256_cvtps_ph(_mm256_add_ps(a_lo, b_lo), _MM_FROUND_TO_NEAREST_INT));
+    _mm_storeu_si128((__m128i*) (ap + 8), _mm256_cvtps_ph(_mm256_add_ps(a_hi, b_hi), _MM_FROUND_TO_NEAREST_INT));
+}
+
+AVX_F16C_TARGET
+inline void fp16_add_inplace_avx(uint16_t* __restrict a, const uint16_t* __restrict b, size_t count)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_fp16_avx(a + i, b + i);
+        do16_fp16_avx(a + i + 16, b + i + 16);
+    }
+}
+
+AVX_F16C_TARGET
+inline void do16_fp16_twosrc_avx(uint16_t* __restrict dst, const uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m256 s_lo = _mm256_add_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) ap)),
+                                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) bp)));
+    __m256 s_hi = _mm256_add_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (ap + 8))),
+                                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (bp + 8))));
+    _mm_storeu_si128((__m128i*) dst, _mm256_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT));
+    _mm_storeu_si128((__m128i*) (dst + 8), _mm256_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT));
+}
+
+AVX_F16C_TARGET
+inline void fp16_add_twosrc_avx(uint16_t* __restrict dst, const uint16_t* __restrict src_a, const uint16_t* __restrict src_b, size_t count)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_fp16_twosrc_avx(dst + i, src_a + i, src_b + i);
+        do16_fp16_twosrc_avx(dst + i + 16, src_a + i + 16, src_b + i + 16);
+    }
+}
+
+// Tier selection: the highest the CPU supports, capped by EXL3_TP_REDUCE_MAX_ISA (avx|avx2|avx512)
+// so the lower tiers can be exercised on a newer CPU. Plain AVX is the floor; the Python-side
+// check refuses the native backend below it
+enum ReduceTier { REDUCE_TIER_AVX = 0, REDUCE_TIER_AVX2 = 1, REDUCE_TIER_AVX512 = 2 };
+
+static int reduce_tier()
+{
+    static const int tier = []
+    {
+        int cap = REDUCE_TIER_AVX512;
+        if (const char* e = getenv("EXL3_TP_REDUCE_MAX_ISA"))
+        {
+            if (!strcmp(e, "avx")) cap = REDUCE_TIER_AVX;
+            else if (!strcmp(e, "avx2")) cap = REDUCE_TIER_AVX2;
+            else if (!strcmp(e, "avx512")) cap = REDUCE_TIER_AVX512;
+        }
+        int have = is_avx512_supported() ? REDUCE_TIER_AVX512 : is_avx2_supported() ? REDUCE_TIER_AVX2 : REDUCE_TIER_AVX;
+        return MIN(have, cap);
+    }();
+    return tier;
+}
+
 void enable_fast_fp()
 {
-    if (is_avx512_supported())
-        enable_fast_fp_avx512();
-    else
-        enable_fast_fp_avx2();
+    switch (reduce_tier())
+    {
+        case REDUCE_TIER_AVX512: enable_fast_fp_avx512(); break;
+        case REDUCE_TIER_AVX2: enable_fast_fp_avx2(); break;
+        default: enable_fast_fp_avx(); break;
+    }
 }
 
 AVX2_TARGET
 void enable_fast_fp_avx2()
+{
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+}
+
+AVX_TARGET
+void enable_fast_fp_avx()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
@@ -315,18 +464,31 @@ void perform_cpu_reduce
     size_t shbuf_size
 )
 {
-    if (is_avx512_supported())
+    switch (reduce_tier())
     {
-        perform_cpu_reduce_avx512(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
-    }
-    else
-    {
-        perform_cpu_reduce_avx2(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
+        case REDUCE_TIER_AVX512:
+            perform_cpu_reduce_avx512(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
+            break;
+        case REDUCE_TIER_AVX2:
+            perform_cpu_reduce_avx2(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
+            break;
+        default:
+            perform_cpu_reduce_avx(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
+            break;
     }
 }
 
+// The accumulate kernels of one tier, picked by wire format
+struct ReduceKernels
+{
+    void (*twosrc)(uint16_t*, const uint16_t*, const uint16_t*, size_t);
+    void (*inplace)(uint16_t*, const uint16_t*, size_t);
+};
+
+static void perform_cpu_reduce_with(PGContext* ctx, size_t data_size, uint32_t device_mask, uint32_t wire_dtype,
+                                    uint8_t* shbuf_ptr, size_t shbuf_size, ReduceKernels k);
+
 // Perform reduction on current job using AVX2
-AVX2_F16C_TARGET
 void perform_cpu_reduce_avx2
 (
     PGContext* ctx,
@@ -335,6 +497,41 @@ void perform_cpu_reduce_avx2
     uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
+)
+{
+    ReduceKernels k = wire_dtype == REDUCE_WIRE_FP16
+        ? ReduceKernels{ fp16_add_twosrc_avx2, fp16_add_inplace_avx2 }
+        : ReduceKernels{ bf16_add_twosrc_avx2, bf16_add_inplace_avx2 };
+    perform_cpu_reduce_with(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size, k);
+}
+
+// Perform reduction on current job using plain AVX
+void perform_cpu_reduce_avx
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint32_t wire_dtype,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size
+)
+{
+    ReduceKernels k = wire_dtype == REDUCE_WIRE_FP16
+        ? ReduceKernels{ fp16_add_twosrc_avx, fp16_add_inplace_avx }
+        : ReduceKernels{ bf16_add_twosrc_avx, bf16_add_inplace_avx };
+    perform_cpu_reduce_with(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size, k);
+}
+
+// The staged reduce loop, shared by the AVX2 and AVX tiers (the kernels are the only difference)
+static void perform_cpu_reduce_with
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint32_t wire_dtype,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size,
+    ReduceKernels k
 )
 {
     // Indexing - original MAX_DEVICES-based layout
@@ -444,7 +641,7 @@ void perform_cpu_reduce_avx2
                         {
                             // Second contribution: fused add of first + second -> dst
                             cpu_reduce_parallel(
-                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_twosrc_avx2 : bf16_add_twosrc_avx2,
+                                k.twosrc,
                                 nullptr,
                                 (uint16_t*) dst,
                                 (uint16_t*) first_src,
@@ -459,7 +656,7 @@ void perform_cpu_reduce_avx2
                             // Third+ contribution: accumulate into dst
                             cpu_reduce_parallel(
                                 nullptr,
-                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx2 : bf16_add_inplace_avx2,
+                                k.inplace,
                                 (uint16_t*) dst,
                                 nullptr,
                                 (uint16_t*) src,
@@ -521,9 +718,11 @@ void perform_cpu_reduce_avx2
 #include <torch/extension.h>
 void enable_fast_fp() {}
 void enable_fast_fp_avx2() {}
+void enable_fast_fp_avx() {}
 void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint32_t, uint8_t*, size_t)
 { TORCH_CHECK(false, "Native tensor-parallel CPU reduce is not available on this CPU architecture (x86 AVX2 only); use the nccl backend"); }
 void perform_cpu_reduce_avx2(PGContext* c, size_t a, uint32_t b, uint32_t d, uint8_t* e, size_t f) { perform_cpu_reduce(c, a, b, d, e, f); }
+void perform_cpu_reduce_avx(PGContext* c, size_t a, uint32_t b, uint32_t d, uint8_t* e, size_t f) { perform_cpu_reduce(c, a, b, d, e, f); }
 void cpu_reduce_parallel(void (*)(uint16_t*, const uint16_t*, const uint16_t*, size_t), void (*)(uint16_t*, const uint16_t*, size_t),
                          uint16_t*, const uint16_t*, const uint16_t*, size_t, int) { TORCH_CHECK(false, "cpu_reduce_parallel unavailable on this architecture"); }
 #endif

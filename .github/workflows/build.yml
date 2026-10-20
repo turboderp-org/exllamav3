@@ -231,6 +231,11 @@ jobs:
           # sccache already stores entries zstd-compressed (hence the Actions cache's own zstd gains
           # nothing on top); a mid level shrinks them further at a cost paid only on misses
           Write-Output "SCCACHE_CACHE_ZSTD_LEVEL=10" >> "$env:GITHUB_ENV"
+          # Server log, the Windows counterpart of the ccache log: the server starts with the build's
+          # first compile and inherits these, logging every compile with its hit or miss and the
+          # inputs hashed for it. Uploaded per job with the diagnostics below
+          Write-Output "SCCACHE_ERROR_LOG=$(Join-Path $env:RUNNER_TEMP 'sccache.log')" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_LOG=debug" >> "$env:GITHUB_ENV"
 
       - name: Stable site-packages path for the compiler cache
         run: |
@@ -242,6 +247,7 @@ jobs:
           Write-Output "PYTHONPATH=$link" >> "$env:GITHUB_ENV"
 
       - name: Restore compiler cache
+        id: compiler_cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
@@ -249,6 +255,22 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}-
             ccache-${{ runner.os }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-
+
+      # Compiler cache diagnostics. The restored cache carries ccache's counters from the builds
+      # that filled it, so they are zeroed here and the statistics step reports this job alone.
+      # CCACHE_DEBUG leaves a <object>.ccache-input-text next to every object file, listing what
+      # went into its hash; diffing the file for one source between a fast and a slow job shows
+      # what made the slow one miss. Those files and the ccache log are uploaded per job
+      - name: Compiler cache diagnostics
+        run: |
+          Write-Output "Restored cache key: '${{ steps.compiler_cache.outputs.cache-matched-key }}'"
+          if (-not $IsWindows) {
+            ccache --version | Select-Object -First 1
+            ccache -z
+            ccache -p | Select-String "base_dir|compiler_check|direct_mode|hash_dir|sloppiness|max_size"
+            Write-Output "CCACHE_DEBUG=1" >> "$env:GITHUB_ENV"
+            Write-Output "CCACHE_LOGFILE=$(Join-Path $env:RUNNER_TEMP 'ccache.log')" >> "$env:GITHUB_ENV"
+          }
 
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
@@ -525,9 +547,47 @@ jobs:
           Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
           python patch_pyproject_deps.py
 
+          # Memory high-water sampler for the build steps: lowest MemAvailable (Linux) / available physical
+          # memory (Windows) seen, rewritten every few seconds, so a job that dies mid-build still leaves the
+          # last reading in the file
+          $memwatch = @'
+          import ctypes, os, sys, time
+          out = sys.argv[1]
+          def available_mib():
+              if os.name == "nt":
+                  class MS(ctypes.Structure):
+                      _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                                 [(n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                                  "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+                  ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+                  ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                  return ms.ullAvailPhys >> 20
+              with open("/proc/meminfo") as f:
+                  for line in f:
+                      if line.startswith("MemAvailable:"):
+                          return int(line.split()[1]) >> 10
+              return -1
+          lowest = None
+          while True:
+              a = available_mib()
+              if lowest is None or a < lowest:
+                  lowest = a
+                  with open(out, "w") as f:
+                      f.write(str(lowest))
+              time.sleep(3)
+          '@
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'memwatch.py') -Value $memwatch -Encoding UTF8
+
       - name: Build for CUDA
         if: matrix.cuda != ''
         run: |
+          # Ninja's default is nproc + 2 parallel compiles; six nvcc processes over eight architectures
+          # exhaust a 16 GB hosted runner, which starves the runner agent and ends the job with "lost
+          # communication with the server". Bound the parallelism (sccache's nvcc mode adds processes of its
+          # own on Windows) and record the lowest available memory seen during the build
+          $env:MAX_JOBS = if ($IsWindows) { "3" } else { "4" }
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
+
           # --- Spawn the VS shell
           if ($IsWindows) {
             Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
@@ -548,7 +608,12 @@ jobs:
           # uncompressed extension grows past what the Windows loader accepts (issue #413)
           $env:EXLLAMA_EXT_COMPRESS = "require"
 
-          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
 
       - name: Build for ROCm
         if: matrix.rocm != ''
@@ -563,8 +628,15 @@ jobs:
           # verbatim, wrapper included
           $hipcc = Join-Path (python -m rocm_sdk path --bin) 'hipcc'
           $env:PYTORCH_NVCC = "ccache $hipcc"
+          $env:MAX_JOBS = "4"
+          $sampler = Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP/memwatch.py", "$env:RUNNER_TEMP/memwatch.txt" -PassThru -NoNewWindow
 
-          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          try {
+            python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+          } finally {
+            Stop-Process -Id $sampler.Id -ErrorAction SilentlyContinue
+            if (Test-Path "$env:RUNNER_TEMP/memwatch.txt") { Write-Host "Lowest available memory during the build: $(Get-Content "$env:RUNNER_TEMP/memwatch.txt") MiB" }
+          }
 
       - name: Compiler cache statistics
         if: (matrix.cuda != '' || matrix.rocm != '') && always()
@@ -578,6 +650,18 @@ jobs:
           } else {
             ccache -s -v
           }
+
+      - name: Upload compiler cache diagnostics
+        if: (matrix.cuda != '' || matrix.rocm != '') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccache-debug-${{ runner.os }}-py${{ matrix.pyver }}-${{ matrix.cuda && format('cu{0}', matrix.cuda) || format('rocm{0}', matrix.rocm) }}-torch${{ matrix.torch }}
+          path: |
+            ${{ runner.temp }}/ccache.log
+            ${{ runner.temp }}/sccache.log
+            build/**/*.ccache-input-text
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Save compiler cache
         if: matrix.save_cache

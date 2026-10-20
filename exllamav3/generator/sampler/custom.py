@@ -182,8 +182,10 @@ class SS_Fused(SS_Base):
       Tokens 32 nats or more below the max (at the filter temperature, relative weight below
       e^-32) are not ordered: when the cutoff falls among them they are dropped, so fewer than
       top_k tokens remain.
-    - top-P: the token crossing the cumulative mass is dropped together with every token tied
-      with it (sort-order truncation drops only the crossing token and keeps its earlier ties).
+    - top-P: the token crossing the cumulative mass is included. When it is tied with other
+      tokens, all of the ties stay eligible but are down-weighted together to the number of them
+      the sort-order cumulative sum would pass through, so the sample picks uniformly among them
+      instead of in sort order.
 
     Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
     Gumbel noise stream for a given rand_u32, up to rounding at exact ties).
@@ -465,8 +467,8 @@ class SS_TopK(SS_Base):
 
 class SS_TopP(SS_Base):
     """
-    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remaining tokens
+    Identify the smallest set of top tokens with a cumulative probability of at least P (the token whose
+    probability crosses P is included), mask out all remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
@@ -475,8 +477,9 @@ class SS_TopP(SS_Base):
     def run(self, state: SamplingState):
         match state.state:
             case SS.PROBS_N_S:
+                # Keep each token whose preceding mass is still short of P
                 cumsum = state.probs.cumsum(dim = -1)
-                mask = cumsum <= self.top_p
+                mask = (cumsum - state.probs) < self.top_p
                 state.probs[..., 1:] *= mask[..., 1:]
                 state.state = SS.PROBS_S
             case _:

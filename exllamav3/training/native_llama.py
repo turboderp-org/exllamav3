@@ -104,7 +104,7 @@ import torch.nn.functional as F
 from . import backbone
 from . import vision
 from . import quant_aware as _qa
-from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction
+from .qlora_linear import EXL3LoRAFunction, EXL3LoRAHadFunction, init_lora_a_
 from .fused_ce import (
     fused_linear_cross_entropy, fused_linear_cross_entropy_vocab_chunked,
     DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK, IGNORE_INDEX,
@@ -131,21 +131,6 @@ _FLASH_FN = None
 _FLASH_TRIED = False
 
 
-
-def init_lora_a_(t: torch.Tensor, fan_in: int) -> torch.Tensor:
-    """PEFT's LoRA-A init on an A stored as ``[in_features, r]``.
-
-    PEFT stores A as ``[r, in]`` and uses torch's kaiming-uniform init with
-    a=sqrt(5), whose bound is ``1/sqrt(fan_in)`` with fan_in read from dim 1 =
-    ``in``. Our A is transposed, so the same call read fan_in = r and
-    initialised A ``sqrt(in/r)`` too large (8.9x at r=32 on a 2560-wide input),
-    which made the effective update per Adam step that much larger than PEFT's
-    at the same lr (found 2026-10-11, doc/exl3_vs_bnb_qwen35_4b_2026-10-11.md).
-    Explicit bound, independent of storage layout.
-    """
-    bound = 1.0 / math.sqrt(fan_in)
-    with torch.no_grad():
-        return t.uniform_(-bound, bound)
 
 def _flash_attn_func():
     global _FLASH_FN, _FLASH_TRIED
@@ -2845,8 +2830,21 @@ class NativeLlamaQLoRA(nn.Module):
         return self._head_logits(mtp_hidden)
 
     def _head_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        w = self.lm_head_weight_fn()()
-        logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
+        if self.head_vocab_chunk > 0 and self._head_slice is not None:
+            # --head-vocab-chunk: reconstruct the head in vocab-column tiles, as
+            # the chunked CE does, so the full [hidden, vocab] weight + its fp32
+            # upcast is never held at once (~20 GB for a 16k x 128k head).
+            slice_fn, vocab_size, granularity = self._head_slice
+            vc = max(granularity, (self.head_vocab_chunk // granularity) * granularity)
+            parts = []
+            for a in range(0, vocab_size, vc):
+                w = slice_fn(a, min(vc, vocab_size - a))
+                parts.append(backbone.to_device(hidden, w.device).to(w.dtype) @ w)
+                del w
+            logits = torch.cat(parts, dim=-1)
+        else:
+            w = self.lm_head_weight_fn()()
+            logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
         if self.final_softcap:
             logits = self.final_softcap * torch.tanh(logits / self.final_softcap)
         return logits
@@ -3057,6 +3055,7 @@ class NativeLlamaQLoRA(nn.Module):
         ignore_index: int = IGNORE_INDEX,
         position_ids: Optional[torch.Tensor] = None,
         mm: Optional[dict] = None,
+        return_per_token: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sequence summed completion log-probabilities (DPO / KTO).
 
@@ -3066,6 +3065,14 @@ class NativeLlamaQLoRA(nn.Module):
         (for length-normalized variants like IPO). Streams through the fused
         heads with ``reduction="none"``, so the ``[tokens, vocab]`` logits are
         never materialized -- same memory story as :meth:`compute_loss`.
+
+        ``return_per_token=True`` returns ``(token_logps, mask)`` instead:
+        ``token_logps[b, t-1]`` = ``log p(label | prefix)`` at every
+        supervised shifted position (fp32, differentiable; an exact 0
+        elsewhere) and ``mask[b, t-1]`` = bool of the supervised positions.
+        One forward then serves several maskings (ORPO's full-sequence NLL
+        next to its completion-only odds) and per-token objectives (GRPO's
+        ratios and KL).
 
         Matches TRL's convention (sum over completion tokens, prompt masked).
         One sequence per batch ROW: sample packing is not supported here (a
@@ -3096,9 +3103,11 @@ class NativeLlamaQLoRA(nn.Module):
         b, t = labels.shape
         # Ignored positions carry an exact 0 in the per-token NLL, so the row
         # sum is the completion logprob with the prompt contributing nothing.
-        logps = -nll.view(b, t - 1).float().sum(dim=-1)
-        counts = (labels[:, 1:] != ignore_index).sum(dim=-1)
-        return logps, counts
+        token_logps = -nll.view(b, t - 1).float()
+        mask = labels[:, 1:] != ignore_index
+        if return_per_token:
+            return token_logps, mask
+        return token_logps.sum(dim=-1), mask.sum(dim=-1)
 
     # --- adapter parameters / IO ------------------------------------------
 

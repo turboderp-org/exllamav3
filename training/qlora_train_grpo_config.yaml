@@ -1,0 +1,133 @@
+# EXL3 GRPO config (reward-function RL on a frozen quantized base) -- ready to run.
+#   python training/qlora_train.py --config training/qlora_train_grpo_config.yaml
+#   python training/qlora_train.py --config training/qlora_train_grpo_config.yaml --dry-run
+#
+# Backend: training/qlora_train_grpo.py. Keys mirror its CLI flags one-to-one
+# (snake_case here; the launcher converts to --kebab-case). GRPO is single|split
+# only (no ddp). Try a NEW setup once with `self_test: true` -- it runs one
+# generation batch, prints the completions with their rewards and one policy
+# pass, then exits.
+
+# ---------------------------------------------------------------------------
+# Required
+# ---------------------------------------------------------------------------
+model: /path/to/exl3_model         # directory of the EXL3-quantized model
+out: out/exl3_grpo_adapter         # adapter output dir (PEFT format)
+method: grpo
+parallel: single                   # single: one GPU (`device`). split: layers autosplit
+device: cuda:0
+
+# ---------------------------------------------------------------------------
+# Rewards (REQUIRED). Each entry: a built-in name (exact_answer, think_format,
+# length_target), path/to/file.py:func, or package.module:func. TRL's reward
+# signature: f(prompts=, completions=, completion_ids=, **other_columns) ->
+# list[float | None]. Rewards are summed with reward_weights.
+# ---------------------------------------------------------------------------
+reward:
+  - exact_answer                   # needs an `answer` column in the dataset
+  # - think_format
+  # - rewards/my_rewards.py:judge  # your own file
+reward_weights: null               # one per reward; null = all 1.0
+
+# ---------------------------------------------------------------------------
+# GRPO objective (TRL GRPOConfig defaults unless noted)
+# ---------------------------------------------------------------------------
+num_generations: 8                 # G completions per prompt (paper: 64)
+prompts_per_step: 4                # prompts per generation batch = per optimizer step
+batch: 8                           # completion ROWS per policy micro-forward (memory knob)
+num_iterations: 1                  # optimizer steps per generation batch (mu); 1 = ratio 1
+max_completion_length: 512
+max_prompt_length: 512             # longer prompts are dropped
+temperature: 1.0                   # keep at 1.0: colder samplers collapse the groups
+top_k: 0
+top_p: 1.0
+beta: 0.0                          # KL weight; 0 = no reference forward (TRL default), paper 0.04
+epsilon: 0.2                       # clip range (lower bound)
+epsilon_high: null                 # DAPO clip-higher, e.g. 0.28; null = epsilon
+loss_type: dapo                    # dapo | grpo | bnpo | dr_grpo
+scale_rewards: group               # group | batch | none (Dr. GRPO)
+importance_sampling_level: token   # token (GRPO) | sequence (GSPO)
+mask_truncated_completions: false  # drop completions that hit max_completion_length
+rollout_sampler: native            # native: KV-cached generator (fast) | exact: differentiable forward
+sampler_cache_tokens: 65536        # paged KV cache for the native sampler
+
+# ---------------------------------------------------------------------------
+# LoRA adapter + init
+# ---------------------------------------------------------------------------
+r: 32
+alpha: 32.0
+use_rslora: false
+targets: null                      # null = default attn+mlp projections (keep experts OUT for
+                                   #   rollout_sampler: native)
+expert_r: null
+init_lora: default
+init_svd_niter: 16
+init_ref_model: null
+init_eva_tokens: 65536
+
+# ---------------------------------------------------------------------------
+# Optimization (LoRA RL: 1e-5 .. 5e-5; the paper's full-FT LR is 1e-6)
+# ---------------------------------------------------------------------------
+lr: 1.0e-5
+weight_decay: 0.0
+optim: adamw
+adam_betas: "0.9,0.99"
+scheduler: none
+warmup_ratio: 0.0
+warmup_steps: 0
+epochs: 0.0                        # 0 = use steps
+steps: 300
+max_grad_norm: 1.0
+
+# ---------------------------------------------------------------------------
+# Data: a prompt set. prompt_key is a string or a conversational message list;
+# EVERY other column is handed to the reward functions (e.g. answer).
+# ---------------------------------------------------------------------------
+dataset: /data/gsm8k_train.jsonl
+dataset_split: train
+dataset_config: null
+prompt_key: question
+prompt_format: auto                # auto | mistral | metharme | gemma4-nothink | llama3 |
+                                   #   qwen3.5 | qwen3.5-nothink | chatml | jinja
+chat_template_file: null
+template_vars: null
+strip_sys_prompt_extras: false
+max_samples: 0
+shuffle: true
+shuffle_seed: 0
+
+# ---------------------------------------------------------------------------
+# Eval / saving (eval metric = mean reward on held-out prompts; higher is better)
+# ---------------------------------------------------------------------------
+eval_split: null
+eval_dataset: null
+eval_max_samples: 0
+val_frac: 0.05
+eval_every: 25
+eval_generations: 1
+save_best: false
+save_every: 0
+checkpoint_every: 0
+keep_checkpoints: 0
+resume: null
+reset_optimizer: false
+run_log: qlora_runs.csv
+seed: 43
+print_samples: 2                   # completions printed every sample_every steps (0 = off)
+sample_every: 10
+self_test: false
+
+# ---------------------------------------------------------------------------
+# Runtime knobs (shared with the SFT trainer)
+# ---------------------------------------------------------------------------
+compute_dtype: bfloat16
+no_grad_ckpt: false
+attn_impl: auto
+ce_chunk: 1024
+head_vocab_chunk: 0
+offload_activations: false
+offload_mode: async
+use_liger: false
+dequant_mode: fast
+no_report: false
+run_name: ""

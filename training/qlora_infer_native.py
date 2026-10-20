@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 from exllamav3.model.lora import LoRA
@@ -73,6 +74,9 @@ def main():
                          "this script's original hardcoded template. Use 'jinja' to "
                          "render the model's OWN chat template -- the only correct "
                          "choice for a run trained with prompt_format: jinja.")
+    ap.add_argument("--template-vars", default=None,
+                    help="JSON dict of extra chat-template variables, e.g. "
+                         "'{\"enable_thinking\": false}' (same as the trainer's template_vars)")
     ap.add_argument("--chat-template-file", default=None,
                     help="Jinja template file for --prompt-format jinja. Defaults to "
                          "the model directory's own chat_template.jinja. Must match "
@@ -156,8 +160,10 @@ def main():
         cand = os.path.join(args.model, "chat_template.jinja")
         if os.path.exists(cand):
             ctf = cand
+    template_vars = json.loads(args.template_vars) if args.template_vars else None
     build_prompt, eot = format_prompt_and_eot(model, tokenizer, args.prompt_format,
-                                              chat_template_file=ctf)
+                                              chat_template_file=ctf,
+                                              template_vars=template_vars)
     if args.prompt_format == "jinja":
         print(f" -- jinja template: {ctf or '(from model config)'}")
         print(f" -- derived eot: {eot!r}")
@@ -192,6 +198,9 @@ def main():
                 sampler=sampler,
                 seed=args.seed,
                 add_bos=False,
+                # The rendered template carries control tokens (<|im_start|>, <|eot_id|>, ...);
+                # the generator's default encodes them as plain text
+                encode_special_tokens=True,
                 completion_only=True,
                 stop_conditions=stop,
                 return_last_results=True,
@@ -239,7 +248,7 @@ def main():
             lora_mtp.unload()
 
     if args.gen_out:
-        import json
+
         with open(args.gen_out, "w", encoding="utf-8") as f:
             for arm, rows in dumps.items():
                 for r in rows:

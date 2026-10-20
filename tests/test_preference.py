@@ -60,6 +60,8 @@ NativeLlamaQLoRA = _nl.NativeLlamaQLoRA
 dpo_loss = _pref.dpo_loss
 kto_loss = _pref.kto_loss
 simpo_loss = _pref.simpo_loss
+orpo_loss = _pref.orpo_loss
+log1mexp = _pref.log1mexp
 mismatched_kl_shift = _pref.mismatched_kl_shift
 
 
@@ -336,6 +338,87 @@ def test_simpo_gradient_direction():
     assert torch.all(pc.grad < 0), "chosen grad should be negative (ascent on logp)"
     assert torch.all(pr.grad > 0), "rejected grad should be positive"
     print("[pref] SimPO gradient direction PASSED")
+
+
+# ----------------------------------------------------------------------------
+# ORPO loss
+# ----------------------------------------------------------------------------
+
+def test_log1mexp():
+    """log(1 - exp(x)) on both branches vs float64 direct evaluation; finite
+    with a finite gradient at x = 0 (p = 1 exactly)."""
+    x = -torch.logspace(-6, 2, 200, dtype=torch.float64)      # -1e-6 .. -100
+    ref = torch.log1p(-torch.exp(x))
+    assert torch.allclose(log1mexp(x), ref, rtol=1e-9, atol=0), "log1mexp"
+    # fp32 near zero: the naive form loses everything, the stable one doesn't
+    x32 = torch.tensor([-1e-5], dtype=torch.float32)
+    assert abs(log1mexp(x32).item() - float(torch.log1p(-torch.exp(x32.double())))) < 1e-5
+    z = torch.zeros(1, requires_grad=True)
+    y = log1mexp(z)
+    y.backward()
+    assert torch.isfinite(y).all() and torch.isfinite(z.grad).all()
+    print("[pref] log1mexp PASSED")
+
+
+def test_orpo_formula():
+    """orpo_loss vs the hand-written TRL ORPOTrainer.odds_ratio_loss form on
+    length-normalized logps: log_odds = (lc - lr) - (log(1-e^lc) -
+    log(1-e^lr)), loss = -beta * log sigmoid(log_odds), rewards = beta *
+    mean logp (detached)."""
+    torch.manual_seed(12)
+    b, beta = 8, 0.1
+    nc = torch.randint(3, 30, (b,))
+    nr = torch.randint(3, 30, (b,))
+    pc = -torch.rand(b) * nc * 2          # summed logps (negative)
+    pr = -torch.rand(b) * nr * 2
+    losses, cr, rr, lo = orpo_loss(pc, pr, nc, nr, beta=beta)
+    lc, lr = pc / nc, pr / nr
+    log_odds = (lc - lr) - (torch.log1p(-torch.exp(lc)) - torch.log1p(-torch.exp(lr)))
+    assert torch.allclose(lo, log_odds, atol=1e-6), "log odds mismatch"
+    assert torch.allclose(losses, -beta * F.logsigmoid(log_odds), atol=1e-7), \
+        "ORPO loss mismatch"
+    assert torch.allclose(cr, beta * lc) and torch.allclose(rr, beta * lr)
+    assert not cr.requires_grad and not rr.requires_grad and not lo.requires_grad
+    # Equal mean logps -> log odds 0 -> loss exactly beta * ln 2.
+    l0, _, _, lo0 = orpo_loss(pc, pc, nc, nc, beta=beta)
+    ln2 = float(torch.log(torch.tensor(2.0)))
+    assert torch.allclose(l0, torch.full_like(l0, beta * ln2), atol=1e-7)
+    assert torch.allclose(lo0, torch.zeros_like(lo0), atol=1e-7)
+    # Odds, not probabilities: the same logp gap counts for more at high p.
+    # lc - lr = 0.1 at p ~ 0.9 vs p ~ 0.05 -> larger log odds ratio.
+    hi, _, _, lo_hi = orpo_loss(torch.tensor([-0.1]), torch.tensor([-0.2]),
+                                torch.ones(1), torch.ones(1), beta=beta)
+    low, _, _, lo_low = orpo_loss(torch.tensor([-3.0]), torch.tensor([-3.1]),
+                                  torch.ones(1), torch.ones(1), beta=beta)
+    assert lo_hi > lo_low and hi < low
+    # Zero counts clamp, not divide by zero.
+    z = torch.zeros(b, dtype=torch.long)
+    lz, _, _, _ = orpo_loss(pc, pr, z, z, beta=beta)
+    assert torch.isfinite(lz).all()
+    print("[pref] ORPO formula + anchors PASSED")
+
+
+def test_orpo_gradient_direction():
+    """The odds-ratio term pushes chosen logps UP and rejected DOWN (no
+    reference tensors anywhere). Its gradient carries the paper's fade factor
+    sigma(-log_odds) = 1 / (1 + odds_w/odds_l) (sec. 4.3): with rejected held
+    fixed, the push on rejected shrinks as chosen pulls ahead. (The chosen
+    side also carries d log_odds / d logp_w = 1 / (1 - P_w), which GROWS with
+    P_w, so no such monotone statement holds there.)"""
+    pc = torch.full((4,), -5.0, requires_grad=True)
+    pr = torch.full((4,), -5.0, requires_grad=True)
+    counts = torch.full((4,), 10)
+    losses, _, _, _ = orpo_loss(pc, pr, counts, counts, beta=0.1)
+    losses.mean().backward()
+    assert torch.all(pc.grad < 0) and torch.all(pr.grad > 0)
+    g_even = pr.grad.clone()
+    pr2 = torch.full((4,), -5.0, requires_grad=True)
+    pc2 = torch.full((4,), -2.0)                        # chosen well ahead
+    losses, _, _, _ = orpo_loss(pc2, pr2, counts, counts, beta=0.1)
+    losses.mean().backward()
+    assert torch.all(pr2.grad > 0) and torch.all(pr2.grad < g_even), \
+        "rejected-side push should fade as chosen pulls ahead"
+    print("[pref] ORPO gradient direction PASSED")
 
 
 # ----------------------------------------------------------------------------

@@ -164,8 +164,9 @@ def test_gdn_split_bsz1_graph_guarded():
     src = _src("exllamav3", "modules", "gated_delta_net.py")
     assert re.search(
         r"self\.bc_split and save_state and[^:]*?"
-        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,",
-        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA guard"
+        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj, self\.b_proj,.*?"
+        r"self\.f_a_proj, self\.f_b_proj, self\.g_a_proj, self\.g_b_proj",
+        src, re.S), "GatedDeltaNet: split fused decode lost its runtime-LoRA guard (incl. KDA gates)"
 
 
 def test_moe_expert_dispatch_guarded():
