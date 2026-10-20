@@ -3042,6 +3042,7 @@ class NativeLlamaQLoRA(nn.Module):
         ignore_index: int = IGNORE_INDEX,
         position_ids: Optional[torch.Tensor] = None,
         mm: Optional[dict] = None,
+        return_per_token: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sequence summed completion log-probabilities (DPO / KTO).
 
@@ -3051,6 +3052,14 @@ class NativeLlamaQLoRA(nn.Module):
         (for length-normalized variants like IPO). Streams through the fused
         heads with ``reduction="none"``, so the ``[tokens, vocab]`` logits are
         never materialized -- same memory story as :meth:`compute_loss`.
+
+        ``return_per_token=True`` returns ``(token_logps, mask)`` instead:
+        ``token_logps[b, t-1]`` = ``log p(label | prefix)`` at every
+        supervised shifted position (fp32, differentiable; an exact 0
+        elsewhere) and ``mask[b, t-1]`` = bool of the supervised positions.
+        One forward then serves several maskings (ORPO's full-sequence NLL
+        next to its completion-only odds) and per-token objectives (GRPO's
+        ratios and KL).
 
         Matches TRL's convention (sum over completion tokens, prompt masked).
         One sequence per batch ROW: sample packing is not supported here (a
@@ -3081,9 +3090,11 @@ class NativeLlamaQLoRA(nn.Module):
         b, t = labels.shape
         # Ignored positions carry an exact 0 in the per-token NLL, so the row
         # sum is the completion logprob with the prompt contributing nothing.
-        logps = -nll.view(b, t - 1).float().sum(dim=-1)
-        counts = (labels[:, 1:] != ignore_index).sum(dim=-1)
-        return logps, counts
+        token_logps = -nll.view(b, t - 1).float()
+        mask = labels[:, 1:] != ignore_index
+        if return_per_token:
+            return token_logps, mask
+        return token_logps.sum(dim=-1), mask.sum(dim=-1)
 
     # --- adapter parameters / IO ------------------------------------------
 

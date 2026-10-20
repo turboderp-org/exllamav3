@@ -4,21 +4,22 @@ YAML-driven QLoRA training launcher.
 Single command entry point for the native EXL3 QLoRA trainers. ``method:``
 selects the objective -- ``sft`` (next-token CE, the default), ``ebft``
 (Energy-Based Fine-Tuning), or a preference objective ``dpo`` / ``kto`` /
-``simpo`` -- and ``parallel:`` selects ``single``, ``split`` or ``ddp``; this
+``simpo`` / ``orpo`` -- and ``parallel:`` selects ``single``, ``split`` or ``ddp``; this
 launcher then execs the matching backend with the corresponding command-line
 arguments. ``method: ebft`` and the preference methods run their own backends
 and support ``parallel: single|split`` only (no ddp). For DDP, run this script
 directly (not under torchrun): it will launch torchrun using the ``ddp`` section
 in the config.
 
-The preference methods share the ``qlora_train_pref.py`` backend: ``dpo`` and
-``simpo`` want paired ``chosen``/``rejected`` data (keys
+The preference methods share the ``qlora_train_pref.py`` backend: ``dpo``,
+``simpo`` and ``orpo`` want paired ``chosen``/``rejected`` data (keys
 ``prompt_key``/``chosen_key``/``rejected_key``), ``kto`` wants unpaired
 ``prompt``/``completion``/``label`` rows. Objective knobs (``beta``, ``gamma``,
 ``sft_weight``, ``dpo_loss``, ``kto_loss``, ``desirable_weight`` /
-``undesirable_weight``, ``label_smoothing``) are exposed as flat config keys;
-leave the ones for other methods at their defaults. Note ``beta`` left null
-picks the backend's per-method default (0.1 for dpo/kto, 2.0 for simpo).
+``undesirable_weight``, ``label_smoothing``, ``orpo_nll``) are exposed as flat
+config keys; leave the ones for other methods at their defaults. Note ``beta``
+left null picks the backend's per-method default (0.1 for dpo/kto/orpo, 2.0
+for simpo).
 
 Usage:
     python training/qlora_train.py --config training/qlora_train_config.yaml
@@ -42,7 +43,7 @@ EBFT_BACKEND = SCRIPT_DIR / "qlora_train_ebft.py"
 PREF_BACKEND = SCRIPT_DIR / "qlora_train_pref.py"
 
 # Preference-optimization methods share one backend (qlora_train_pref.py).
-PREF_METHODS = {"dpo", "kto", "simpo"}
+PREF_METHODS = {"dpo", "kto", "simpo", "orpo"}
 METHOD_CHOICES = {"sft", "ebft"} | PREF_METHODS
 
 
@@ -141,7 +142,7 @@ EBFT_KEYS = {
 }
 
 # Keys forwarded to the preference backend (qlora_train_pref.py) when method is
-# dpo|kto|simpo. Explicit, like EBFT_KEYS, so an unsupported knob under a
+# dpo|kto|simpo|orpo. Explicit, like EBFT_KEYS, so an unsupported knob under a
 # preference method fails early instead of being silently dropped. ``method``
 # and ``parallel`` are appended by the launcher, not from here. NOTE the
 # preference backend defines EVERY objective's knobs on one argparser, so
@@ -157,6 +158,7 @@ PREF_KEYS = {
     # preference objective (all methods' knobs live on one parser)
     "beta", "label_smoothing", "gamma", "sft_weight", "rpo_alpha",
     "dpo_loss", "kto_loss", "desirable_weight", "undesirable_weight",
+    "orpo_nll",
     # optimization
     "lr", "weight_decay", "optim", "scheduler", "warmup_ratio",
     "warmup_steps", "epochs", "steps", "batch", "grad_accum", "max_grad_norm",
@@ -186,7 +188,7 @@ PREF_KEYS = {
 # defaults under method: sft|ebft (where these keys aren't forwarded) without
 # tripping the unsupported-key check -- only a non-default preference value
 # under a non-preference method is an error. ``beta`` defaults to None in the
-# backend (it then picks 0.1 for dpo/kto, 2.0 for simpo), so leave it null.
+# backend (it then picks 0.1 for dpo/kto/orpo, 2.0 for simpo), so leave it null.
 PREF_DEFAULTS = {
     "beta": None,
     "label_smoothing": 0.0,
@@ -197,6 +199,7 @@ PREF_DEFAULTS = {
     "kto_loss": "kto",
     "desirable_weight": 1.0,
     "undesirable_weight": 1.0,
+    "orpo_nll": "full",
     "prompt_key": "prompt",
     "chosen_key": "chosen",
     "rejected_key": "rejected",
@@ -405,7 +408,7 @@ def validate_config(cfg: dict[str, Any], parallel: str, method: str) -> None:
         allowed, label = PREF_KEYS, f"method: {method}"
         if not cfg.get("dataset"):
             raise SystemExit(f"method: {method} requires `dataset:` "
-                             "(a paired chosen/rejected set for dpo/simpo, or a "
+                             "(a paired chosen/rejected set for dpo/simpo/orpo, or a "
                              "prompt/completion/label set for kto)")
     elif method == "ebft":
         allowed, label = EBFT_KEYS, "method: ebft"
@@ -466,7 +469,7 @@ def build_backend_argv(cfg: dict[str, Any], config_path: Path) -> list[str]:
                 append_arg(argv, key, cfg[key], ddp=False)
         return argv
 
-    # Preference optimization (dpo|kto|simpo): exec the preference backend,
+    # Preference optimization (dpo|kto|simpo|orpo): exec the preference backend,
     # forwarding --method + only the keys it accepts.
     if method in PREF_METHODS:
         argv = [sys.executable, str(PREF_BACKEND)]
