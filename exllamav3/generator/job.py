@@ -1276,11 +1276,19 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
-        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
-        # requeue budget's headroom below so that budget still fits the cache exactly
+        # The cache bounds the response: past the prompt, every generated token and the drafter's
+        # speculative window (written past the budget by a verification pass) have to fit. That is
+        # the limit when none is given, and the cap on one that is, so a chunked job that writes
+        # its way to the end of the cache ends with max_new_tokens instead of asserting at the
+        # requeue that finds no pages left (the cap holds for the requeued rounds too, whose prompt
+        # is the sequence so far). A prompt with no room at all keeps its limit and fails the page
+        # check below, which is the message the caller expects for that
+        room = self.generator.max_total_tokens - max(len(s.input_ids) for s in self.sequences) \
+               - 1 - self.generator.max_draft_tokens
         if self.max_new_tokens is None:
-            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.max_draft_tokens)
+            self.max_new_tokens = max(1, room)
+        elif room >= 1:
+            self.max_new_tokens = min(self.max_new_tokens, room)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1289,7 +1297,12 @@ class Job:
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
-                self.max_rq_tokens = y - x
+                # The final segment: a budget aligned to the end of the cache leaves no room for the
+                # speculative window past it, and no requeue can follow it anyway, so it is cut to what
+                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
+                # 31-token draft window could not be enqueued at all)
+                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
+                self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
