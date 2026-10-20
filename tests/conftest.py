@@ -295,7 +295,9 @@ def _isolated_expert_profiles(tmp_path_factory):
     # training files standalone) before this session fixture runs; the real package cannot be
     # imported behind it, and those suites do not touch the CPU expert split
     import sys
-    stand_in = sys.modules.get("exllamav3") is not None and not hasattr(sys.modules["exllamav3"], "__path__")
+    # (a types.ModuleType stand-in has no __spec__; an imported package always does)
+    _m = sys.modules.get("exllamav3")
+    stand_in = _m is not None and getattr(_m, "__spec__", None) is None
     if env.cuda_available() and not stand_in:
         import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
         bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
