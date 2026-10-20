@@ -59,8 +59,17 @@ The merge was done in a cloud session without a GPU; this was its first build an
   - Held-out reward (greedy, 32 prompts) was 1.0 at baseline and stayed 1.0: the 9B already
     solves GSM8K, so the task is ceiling-limited. The learning signal shows in the sampled
     train reward and in `frac_zero_std` (groups all-correct) rising toward 1.0 at the end.
-- Still owed from the handoff box list: `--rollout-sampler exact` comparison, `--beta 0.04`
-  kl check, `--num-iterations 2` clip_frac check, and a harder task for a real curve.
+- Box-list leftovers, run 2026-10-20 (`out/grpo_qwen35_9b_gsm8k_v1/check_*.log`):
+  - `--rollout-sampler exact` self-test: 8 rollouts through the differentiable forward,
+    reward 0.875, lengths like the native sampler's, finite policy pass, |grad|_1 4.9e3.
+  - `--beta 0.04`, 6 steps: kl 0.0000 -> 0.0033 -> 0.0104 -> 0.0089 -> 0.0037 -> 0.0035
+    (zero at step 1 by construction, then bounded). The reference forward via
+    `adapters_disabled()` works.
+  - `--num-iterations 2`, 6 steps: **logging bug found and fixed** -- the step line kept
+    pass 0's metrics, where the ratio is exactly 1, so clip_frac could never be non-zero
+    under mu > 1. It now reports the last pass: clip 0.022 / 0.008 / 0.006 / 0.010 / 0.007
+    / 0.000 (all-correct batch) at lr 1e-5.
+  - Still open: a task the 9B does not already solve, for a real reward curve.
 
 ## 4. Community PRs (adamo1139 / melatonina)
 
