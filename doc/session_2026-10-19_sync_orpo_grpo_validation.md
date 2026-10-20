@@ -114,3 +114,17 @@ merged in that order with no conflicts, plus the conftest stand-in guard (keyed 
   52x flash, 798 docs -> 152 bfd blocks of 3072 (98.2% filled), 76 steps at 25 s/step,
   peak 14.5 / 11.5 GB, held-out 2.4816 -> 1.9308 @38 -> **1.8773 @76**. This is the path
   that raised `No matching attention function` on master.
+
+## 8. The 21.6 GB peak on the 9B A/B was the LM head, not attention
+
+Same yaml, 12 steps on cuda:0 (Qwen3.5-9B, b2 x 512, 248k vocab):
+
+| attn_impl | head_vocab_chunk | peak VRAM | s/step |
+|---|---|---|---|
+| flash | 0 | 21.61 GB | 1.0 |
+| flash | 16384 | 7.83 GB | 1.0 |
+| eager | 16384 | 9.33 GB | 7.3 (eager also drops to the torch GDN reference) |
+
+The §1 A/B yamls omitted `head_vocab_chunk`; on a 248k-vocab model the whole-head
+reconstruction + fp32 logits is a ~14 GB transient. Every Qwen3.5/3.6 config should set it
+(the Muse-Glimmer / DPO yamls already do). Flash vs eager is a wash for VRAM at seq 512.
