@@ -1554,34 +1554,28 @@ def attn_varlen(q, k, v, cu_seqlens, max_seqlen, sm_scale,
     marking the per-document boundaries so a document never attends across one.
     ``max_seqlen`` is the longest document length.
 
-    Routed through ``attention_fn.attn_dispatch`` with no cache, so it skips every
-    paged/cache backend and lands on ``fn_flash_attn_varlen_func`` -- the upstream
-    ``flash_attn_varlen_func``, which (unlike exllamav3's inference kernels) is NOT
-    wrapped in ``inference_mode`` and has a real backward. Requires
+    Calls the upstream ``flash_attn_varlen_func`` directly: it is NOT wrapped in
+    ``inference_mode`` and has a real backward. (This used to route through
+    ``attention_fn.attn_dispatch``, but upstream's dispatch rework (017b4408)
+    dropped the flash backend -- the remaining Triton varlen kernel is fp16-only
+    and inference-only, so packed bf16 training found no backend.) Requires
     ``head_dim <= 256`` (FA2 limit; the caller routes larger heads elsewhere).
 
     ``window > 0`` is the native forward's QUERY-INCLUSIVE sliding window (a
     token attends to itself + ``window - 1`` previous tokens = ``window`` total;
     ``block_metadata`` derives it as the module's past-tokens-only
-    ``sliding_window`` + 1). We hand ``attn_dispatch`` ``window - 1`` because its
-    ``get_window_size`` wraps the value as the FA2 left-window ``(w, 0)`` -- so the
-    result matches the eager reference's ``-window`` diagonal exactly. ``softcap``
-    applies tanh logit softcapping. Returns ``[total_tokens, num_heads, head_dim]``.
+    ``sliding_window`` + 1), so FA2's left window is ``window - 1`` -- the same
+    ``(window - 1, 0)`` the unpacked flash path passes, matching the eager
+    reference's ``-window`` diagonal exactly. ``softcap`` applies tanh logit
+    softcapping. Returns ``[total_tokens, num_heads, head_dim]``.
     """
-    from ..modules.attention_fn.dispatch import attn_dispatch
-    # attn_dispatch reads [bsz, q_len, num_heads, head_dim]; the varlen backend
-    # asserts bsz == 1 and squeezes it, reading boundaries from cu_seqlens. Present
-    # the flattened stream as a single batch row; the result is [total, nh, hd].
-    window_size = (int(window) - 1) if (window and window > 0) else None
-    return attn_dispatch(
-        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-        cache=None,
-        causal=True,
-        sm_scale=float(sm_scale),
-        cu_seqlens=cu_seqlens,
-        max_seqlen=int(max_seqlen),
-        window_size=window_size,
-        softcap=float(softcap or 0.0),
+    from flash_attn import flash_attn_varlen_func
+    ws = (int(window) - 1, 0) if (window and window > 0) else (-1, -1)
+    max_seqlen = int(max_seqlen)
+    return flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        softmax_scale=float(sm_scale), causal=True,
+        window_size=ws, softcap=float(softcap or 0.0),
     )
 
 
