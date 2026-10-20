@@ -24,13 +24,14 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
 - `qlora_train.py` + `qlora_train_config.yaml` — the YAML launcher (single
   command entry point) and its fully-commented reference config. `method:`
   picks the objective — `sft` (next-token CE, default), `ebft`, or a preference
-  objective `dpo` / `kto` / `simpo` / `orpo` — and `parallel:` picks the single-GPU,
+  objective `dpo` / `kto` / `simpo` / `orpo`, or `grpo` — and `parallel:` picks the single-GPU,
   layer-split, or DDP backend (`ebft` and the preference methods are
   single/split only). A paired SFT-vs-EBFT A/B is the same config with only
   `method` (and `out`/`run_name`) changed; see `semancer_llama1b_{sft,ebft}.yaml`
   in the repo root for a worked pair. The preference methods need a
   preference-shaped dataset, so they get their own ready-to-run template,
-  `qlora_train_pref_config.yaml` (switch `method` between `dpo`/`kto`/`simpo`/`orpo`).
+  `qlora_train_pref_config.yaml` (switch `method` between `dpo`/`kto`/`simpo`/`orpo`);
+  GRPO has `qlora_train_grpo_config.yaml`.
 - `qlora_train_native.py` — the single-GPU / layer-split SFT trainer (plain
   PyTorch, no transformers). Also home to the shared data/tokenization helpers
   the other trainers import.
@@ -90,6 +91,14 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   too — SFT NLL on the chosen rows plus an odds-ratio preference term at
   `--beta` (the paper's λ, default 0.1), `--orpo-nll full|completion` choosing
   whether the NLL spans the prompt (TRL/axolotl parity) or only the answer.
+- `qlora_train_grpo.py` — GRPO (arXiv:2402.03300; TRL `GRPOTrainer` semantics):
+  on-policy RL from plug-in reward functions. Per step: G completions per
+  prompt through the native generator with the adapter in the runtime LoRA
+  slots (`--rollout-sampler exact` for the differentiable forward instead),
+  `--reward` functions in TRL's signature (built-ins or `file.py:func`),
+  group-relative advantages, the clipped surrogate with `--loss-type
+  dapo|grpo|bnpo|dr_grpo`, optional `--beta` k3 KL against the adapter-disabled
+  base. `--self-test` prints one generation batch with rewards and exits.
 - `qlora_train_ebft.py` — Energy-Based Fine-Tuning (EBFT, arXiv:2603.12248):
   on-policy feature-matching policy gradient. The frozen feature network is
   the adapter-disabled base (the DPO/KTO reference trick); rollouts use the
