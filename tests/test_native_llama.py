@@ -659,6 +659,43 @@ def test_modules_to_save_param_groups():
     print("[modules_to_save] param-group split (embed/head = no weight decay) PASSED")
 
 
+def test_head_logits_vocab_chunked():
+    # --head-vocab-chunk: materialized logits are built from head slices (tile
+    # rounded to the granularity, ragged tail) and match the single-shot head;
+    # without the flag the full head is used and slices are never touched.
+    torch.manual_seed(0)
+    d, v = 8, 25
+    weight = torch.randn(d, v, dtype=torch.float64)
+    hidden = torch.randn(2, 5, d, dtype=torch.float64)
+    calls = []
+
+    def slice_fn(start, n):
+        calls.append((start, n))
+        return weight[:, start:start + n]
+
+    net = NativeLlamaQLoRA.__new__(NativeLlamaQLoRA)
+    torch.nn.Module.__init__(net)
+    net.lm_head_weight_fn = lambda: (lambda: weight)
+    net._head_slice = (slice_fn, v, 4)
+    for softcap in (0.0, 3.0):
+        net.final_softcap = softcap
+        ref = hidden @ weight
+        if softcap:
+            ref = softcap * torch.tanh(ref / softcap)
+
+        calls.clear()
+        net.head_vocab_chunk = 10                       # rounds down to 8
+        out = net._head_logits(hidden)
+        assert calls == [(0, 8), (8, 8), (16, 8), (24, 1)], calls
+        assert torch.allclose(out, ref, atol=1e-12)
+
+        calls.clear()
+        net.head_vocab_chunk = 0
+        assert torch.allclose(net._head_logits(hidden), ref, atol=1e-12)
+        assert calls == []
+    print("[head] vocab-chunked materialized logits == single-shot head PASSED")
+
+
 def test_mtp_head_matches_reference_and_trains_head_only():
     # The MTP (multi-token prediction) head forward, Qwen3.5 layout: position i
     # pairs token i's embedding with the trunk's final-norm state at i-1 (zero
@@ -787,6 +824,7 @@ def main():
         test_packing_pad_no_nan,
         test_sliding_window_right_pad_no_nan,
         test_modules_to_save_param_groups,
+        test_head_logits_vocab_chunked,
         test_mtp_head_matches_reference_and_trains_head_only,
     ], label="native-llama")
     print("\nAll native-Llama differentiable-forward checks passed.")
