@@ -64,7 +64,9 @@ from run_report import (RunLogger, decode_example_docs,  # noqa: E402
 from chat_turns import (extract_turns, single_turn_shape,  # noqa: E402
                         trim_trailing_context, make_segment_builder,
                         encode_segments, encode_completion,
-                        turn_text, AUTO_SINGLE_TURN_HINT)
+                        turn_text, AUTO_SINGLE_TURN_HINT,
+                        HY3_BOS, HY3_USER, HY3_ASSISTANT, HY3_EOS,
+                        HY3_NOTHINK_HEADER, HY3_EMPTY_THINK)
 
 
 class ThroughputMeter:
@@ -408,6 +410,11 @@ def turn_end_token(tokenizer):
         return tokenizer.eos_token
     if "<|eot_id|>" in tokenizer.extended_piece_to_id:
         return "<|eot_id|>"
+    # HunYuan V3 ends every turn with <｜hy_eos:opensource｜> (its
+    # default_chat_prompt / PromptFormat_hy3 and the generator's stop list
+    # agree); prefer it over whatever the checkpoint declares as EOS.
+    if HY3_EOS in tokenizer.extended_piece_to_id:
+        return HY3_EOS
     if "<|eot|>" in tokenizer.extended_piece_to_id:
         return "<|eot|>"
     if tokenizer.eos_token:
@@ -479,6 +486,19 @@ def format_prompt_and_eot(model, tokenizer, prompt_format,
       prefills at inference when thinking is disabled, so train and serve see
       the same context (the gemma4-nothink of the Qwen3.5/3.6 family).
       ``<|im_end|>`` ends the turn.
+    - ``hy3``: the HunYuan V3 format,
+      ``<｜hy_begin_of_sentence:opensource｜>{system}<｜hy_User:opensource｜>{user}
+      <｜hy_Assistant:opensource｜>{response}<｜hy_eos:opensource｜>`` (the bare
+      system text directly after BOS; no separators). Identical to ``auto``
+      on the hy_v3 arch; use it when the responses carry their own
+      ``<think:opensource>…</think:opensource>`` spans or the explicit name
+      is wanted. ``<｜hy_eos:opensource｜>`` ends the turn.
+    - ``hy3-nothink``: ``hy3`` with thinking off the way ``PromptFormat_hy3``
+      in ``examples/chat_templates.py`` prefills it: the
+      ``<｜reasoning_mode:opensource｜>reasoning_effort:no_think`` header right
+      after the (optional) system text and an empty
+      ``<think:opensource></think:opensource>`` span in the masked assistant
+      opener, so the model is trained to answer directly.
 
     For ``mistral``/``metharme``/``gemma4-nothink``/``llama3`` a literal BOS is
     prepended so the sequence starts with one; the caller's BOS-normalization
@@ -525,6 +545,22 @@ def format_prompt_and_eot(model, tokenizer, prompt_format,
             return (f"{sys_part}<|im_start|>user\n{user}<|im_end|>\n"
                     f"<|im_start|>assistant\n{nothink}")
         return build, "<|im_end|>"
+    if prompt_format in ("hy3", "hy3-nothink"):
+        # HunYuan V3 (HYV3ForCausalLM): BOS + bare system text + the
+        # <｜hy_User｜>/<｜hy_Assistant｜> turn markers, no separators. "hy3" is
+        # exactly default_chat_prompt (= auto on the hy_v3 arch); "-nothink"
+        # adds the reasoning_effort:no_think header after the system text and
+        # pre-closes the think span in the masked prompt, matching what
+        # PromptFormat_hy3 (examples/chat_templates.py) prefills at inference
+        # with thinking off. The literal BOS is the tokenizer's own token, so
+        # the caller's single-BOS normalization collapses a duplicate.
+        nothink = prompt_format.endswith("-nothink")
+        header = HY3_NOTHINK_HEADER if nothink else ""
+        think = HY3_EMPTY_THINK if nothink else ""
+        def build(user, system=None):
+            return (f"{HY3_BOS}{system or ''}{header}{HY3_USER}{user}"
+                    f"{HY3_ASSISTANT}{think}")
+        return build, HY3_EOS
     if prompt_format == "jinja":
         from chat_jinja import jinja_renderers, tokenizer_special_tokens
         _, build, eot = jinja_renderers(
@@ -537,7 +573,7 @@ def format_prompt_and_eot(model, tokenizer, prompt_format,
                 turn_end_token(tokenizer))
     raise ValueError(f"unknown prompt-format '{prompt_format}' "
                       f"(expected auto/mistral/metharme/gemma4-nothink/llama3/"
-                      f"qwen3.5/qwen3.5-nothink/chatml/jinja)")
+                      f"qwen3.5/qwen3.5-nothink/chatml/hy3/hy3-nothink/jinja)")
 
 
 # Stage directions / inline actions, e.g. "[as CAMBIO]", "[TRINCULO grabs ...]",
@@ -1706,7 +1742,7 @@ def _run_main():
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
                              "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
-                             "jinja"],
+                             "hy3", "hy3-nothink", "jinja"],
                     default="auto",
                     help="Chat format. auto: the model's native template "
                          "(Llama-3, Mistral [INST], mistral3 [SYSTEM_PROMPT]/[INST]). "
@@ -1721,6 +1757,12 @@ def _run_main():
                          "<think> spans). qwen3.5-nothink: ChatML with an empty "
                          "<think>\\n\\n</think>\\n\\n pre-closed in the masked prompt, "
                          "matching the inference-side no-think prefill. "
+                         "hy3: HunYuan V3 <｜hy_User｜>{q}<｜hy_Assistant｜>{a} turns "
+                         "(= auto for the hy_v3 arch). hy3-nothink: hy3 with the "
+                         "reasoning_effort:no_think header and an empty "
+                         "<think:opensource></think:opensource> span pre-closed in "
+                         "the masked prompt, matching the inference-side no-think "
+                         "prefill. "
                          "jinja: the model directory's own Jinja chat template "
                          "(tokenizer_config.json / chat_template.jinja), with "
                          "tool roles, tool_calls, reasoning_content, per-row "
@@ -1730,8 +1772,9 @@ def _run_main():
                          "--template-vars below). "
                          "EOS ends the turn for mistral/metharme; <turn|> for "
                          "gemma4-nothink; <|eot_id|> for llama3; <|im_end|> for "
-                         "qwen3.5/qwen3.5-nothink; whatever the template "
-                         "appends after assistant content for jinja.")
+                         "qwen3.5/qwen3.5-nothink; <｜hy_eos:opensource｜> for "
+                         "hy3/hy3-nothink; whatever the template appends after "
+                         "assistant content for jinja.")
     ap.add_argument("--chat-template-file", default=None,
                     help="(jinja) Path to a Jinja template file to use instead "
                          "of the one in the model directory.")

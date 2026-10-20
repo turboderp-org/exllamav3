@@ -88,7 +88,7 @@ dataset_split: train
 dataset_config: null
 prompt_key: question
 prompt_format: auto                # auto | mistral | metharme | gemma4-nothink | llama3 |
-                                   #   qwen3.5 | qwen3.5-nothink | chatml | jinja
+                                   #   qwen3.5 | qwen3.5-nothink | chatml | hy3 | hy3-nothink | jinja
 chat_template_file: null
 template_vars: null
 strip_sys_prompt_extras: false

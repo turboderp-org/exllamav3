@@ -103,6 +103,14 @@ SINGLE_TURN_EXPECTED = {
                         "\n\nR<|im_end|>"),
     "chatml": ("<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nQ<|im_end|>\n"
                "<|im_start|>assistant\nR<|im_end|>"),
+    # HunYuan V3: the literal BOS of the model's own template (not the
+    # tokenizer's bos_token argument), bare system text, no separators.
+    "hy3": ("<｜hy_begin_of_sentence:opensource｜>S<｜hy_User:opensource｜>Q"
+            "<｜hy_Assistant:opensource｜>R<｜hy_eos:opensource｜>"),
+    "hy3-nothink": ("<｜hy_begin_of_sentence:opensource｜>S"
+                    "<｜reasoning_mode:opensource｜>reasoning_effort:no_think"
+                    "<｜hy_User:opensource｜>Q<｜hy_Assistant:opensource｜>"
+                    "<think:opensource></think:opensource>R<｜hy_eos:opensource｜>"),
 }
 
 SINGLE_TURN_SUPERVISED = {
@@ -110,6 +118,7 @@ SINGLE_TURN_SUPERVISED = {
     "gemma4-nothink": "R<turn|>", "llama3": "R<|eot_id|>",
     "qwen3.5": "R<|im_end|>", "qwen3.5-nothink": "R<|im_end|>",
     "chatml": "R<|im_end|>",
+    "hy3": "R<｜hy_eos:opensource｜>", "hy3-nothink": "R<｜hy_eos:opensource｜>",
 }
 
 
@@ -156,6 +165,30 @@ def test_multi_turn_gemma4_separator():
         f"<|channel>thought\n<channel|>R2<turn|>")
     assert sup(segs) == ["R1<turn|>", "R2<turn|>"]
     print("multi-turn [gemma4-nothink] separator: OK")
+
+
+def test_multi_turn_hy3():
+    # No separators between turns; the no_think header sits right after BOS
+    # when there is no system turn (PromptFormat_hy3 with think=False), and
+    # the empty think span is part of the MASKED assistant opener.
+    build = ct.make_segment_builder("hy3-nothink", bos_token=BOS, eos_token=EOS)
+    segs = build([u("Q1"), a("R1"), u("Q2"), a("R2")])
+    assert cat(segs) == (
+        "<｜hy_begin_of_sentence:opensource｜>"
+        "<｜reasoning_mode:opensource｜>reasoning_effort:no_think"
+        "<｜hy_User:opensource｜>Q1<｜hy_Assistant:opensource｜>"
+        "<think:opensource></think:opensource>R1<｜hy_eos:opensource｜>"
+        "<｜hy_User:opensource｜>Q2<｜hy_Assistant:opensource｜>"
+        "<think:opensource></think:opensource>R2<｜hy_eos:opensource｜>")
+    assert sup(segs) == ["R1<｜hy_eos:opensource｜>", "R2<｜hy_eos:opensource｜>"]
+    build = ct.make_segment_builder("hy3", bos_token=BOS, eos_token=EOS)
+    segs = build([u("Q1"), a("R1")], add_generation_prompt=False)
+    assert cat(segs) == (
+        "<｜hy_begin_of_sentence:opensource｜><｜hy_User:opensource｜>Q1"
+        "<｜hy_Assistant:opensource｜>R1<｜hy_eos:opensource｜>")
+    segs = build([u("Q1")], add_generation_prompt=True)
+    assert cat(segs).endswith("Q1<｜hy_Assistant:opensource｜>")
+    print("multi-turn [hy3 / hy3-nothink]: OK")
 
 
 def test_generation_prompt():
@@ -237,6 +270,7 @@ if __name__ == "__main__":
     test_multi_turn_llama3()
     test_multi_turn_chatml_separator()
     test_multi_turn_gemma4_separator()
+    test_multi_turn_hy3()
     test_generation_prompt()
     test_unrenderable_shapes()
     test_encode_segments()

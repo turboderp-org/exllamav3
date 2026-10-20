@@ -597,7 +597,7 @@ def _run_main():
     ap.add_argument("--prompt-format",
                     choices=["auto", "mistral", "metharme", "gemma4-nothink",
                              "llama3", "qwen3.5", "qwen3.5-nothink", "chatml",
-                             "jinja"],
+                             "hy3", "hy3-nothink", "jinja"],
                     default="auto",
                     help="Chat format (see the SFT trainer's help; jinja = the "
                          "model directory's own Jinja chat template).")

@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--prompt-format", default="llama3",
                     help="Chat template the adapter was trained with (same choices "
                          "as the trainer: jinja/auto/mistral/metharme/gemma4-nothink/"
-                         "llama3/qwen3.5/qwen3.5-nothink). Default llama3 matches "
+                         "llama3/qwen3.5/qwen3.5-nothink/hy3/hy3-nothink). Default llama3 matches "
                          "this script's original hardcoded template. Use 'jinja' to "
                          "render the model's OWN chat template -- the only correct "
                          "choice for a run trained with prompt_format: jinja.")

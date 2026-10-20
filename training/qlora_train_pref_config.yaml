@@ -103,7 +103,7 @@ rejected_key: rejected    # (dpo/simpo)
 completion_key: completion   # (kto)
 label_key: label          # (kto) truthy = desirable
 prompt_format: auto       # model's native chat template; or mistral / llama3 / qwen3.5 /
-                          #   qwen3.5-nothink / gemma4-nothink / chatml / metharme
+                          #   qwen3.5-nothink / gemma4-nothink / chatml / hy3 / hy3-nothink / metharme
 max_samples: 0            # 0 = all source rows
 shuffle: false
 shuffle_seed: 0
