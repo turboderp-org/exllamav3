@@ -41,6 +41,14 @@ DEFAULT_PROMPTS = [
     "Water is made of hydrogen and",
 ]
 
+# Constructor kwargs every gate's net shares, set once from the CLI in main()
+# (e.g. head_vocab_chunk) so each check validates the configuration being trained.
+_NET_DEFAULTS = {}
+
+
+def make_net(model, **kwargs):
+    return NativeLlamaQLoRA(model, **{**_NET_DEFAULTS, **kwargs})
+
 
 def check_vision(model, net, tokenizer, config, image_path, prompt, device, cdt):
     """
@@ -156,7 +164,7 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
     print("\n" + "-" * 78)
     print("backward smoke: cross-device gradient flow through the split")
     try:
-        net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
+        net = make_net(model, r=4, alpha=8.0,
                                target_modules=["q_proj", "down_proj"],
                                compute_dtype=cdt, gradient_checkpointing=True,
                                attn_impl=attn_impl, use_liger=use_liger)
@@ -164,7 +172,7 @@ def check_backward(model, tokenizer, prompt, device, cdt, attn_impl="auto",
         # A pure-MoE model with no shared expert has no plain down_proj (the
         # routed experts need the explicit expert_* targets); q_proj alone
         # still exercises the cross-device backward this smoke is for.
-        net = NativeLlamaQLoRA(model, r=4, alpha=8.0,
+        net = make_net(model, r=4, alpha=8.0,
                                target_modules=["q_proj"],
                                compute_dtype=cdt, gradient_checkpointing=True,
                                attn_impl=attn_impl, use_liger=use_liger)
@@ -232,7 +240,7 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
         # so the two nets are the same function and gradients are comparable.
         torch.manual_seed(0)
         try:
-            net = NativeLlamaQLoRA(
+            net = make_net(
                 model, r=8, alpha=16.0,
                 # gate/up/down exercise the Liger SwiGLU (silu models); q_proj sits
                 # after the input RMSNorm so it sees the Liger norm's backward too.
@@ -242,7 +250,7 @@ def check_liger_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"):
         except ValueError:
             # Pure-MoE, no shared expert: no plain gate/up/down_proj to adapt.
             torch.manual_seed(0)
-            net = NativeLlamaQLoRA(
+            net = make_net(
                 model, r=8, alpha=16.0, target_modules=["q_proj"],
                 compute_dtype=dtype, gradient_checkpointing=True,
                 attn_impl=attn_impl, use_liger=use_liger)
@@ -378,7 +386,7 @@ def check_init_lora(model, tokenizer, prompt, device, cdt, mode,
 
     def loss_of(dtype, with_init):
         torch.manual_seed(0)
-        net = NativeLlamaQLoRA(
+        net = make_net(
             model, r=8, alpha=8.0,
             target_modules=["q_proj", "v_proj", "down_proj"],
             compute_dtype=dtype, gradient_checkpointing=True,
@@ -461,14 +469,14 @@ def check_dequant_parity(model, tokenizer, prompt, device, cdt, attn_impl="auto"
     def build(pissa):
         torch.manual_seed(0)
         try:
-            net = NativeLlamaQLoRA(
+            net = make_net(
                 model, r=8, alpha=16.0,
                 target_modules=["q_proj", "gate_proj", "up_proj", "down_proj"],
                 compute_dtype=cdt, gradient_checkpointing=True,
                 attn_impl=attn_impl)
         except ValueError:
             torch.manual_seed(0)
-            net = NativeLlamaQLoRA(
+            net = make_net(
                 model, r=8, alpha=16.0, target_modules=["q_proj"],
                 compute_dtype=cdt, gradient_checkpointing=True,
                 attn_impl=attn_impl)
@@ -710,7 +718,7 @@ def check_mtp(model, tokenizer, config, prompts, device, cdt, attn_impl="auto"):
     draft.attach_to(model)      # borrows embed / lm_head, sets the export key
     # Adapter-free head: pure frozen forward for parity (mtp_targets=[] wraps
     # every head linear at r=0, like target_modules=[] for the trunk).
-    net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
+    net = make_net(model, target_modules=[], compute_dtype=cdt,
                            gradient_checkpointing=False, attn_impl=attn_impl,
                            mtp_model=draft, mtp_targets=[])
     net.eval()
@@ -763,6 +771,15 @@ def main():
                     help="(split) GB to reserve per device; negative excludes a device")
     ap.add_argument("--use-per-device", nargs="*", type=float, default=None, metavar="GB",
                     help="(split) GB budget per device; caps a card to force a split on a small model")
+    ap.add_argument("--verbose-load", action="store_true",
+                    help="(split) print where each module lands and why the autosplit "
+                         "loader advances to the next device")
+    ap.add_argument("--split-even", nargs="?", type=float, const=2.0, default=None,
+                    metavar="MARGIN_GB",
+                    help="(split) balance the layer split evenly instead of greedy "
+                         "fill-device-0-first, as the trainer flag does; leaves every "
+                         "card backward headroom (needed when a model nearly fills all "
+                         "cards, e.g. 405B on 8x24 GB)")
     ap.add_argument("--compute-dtype", default="float32",
                     choices=["float32", "float16", "bfloat16"],
                     help="dtype for the differentiable linears (float32 = closest to true math)")
@@ -833,12 +850,21 @@ def main():
     ap.add_argument("--load-ref", default=None, metavar="PATH",
                     help="Take the native-inference logits from PATH (--save-ref output) "
                          "instead of running the inference forward in this process.")
+    ap.add_argument("--head-vocab-chunk", type=int, default=0,
+                    help="build every net with the chunked-vocab head (matches the "
+                         "trainer flag); needed when the full head reconstruction "
+                         "doesn't fit on the output device (e.g. 405B: 16k x 128k)")
     ap.add_argument("--skip-dequant-parity", action="store_true",
                     help="skip the fast-vs-legacy dequant parity gate (forward + "
                          "adapter-grad compare under both modes)")
     args = ap.parse_args()
 
     backbone.set_dequant_mode(args.dequant_mode)
+
+    if args.head_vocab_chunk:
+        # Every gate's net (compute_loss included) takes the chunked-vocab head, as
+        # the trainer would with the same flag -- big heads can't reconstruct whole.
+        _NET_DEFAULTS["head_vocab_chunk"] = args.head_vocab_chunk
 
     cdt = {"float32": torch.float32, "float16": torch.float16,
            "bfloat16": torch.bfloat16}[args.compute_dtype]
@@ -852,11 +878,21 @@ def main():
         raise SystemExit("--stream-experts is single-device (--parallel single)")
     if args.parallel == "split":
         load_kwargs = {}
+        if args.split_even is not None:
+            if args.reserve_per_device is not None or args.use_per_device is not None:
+                raise SystemExit("--split-even computes its own per-device budgets; "
+                                 "drop --reserve-per-device/--use-per-device.")
+            from qlora_train_native import compute_even_split_budgets
+            budgets = compute_even_split_budgets(model, config, args.split_even)
+            print(f" -- split-even: use_per_device = "
+                  f"[{', '.join(f'{b:.1f}' for b in budgets)}] GB "
+                  f"(even weight shares + {args.split_even:g} GB load margin)")
+            load_kwargs["use_per_device"] = budgets
         if args.reserve_per_device is not None:
             load_kwargs["reserve_per_device"] = args.reserve_per_device
         if args.use_per_device is not None:
             load_kwargs["use_per_device"] = args.use_per_device
-        model.load(progressbar=True, **load_kwargs)
+        model.load(progressbar=True, verbose=args.verbose_load, **load_kwargs)
         print(f" -- layer-autosplit: active devices {model.active_devices}, "
               f"output device {model.output_device}")
     elif args.stream_experts:
@@ -902,7 +938,7 @@ def main():
               f"(saved from {blob.get('model')!r})")
 
     # No adapters: a pure frozen forward, directly comparable to native inference.
-    net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
+    net = make_net(model, target_modules=[], compute_dtype=cdt,
                            gradient_checkpointing=False, attn_impl=args.attn_impl,
                            use_liger=args.use_liger)
     net.eval()
