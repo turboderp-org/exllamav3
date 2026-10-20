@@ -291,7 +291,12 @@ def _isolated_expert_profiles(tmp_path_factory):
     # XDG_CACHE_HOME: torch's extension build root follows it too, and would rebuild the extension per session)
     # Importing the module builds the extension, which a CPU-only box (the training suites' home)
     # cannot do; the CPU expert split needs a device anyway, so the isolation only matters with one
-    if env.cuda_available():
+    # A test module may have installed a stand-in ``exllamav3`` (test_vision_training loads the
+    # training files standalone) before this session fixture runs; the real package cannot be
+    # imported behind it, and those suites do not touch the CPU expert split
+    import sys
+    stand_in = sys.modules.get("exllamav3") is not None and not hasattr(sys.modules["exllamav3"], "__path__")
+    if env.cuda_available() and not stand_in:
         import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
         bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
     yield
