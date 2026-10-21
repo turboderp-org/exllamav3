@@ -125,7 +125,23 @@ embed, head byte-identical; MemT drops vision + MTP). Sidecar dir = yeasah/Qwen3
 changes its rounding, max|dlogit| 0.3, KL 3e-4 -- not a MemT effect). Recall: committing one
 turn ("cat Quillon, locker 4817") and asking in a fresh context answers verbatim from memory,
 same as with the fact in context; without memory it refuses. Step 4 (numeric parity vs the
-release) not done.
+release): done, see below.
+
+**Step 4 done 2026-10-21.** Reference = the authors' `modeling_memt.py` (transformers 5.12.1 in
+an isolated `PYTHONPATH` dir; the code does not run on 5.18), bf16, **all on CPU**
+(`util/memt_release_reference.py --cpu`; accelerate GPU+CPU offload gave NaN states and garbage
+logits on the offloaded layers 27+). Two comparisons:
+- End to end (`util/memt_release_parity.py`, EXL3 6.00bpw vs release bf16, one committed turn +
+  a 26-token follow-up): committed state cos >= 0.9994 on all layers, rel err 0.8% (layer 3)
+  growing to 3.8% (layer 39); follow-up KL vs release 1.05e-2 nats mean reading our state,
+  1.13e-2 reading the release's state (so the commit is not the error source) vs a
+  no-memory floor of 7.8e-4; the memory effect itself is KL 4.1.
+- Math isolation (`util/memt_release_math_check.py` on activations captured with `--capture`):
+  our math on the release's exact inputs agrees with its outputs to 0.17-0.35% (read and
+  commit, every layer), and ours is closer to an fp64 evaluation than the release on all 20
+  rows (0.15-0.23% vs 0.23-0.41%, bf16 GEMM rounding on both sides). So the end-to-end excess
+  over the floor is the quantized backbone feeding the memory different activations, not the
+  memory port.
 
 1. **Get the weights.** `huggingface.co/MemTensor/MemT-1.0-Nano` (bf16 safetensors, ~70 GB).
    Confirm `config.json` matches the layout the parser expects: top-level
