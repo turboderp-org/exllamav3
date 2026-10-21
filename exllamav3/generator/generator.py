@@ -1467,8 +1467,8 @@ class Generator:
         if self.stage_devices is None:
             # TP forwards ship params to the workers themselves; there the tables stay host-side
             self.stage_devices = [] if self.model.loaded_tp else \
-                sorted({m.device for m in self.model.get_cache_layers() if m.device is not None and
-                        m.device.type == "cuda"}, key = lambda d: d.index)
+                sorted({torch.device(m.device) for m in self.model.get_cache_layers() if m.device is not None and
+                        torch.device(m.device).type == "cuda"}, key = lambda d: d.index)
         if not self.stage_devices:
             return
         host, views, dev = arena
