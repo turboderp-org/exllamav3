@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -57,10 +58,10 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
-        memt_memory: bool = False,
-        memt_context_turns: int = 0,
-        memt_cache_size: int = 2 * 1024**3,
-        memt_verbose: bool = False,
+        memt_memory: bool | None = None,
+        memt_context_turns: int | None = None,
+        memt_cache_size: int | None = None,
+        memt_verbose: bool | None = None,
         **kwargs
     ):
         """
@@ -202,18 +203,22 @@ class Generator:
             conversation memory keyed on its prompt content. The prompt (Qwen chat format) is split into
             turns; completed turns are committed into memory, one snapshot per turn boundary, and the job
             runs on system turn + live turn reading the snapshot. Full-history resends, edits and
-            regenerations are handled by matching the longest committed prefix. See generator/memt_memory.py
+            regenerations are handled by matching the longest committed prefix. See generator/memt_memory.py.
+            Default None: on for a MemT model (so a server that only passes the model through, like
+            TabbyAPI, serves it with memory), off otherwise. False disables it.
 
         :param memt_context_turns:
             With memt_memory, the number of most recent completed turns to keep as raw text in the prompt
-            instead of in memory (they are committed by a later request once they fall out of the window)
+            instead of in memory (they are committed by a later request once they fall out of the window).
+            Default: env EXL3_MEMT_CONTEXT_TURNS, else 0
 
         :param memt_cache_size:
-            With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default 2 GB (~50 snapshots
-            of MemT-1.0-Nano)
+            With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default: env
+            EXL3_MEMT_CACHE_MB, else 2 GB (~50 snapshots of MemT-1.0-Nano)
 
         :param memt_verbose:
-            With memt_memory, print one line per request: turns matched, committed, prompt length
+            With memt_memory, print one line per request: turns matched, committed, prompt length.
+            Default: env EXL3_MEMT_VERBOSE (non-empty, not "0")
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -312,9 +317,17 @@ class Generator:
 
         # MemT conversation memory (content-addressed snapshots), see enqueue()
         self.memt_memory = None
+        if memt_memory is None:
+            memt_memory = bool(self.model.caps.get("memt"))
         if memt_memory:
             assert self.model.caps.get("memt"), "memt_memory requires a MemT model"
             assert draft_model is None, "memt_memory is not supported with a draft model"
+            if memt_context_turns is None:
+                memt_context_turns = int(os.environ.get("EXL3_MEMT_CONTEXT_TURNS", "0"))
+            if memt_cache_size is None:
+                memt_cache_size = int(float(os.environ.get("EXL3_MEMT_CACHE_MB", "2048")) * 1024**2)
+            if memt_verbose is None:
+                memt_verbose = os.environ.get("EXL3_MEMT_VERBOSE", "") not in ("", "0")
             self.memt_memory = MemTConversationMemory(
                 self.model, tokenizer,
                 context_turns = memt_context_turns,
