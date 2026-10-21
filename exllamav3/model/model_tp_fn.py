@@ -705,10 +705,12 @@ class DiskRankWorker:
         """Move this rank's pieces of every stashed tensor between the stash (pooled host tensors) and the
         canonical checkpoint image; a read allocates the stash first and files it under the handle"""
         import numpy as np
-        from ..cache.recurrent import host_pool
+        from ..cache.recurrent import host_pool, wait_stashes
         cache_id, cp_handle = what
         lc = self.local_context
         write = kind == "state_write"
+        if write:
+            wait_stashes()  # the stash's copies to host may still be in flight
         image_size = max(e["offset"] + e["nbytes"] for layer in plan.values() for e in layer["tensors"])
         mm = np.memmap(path, dtype = np.uint8, mode = "r+" if write else "r", offset = data_offset, shape = (image_size,))
         stashed_in = lc["recurrent_cache"][cp_handle] if write else None
