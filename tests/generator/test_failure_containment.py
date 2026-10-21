@@ -53,7 +53,10 @@ class StubJob:
         if self.fail_in == "allocate_pages":
             raise RuntimeError(f"allocation failure for {self.name}")
 
-    def prefill(self, results):
+    def is_prefill_done(self):
+        return False
+
+    def prefill(self, results, chunk_size = None):
         if self.fail_in == "prefill":
             raise RuntimeError(f"prefill failure for {self.name}")
 
@@ -144,6 +147,11 @@ def test_failing_prefill_is_contained_in_iterate():
     generator.draft_cache = None
     generator.recurrent_cache = None
     generator.draft_model = None
+    generator.max_chunk_size = 2048
+    generator.shared_chunk_size = 2048
+    generator.prefill_cooldown = 0
+    generator.prefill_cooldown_left = 0
+    generator.prefill_rotation = 0
     generator.ngram_match_min = 0
     generator.hybrid_draft_tokens = 0
     generator.visualizer = None
