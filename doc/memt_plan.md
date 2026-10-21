@@ -195,7 +195,7 @@ nobody else can do cheaply.
 
 ## 6. Must-verify list (things assumed without the checkpoint in hand)
 
-1. `config.json` layout and the exact `memt` keys (parser is strict by design).
+1. ~~`config.json` layout and the exact `memt` keys~~ **Confirmed 2026-10-21** from the released file: top-level `model_type: memt_qwen3_5_moe`, `tie_word_embeddings: false`, `pad_token_id`, the `memt` object with exactly the 16 expected keys (16/16 heads, `chunk_tokens` 2048, softcap 2.0), `backbone_configs.text_config` = the Qwen3.6-35B-A3B text config (`model_type: qwen3_5_moe_text`, 40 layers with the explicit `layer_types` list, 16/2 heads x 256, 256 experts top-8, `mtp_num_hidden_layers: 1`, vocab 248320), and an `auto_map` pointing at `configuration_memt.py` / `modeling_memt.py` -- so the HF repo ships a transformers reference implementation, which is a second parity oracle next to the SGLang server. `util/memt_check_checkpoint.py` checks the tensors (item 2/3) and can write the sidecar file.
 2. Backbone tensors byte-identical to Qwen3.6-35B-A3B (enables the sidecar route).
 3. Memory tensor dtype bf16 and shapes as in section 1 (the loader asserts shapes).
 4. Readout + commit parity vs the release server (3.4).
