@@ -16,6 +16,37 @@ import uuid
 from ..util import log_tp, global_t0
 from ..tokenizer.mm_embedding import send_embeddings
 
+
+def _find_raw_tensor(obj, path = "args"):
+    """
+    Path of the first torch tensor inside a command's argument containers, or None. Tensors must reach the
+    workers through the shared arena: a tensor pickled over the pipe becomes a torch shared-memory segment whose
+    per-pickle refcount is unbalanced across several receiving ranks, so a rank that opens it late finds it
+    unlinked (issue #530). Raising here names the offending parameter instead of crashing a straggler rank.
+    """
+    if isinstance(obj, torch.Tensor):
+        return path
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            r = _find_raw_tensor(v, f"{path}[{k!r}]")
+            if r is not None:
+                return r
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            r = _find_raw_tensor(v, f"{path}[{i}]")
+            if r is not None:
+                return r
+    return None
+
+
+def _check_command(fn, args):
+    path = _find_raw_tensor(args)
+    if path is not None:
+        raise TypeError(
+            f"Tensor-parallel command {getattr(fn, '__name__', fn)} would pickle a raw tensor at {path}; tensors "
+            f"sent to TP workers must go through the shared arena (SMProducer.send)"
+        )
+
 cleanupper = Cleanupper()
 DISPATCH_TIMEOUT = 20
 
@@ -201,6 +232,8 @@ class Model_TPMixin:
         """
         self.tp_drain_acks()
         conn = self.mp_parent_conn[device]
+        if not isinstance(conn, PseudoParentConn):
+            _check_command(fn, args)
         conn.send((fn, args))
         if conn.poll(DISPATCH_TIMEOUT):
             result = conn.recv()
@@ -217,6 +250,8 @@ class Model_TPMixin:
         """
         self.tp_drain_acks()
         conn = self.mp_parent_conn[device]
+        if not isinstance(conn, PseudoParentConn):
+            _check_command(fn, args)
         conn.send((fn, args))
 
 
@@ -249,6 +284,8 @@ class Model_TPMixin:
             if dev_args is not None:
                 d_args = d_args + dev_args[idx]
             conn = self.mp_parent_conn[device]
+            if not isinstance(conn, PseudoParentConn):
+                _check_command(fn, d_args)
             conn.send((fn, d_args))
 
 
@@ -689,6 +726,7 @@ class Model_TPMixin:
         # command, pickled once and sent as raw bytes (Connection.send is dumps + send_bytes, so this is
         # wire-identical) — per-rank pickling of the params dict was part of the dispatch stagger.
         args = (x, params, last_kv_module_idx, True, None)
+        _check_command(mp_model_forward, args)
         msg = ForkingPickler.dumps((mp_model_forward, args))
         for device in self.active_devices:
             if device == self.tp_output_device:
@@ -725,6 +763,7 @@ class Model_TPMixin:
         # immediately in the main process and may block inside TP collectives until child workers arrive.
         # Shared pre-pickled command bytes for child ranks, as in prefill_tp
         args = (x, params, last_kv_module_idx, False, None)
+        _check_command(mp_model_forward, args)
         msg = ForkingPickler.dumps((mp_model_forward, args))
         for device in self.active_devices:
             if device == self.tp_output_device:
