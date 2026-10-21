@@ -194,6 +194,7 @@ class Attention(Module):
         select_hq_bits: int = 0,
         qbits_key: str = "bits",
         qsa_indexer: Module | None = None,
+        memt: Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -216,6 +217,9 @@ class Attention(Module):
         self.rope = None
         self.qsa_indexer = qsa_indexer
         self.register_submodule(qsa_indexer)
+        # MemT native memory block (experimental, see modules/arch_specific/memt_memory.py)
+        self.memt = None
+        self.attach_memt(memt)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
@@ -429,6 +433,15 @@ class Attention(Module):
         v = self.v_proj.optimizer_targets() if self.v_proj is not None else []   # use_k_as_v: no V projection
         o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
+
+
+    def attach_memt(self, memt: Module | None):
+        """Attach a MemT memory block (loads/unloads/converts with this layer; fused before o_proj)"""
+        if memt is None:
+            return
+        assert self.memt is None, f"{self.key}: memory block already attached"
+        self.memt = memt
+        self.register_submodule(memt)
 
 
     def load_local(self, device, **kwargs):
@@ -975,6 +988,8 @@ class Attention(Module):
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        # MemT native memory (experimental): readout added to the gated context before o_proj
+        if self.memt is not None: o = self.memt.fuse(x, o, params)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -1156,6 +1171,7 @@ class Attention(Module):
         # call: the graph is cached and a LoRA can be attached/detached after build).
         if (
             _bc_attn_enable and non_causal_spans is None and
+            (self.memt is None or not self.memt.active(params)) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
             not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
                                  getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
@@ -1243,6 +1259,8 @@ class Attention(Module):
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        # MemT native memory (experimental): readout added to the gated context before o_proj
+        if self.memt is not None: o = self.memt.fuse(x, o, params)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -1313,6 +1331,8 @@ class Attention(Module):
         def _export(child):
             nonlocal producer
             return child.tp_export(plan, producer) if child is not None else None
+
+        assert self.memt is None, "MemT memory layers do not support tensor parallelism yet"
 
         # Check if q_norm uses span_heads
         q_norm_span_heads = (
