@@ -12,16 +12,20 @@ MAX_CACHE_PER_PROCESS = 4 * 1024**3
 
 def _open_shm(name: str) -> shared_memory.SharedMemory:
     """
-    Open an existing shared-memory segment by name without registering it with this process's resource
-    tracker: the creating process owns the segment and unlinks it, so a consumer handle must not count as a
-    leak when the consumer exits (Python 3.13 has a flag for this; earlier versions register in the
-    constructor and have to be told to forget)
+    Open an existing shared-memory segment by name without involving this process's resource tracker: the
+    creating process owns the segment, registered it and unlinks it. Python 3.13 has a flag for this. Earlier
+    versions register every handle in the constructor, and the matching unregister is not an option either:
+    the tracker's bookkeeping is a set, so the first unregister from any process drops the name and every later
+    one (other ranks, the owner's unlink) raises inside the tracker. Registration is suppressed instead.
     """
     if sys.version_info >= (3, 13):
         return shared_memory.SharedMemory(name = name, track = False)
-    shm = shared_memory.SharedMemory(name = name)
-    resource_tracker.unregister(shm._name, "shared_memory")
-    return shm
+    register = resource_tracker.register
+    resource_tracker.register = lambda *args, **kwargs: None
+    try:
+        return shared_memory.SharedMemory(name = name)
+    finally:
+        resource_tracker.register = register
 
 
 _torch_dtypes = {
@@ -79,8 +83,11 @@ class SMProducer:
         self.buf = np.ndarray((self.buffer_size,), dtype = np.uint8, buffer = self.shm.buf)
         self.buf_is_pinned = False
         self.next_offset = 0
-        # Segments created for tensors that did not fit in the arena, alive until the next clear()
+        # Segments for tensors that did not fit in the arena, each filled like the arena is and alive until
+        # the next clear(). A segment per tensor would hold a few descriptors each; a module whose export
+        # overflows by hundreds of expert tensors then exhausts a 1024-descriptor limit during load
         self.overflow: list[shared_memory.SharedMemory] = []
+        self.overflow_offset = 0
 
         # Pre-touch buffer to avoid page faults later
         self.buf[: self.buffer_size: 4096] = 0
@@ -136,7 +143,7 @@ class SMProducer:
                 "cache_id": cache_id,
             }
 
-        # Destination: the arena, or a segment of its own when the arena cannot hold it
+        # Destination: the arena, or an overflow segment when the arena cannot hold it
         if self.next_offset + nbytes_align < self.buffer_size:
             offset = self.next_offset
             self.next_offset += nbytes_align
@@ -147,13 +154,12 @@ class SMProducer:
                 "nbytes": nbytes,
             }
         else:
-            check_shm_capacity(nbytes, f"A tensor-parallel transfer of {nbytes / 2**20:.1f} MiB (larger than the arena)")
-            segment = shared_memory.SharedMemory(create = True, size = max(nbytes, 1), name = uuid.uuid4().hex)
-            self.overflow.append(segment)
-            dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf)
+            segment, offset = self._overflow_alloc(nbytes_align)
+            dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf, offset = offset)
             desc = {
                 "method": "overflow",
                 "shm_name": segment.name,
+                "offset": offset,
                 "nbytes": nbytes,
             }
 
@@ -182,11 +188,27 @@ class SMProducer:
         self.next_offset = 0
         self._release_overflow()
 
+    def _overflow_alloc(self, nbytes_align: int) -> tuple:
+        """
+        Room for nbytes_align bytes in the current overflow segment, or in a new one at least as large as the
+        arena. Segment pages are only backed once written, so the capacity check covers the bytes about to be
+        copied rather than the segment's nominal size.
+        """
+        check_shm_capacity(nbytes_align, f"A tensor-parallel transfer of {nbytes_align / 2**20:.1f} MiB (the arena is full)")
+        if not self.overflow or self.overflow_offset + nbytes_align > self.overflow[-1].size:
+            size = max(nbytes_align, self.buffer_size)
+            self.overflow.append(shared_memory.SharedMemory(create = True, size = size, name = uuid.uuid4().hex))
+            self.overflow_offset = 0
+        offset = self.overflow_offset
+        self.overflow_offset += nbytes_align
+        return self.overflow[-1], offset
+
     def _release_overflow(self):
         for segment in self.overflow:
             segment.close()
             segment.unlink()
         self.overflow = []
+        self.overflow_offset = 0
 
     def close(self):
         self._release_overflow()
@@ -210,6 +232,7 @@ class SMConsumer:
         can perform non-blocking copies to the worker device.
         """
         self.pin_memory = pin_memory
+        self.overflow_segment = None
         self.device = device
         torch.cuda.set_device(self.device)
 
@@ -228,7 +251,7 @@ class SMConsumer:
             self.producer = None
             self.shm_name = producer_imp["shm_name"]
             self.buffer_size = producer_imp["buffer_size"]
-            self.shm = shared_memory.SharedMemory(name = self.shm_name)
+            self.shm = _open_shm(self.shm_name)
             self.arena = get_local_tensor(self.shm.buf, self.buffer_size)
 
             # Optionally pin memory
@@ -292,14 +315,13 @@ class SMConsumer:
             assert not cuda, "Cannot share cached tensor for CUDA"
             return self.cached_cpu_tensors[cache_id]
 
-        # View the bytes in place: the arena, or the overflow segment made for this tensor
+        # View the bytes in place: the arena, or the overflow segment holding this tensor
         nbytes = imp["nbytes"]
         dtype = _torch_dtypes[imp["dtype"]]
         shape = imp["shape"]
-        segment = None
         if method == "overflow":
-            segment = _open_shm(imp["shm_name"])
-            flat = torch.as_tensor(np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf))
+            segment = self._overflow_segment(imp["shm_name"])
+            flat = torch.as_tensor(np.ndarray((nbytes,), dtype = np.uint8, buffer = segment.buf, offset = imp["offset"]))
             pinned = False
         else:
             flat = self.arena.narrow(0, imp["offset"], nbytes)
@@ -315,7 +337,7 @@ class SMConsumer:
             tensor = tensor.narrow(slice_dim, first, last - first)
 
         # Move to GPU or clone to unshared memory. Only the arena is pinned, so only it can be copied
-        # asynchronously; an overflow segment is unmapped as soon as the copy is done
+        # asynchronously
         if cuda:
             tensor = tensor.to(
                 self.device,
@@ -326,14 +348,29 @@ class SMConsumer:
         else:
             tensor = tensor.clone(memory_format = torch.contiguous_format)
 
-        if segment is not None:
-            del flat
-            segment.close()
-
         return tensor
 
 
+    def _overflow_segment(self, name: str) -> shared_memory.SharedMemory:
+        """
+        The producer fills one overflow segment at a time and never returns to an earlier one, so the open
+        handle is kept across the tensors it holds and released when the next segment's name arrives. The
+        mapping outlives the producer's unlink harmlessly.
+        """
+        if self.overflow_segment is None or self.overflow_segment.name != name:
+            self._close_overflow()
+            self.overflow_segment = _open_shm(name)
+        return self.overflow_segment
+
+
+    def _close_overflow(self):
+        if self.overflow_segment is not None:
+            self.overflow_segment.close()
+            self.overflow_segment = None
+
+
     def close(self):
+        self._close_overflow()
         if self.pin_memory:
             cuda_host_unregister(self.arena.data_ptr())
         if self.producer is not None:

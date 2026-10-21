@@ -504,7 +504,10 @@ class Linear(Module):
             if not t.is_contiguous():
                 t = t.contiguous()
             nbytes = t.numel() * t.element_size()
-            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            # Registered memory belongs to the device current at registration, and the alias must be
+            # on that device. The current device is otherwise whatever the loading thread last used
+            with torch.cuda.device(device):
+                inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
             p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
