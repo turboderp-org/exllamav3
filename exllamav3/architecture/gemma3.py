@@ -108,6 +108,13 @@ class Gemma3Config(Config):
         # Output softcap
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
+        # A text-only checkpoint does not establish a usable vision preprocessor/schema.
+        prep_path = os.path.join(self.directory, "preprocessor_config.json")
+        if not os.path.exists(prep_path):
+            self.vision = None
+            self.vision_pp = None
+            return
+
         # Vision model settings
         self.vision = SimpleNamespace(
             num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default),
@@ -403,6 +410,8 @@ class Gemma3VisionModel(Model):
         key_prefix = "vision_tower",
         **kwargs
     ):
+        if config.vision_pp is None:
+            raise FileNotFoundError("preprocessor_config.json is required for Gemma 3 vision; this checkpoint supports text-only loading")
         super().__init__(config, **kwargs)
         self.config = config
         self.caps.update({
