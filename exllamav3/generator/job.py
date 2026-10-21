@@ -1286,6 +1286,38 @@ class Job:
         return rq_job
 
 
+    def memt_rebase(self, input_ids: torch.Tensor, memt_state: dict | None, memt_key: bytes):
+        """
+        Re-create this not-yet-queued job with another prompt and a memory snapshot, keeping every other
+        setting. Used by the generator's conversation memory, which replaces the client's full history with
+        system turn + recent turns + live turn and a state holding the rest.
+        """
+        assert self.generator is None, "memt_rebase must run before the job is prepared for the queue"
+        stop_conditions = list(self.stop_strings) + list(self.stop_tokens)
+        self.__init__(
+            input_ids = input_ids,
+            max_new_tokens = self.max_new_tokens,
+            min_new_tokens = self.min_new_tokens,
+            max_skips = self.max_skips,
+            sampler = self.sampler,
+            seed = self.seed,
+            stop_conditions = stop_conditions or None,
+            decode_special_tokens = self.decode_special_tokens,
+            return_top_tokens = self.return_top_tokens,
+            return_logits = self.return_logits,
+            return_probs = self.return_probs,
+            filters = self.filters,
+            token_healing = self.prefix_token is not None,
+            identifier = self.identifier,
+            banned_strings = self.banned_strings,
+            embeddings = self.embeddings,
+            max_rq_tokens = self.orig_max_rq_tokens,
+            stop_on_loop = self.stop_on_loop,
+            memt_state = memt_state,
+            memt_key = memt_key,
+        )
+
+
     def memt_read_params(self) -> dict:
         """
         The job's memory snapshot as the forward reads it: {layer_idx: fp32 [1, H, D, D]} with each layer's state

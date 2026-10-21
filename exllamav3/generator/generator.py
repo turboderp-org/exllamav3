@@ -16,6 +16,7 @@ from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
+from .memt_memory import MemTConversationMemory
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
@@ -56,6 +57,10 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        memt_memory: bool = False,
+        memt_context_turns: int = 0,
+        memt_cache_size: int = 2 * 1024**3,
+        memt_verbose: bool = False,
         **kwargs
     ):
         """
@@ -192,6 +197,24 @@ class Generator:
             each sequence are not queued: speculative decoding can still rewind them, and the MTP draft cache
             writes the last slot of a page one step later. 0 disables. Default 2.0
 
+        :param memt_memory:
+            MemT models only (model.caps["memt"]): give every job without an explicit memt_state a
+            conversation memory keyed on its prompt content. The prompt (Qwen chat format) is split into
+            turns; completed turns are committed into memory, one snapshot per turn boundary, and the job
+            runs on system turn + live turn reading the snapshot. Full-history resends, edits and
+            regenerations are handled by matching the longest committed prefix. See generator/memt_memory.py
+
+        :param memt_context_turns:
+            With memt_memory, the number of most recent completed turns to keep as raw text in the prompt
+            instead of in memory (they are committed by a later request once they fall out of the window)
+
+        :param memt_cache_size:
+            With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default 2 GB (~50 snapshots
+            of MemT-1.0-Nano)
+
+        :param memt_verbose:
+            With memt_memory, print one line per request: turns matched, committed, prompt length
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -286,6 +309,18 @@ class Generator:
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+
+        # MemT conversation memory (content-addressed snapshots), see enqueue()
+        self.memt_memory = None
+        if memt_memory:
+            assert self.model.caps.get("memt"), "memt_memory requires a MemT model"
+            assert draft_model is None, "memt_memory is not supported with a draft model"
+            self.memt_memory = MemTConversationMemory(
+                self.model, tokenizer,
+                context_turns = memt_context_turns,
+                cache_size = memt_cache_size,
+                verbose = memt_verbose,
+            )
 
         # Filter threads
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
@@ -587,6 +622,11 @@ class Generator:
                 serials.append(self.enqueue(j))
             return serials
 
+        if self.memt_memory is not None and job.memt_state is None:
+            # Commits the prompt's completed turns and rebases the job onto the short prompt + snapshot. The
+            # commit forwards run here, on the caller's thread: AsyncGenerator serves enqueue and iterate from
+            # one event loop, so no other forward is in flight
+            self.memt_memory.prepare(job)
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
