@@ -1332,6 +1332,28 @@ class Generator:
         return draft_ids
 
 
+    def memt_batch_read(self, batch_jobs: list) -> dict | None:
+        """
+        {layer_idx: fp32 [bsz, H, D, D]} over the rows of batch_jobs (one row per job sequence), or None when
+        no job in the batch reads memory.
+        """
+        if not any(job.memt_state is not None for job in batch_jobs):
+            return None
+        per_job = [(job.memt_read_params() if job.memt_state is not None else None, len(job.sequences))
+                   for job in batch_jobs]
+        if len(per_job) == 1 and per_job[0][1] == 1:
+            return per_job[0][0]
+        first = next(s for s, _ in per_job if s is not None)
+        out = {}
+        for i, ref in first.items():
+            rows = []
+            for s, n in per_job:
+                row = s[i][0] if s is not None else torch.zeros_like(ref[0])
+                rows += [row] * n
+            out[i] = torch.stack(rows, dim = 0)
+        return out
+
+
     def new_recurrent_state(self) -> PairedState:
         """A fresh (cleared) pair of recurrent states for a new sequence, one side per recurrent model"""
         target = draft = None
@@ -1497,6 +1519,11 @@ class Generator:
         if self.target_recurrent:
             batch_states = [job.recurrent_state.target for job in batch_jobs]
 
+        # MemT memory: one snapshot per batch row, stacked per layer in compact-batch order. Rows of jobs
+        # without a snapshot read zeros (exactly the plain backbone). A lone row passes its cached copy
+        # through unstacked. The attention module leaves the graph-captured decode path while this is set
+        memt_read = self.memt_batch_read(batch_jobs) if self.model.caps.get("memt") else None
+
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
             if job.new_tokens < 0: continue
@@ -1521,6 +1548,8 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
+        if memt_read is not None:
+            params["memt_read"] = memt_read
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(

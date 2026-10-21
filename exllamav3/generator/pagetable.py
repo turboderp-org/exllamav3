@@ -218,6 +218,11 @@ class Sequence:
         self.kv_position = 0
         self.page_hashes = None
         self.max_cached_pages = None
+        # Seed of the page hash chain (the predecessor hash of page 0). None for an ordinary sequence. A job
+        # whose forward depends on state outside the token ids (a MemT memory snapshot) sets it to a digest
+        # of that state, so its K/V pages and recurrent checkpoints are only ever shared with sequences
+        # reading the same state
+        self.hash_seed = None
         self.new_unique_pages = 0
         self.allocated_pages = None
         self.block_index_tensor = None
@@ -246,7 +251,7 @@ class Sequence:
         context_pages = (len(self.sequence_ids) - 1) // PAGE_SIZE
         total_pages = (max_len + PAGE_SIZE - 1) // PAGE_SIZE
 
-        r_hash = None
+        r_hash = self.hash_seed
         for i in range(context_pages):
             # TODO: profile/optimize hash function
             page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
