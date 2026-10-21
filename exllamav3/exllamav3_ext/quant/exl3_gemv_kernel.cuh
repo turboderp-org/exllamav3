@@ -44,7 +44,7 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
     a.elems[2] = a23.elems[0];
     a.elems[3] = a23.elems[1];
     ptx_mma_m16n8k16(a, b, c);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
