@@ -115,6 +115,18 @@ tokens: fine for turn-sized commits, O(t) kernel launches), per-job memory in th
 
 ## 3. Phase 1 -- box validation (next; needs the checkpoint + a GPU)
 
+**Box status 2026-10-21 (2x3090):** steps 1-3 done. Backbone of MemT-1.0-Nano == stock
+Qwen3.6-35B-A3B (693 shared tensors same dtype/shape; 138 sampled incl. layers 0-3/19/20/38/39,
+embed, head byte-identical; MemT drops vision + MTP). Sidecar dir = yeasah/Qwen3.6-35B-A3B-exl3
+6.00bpw hardlinked + MemT's `memt_block.safetensors`, `config.json` (with the quant's
+`quantization_config`), `chat_template.jinja`, `tokenizer_config.json`, `generation_config.json`.
+`util/memt_parity_memfree.py`: MemT with no / zero state is bitwise equal to the plain quant
+*when both land on the same layer split* (an autosplit that moves a layer to the other card
+changes its rounding, max|dlogit| 0.3, KL 3e-4 -- not a MemT effect). Recall: committing one
+turn ("cat Quillon, locker 4817") and asking in a fresh context answers verbatim from memory,
+same as with the fact in context; without memory it refuses. Step 4 (numeric parity vs the
+release) not done.
+
 1. **Get the weights.** `huggingface.co/MemTensor/MemT-1.0-Nano` (bf16 safetensors, ~70 GB).
    Confirm `config.json` matches the layout the parser expects: top-level
    `model_type: memt_qwen3_5_moe`, `architectures: ["MemTQwen3_5MoeForCausalLM"]`, a

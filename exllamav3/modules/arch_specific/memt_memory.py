@@ -98,6 +98,9 @@ class MemTMemory(Module):
 
     # --- forward -----------------------------------------------------------
 
+    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
+        raise NotImplementedError("MemTMemory is driven by its Attention block through fuse()")
+
     @staticmethod
     def active(params: dict) -> bool:
         return params.get("memt_read") is not None or params.get("memt_commit") is not None
