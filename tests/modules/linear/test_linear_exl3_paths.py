@@ -119,3 +119,51 @@ def test_auto_reconstruct_dispatch(tmp_path, device):
             assert recon == expect, f"{name}, rows {rows}: reconstruct path taken = {recon}"
             _, recon = spies[name].took_reconstruct(lambda: module.forward(x, {"reconstruct": True}))
             assert recon, f"{name}, rows {rows}: reconstruct requested but not taken"
+
+
+@pytest.mark.parametrize("original_basis", [False, True])
+@pytest.mark.parametrize("K, codebook", [(2, "3inst"), (4, "mcg"), (3.5, "mul1")])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
+@torch.inference_mode()
+def test_reconstruct_cache_keeps_decode_and_prefill_correct(tmp_path, device, monkeypatch,
+                                                           original_basis, K, codebook, out_dtype):
+    k, n = 512, 256
+    module, tensors = build(tmp_path, device, k, n, K, codebook, True, seed=42)
+    inner = module.inner
+    decode = torch.randn((1, 1, k), device=device).half()
+    before = module.forward(decode, {}, out_dtype).clone()
+    assert inner.prepare_reconstruct_cache(original_basis) == k * n * 2
+    pointer = inner._reconstruct_cache.data_ptr()
+    assert inner.prepare_reconstruct_cache(original_basis) == k * n * 2
+    assert inner._reconstruct_cache.data_ptr() == pointer
+
+    def unexpected_reconstruction(*args, **kwargs):
+        raise AssertionError("A cached prefill must not reconstruct weights again")
+
+    from exllamav3.modules.quant import exl3
+    with monkeypatch.context() as patch:
+        patch.setattr(inner, "_reconstruct_inner", unexpected_reconstruction)
+        patch.setattr(exl3.ext, "reconstruct_had_slice", unexpected_reconstruction)
+        assert torch.equal(before, module.forward(decode, {}, out_dtype))
+        outputs = []
+        for rows in (AUTO_RECONSTRUCT_THRESHOLD + 1, 399, 1024):
+            x = (torch.randn((1, rows, k), device=device) * 0.5).half()
+            outputs.append((x, module.forward(x, {}, out_dtype).clone()))
+    for x, y in outputs:
+        assert y.dtype == out_dtype and torch.isfinite(y).all()
+        assert rel_rms(y, reference(tensors, x, K, codebook)) < 0.02
+    inner.clear_reconstruct_cache()
+    assert inner._reconstruct_cache is None
+    assert torch.equal(before, module.forward(decode, {}, out_dtype))
+    inner.prepare_reconstruct_cache(original_basis)
+    inner.unload()
+    assert inner._reconstruct_cache is None
+
+
+@torch.inference_mode()
+def test_reconstruct_cache_rejects_sliced_head(tmp_path, device):
+    module, _ = build(tmp_path, device, 128, MAX_RECONSTRUCT_SLICE_N + 128,
+                      4, "mcg", False, seed=42)
+    with pytest.raises(ValueError, match="sliced wide"):
+        module.inner.prepare_reconstruct_cache()
+    assert module.inner._reconstruct_cache is None

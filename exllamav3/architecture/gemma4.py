@@ -35,6 +35,10 @@ from .mm_processing.gemma4 import (
     convert_image_to_patches,
 )
 from ..cache.recurrent_util import prepare_for_recurrence
+from ..modules.arch_specific.gemma4_e import (
+    Gemma4PerLayerEmbedding, Gemma4PerLayerProjection, Gemma4PerLayerInput,
+    Gemma4Attention, Gemma4SharedAttention,
+)
 
 class Gemma4Config(Config):
     arch_string = "Gemma4ForConditionalGeneration"
@@ -95,8 +99,12 @@ class Gemma4Config(Config):
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
         self.hidden_size_per_layer_input = self.read_cfg(int, "text_config->hidden_size_per_layer_input", 0)
-        if self.hidden_size_per_layer_input:
-            raise NotImplementedError("Gemma4 per-layer inputs are not implemented yet")
+        self.vocab_size_per_layer_input = self.read_cfg(int, "text_config->vocab_size_per_layer_input", 0)
+        self.num_kv_shared_layers = self.read_cfg(int, "text_config->num_kv_shared_layers", 0)
+        self.use_double_wide_mlp = self.read_cfg(bool, "text_config->use_double_wide_mlp", False)
+        self.first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers
+        if not 0 < self.first_shared_layer <= self.num_hidden_layers:
+            raise ValueError("Gemma4 target must have at least one non-shared K/V layer")
 
         self.enable_moe_block = self.read_cfg(bool, "text_config->enable_moe_block", False)
         self.num_experts = self.read_cfg(int, "text_config->num_experts", 0)
@@ -202,6 +210,9 @@ class Gemma4TextModel(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        # E-series initially uses paged caches with sliding masks, including the two
+        # K/V producers reused by its final layers. Ring-cache sharing is separate.
+        swa_full = swa_full or bool(config.hidden_size_per_layer_input)
         self.swa_full = swa_full
 
         use_moe = config.enable_moe_block
@@ -216,13 +227,36 @@ class Gemma4TextModel(Model):
             )
         ]
 
+        if config.hidden_size_per_layer_input:
+            self.modules += [
+                Gemma4PerLayerEmbedding(
+                    config, f"{key_prefix}.embed_tokens_per_layer",
+                    config.vocab_size_per_layer_input,
+                    config.num_hidden_layers * config.hidden_size_per_layer_input,
+                    multiplier=config.hidden_size_per_layer_input ** 0.5,
+                ),
+                Gemma4PerLayerProjection(config, key_prefix),
+            ]
+
         self.first_block_idx = len(self.modules)
+        shared_sources = {
+            kind: max(i for i, t in enumerate(config.layer_types[:config.first_shared_layer]) if t == kind)
+            for kind in set(config.layer_types)
+        }
 
         for idx in range(config.num_hidden_layers):
             layer_is_full = config.layer_types[idx] == "full_attention"
 
-            if swa_full or config.swa_pattern[idx] <= 0:
-                attn = Attention(
+            if idx >= config.first_shared_layer:
+                attn = Gemma4SharedAttention(
+                    config, f"{key_prefix}.layers.{idx}.self_attn", idx,
+                    shared_sources[config.layer_types[idx]],
+                    config.global_head_dim if layer_is_full else config.head_dim,
+                    config.rope_settings_global if layer_is_full else config.rope_settings_local,
+                    config.swa_pattern[idx],
+                )
+            elif swa_full or config.swa_pattern[idx] <= 0:
+                attn = Gemma4Attention(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.self_attn",
                     layer_idx = idx,
@@ -295,11 +329,16 @@ class Gemma4TextModel(Model):
                     select_hq_bits = 2 if use_moe else 0,
                 )
 
+            if isinstance(attn, Gemma4Attention):
+                attn.store_shared_kv = bool(config.num_kv_shared_layers) and idx in shared_sources.values()
+
             mlp = GatedMLP(
                 config = config,
                 key = f"{key_prefix}.layers.{idx}.mlp",
                 hidden_size = config.hidden_size,
-                intermediate_size = config.intermediate_size,
+                intermediate_size = config.intermediate_size * (
+                    2 if config.use_double_wide_mlp and idx >= config.first_shared_layer else 1
+                ),
                 key_up = "up_proj",
                 key_gate = "gate_proj",
                 key_down = "down_proj",
@@ -366,6 +405,8 @@ class Gemma4TextModel(Model):
                 key = f"{key_prefix}.layers.{idx}",
                 layer_idx = idx,
                 key_layer_scalar = "layer_scalar",
+                post_mlp = Gemma4PerLayerInput(config, f"{key_prefix}.layers.{idx}", idx)
+                if config.hidden_size_per_layer_input else None,
                 attn_norm = RMSNorm(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.input_layernorm",
@@ -394,7 +435,7 @@ class Gemma4TextModel(Model):
 
             self.modules.append(block)
 
-        self.last_kv_module_idx = len(self.modules) - 1
+        self.last_kv_module_idx = self.first_block_idx + config.first_shared_layer - 1
 
         self.modules += [
             RMSNorm(
@@ -422,9 +463,11 @@ class Gemma4TextModel(Model):
             self.calibration_all_experts = True
 
         self.caps.update({
-            "supports_tp": True,
+            "supports_tp": not bool(config.hidden_size_per_layer_input or config.num_kv_shared_layers),
             "atomic_mm_prefill": config.use_bidirectional_attention == "vision",
         })
+        if config.hidden_size_per_layer_input or config.num_kv_shared_layers:
+            self.caps["quant_preserve_tensors"] = True
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
         self.recurrent_state_cls = None
@@ -438,6 +481,8 @@ class Gemma4TextModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # Callers may reuse a params dict across chunks. Side inputs belong to this pass.
+        params["input_ids"] = input_ids
         _prepare_noncausal_mm_spans(input_ids, params)
         if not self.swa_full:
             prepare_for_recurrence(input_ids, params, self)

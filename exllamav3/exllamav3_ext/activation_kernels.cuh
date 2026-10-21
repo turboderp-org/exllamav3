@@ -44,7 +44,7 @@ __device__ __forceinline__ half _gelu(half x)
     float xf = __half2float(x);
     const float c = 0.797884560803f;  // sqrt(2/Pi)
     float tanh_arg = c * (xf + 0.044715f * xf * xf * xf);
-    xf = 0.5f * xf * (1.0 + tanh_opt(tanh_arg));
+    xf = 0.5f * xf * (1.0f + tanh_opt(tanh_arg));
     return __float2half_rn(xf);
 }
 
@@ -53,7 +53,7 @@ __device__ __forceinline__ float _gelu(float x)
 {
     const float c = 0.797884560803f;  // sqrt(2/Pi)
     float tanh_arg = c * (x + 0.044715f * x * x * x);
-    x = 0.5f * x * (1.0 + tanh_opt(tanh_arg));
+    x = 0.5f * x * (1.0f + tanh_opt(tanh_arg));
     return x;
 }
 
