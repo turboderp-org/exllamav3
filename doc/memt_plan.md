@@ -80,6 +80,22 @@ state, and the result is published). Snapshots are safetensors files with one fp
 Mixture-of-Storage (E memory experts with dense routing) is in the paper but **E = 1 in
 both released checkpoints**; the released kernels implement only that. Not built here.
 
+**Confirmed against the authors' transformers code (2026-10-21).** The HF repo's
+`modeling_memt.py` / `configuration_memt.py` were read after the above was written: tensor
+layout, read, gated softcap norm, the commit loop (decay rows, `erase = u S`,
+`S += u^T (w*v - erase)`) and the fusion point (`sigmoid(gate) * attn + read` -> `o_proj`)
+are all the same; `tests/test_memt.py` now carries a transcription of that forward as an
+oracle and passes to 1e-16. Extra facts from it: states are `[1, H, D, D]`; `commit_memory`
+splits a turn into `chunk_tokens` events but carries the KV cache (= one un-split pass) and
+has a `document=True` mode (independent 2048-token chunks, no cross-chunk attention, each
+chunk reads the running state); a session keeps turns *uncompressed in the prompt* until a
+turn with `enable_memory=True` completes, then replays every uncompressed turn (its
+template-rendered prompt ids + the exact generated ids) through `commit_memory` in order and
+clears them; documents are committed with `document=True` before the first chat; snapshot
+metadata carries an `identity` sha256 over `backbone_configs + memt + chat_template + vocab`.
+Its `g_down` has an optional bias (`output_gate_bias`, false in the release; the loader here
+assumes none).
+
 ## 2. What is built (Phase 0, this branch)
 
 | File | What |

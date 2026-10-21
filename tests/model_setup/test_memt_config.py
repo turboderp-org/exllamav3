@@ -122,7 +122,7 @@ def test_model_attaches_memory_blocks(tmp_path):
             assert mem is None
     assert model.caps.get("memt") is True
     z = model.memt_zero_state()
-    assert set(z) == {3, 7} and tuple(z[3].shape) == (4, 64, 64)
+    assert set(z) == {3, 7} and tuple(z[3].shape) == (1, 4, 64, 64)
 
 
 def test_pinned_switch_refused(tmp_path):

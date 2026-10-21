@@ -13,7 +13,9 @@ Checks:
   * the vectorized sequential scan equals an explicit matrix-form
     transcription of the paper's update, eq. (22):
     ``S = (I - u^T u) D S + u^T (w * v)``, in fp64;
-  * the whole block equals a port of the released SGLang ``QwenMemoryBlock``
+  * the whole block equals a transcription of the authors' transformers
+    reference (``modeling_memt.py:MemTMemory.forward`` from the HF repo), and
+    a port of the released SGLang ``QwenMemoryBlock``
     (its in_proj row slicing, gate nonlinearities, decay, gated softcap norm)
     with the Triton scan replaced by the matrix-form reference;
   * the symmetrized erase is non-expansive and a long random commit stays
@@ -252,6 +254,75 @@ def test_block_matches_sglang_port():
     print(f"[memt] block matches SGLang QwenMemoryBlock port (out {e_out:.1e}, state {e_st:.1e}) PASSED")
 
 
+
+def _hf_memt_forward(w, spec, hidden, state, commit, write_state = None):
+    """Transcription of modeling_memt.py:MemTMemory.forward (the authors' transformers
+    reference shipped with the HF checkpoint), fp64 (its bf16 roundings are no-ops here)."""
+    num_heads, dim = spec.num_heads, spec.head_dim
+    width = num_heads * dim
+    read_scale = dim ** -0.5
+    batch, length, _ = hidden.shape
+    shape = (batch, length, num_heads, dim)
+
+    def _normalize(value):
+        return value * torch.rsqrt(value.square().sum(-1, keepdim = True) + 1e-6)
+
+    def o_norm(value, gate):
+        normalized = value * torch.rsqrt(value.square().mean(-1, keepdim = True) + spec.rms_norm_eps)
+        normalized = w.o_norm * normalized
+        activated = F.silu(gate)
+        limit = spec.output_gate_softcap
+        activated = limit * torch.tanh(activated / limit)
+        return normalized * activated
+
+    snapshot = torch.zeros(batch, num_heads, dim, dim, dtype = hidden.dtype) if state is None else state
+    projected = F.linear(hidden, w.in_proj[: 3 * width if commit else width])
+    query = _normalize(projected[..., :width].reshape(shape))
+    read = read_scale * torch.einsum("blhk,bhkv->blhv", query, snapshot)
+    gate = F.linear(F.linear(hidden, w.in_proj[-dim:]), w.g_down).reshape(shape)
+    read = o_norm(read, gate).reshape(batch, length, width)
+    if not commit:
+        return read, state
+    key, value = (item.reshape(shape) for item in projected[..., width:].split(width, -1))
+    key = _normalize(key)
+    b, wg, f = F.linear(hidden, w.in_proj[3 * width : -dim]).split((width, width, dim), -1)
+    sqrt_b = (0.5 * F.logsigmoid(b)).exp().reshape(shape)
+    key = key * sqrt_b
+    write_value = wg.sigmoid().reshape(shape) * value
+    decay = (-w.decay_scale_log.exp().reshape(num_heads, 1)
+             * F.softplus(F.linear(f, w.f_down) + w.decay_bias).reshape(shape)).exp()
+    updated = snapshot if write_state is None else write_state
+    for index in range(length):
+        u = key[:, index]
+        updated = updated * decay[:, index].unsqueeze(-1)
+        erase = (u.unsqueeze(-1) * updated).sum(-2)
+        updated = updated + u.unsqueeze(-1) * (write_value[:, index] - erase).unsqueeze(-2)
+    return read, updated
+
+
+def test_block_matches_hf_modeling_memt():
+    torch.manual_seed(6)
+    spec = _spec(hidden = 16, heads = 4, dim = 8)
+    w = _weights(spec, dtype = torch.float64)
+    b, t = 2, 9
+    x = torch.randn(b, t, spec.hidden_size, dtype = torch.float64)
+    s0 = torch.randn(b, *spec.state_shape, dtype = torch.float64) * 0.5
+    ws = torch.randn(b, *spec.state_shape, dtype = torch.float64) * 0.5
+    ref_out, ref_state = _hf_memt_forward(w, spec, x, s0, True, write_state = ws)
+    out, state = _mt.memt_block_forward(x, w, spec, s0, commit = True, write_state = ws)
+    e_out = (out - ref_out).abs().max().item()
+    e_st = (state - ref_state).abs().max().item()
+    assert e_out < 1e-10 and e_st < 1e-10, f"vs modeling_memt.py: out {e_out}, state {e_st}"
+    ref_out2, _ = _hf_memt_forward(w, spec, x, s0, False)
+    out2, _ = _mt.memt_block_forward(x, w, spec, s0)
+    assert (out2 - ref_out2).abs().max().item() < 1e-10
+    # Zero-state commit (state None) as the HF code does it
+    ref_out3, ref_state3 = _hf_memt_forward(w, spec, x, None, True)
+    out3, state3 = _mt.memt_block_forward(x, w, spec, None, commit = True)
+    assert (out3 - ref_out3).abs().max().item() < 1e-10 and (state3 - ref_state3).abs().max().item() < 1e-10
+    print(f"[memt] block matches the HF modeling_memt.py reference (out {e_out:.1e}, state {e_st:.1e}) PASSED")
+
+
 def test_erase_nonexpansive_and_bounded():
     torch.manual_seed(3)
     spec = _spec(hidden = 8, heads = 2, dim = 6)
@@ -347,6 +418,7 @@ if __name__ == "__main__":
         test_zero_state_is_noop,
         test_update_matches_matrix_form,
         test_block_matches_sglang_port,
+        test_block_matches_hf_modeling_memt,
         test_erase_nonexpansive_and_bounded,
         test_turn_reads_fixed_snapshot,
         test_parse_memt_block_nano,

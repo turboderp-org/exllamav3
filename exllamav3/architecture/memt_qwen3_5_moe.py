@@ -99,9 +99,10 @@ class MemTQwen3_5MoeModel(Qwen3_5BaseModel):
     # --- session state helpers ---------------------------------------------
 
     def memt_zero_state(self, device = "cpu") -> dict[int, torch.Tensor]:
-        """A fresh (all-zero) memory for a new trajectory."""
+        """A fresh (all-zero) memory for a new trajectory: fp32 ``[1, H, D, D]`` per
+        memory layer, the rank the authors' transformers code and snapshot files use."""
         shape = self.memt_layout.spec.state_shape
-        return {i: torch.zeros(shape, dtype = torch.float32, device = device)
+        return {i: torch.zeros((1, *shape), dtype = torch.float32, device = device)
                 for i in self.memt_layout.layers}
 
     def memt_check_state(self, states: dict[int, torch.Tensor]):
@@ -118,28 +119,45 @@ class MemTQwen3_5MoeModel(Qwen3_5BaseModel):
         input_ids: torch.Tensor,
         states: dict[int, torch.Tensor],
         params: dict | None = None,
+        document: bool = False,
     ) -> dict[int, torch.Tensor]:
         """
-        Store a completed turn into memory: one forward over ``input_ids`` (the
-        whole turn, prompt and reply, ``[1, t]``) that reads ``states`` and
-        returns the committed successor. ``states`` is left untouched. The
-        release commits each turn as one un-split pass from the published
-        state, which is what this does (no chunking yet: the backbone attends
-        over the turn without a cache).
+        Store text into memory and return the successor state (``states`` is
+        left untouched). Mirrors ``commit_memory`` of the authors' transformers
+        code (modeling_memt.py):
+
+        * a turn (``document=False``): every token reads the incoming snapshot
+          while the write runs through the whole turn ``[1, t]`` (prompt and
+          reply as generated); the backbone attends across the whole turn. One
+          un-split forward here (the HF code splits into ``chunk_tokens`` events
+          but carries the KV cache, which is the same computation).
+        * a document (``document=True``): ``chunk_tokens`` (2048) chunks, each a
+          separate forward with NO attention across chunks, each reading the
+          state the previous chunk wrote.
         """
         self.memt_check_state(states)
-        write = {i: s.detach().clone() for i, s in states.items()}
-        p = dict(params or {})
-        p["memt_read"] = states
-        p["memt_commit"] = write
-        self.forward(input_ids, p)
-        return write
+        candidate = {i: s.detach().clone() for i, s in states.items()}
+        chunk = self.memt_layout.chunk_tokens if document else input_ids.shape[1]
+        for start in range(0, input_ids.shape[1], max(chunk, 1)):
+            event = input_ids[:, start:start + chunk]
+            read = candidate if document else states
+            write = {i: s.clone() for i, s in candidate.items()}
+            p = dict(params or {})
+            p["memt_read"] = read
+            p["memt_commit"] = write
+            self.forward(event, p)
+            candidate = write
+        return candidate
 
     def memt_save_state(self, states: dict[int, torch.Tensor], path: str, identity: str = ""):
-        """Write the release's snapshot layout: fp32 ``memory.{layer}`` tensors."""
+        """Write the release's snapshot layout: fp32 ``memory.{layer}`` tensors of
+        ``[1, H, D, D]``. The authors' loaders also check an ``identity`` metadata
+        string (sha256 over backbone_configs + memt + chat template + vocab, see
+        ``MemTSession._state_identity``); pass it to produce a file their code
+        accepts, else the file loads here only."""
         from safetensors.torch import save_file
         self.memt_check_state(states)
-        tensors = {f"memory.{i}": s.detach().to("cpu", torch.float32).contiguous()
+        tensors = {f"memory.{i}": s.detach().to("cpu", torch.float32).reshape(1, *self.memt_layout.spec.state_shape).contiguous()
                    for i, s in states.items()}
         save_file(tensors, path, metadata = {"format": MEMT_SNAPSHOT_FORMAT, "identity": identity})
 
