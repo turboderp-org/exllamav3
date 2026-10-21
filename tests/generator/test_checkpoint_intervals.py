@@ -1,7 +1,7 @@
 """
 Recurrent checkpoint interval arguments of Generator: unaligned intervals are rejected, defaults and the
-architecture default apply, an explicit interval overrides it, and the prefill interval rounds up to the chunk
-size. Checked against the documented argument contract with a stub model and cache, without GPU memory.
+architecture default apply, an explicit interval overrides it, and the prefill interval is kept as given, since
+checkpoints no longer need a fixed grid. Checked against the documented argument contract with a stub model and cache, without GPU memory.
 """
 
 from types import SimpleNamespace
@@ -57,7 +57,7 @@ def test_explicit_interval_overrides_architecture_default():
     assert gen.recurrent_checkpoint_interval == 256
 
 
-@pytest.mark.parametrize("interval, expected", [(256, 2048), (2048, 2048), (2304, 4096), (32768, 32768)])
-def test_aligned_prefill_interval_still_rounds_to_chunk_size(interval, expected):
+@pytest.mark.parametrize("interval", [256, 2048, 2304, 32768])
+def test_aligned_prefill_interval_is_kept_regardless_of_chunk_size(interval):
     gen = make_generator(recurrent_checkpoint_interval_pp = interval, max_chunk_size = 2048)
-    assert gen.recurrent_checkpoint_interval_pp == expected
+    assert gen.recurrent_checkpoint_interval_pp == interval

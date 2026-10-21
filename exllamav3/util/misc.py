@@ -32,15 +32,26 @@ class Timer:
         self.interval = self.end_time - self.start_time
 
 
+_has_primary_context = getattr(torch._C, "_cuda_hasPrimaryContext", None)
+
+
 def cuda_sync_active():
     """
     Calling torch.cuda.synchronize() will create a CUDA context on CUDA:0 even if that device is not being used.
-    This function synchronizes only devices actively used by Torch in the current process.
+    This function synchronizes only devices actively used by Torch in the current process: those holding a
+    primary context, which is exactly the set that can have work in flight, and which a model load extends and
+    nothing in-process ever shrinks, so no cached device set is needed. The query (cuDevicePrimaryCtxGetState)
+    creates no context and is orders of magnitude cheaper than the allocator statistics behind
+    memory_allocated, which build a full stats dict per device.
     """
-    for device_id in range(torch.cuda.device_count()):
-        device = torch.device(f'cuda:{device_id}')
-        if torch.cuda.memory_allocated(device) > 0:
-            torch.cuda.synchronize(device)
+    if _has_primary_context is not None:
+        for device_id in range(torch.cuda.device_count()):
+            if _has_primary_context(device_id):
+                torch.cuda.synchronize(device_id)
+    else:
+        for device_id in range(torch.cuda.device_count()):
+            if torch.cuda.memory_allocated(device_id) > 0:
+                torch.cuda.synchronize(device_id)
 
 
 def next_power_of_2(x):

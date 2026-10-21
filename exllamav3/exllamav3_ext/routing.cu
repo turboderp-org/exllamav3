@@ -1362,7 +1362,9 @@ __global__ void routing_sel_norm_kernel
     float o = 0.0f;
     if (lane < K)
     {
-        int e = (int) selected[row * K + lane];
+        // Selections come from the router or from a checkpoint table (hash routing); the table
+        // is validated at load, the bound here keeps any producer inside the score row (issue #526)
+        int e = max(0, min((int) selected[row * K + lane], num_experts - 1));
         float logit = __half2float(scores[row * num_experts + e]);
         o = act_fn == ROUTING_ACT_SQRTSP ?
             routing_act<ROUTING_ACT_SQRTSP>(logit) :

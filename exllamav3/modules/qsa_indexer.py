@@ -55,6 +55,7 @@ class QSAIndexer(Module):
         out_dtype: torch.dtype | None = None,
         qbits_key: str = "bits",
         submodules: dict | None = None,
+        select_hq_bits: int = 2
     ):
         super().__init__(config = config, key = key, qmap = None)
         assert kv_heads == 1, "QSAIndexer assumes a single raw key head"
@@ -83,6 +84,7 @@ class QSAIndexer(Module):
             qmap = qmap + ".input" if qmap is not None else None,
             out_dtype = torch.half,
             qbits_key = qbits_key,
+            select_hq_bits = select_hq_bits,
         ))
         self.q_layernorm = _sub("q_layernorm", lambda: RMSNorm(config, f"{key}.q_layernorm", rms_norm_eps, constant_bias = 1.0))
         self.k_layernorm = _sub("k_layernorm", lambda: RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0))

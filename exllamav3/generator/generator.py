@@ -33,6 +33,8 @@ class Generator:
         tokenizer: Tokenizer,
         max_batch_size: int = 256,
         max_chunk_size: int = 2048,
+        shared_chunk_size: int | None = None,
+        prefill_cooldown: int = 4,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -75,7 +77,23 @@ class Generator:
         :param max_chunk_size:
             Maximum number of tokens to process in parallel during prefill (prompt ingestion). Should not
             exceed the model's max_input_len but can be lowered to trade off prompt speed for a shorter
-            interruption to ongoing jobs when a new job is started.
+            interruption to ongoing jobs when a new job is started. See shared_chunk_size for lowering it
+            only while other jobs are generating.
+
+        :param shared_chunk_size:
+            Prefill chunk size to use while another active job is already generating, so that a new prompt
+            interrupts ongoing generation for shorter stretches at a time. Must be a multiple of the page size
+            and no larger than max_chunk_size. Prompt ingestion with no job generating keeps the full
+            max_chunk_size, which remains the efficient choice for cold prefill. Default is None, which selects
+            half of max_chunk_size rounded up to the page size. Set it to max_chunk_size to keep full chunks
+            while other jobs generate
+
+        :param prefill_cooldown:
+            Number of iterations to wait between prefill passes while another active job is generating. Every
+            call to iterate() still runs one generation step, so the generating jobs keep streaming at an even
+            pace while prompt ingestion takes one chunk every prefill_cooldown + 1 calls. With several prompts
+            waiting, they take turns, one chunk per pass. Default is 4. Set to 0 for a prefill pass on every
+            iteration, as when no job is generating
 
         :param max_q_size:
             Maximum number of tokens to evaluate per sequence during generation. Leave this at the default
@@ -182,9 +200,10 @@ class Generator:
             Minimum number of tokens between recurrent checkpoints in model output and the tail end of
             the prompt. Must be a multiple of the page size. Model architecture determines default
 
-        :param recurrent_checkpoint_interval_pp]:
+        :param recurrent_checkpoint_interval_pp:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
-            multiple of the page size. Default is 32768 tokens
+            multiple of the page size. Checkpoints land on the first chunk boundary at least this far past the
+            previous one, so the interval need not be a multiple of the chunk size. Default is 32768 tokens
 
         :param kwargs:
         """
@@ -250,6 +269,18 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+
+        # Prompt ingestion alongside generating jobs, see iterate()
+        if shared_chunk_size is None:
+            shared_chunk_size = (max_chunk_size // 2 + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        assert 0 < shared_chunk_size <= max_chunk_size and shared_chunk_size % PAGE_SIZE == 0, \
+            "shared_chunk_size must be a multiple of the page size (256) and no larger than max_chunk_size"
+        assert prefill_cooldown >= 0, \
+            "prefill_cooldown must not be negative"
+        self.shared_chunk_size = shared_chunk_size
+        self.prefill_cooldown = prefill_cooldown
+        self.prefill_cooldown_left = 0
+        self.prefill_rotation = 0
 
         # Job queues
         self.job_serial = 0
@@ -355,11 +386,8 @@ class Generator:
 
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
-        def ceil_span(a, b):
-            return (a + b - 1) // b * b
-        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
-        self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
+        self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -679,10 +707,35 @@ class Generator:
         results = []
         self.iterate_start_jobs(results)
 
-        # Perform one round of prefill
+        # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
+        # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
+        # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
+        # still produces one generation step for the generating jobs. The other jobs' passes are deferred;
+        # jobs with nothing left to ingest keep their call, which only does bookkeeping. With no job
+        # generating, or with a full shared chunk and no cooldown, every job runs a full chunk on every
+        # iteration
+        prefilling = [job for job in self.active_jobs if not job.is_prefill_done()]
+        chunk_size = None
+        deferred = []
+        if prefilling and len(prefilling) < len(self.active_jobs) and \
+                (self.shared_chunk_size < self.max_chunk_size or self.prefill_cooldown > 0):
+            if self.shared_chunk_size < self.max_chunk_size:
+                chunk_size = self.shared_chunk_size
+            if self.prefill_cooldown_left > 0:
+                self.prefill_cooldown_left -= 1
+                deferred = prefilling
+            else:
+                self.prefill_cooldown_left = self.prefill_cooldown
+                selected = prefilling[self.prefill_rotation % len(prefilling)]
+                self.prefill_rotation += 1
+                deferred = [job for job in prefilling if job is not selected]
+        else:
+            self.prefill_cooldown_left = 0
         for job in list(self.active_jobs):
+            if any(job is d for d in deferred):
+                continue
             try:
-                job.prefill(results)
+                job.prefill(results, chunk_size)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
 

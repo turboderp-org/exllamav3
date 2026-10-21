@@ -64,3 +64,27 @@ def size_to_longest_edge_and_patch_size(
     # Align size to patch grid
     output_size = tuple((((d + p - 1) // p) * p) for d, p in zip(output_size, patch_size))
     return output_size
+
+
+def find_closest_aspect_ratio(
+    size: tuple,
+    target_ratios: list,
+    tile_size: int,
+) -> tuple:
+    """
+    InternVL-style tile grid selection: the (cols, rows) grid from target_ratios whose aspect ratio is
+    closest to the image's. Ties go to the larger grid when the image covers more than half its area.
+    `size` is (width, height) in pixels.
+    """
+    width, height = size
+    aspect_ratio = width / height
+    best_diff = float("inf")
+    best = (1, 1)
+    for ratio in target_ratios:
+        diff = abs(aspect_ratio - ratio[0] / ratio[1])
+        if diff < best_diff:
+            best_diff = diff
+            best = ratio
+        elif diff == best_diff and width * height > 0.5 * tile_size * tile_size * ratio[0] * ratio[1]:
+            best = ratio
+    return best

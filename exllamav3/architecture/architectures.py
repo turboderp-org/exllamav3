@@ -33,6 +33,7 @@ from .bailing_hybrid import BailingHybridModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
@@ -43,7 +44,7 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
-from .nemotronh import NemotronHModel
+from .nemotronh import NemotronHModel, NemotronHOmniModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -106,6 +107,7 @@ ARCHITECTURES = {
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
+        Lfm2VlTextModel,
         LlamaModel,
         MiMoModel,
         MiMoV2Model,
@@ -117,6 +119,7 @@ ARCHITECTURES = {
         MuseGlimmerTextModel,
         MuseGlimmerAssistantModel,
         NemotronHModel,
+        NemotronHOmniModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,
