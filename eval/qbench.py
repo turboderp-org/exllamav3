@@ -30,7 +30,8 @@ buckets isolate quantization damage from that floor. All results are cached per
 
 Engines: "exllamav3" (module-streamed), "transformers" (full load with accelerate device_map),
 "llamacpp" (llama-cpp-python, full logits). A model entry may carry an "options" dict passed to
-the engine (e.g. device_map or trust_remote_code for transformers, n_gpu_layers for llamacpp).
+the engine (e.g. device_map, trust_remote_code or time_step_limit for transformers, n_gpu_layers
+for llamacpp; see the engine docstrings).
 
 Relative paths in the project file resolve against the project file's directory.
 """
