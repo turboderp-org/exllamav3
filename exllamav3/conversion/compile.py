@@ -214,6 +214,10 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         qcfg.update({
             "codebook": args["codebook"]
         })
+    if args.get("tile_order", "sm80") != "sm80":
+        qcfg.update({
+            "tile_order": args["tile_order"]
+        })
 
     if "quantization_config" in config_dict:
         orig_qcfg = config_dict["quantization_config"].copy()
@@ -226,6 +230,10 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             if "codebook" in args:
                 qcfg.update({
                     "codebook": args["codebook"]
+                })
+            if args.get("tile_order", "sm80") != "sm80":
+                qcfg.update({
+                    "tile_order": args["tile_order"]
                 })
         else:
             qcfg.update({
