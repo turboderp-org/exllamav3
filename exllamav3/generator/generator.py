@@ -1480,10 +1480,7 @@ class Generator:
                 d = (darena, self._arena_views(darena, rows, width, with_positions))
                 dev[device] = d
             darena, dviews = d
-            if len(self.stage_devices) > 1:
-                with torch.cuda.device(device):
-                    ext.cuda_memcpy_async(darena.data_ptr(), host.data_ptr(), host.numel() * 4, 1)
-            else:
+            with torch.cuda.device(device):
                 ext.cuda_memcpy_async(darena.data_ptr(), host.data_ptr(), host.numel() * 4, 1)
             for hv, dv in zip(views, dviews):
                 if hv is not None:
