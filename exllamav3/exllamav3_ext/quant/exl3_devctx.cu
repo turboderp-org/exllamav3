@@ -6,6 +6,9 @@ namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include "../util.h"
 #include "../util.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_rdna3.cuh"
+#endif
 
 //DevCtx::DevCtc()
 //{
@@ -126,4 +129,8 @@ void prepare_ctx(int device)
     DevCtx::instance().get_cc(device);
     DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
+#if defined(USE_ROCM)
+    // the RDNA3 matmul's workspace must exist before any graph capture
+    exl3_rdna3_prepare(device);
+#endif
 }

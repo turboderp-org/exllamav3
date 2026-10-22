@@ -317,6 +317,15 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+### `EXL3_RDNA3_GEMM` (ROCm, gfx11; default: `1`)
+
+On RDNA3 (gfx11) the EXL3 matmul for every row count up to the reconstruct threshold runs on a split-k kernel
+(`rocm/quant/exl3_rdna3.cu`, adapted from exllamav3-rocm) ahead of the RDNA GEMVs and the cooperative GEMM: the
+input transform runs once per matmul, each block owns 128 output columns of up to 16 rows and a k-range sized so
+the grid fills one residency wave, mul1 at 2..6 bits decodes with byte sums of the multiplied window (the codebook's
+affine map applied to the dot products), and products accumulate in fp32. `0` restores the generic RDNA paths;
+other architectures never take it.
+
 ### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
 
 Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels
