@@ -155,7 +155,7 @@ __device__ __forceinline__ void windows8(G gather, int lane, uint32_t* w)
 
 }  // namespace exl3_rdna3_ns
 
-// One block: output columns group * 128 .. +127, rows rc * MR .. +MR-1, k-slices of split
+// One block: output columns group * 128 .. +127 of entry blockIdx.z, rows rc * MR .. +MR-1, k-slices of split
 template <int bits, bool half_k, int cb, int MR, bool c_fp32>
 __global__ __launch_bounds__(EXL3_RDNA3_THREADS)
 void exl3_rdna3_kernel
@@ -171,7 +171,8 @@ void exl3_rdna3_kernel
     float* __restrict__ ws,
     const half* __restrict__ svh,
     int splits,
-    int ks_per_split
+    int ks_per_split,
+    Exl3Rdna3MTab mt
 )
 {
     using namespace exl3_rdna3_ns;
@@ -180,6 +181,22 @@ void exl3_rdna3_kernel
     const int rc = blockIdx.y;
     const int group = blockIdx.x % groups;
     const int split = blockIdx.x / groups;
+
+    int n_stride = size_n;
+    if (mt.b)
+    {
+        const int e = blockIdx.z;
+        const int src = mt.src ? mt.src[e] : e;
+        B = (const uint32_t*) mt.b[e];
+        svh = (const half*) mt.svh[e];
+        if (mt.c) C = (void*) mt.c[e];
+        else C = (void*) ((char*) C + (size_t) e * size_m * size_n * (c_fp32 ? 4 : 2));
+        if (mt.n_stride) n_stride = mt.n_stride[e];
+        xh += (size_t) src * size_m * (size_k / 16) * 4;
+        xcs += (size_t) src * size_m * (size_k / 128);
+        ws += (size_t) e * splits * size_m * size_n;
+        counters += (size_t) e * gridDim.y * groups;
+    }
 
     constexpr int TWORDS = half_k ? 4 * (2 * bits + 1) : 8 * bits;   // uint32 per 16x16 tile
     // Raw integer path: each lane loads exactly the tile words its eight windows need (2, or 4 for 5 / 6
@@ -211,7 +228,7 @@ void exl3_rdna3_kernel
     const int ks_begin = split * ks_per_split;
     const int ks_end = min(kslices, ks_begin + ks_per_split);
     const int nt = group * NT + warp;                // this wave's n-tile
-    const uint32_t sstride_b = (uint32_t) (size_n / 16) * TWORDS * 4u;   // bytes per k-slice row of tiles
+    const uint32_t sstride_b = (uint32_t) (n_stride / 16) * TWORDS * 4u;   // bytes per k-slice row of tiles
 
     if constexpr (RAW)
     {
@@ -439,7 +456,7 @@ void exl3_rdna3_kernel
         h1 *= r * __high2float(s01);
         h2 *= r * __low2float(s23);
         h3 *= r * __high2float(s23);
-        const size_t o = (size_t) (row0 + m) * size_n + col;
+        const size_t o = (size_t) (row0 + m) * n_stride + col;
         if constexpr (c_fp32)
         {
             *((float4*) (((float*) C) + o)) = make_float4(h0, h1, h2, h3);

@@ -673,6 +673,24 @@ int exl3_mgemm_gr
     }
 
 #if defined(USE_ROCM)
+    // RDNA3 (gfx11): shared-input bundles without routing, sliced ones included, as one input-transform launch plus
+    // one split-k matmul launch (rocm/quant/exl3_rdna3.cu, blockIdx.z per entry). Its outputs are size_n wide,
+    // which a size_n_list only guarantees in sliced mode
+    if (bszm_in == 1 && !indices_ptr && !weights_ptr && min_index < 0 && num_tokens == 1 &&
+        (!size_n_list_ptr || had_src_list_ptr) && force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        if (exl3_rdna3_mgemm
+        (
+            A_ptr, (const uint64_t*) B_ptr_ptr, C_ptr, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+            (const uint64_t*) suh_ptr_ptr, (const uint64_t*) svh_ptr_ptr, (const uint64_t*) c_list_ptr,
+            n_stride_list_ptr, had_src_list_ptr, bszm_out, had_src_list ? num_had_src : bszm_out, device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 95;
+        }
+    }
+
     // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
     // take m = 1..8 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
     // handle, so it stays on the cooperative kernel

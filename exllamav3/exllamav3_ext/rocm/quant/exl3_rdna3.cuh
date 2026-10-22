@@ -12,7 +12,8 @@
 // - k-splits reduce through a fp32 workspace; the last block per column group (atomic counter) sums the
 //   partials, applies the output Hadamard and svh and writes C
 //
-// EXL3_RDNA3_GEMM=0 disables it.
+// exl3_mgemm runs shared-input bundles (gate/up, sliced Q/K/V) as one input-transform launch plus one matmul launch,
+// one blockIdx.z per entry. EXL3_RDNA3_GEMM=0 disables both.
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -24,6 +25,17 @@
 #define EXL3_RDNA3_MAX_COUNTERS (1 << 16)
 #define EXL3_RDNA3_XH_BYTES (16ull << 20)
 #define EXL3_RDNA3_XCS_FLOATS (1 << 18)
+
+// Multi-matrix mode (blockIdx.z = entry): per-entry trellis / svh / output pointers, output row stride and input
+// source. A null b table selects plain single-matrix mode
+struct Exl3Rdna3MTab
+{
+    const uint64_t* b;         // trellis pointers (pre-offset to the entry's first column)
+    const uint64_t* svh;       // svh pointers (pre-offset)
+    const uint64_t* c;         // output pointers, or null: C + e * size_m * size_n
+    const int* n_stride;       // row stride of trellis and output, or null: size_n
+    const int* src;            // input source (transformed-input slab), or null: e
+};
 
 typedef void (*fp_exl3_rdna3_kernel)
 (
@@ -38,7 +50,8 @@ typedef void (*fp_exl3_rdna3_kernel)
     float* __restrict__ ws,
     const half* __restrict__ svh,
     int splits,
-    int ks_per_split
+    int ks_per_split,
+    Exl3Rdna3MTab mt
 );
 
 // mr_idx: rows per pass 1, 2, 4, 8, 16, 3, 5, 6, 12
@@ -68,6 +81,31 @@ bool exl3_rdna3_gemm
     bool c_fp32,
     const half* suh,
     const half* svh,
+    int device,
+    cudaStream_t stream,
+    Graph* graph
+);
+
+// Several matrices sharing one input (MultiLinear / SlicedMultiLinear tables), one launch pair
+bool exl3_rdna3_mgemm
+(
+    const half* A,
+    const uint64_t* b_tab,
+    void* C,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    const uint64_t* suh_tab,
+    const uint64_t* svh_tab,
+    const uint64_t* c_tab,
+    const int* n_stride_tab,
+    const int* src_tab,
+    int num_entries,
+    int num_src,
     int device,
     cudaStream_t stream,
     Graph* graph

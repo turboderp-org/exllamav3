@@ -64,7 +64,8 @@ void exl3_rdna3_prepare(int device)
 
 // Input transform, once per matmul: x * suh -> 128-point Hadamard -> 1/sqrt(128) -> fp16 in the main kernel's LDS
 // pair layout ([m][k/16][4] uint2), plus the per-128-block sums of the rounded values (codebook bias term of the
-// raw mul1 decode). One wave per (row, 128-block)
+// raw mul1 decode). One wave per (row, 128-block); with suh_tab one source per blockIdx.y, each with its own suh and
+// its own xh / xcs slab
 __global__ __launch_bounds__(256)
 void exl3_rdna3_had_kernel
 (
@@ -73,11 +74,18 @@ void exl3_rdna3_had_kernel
     uint2* __restrict__ xh,
     float* __restrict__ xcs,
     int size_m,
-    int size_k
+    int size_k,
+    const uint64_t* __restrict__ suh_tab
 )
 {
     const int lane = threadIdx.x & 31;
     const int kblocks = size_k / 128;
+    if (suh_tab)
+    {
+        suh = (const half*) suh_tab[blockIdx.y];
+        xh += (size_t) blockIdx.y * size_m * (size_k / 16) * 4;
+        xcs += (size_t) blockIdx.y * size_m * kblocks;
+    }
     const int task = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (task >= size_m * kblocks) return;
     const int m = task / kblocks;
@@ -182,12 +190,12 @@ bool exl3_rdna3_gemm
             const int had_tasks = m * kblocks;
             exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>
             (
-                A + (size_t) r0 * size_k, suh, g_xh[device], g_xcs[device], m, size_k
+                A + (size_t) r0 * size_k, suh, g_xh[device], g_xcs[device], m, size_k, nullptr
             );
             kernel<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, stream>>>
             (
                 g_xh[device], B32, (char*) C + (size_t) r0 * size_n * c_elem, m, size_k, size_n,
-                g_counters[device], g_xcs[device], g_ws[device], svh, splits, ks_per_split
+                g_counters[device], g_xcs[device], g_ws[device], svh, splits, ks_per_split, Exl3Rdna3MTab {}
             );
 
             // Graph patching: callers bind the input (A) and output (C) pointers; the transformed input,
@@ -199,6 +207,81 @@ bool exl3_rdna3_gemm
                 graph->record_param((void*) kernel, GP_gemm_C, 2);
                 graph->record_param((void*) kernel, GP_end, 0);
             }
+        }
+        cuda_check(cudaPeekAtLastError());
+        return true;
+    #else
+        return false;
+    #endif
+}
+
+bool exl3_rdna3_mgemm
+(
+    const half* A,
+    const uint64_t* b_tab,
+    void* C,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    const uint64_t* suh_tab,
+    const uint64_t* svh_tab,
+    const uint64_t* c_tab,
+    const int* n_stride_tab,
+    const int* src_tab,
+    int num_entries,
+    int num_src,
+    int device,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (!exl3_rdna3_enabled()) return false;
+        if (size_k % 128 || size_n % 128) return false;
+        if (K < 1 || K > 8) return false;
+        if (num_entries < 1 || num_src < 1 || size_m < 1) return false;
+
+        int mr;
+        fp_exl3_rdna3_kernel kernel = select_kernel(size_m, K, half_k, cb, c_fp32, mr);
+        if (!kernel) return false;
+
+        // Single pass only: every source's transformed input has to fit the workspace
+        const int kblocks = size_k / 128;
+        if ((size_t) num_src * size_m * size_k * 2 > EXL3_RDNA3_XH_BYTES) return false;
+        if ((size_t) num_src * size_m * kblocks > EXL3_RDNA3_XCS_FLOATS) return false;
+
+        const int groups = size_n / 128;
+        const int row_chunks = (size_m + mr - 1) / mr;
+        const int items = groups * row_chunks * num_entries;
+        if (items > EXL3_RDNA3_MAX_COUNTERS) return false;
+
+        if (!g_ws[device]) exl3_rdna3_prepare(device);
+
+        int splits, ks_per_split;
+        choose_splits(items, kblocks, (size_t) num_entries * size_m * size_n * sizeof(float), device, splits, ks_per_split);
+
+        const int had_tasks = size_m * kblocks;
+        exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>
+        (
+            A, nullptr, g_xh[device], g_xcs[device], size_m, size_k, suh_tab
+        );
+        kernel<<<dim3(groups * splits, row_chunks, num_entries), EXL3_RDNA3_THREADS, 0, stream>>>
+        (
+            g_xh[device], nullptr, C, size_m, size_k, size_n, g_counters[device], g_xcs[device], g_ws[device], nullptr,
+            splits, ks_per_split, Exl3Rdna3MTab { b_tab, svh_tab, c_tab, n_stride_tab, src_tab }
+        );
+
+        // Graph patching: the input (A) and output (C) only; the pointer tables are static
+        if (graph)
+        {
+            graph->record_param((void*) exl3_rdna3_had_kernel, GP_mgemm_A, 0);
+            graph->record_param((void*) exl3_rdna3_had_kernel, GP_end, 0);
+            graph->record_param((void*) kernel, GP_mgemm_C, 2);
+            graph->record_param((void*) kernel, GP_end, 0);
         }
         cuda_check(cudaPeekAtLastError());
         return true;
