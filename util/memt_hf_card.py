@@ -1,12 +1,14 @@
 """
 Render the Hugging Face model card for the MemT-1.0-Nano EXL3 repo in the ezexl3 dashboard style.
 
-    python util/memt_hf_card.py OUT.md /mnt/two/weights/MemT-1.0-Nano-exl3-3.00bpw /mnt/two/weights/MemT-1.0-Nano-exl3-5.00bpw ...
+    python util/memt_hf_card.py OUT.md [--qbench DIR] FOLDER...
 
-Each folder's name must end in <bpw>bpw; sizes are measured from the folders.
+Each folder's name must end in <bpw>bpw; sizes are measured from the folders. With --qbench, KL divergence
+and perplexity per revision (plus the bf16 reference row) come from DIR/qb_results.json, and the card embeds
+DIR's qb_kld.png / qb_ppl.png (upload them next to README.md).
 """
 
-import os, sys, re
+import os, sys, re, json
 
 REPO = "UnstableLlama/MemT-1.0-Nano-exl3"
 BASE = "MemTensor/MemT-1.0-Nano"
@@ -25,6 +27,8 @@ STYLE = """<style>
   .panel-body { padding: 20px; }
   .repo-data-panel { padding: 14px 10px; }
   .repo-data-body { display: flex; flex-direction: column; align-items: center; gap: 20px; width: 100%; --edge-gap: 8px; }
+  .repo-graph { display: block; width: min(1440px, calc(100% - (var(--edge-gap) * 2))); height: auto; margin: 0 auto; }
+  .repo-graph + .repo-graph { margin-top: 1.25rem; }
   .table-wrapper { display: inline-block; margin: 0 auto; border: 1px solid #666a73; border-radius: 4px; overflow: hidden; max-width: calc(100% - (var(--edge-gap) * 2)); }
   .data-table { border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; width: auto; margin: 0; }
   .data-table th { text-align: left; color: #ffffff; background-color: #2d2f34; padding: 9px 12px; border-bottom: 2px solid #666a73; border-right: 1px solid #4a4d53; }
@@ -49,7 +53,11 @@ def folder_gib(path: str) -> float:
 
 
 def main():
-    out, folders = sys.argv[1], sys.argv[2:]
+    args = sys.argv[1:]
+    qbench = None
+    if "--qbench" in args:
+        i = args.index("--qbench"); qbench = args[i + 1]; del args[i:i + 2]
+    out, folders = args[0], args[1:]
     rows = []
     for f in folders:
         m = re.search(r"(\d+\.\d+)bpw$", f.rstrip("/"))
@@ -57,13 +65,34 @@ def main():
         rows.append((m.group(1) + "bpw", folder_gib(f)))
     rows.sort(key = lambda r: float(r[0][:-3]))
 
+    qb = {}
+    if qbench:
+        for e in json.load(open(os.path.join(qbench, "qb_results.json"))):
+            qb[e["label"]] = e
+    def metrics(label):
+        e = qb.get(label)
+        if e is None:
+            return ""
+        return f'              <td>{e.get("kld", 0.0):.4f}</td>\n              <td>{e["ppl"]:.4f}</td>\n'
+    head_extra = "              <th>KL DIV</th>\n              <th>PPL</th>\n" if qb else ""
     table = "\n".join(
         f'            <tr>\n'
         f'              <td><a class="link-style" href="https://huggingface.co/{REPO}/tree/{rev}">{rev}</a></td>\n'
         f'              <td>{gib:.2f}</td>\n'
+        + metrics(f"{int(float(rev[:-3]))} bpw") +
         f'              <td><a class="link-style" href="https://huggingface.co/{BACKBONE}/tree/{BACKBONE_BRANCH[rev]}">{BACKBONE_BRANCH[rev]}</a></td>\n'
         f'            </tr>'
         for rev, gib in rows)
+    if "BF16" in qb:
+        e = qb["BF16"]
+        table += (f'\n            <tr>\n'
+                  f'              <td><a class="link-style" href="https://huggingface.co/{BASE}">bf16</a></td>\n'
+                  f'              <td>{e.get("vram_gb", 0.0):.2f}</td>\n'
+                  f'              <td>0.0000</td>\n              <td>{e["ppl"]:.4f}</td>\n'
+                  f'              <td>-</td>\n'
+                  f'            </tr>')
+    graphs = ('      <img class="repo-graph" src="qb_kld.png" alt="Mean KL divergence vs bits per weight">\n'
+              '      <img class="repo-graph" src="qb_ppl.png" alt="Perplexity vs bits per weight">\n') if qb else ""
     first = rows[0][0]
 
     md = f"""---
@@ -88,13 +117,13 @@ tags:
   <div class="content-panel">
     <div class="panel-title">Information</div>
     <div class="panel-body">
-      exl3 builds of <b><a class="link-style" href="https://huggingface.co/{BASE}">MemT-1.0-Nano</a></b>
-      for <b><a class="link-style" href="{FORK}">exl3-qlora</a></b> (an
-      <a class="link-style" href="https://github.com/turboderp-org/exllamav3">exllamav3</a> fork with native MemT memory) and TabbyAPI.
-      <br/>
+      exl3 builds of the <b><a class="link-style" href="https://huggingface.co/{BASE}">MemT-1.0-Nano</a></b>
+      &#9888;&#65039; <b>PERSISTENT MEMORY MODEL</b> &#9888;&#65039; that works with TabbyAPI.
+      ExLlamaV3 fork <b><a class="link-style" href="{FORK}">exl3-qlora</a></b> required.
+      <br/><br/>
       MemT-1.0-Nano is Qwen3.6-35B-A3B plus a trained memory block on its ten full-attention layers: the model files earlier
       conversation turns into a 40 MiB latent memory and answers from it instead of re-reading the whole chat.
-      <br/>
+      <br/><br/>
       Each revision is the stock backbone quant from
       <a class="link-style" href="https://huggingface.co/{BACKBONE}">{BACKBONE}</a> (byte for byte, credit yeasah) plus the MemT
       files: <code>memt_block.safetensors</code> (bf16, 0.84 GiB), the MemT configs, and the release chat template with a small
@@ -105,13 +134,13 @@ tags:
   <div class="content-panel">
     <div class="panel-title">Repo Data</div>
     <div class="panel-body repo-data-body repo-data-panel">
-      <div class="table-wrapper">
+{graphs}      <div class="table-wrapper">
         <table class="data-table">
           <thead>
             <tr>
               <th>REVISION</th>
               <th>GiB</th>
-              <th>BACKBONE QUANT</th>
+{head_extra}              <th>BACKBONE QUANT</th>
             </tr>
           </thead>
           <tbody>
