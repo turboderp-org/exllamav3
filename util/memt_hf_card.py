@@ -163,6 +163,10 @@ tags:
       after), or <code>/commit every 3</code> to let it memorize on its own. Edits roll memory back, regenerations don't memorize
       twice, chats don't share memory. Every setting, the request-level controls and the test scripts are in the fork's
       <a class="link-style" href="{FORK}/blob/master/doc/MEMT_README.md">doc/MEMT_README.md</a>.
+      <br/><br/>
+      Not yet measured: whether memorizing replies as the model generated them (reasoning included, the original
+      MemT runtime's way, <code>EXL3_MEMT_COMMIT_GENERATED=1</code>) recalls better than memorizing the client's
+      re-sent copy (the default). Both are supported; nobody has compared them.
     </div>
   </div>
 
