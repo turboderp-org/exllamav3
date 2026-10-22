@@ -242,6 +242,15 @@ replayed as a CUDA graph per (bsz, seqlen) captured on the layer's own device (`
 eager 0.45 ms per layer, replay 0.18 ms. Through Tabby: 79 tok/s without memory, 73 with (was 51).
 `util/memt_gen_test.py` (alone/batched/cached parity, zero state == plain) passes.
 
+**Long documents** (2026-10-22). A pasted document is just a long turn, so the fix was the scan: commits of
+128+ tokens (`EXL3_MEMT_CHUNKED_MIN_TOKENS`) run the GDN-2 update through fla's chunked KDA kernel
+(`training/memt.py: memt_update`; the update is KDA with beta = 1, checked against the sequential reference
+at ~1e-3 relative error, the release commits through the same kernel family; `EXL3_MEMT_CHUNKED=0` forces the
+reference). A 7.6k-token document commits in 1.5 s warm (was 11 s), the same as plain prefill, and the
+facts in it are recalled. The generator compiles the kernel at startup (~4 s, random inputs) so the first
+long commit of a chat does not stall. The release's separate `document=True` mode (2048-token chunks with no
+attention across chunks) exists in `Model.memt_commit` but is not used by the server.
+
 **Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
 model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
 exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby

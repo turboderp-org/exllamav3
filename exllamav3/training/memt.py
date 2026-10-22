@@ -58,6 +58,7 @@ is the follow-up for long commits.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
+import os
 import torch
 import torch.nn.functional as F
 
@@ -269,6 +270,50 @@ def memt_update_reference(
     return S
 
 
+# Long commits (documents, long replies) go through fla's chunked KDA kernel: the GDN-2 update
+#   S = (I - u u^T) diag(exp g) S + u (w*v)^T
+# is Kimi Delta Attention with beta = 1, key u = erase_sqrt * l2norm(k), value w * v and the per-k-channel
+# log decay g. Checked against the sequential reference on random inputs (relative error ~1e-3 in fp32,
+# the kernel's internal precision; the release commits through the same family of fla kernels). Short
+# turns keep the exact fp32 reference.
+MEMT_CHUNKED_MIN_TOKENS = int(os.environ.get("EXL3_MEMT_CHUNKED_MIN_TOKENS", "128"))
+_memt_chunked_enable = os.environ.get("EXL3_MEMT_CHUNKED", "1") != "0"
+
+
+def memt_update(
+    k_raw: torch.Tensor,
+    v: torch.Tensor,
+    erase_sqrt: torch.Tensor,
+    write: torch.Tensor,
+    log_decay: torch.Tensor,
+    state0: Optional[torch.Tensor],
+    spec: MemTSpec,
+) -> torch.Tensor:
+    """``memt_update_reference`` for short or CPU inputs, fla ``chunk_kda`` for long CUDA ones."""
+    b, t, H, D = k_raw.shape
+    if not (_memt_chunked_enable and k_raw.is_cuda and t >= MEMT_CHUNKED_MIN_TOKENS):
+        return memt_update_reference(k_raw, v, erase_sqrt, write, log_decay, state0, spec)
+    try:
+        from fla.ops.kda import chunk_kda
+    except ImportError:
+        return memt_update_reference(k_raw, v, erase_sqrt, write, log_decay, state0, spec)
+    up = _f32
+    u = memt_l2norm(up(k_raw), spec.l2norm_eps) * up(erase_sqrt)
+    wv = up(write) * up(v)
+    if state0 is None:
+        S0 = k_raw.new_zeros(b, H, D, D, dtype = torch.float32)
+    else:
+        S0 = up(state0)
+        if S0.dim() == 3:
+            S0 = S0.unsqueeze(0).expand(b, -1, -1, -1)
+        S0 = S0.contiguous()
+    _, S = chunk_kda(
+        torch.zeros_like(u), u, wv, up(log_decay), torch.ones(b, t, H, device = u.device, dtype = u.dtype),
+        initial_state = S0, output_final_state = True,
+    )
+    return S.to(torch.float32)
+
+
 def memt_output_gate(gate_latent: torch.Tensor, w: MemTWeights, spec: MemTSpec) -> torch.Tensor:
     """``G = g_down(gate_latent)`` viewed per head, ``[b, t, H, D]``."""
     b, t, _ = gate_latent.shape
@@ -330,7 +375,7 @@ def memt_block_forward(
     if commit:
         erase_sqrt, write, log_decay = memt_gates(
             p["erase"], p["write"], p["decay_latent"], w, spec)
-        next_state = memt_update_reference(
+        next_state = memt_update(
             p["k"], p["v"], erase_sqrt, write, log_decay,
             write_state if write_state is not None else read_state, spec)
     return out, next_state

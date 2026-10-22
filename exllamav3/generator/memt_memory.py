@@ -98,7 +98,25 @@ class MemTConversationMemory:
         self.generated_max = 4096
         self.snapshot_bytes = sum(s.numel() * 4 for s in model.memt_zero_state().values())
         self.last = None   # stats of the last prepare(), for tests and logging
+        self._warm_chunked_scan()
         self.last_prompt = None   # token ids the last job actually ran on
+
+    def _warm_chunked_scan(self):
+        """Compile fla's chunked scan now (random inputs, no model forward) so the first long commit does
+        not pay the ~4 s Triton build in the middle of a chat."""
+        from ..training import memt as m
+        if not (m._memt_chunked_enable and torch.cuda.is_available()):
+            return
+        try:
+            layer = next(iter(self.model.memt_zero_state().values()))
+            spec = self.model.memt_layout.spec
+            dev = next(blk.attn.memt.device for blk in self.model.modules
+                       if getattr(getattr(blk, "attn", None), "memt", None) is not None)
+            t = m.MEMT_CHUNKED_MIN_TOKENS
+            r = lambda: torch.randn(1, t, spec.num_heads, spec.head_dim, device = dev)
+            m.memt_update(r(), r(), r().abs(), r().abs(), -r().abs() * 0.01, layer.to(dev), spec)
+        except Exception as e:
+            print(f" !! memt: chunked-scan warmup failed, long commits will compile on first use: {e}", flush = True)
 
     # --- in-band commands ---------------------------------------------------
 
