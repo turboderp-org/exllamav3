@@ -352,11 +352,22 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
+        from ..modules.transformer import TransformerBlock
+        mods = self.fwd_modules
+        for i, (module, instance, idx) in enumerate(mods):
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
+            # A block may leave its final residual add to the next block's input norm (same device)
+            nxt = mods[i + 1][0] if i + 1 < len(mods) else None
+            params["resid_defer"] = (
+                type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
+            )
             x = module.forward(x, params)
+        params.pop("resid_defer", None)
+        pending = params.pop("resid_pending", None)
+        if pending is not None:
+            x += pending
         return x
 
