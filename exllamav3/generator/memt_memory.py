@@ -18,7 +18,9 @@ Commit policy. By default every completed unit is committed (``commit_every`` = 
 ride raw in the context until then; 0 never commits on its own. Two in-band controls override it, and are
 stripped from what the model sees (keys are still taken over the client's untouched ids):
   * ``/commit`` on a line of its own in a user message commits everything before that message;
-    ``/commit every N`` in a user or system message sets the period from there on.
+    ``/commit every N`` in a user or system message sets the period from there on. A message that is
+    nothing but commands gets a fixed one-line reply without running the model, and that exchange is
+    left out of memory and context later.
   * a ``<|im_start|>memt\n...<|im_end|>`` turn carrying the same lines, emitted by the chat template from the
     request's ``template_vars`` (``memt_commit``, ``memt_commit_every``), applies to that request only.
 
@@ -104,13 +106,14 @@ class MemTConversationMemory:
     def _scan_unit(self, unit: list[int], roles: tuple[str, ...]):
         """
         Read /commit commands from the turns of ``roles`` inside one unit. Returns (commit_now, every,
-        unit_without_the_command_lines_and_without_memt_turns). Turns without commands keep their exact ids.
+        unit_without_the_command_lines_and_without_memt_turns, bare). Turns without commands keep their exact
+        ids; bare is True when a user turn held commands and nothing else.
         """
         starts = [i for i, t in enumerate(unit) if t == self.im_start] or [0]
         segs = [unit[a:b] for a, b in zip(starts, starts[1:] + [len(unit)])]
         if starts[0] > 0:
             segs.insert(0, unit[:starts[0]])
-        now, every, out = False, None, []
+        now, every, out, bare = False, None, [], False
         for seg in segs:
             role = self._role_of(seg)
             if role not in roles or self.newline not in seg:
@@ -127,9 +130,22 @@ class MemTConversationMemory:
                 out += seg
                 continue
             now, every = now or n, e if e is not None else every
+            bare = bare or (role == "user" and not stripped)
             body = self.tokenizer.encode(stripped, add_bos = False, encode_special_tokens = True)[0].tolist() if stripped else []
             out += seg[:a] + body + seg[b:]
-        return now, every, out
+        return now, every, out, bare
+
+    @staticmethod
+    def canned_reply(committed: int, in_memory: int, every: int | None) -> str:
+        """What a message consisting only of commands gets back, without running the model"""
+        parts = []
+        if committed:
+            parts.append(f"Memorized {committed} exchange{'s' if committed != 1 else ''}.")
+        elif every is None:
+            parts.append(f"Nothing new to memorize ({in_memory} exchange{'s' if in_memory != 1 else ''} in memory).")
+        if every is not None:
+            parts.append(f"Memorizing every {every} exchanges from now." if every else "Automatic memorizing is off.")
+        return " ".join(parts)
 
     # --- prompt structure ---------------------------------------------------
 
@@ -198,17 +214,19 @@ class MemTConversationMemory:
         # and finally the request's own memt turn (from template_vars), each overriding the one before
         every = self.commit_every
         floor = 0   # units[:floor] must be in memory because a /commit was issued after them
-        _, e, system = self._scan_unit(system, ("system",))
+        _, e, system, _ = self._scan_unit(system, ("system",))
         every = e if e is not None else every
-        stripped_units = []
+        stripped_units, bare = [], []
         for k, u in enumerate(units):
-            now, e, u = self._scan_unit(u, ("user",))
+            now, e, u, b = self._scan_unit(u, ("user",))
             stripped_units.append(u)
+            bare.append(b)
             every = e if e is not None else every
             if now:
                 floor = k
         units = stripped_units
-        now, e, live = self._scan_unit(live, ("user", "memt"))
+        now, e, live, live_bare = self._scan_unit(live, ("user", "memt"))
+        live_every = e
         every = e if e is not None else every
         if now:
             floor = n
@@ -230,25 +248,33 @@ class MemTConversationMemory:
 
         t0 = time.time()
         committed_tokens = 0
+        skipped = 0
         for k in range(matched, target):
-            unit = torch.tensor([units[k]], dtype = torch.long)
-            state = self.model.memt_commit(unit, state)
-            committed_tokens += len(units[k])
+            if bare[k]:
+                skipped += 1   # a command-only message and its canned reply: not worth remembering
+            else:
+                unit = torch.tensor([units[k]], dtype = torch.long)
+                state = self.model.memt_commit(unit, state)
+                committed_tokens += len(units[k])
             self._put(keys[k + 1], state)
         commit_time = time.time() - t0
 
         prompt = list(system)
-        for u in units[target:]:
-            prompt += u
+        for k in range(target, n):
+            if not bare[k]:
+                prompt += units[k]
         prompt += live
         short = torch.tensor([prompt], dtype = torch.long)
         job.memt_rebase(short, state if target > 0 else None, keys[target])
+        if live_bare:
+            job.memt_canned = self.canned_reply(target - matched - skipped, target, live_every)
 
         self.last_prompt = prompt
         self.last = {
             "prompt_tokens": len(ids), "units": n, "matched": matched, "in_memory": target,
             "commit_every": every, "commit_floor": floor,
             "committed": target - matched, "committed_tokens": committed_tokens, "commit_time": commit_time,
+            "skipped": skipped, "canned": job.memt_canned,
             "short_prompt_tokens": len(prompt), "snapshots": len(self.snapshots),
         }
         if self.verbose:

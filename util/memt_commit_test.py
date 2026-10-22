@@ -122,6 +122,22 @@ check("otter" in r.lower(), "recalls the hint")
 r = chat(SYSTEM, turns3, "Say hi.", control = "/commit every 1")
 check(mem.last["in_memory"] == 4 and mem.last["committed"] == 2 and mem.last["commit_every"] == 1, f"'every 1' for one request: {mem.last}")
 
+print("== G. a message that is only /commit: canned reply, no generation, exchange skipped later", flush = True)
+turns4 = []
+chat(SYSTEM, turns4, "Remember: my lucky number is 42.")
+chat(SYSTEM, turns4, "Remember: my hometown is Bergen.")
+r = chat(SYSTEM, turns4, "/commit")
+check(r == "Memorized 2 exchanges." and mem.last["canned"] == r, f"canned reply: {r!r}")
+check(mem.last["in_memory"] == 2 and mem.last["committed"] == 2, f"committed on the bare command: {mem.last}")
+r = chat(SYSTEM, turns4, "/commit")
+check(r == "Nothing new to memorize (3 exchanges in memory).", f"second bare /commit: {r!r}")
+check(mem.last["skipped"] == 1 and mem.last["committed_tokens"] == 0, f"the bare exchange was skipped, not committed: {mem.last}")
+r = chat(SYSTEM, turns4, "/commit every 3")
+check(r == "Memorizing every 3 exchanges from now.", f"bare 'every': {r!r}")
+r = chat(SYSTEM, turns4, "What is my lucky number and my hometown?")
+check("42" in r and "Bergen" in r, "recall after the bare commands")
+check("Memorized" not in seen() and "Nothing new" not in seen(), "canned exchanges kept out of the raw context")
+
 print("== F. regenerate after a typed /commit: nothing new committed, same answer", flush = True)
 t = list(turns)
 t.pop()   # drop the last exchange and resend the same question

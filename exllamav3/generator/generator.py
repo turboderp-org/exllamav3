@@ -768,6 +768,7 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+        self.iterate_canned_jobs(results)
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
@@ -1991,6 +1992,34 @@ class Generator:
             "error": error,
         })
 
+
+    def iterate_canned_jobs(self, results: list):
+        """
+        Finish pending jobs that carry a fixed reply (a MemT command-only message) without running them: one
+        "started" event and one final "streaming" event shaped like a stop-token finish.
+        """
+        for job in self.pending_jobs.copy():
+            if job.memt_canned is None:
+                continue
+            self.pending_jobs.remove(job)
+            now = time.time()
+            text = job.memt_canned
+            ids = self.tokenizer.encode(text, add_bos = False)
+            base = {"job": job, "serial": job.serial_number}
+            if job.identifier is not None:
+                base["identifier"] = job.identifier
+            results.append({**base, "stage": "started", "eos": False})
+            job.is_finished = True
+            job.full_completion = text
+            results.append({
+                **base, "stage": "streaming", "eos": True, "eos_reason": "stop_token",
+                "eos_triggering_token_id": self.tokenizer.eos_token_id,
+                "eos_triggering_token_str": self.tokenizer.get_id_to_piece_list(True)[self.tokenizer.eos_token_id],
+                "text": text, "token_ids": ids, "full_completion": text,
+                "new_tokens": ids.shape[-1], "prompt_tokens": len(job.sequences[0].input_ids),
+                "time_enqueued": now - job.time_enqueue, "time_prefill": 0.0, "time_generate": 0.0,
+                "cached_pages": 0, "cached_tokens": 0,
+            })
 
     def iterate_start_jobs(self, results: list):
         """

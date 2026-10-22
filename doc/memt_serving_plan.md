@@ -219,6 +219,12 @@ sticky for that chat (edits still roll back by prefix match, as before).
 - `/commit every N` in a user or system message: set the period from there on (the system prompt is the
   natural place for a per-chat default).
 
+**Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
+model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
+exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby
+streams it like any reply. That exchange is skipped when later turns are committed and is left out of the
+raw context, so memory never fills with the server's own lines.
+
 **Request-field route.** The sidecar's chat template emits a `<|im_start|>memt ... <|im_end|>` control turn
 right before the generation prompt when the request carries `template_vars` `memt_commit: true` and/or
 `memt_commit_every: N`; the generator reads it and drops it. Tabby forwards any `template_vars` key, and

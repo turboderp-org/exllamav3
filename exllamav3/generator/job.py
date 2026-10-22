@@ -316,6 +316,7 @@ class Job:
         self.memt_state = memt_state
         self.memt_key = memt_key
         self._memt_dev_state = None
+        self.memt_canned = None   # set by MemTConversationMemory: reply with this text instead of generating
         if memt_state is not None:
             if self.memt_key is None:
                 self.memt_key = random_hash()
