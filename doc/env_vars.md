@@ -816,7 +816,7 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
-Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+Use expandable segments for all Torch allocations. Opt out with a value of 0 or by explicitly
 setting `PYTORCH_CUDA_ALLOC_CONF`.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
