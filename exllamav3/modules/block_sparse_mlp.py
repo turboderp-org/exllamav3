@@ -793,6 +793,26 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
 
     @override
+    def capture_pass_experts(self, selected_experts: torch.Tensor, routing_weights: torch.Tensor, capture_qmaps):
+        """All-experts calibration pass limited to the experts whose down-projection Hessians the
+        current capture pass accumulates (the converter splits a module's capture into passes when
+        the per-expert Hessians do not fit beside the weights). Every row holds every expert, so
+        filtering by expert id keeps the selection rectangular. The shared up/gate Hessian is fed
+        by the first expert alone, so a pass without any of this module's experts runs expert 0"""
+        if len(self.downs) != self.num_experts:
+            return selected_experts, routing_weights
+        keep = [i for i, down in enumerate(self.downs) if down.qmap in capture_qmaps]
+        if len(keep) == self.num_experts:
+            return selected_experts, routing_weights
+        if not keep:
+            keep = [0]
+        mask = (selected_experts.unsqueeze(-1) == torch.tensor(keep, device = selected_experts.device)).any(-1)
+        return (
+            selected_experts[mask].view(selected_experts.shape[0], len(keep)),
+            routing_weights[mask].view(routing_weights.shape[0], len(keep)),
+        )
+
+
     def load(self, device: torch.Device, **kwargs):
         # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
         # GPU load entirely; a split registration shrinks the module to its GPU slice first
@@ -1045,6 +1065,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         if self.routing_gate is not None:
             selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
+            if params.get("activate_all_experts") and "capture_qmaps" in params:
+                selected_experts, routing_weights = \
+                    self.capture_pass_experts(selected_experts, routing_weights, params["capture_qmaps"])
         elif bsz == 1:
             # Stable broadcast targets rather than per-call allocations
             if self.bcast_sel_bsz1 is None:

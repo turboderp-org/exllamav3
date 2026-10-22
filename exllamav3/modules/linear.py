@@ -6,6 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
+from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
@@ -597,8 +598,13 @@ class Linear(Module):
 
 
     def init_H_data(self, init_tensor: bool):
+        # The capture accumulates into the block-packed upper triangle (hessian_packed); the full matrix is
+        # reconstructed when the tensor is finalized. The uncalibrated placeholder stays a meta (in, in) matrix
         return {
-            "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device if init_tensor else "meta"),
+            "H": torch.zeros(packed_numel(self.in_features), dtype = torch.float32, device = self.device) if init_tensor else
+                 torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = "meta"),
+            "packed": init_tensor,
+            "n": self.in_features,
             "first_key": self.key,
             "count": 0,
             "finalized": False,
@@ -618,7 +624,7 @@ class Linear(Module):
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]
-            x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
+            x = x.reshape((rows, dim))
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
@@ -628,7 +634,7 @@ class Linear(Module):
                 x = x[finite]
                 rows = x.shape[0]
 
-            params["capture"][self.qmap]["H"].addmm_(x.T, x)
+            accumulate_(params["capture"][self.qmap]["H"], x)
             params["capture"][self.qmap]["count"] += rows
 
 
@@ -657,7 +663,11 @@ class Linear(Module):
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
 
         if self.qmap and "capture" in params:
-            self.capture_H(x, params)
+            # A capture split into passes (convert_model.capture_passes) names the qmaps of the
+            # current pass; everything else runs without accumulating
+            pass_qmaps = params.get("capture_qmaps")
+            if pass_qmaps is None or self.qmap in pass_qmaps:
+                self.capture_H(x, params)
 
         if self.lora_a_tensors:
             lora_input = x
