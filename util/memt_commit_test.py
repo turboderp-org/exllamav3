@@ -21,14 +21,14 @@ args = ap.parse_args()
 
 NOTHINK = "<think>\n\n</think>\n\n"
 
-def render(system, turns, live_user, control = None):
+def render(system, turns, live_user, control = None, think = False):
     s = f"<|im_start|>system\n{system}<|im_end|>\n"
     for u, a in turns:
         s += f"<|im_start|>user\n{u}<|im_end|>\n<|im_start|>assistant\n{a}<|im_end|>\n"
     s += f"<|im_start|>user\n{live_user}<|im_end|>\n"
     if control:
         s += f"<|im_start|>memt\n{control}\n<|im_end|>\n"   # what the sidecar template emits from template_vars
-    s += f"<|im_start|>assistant\n{NOTHINK}"
+    s += "<|im_start|>assistant\n" + ("<think>\n" if think else NOTHINK)
     return s
 
 cfg = Config.from_directory(args.memt_dir)
@@ -40,9 +40,9 @@ gen = Generator(model, cache, tok, memt_memory = True, memt_commit_every = 0, me
 mem = gen.memt_memory
 enc = lambda s: tok.encode(s, add_bos = False, encode_special_tokens = True)
 
-def chat(system, turns, user, control = None):
-    prompt = render(system, turns, user, control)
-    job = Job(input_ids = enc(prompt), max_new_tokens = args.new_tokens, sampler = ArgmaxSampler(),
+def chat(system, turns, user, control = None, think = False):
+    prompt = render(system, turns, user, control, think)
+    job = Job(input_ids = enc(prompt), max_new_tokens = 600 if think else args.new_tokens, sampler = ArgmaxSampler(),
               stop_conditions = [tok.eos_token_id, "<|im_end|>"])
     gen.enqueue(job)
     text = ""
@@ -52,9 +52,11 @@ def chat(system, turns, user, control = None):
             if r["stage"] == "streaming":
                 text += r.get("text", "")
     reply = text.strip()
-    print(f"USER: {user!r}\nBOT:  {reply}   [{time.time() - t0:.2f}s, {mem.last['short_prompt_tokens']}/{mem.last['prompt_tokens']} tok]\n", flush = True)
-    turns.append((user, reply))
-    return reply
+    visible = reply.split("</think>")[-1].strip() if think else reply   # what a UI keeps and resends
+    print(f"USER: {user!r}\nBOT:  {visible}   [{time.time() - t0:.2f}s, {mem.last['short_prompt_tokens']}/{mem.last['prompt_tokens']} tok"
+          f"{', reasoning ' + str(len(reply) - len(visible)) + ' chars' if think else ''}]\n", flush = True)
+    turns.append((user, visible))
+    return visible
 
 def seen():
     return tok.decode(torch.tensor(mem.last_prompt), decode_special_tokens = True)
@@ -137,6 +139,26 @@ check(r == "Memorizing every 3 exchanges from now.", f"bare 'every': {r!r}")
 r = chat(SYSTEM, turns4, "What is my lucky number and my hometown?")
 check("42" in r and "Bergen" in r, "recall after the bare commands")
 check("Memorized" not in seen() and "Nothing new" not in seen(), "canned exchanges kept out of the raw context")
+
+print("== H. commit_generated: replies memorized as generated, reasoning included", flush = True)
+mem.commit_generated = True
+turns5 = []
+chat(SYSTEM, turns5, "Remember: my parrot is called Ziggy.", think = True)
+chat(SYSTEM, turns5, "Remember: my favourite number is 7.", think = True)
+r = chat(SYSTEM, turns5, "What is my parrot called?\n/commit", think = True)
+check(mem.last["committed"] == 2 and mem.last["generated"] == 2, f"both units committed from generated ids: {mem.last}")
+client_copy = mem.last["prompt_tokens"] - mem.last["short_prompt_tokens"]
+check(mem.last["committed_tokens"] > client_copy, f"generated version is longer than the client's copy ({mem.last['committed_tokens']} vs {client_copy} tokens)")
+check("Ziggy" in r, "recalls from memory")
+r = chat(SYSTEM, turns5, "And my favourite number?\n/commit", think = True)
+check(mem.last["generated"] == 1 and mem.last["committed"] == 1, f"the earlier /commit turn itself memorized as generated: {mem.last}")
+check("7" in r, "recalls the number")
+print("-- edit a reply: that unit falls back to the client's copy", flush = True)
+turns5[1] = (turns5[1][0], "Seven, noted.")
+r = chat(SYSTEM, turns5, "What is my favourite number?", think = True)
+check(mem.last["matched"] == 1 and mem.last["committed"] == 2 and mem.last["generated"] == 1, f"rolled back to 1; edited unit from the client's copy, the next as generated: {mem.last}")
+check("7" in r or "seven" in r.lower(), "still recalls the number")
+mem.commit_generated = False
 
 print("== F. regenerate after a typed /commit: nothing new committed, same answer", flush = True)
 t = list(turns)

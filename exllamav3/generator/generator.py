@@ -61,6 +61,7 @@ class Generator:
         memt_memory: bool | None = None,
         memt_context_turns: int | None = None,
         memt_commit_every: int | None = None,
+        memt_commit_generated: bool | None = None,
         memt_cache_size: int | None = None,
         memt_verbose: bool | None = None,
         **kwargs
@@ -219,6 +220,11 @@ class Generator:
             "/commit" and "/commit every N" lines in user/system messages and by the memt turn a chat template
             emits from template_vars (memt_commit, memt_commit_every). Default: env EXL3_MEMT_COMMIT_EVERY, else 1
 
+        :param memt_commit_generated:
+            With memt_memory, commit each reply as the server generated it (reasoning and stop token included,
+            like the release replays turns) instead of the client's re-rendered copy, when the client's visible
+            answer still matches. Default: env EXL3_MEMT_COMMIT_GENERATED (non-empty, not "0"), else off
+
         :param memt_cache_size:
             With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default: env
             EXL3_MEMT_CACHE_MB, else 2 GB (~50 snapshots of MemT-1.0-Nano)
@@ -333,6 +339,8 @@ class Generator:
                 memt_context_turns = int(os.environ.get("EXL3_MEMT_CONTEXT_TURNS", "0"))
             if memt_commit_every is None:
                 memt_commit_every = int(os.environ.get("EXL3_MEMT_COMMIT_EVERY", "1"))
+            if memt_commit_generated is None:
+                memt_commit_generated = os.environ.get("EXL3_MEMT_COMMIT_GENERATED", "") not in ("", "0")
             if memt_cache_size is None:
                 memt_cache_size = int(float(os.environ.get("EXL3_MEMT_CACHE_MB", "2048")) * 1024**2)
             if memt_verbose is None:
@@ -341,6 +349,7 @@ class Generator:
                 self.model, tokenizer,
                 context_turns = memt_context_turns,
                 commit_every = memt_commit_every,
+                commit_generated = memt_commit_generated,
                 cache_size = memt_cache_size,
                 verbose = memt_verbose,
             )
@@ -837,6 +846,11 @@ class Generator:
         # Disk tier: queue the complete pages of the active sequences (see disk_cache_write_interval)
         if self.disk_page_cache is not None and self.active_jobs and self.disk_cache_write_interval > 0:
             self.write_behind()
+
+        if self.memt_memory is not None and self.memt_memory.commit_generated:
+            for r in results:
+                if r["stage"] == "streaming" and r["eos"] and r["job"].memt_pending is not None:
+                    self.memt_memory.record(r["job"])
 
         # Finished iteration
         return results

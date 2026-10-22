@@ -317,6 +317,7 @@ class Job:
         self.memt_key = memt_key
         self._memt_dev_state = None
         self.memt_canned = None   # set by MemTConversationMemory: reply with this text instead of generating
+        self.memt_pending = rq_state.get("memt_pending")   # set by MemTConversationMemory: record the reply when done
         if memt_state is not None:
             if self.memt_key is None:
                 self.memt_key = random_hash()
@@ -1256,6 +1257,7 @@ class Job:
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
+            "memt_pending": self.memt_pending,
         }
 
         serial_number = self.serial_number

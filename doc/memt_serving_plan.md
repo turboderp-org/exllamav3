@@ -219,6 +219,15 @@ sticky for that chat (edits still roll back by prefix match, as before).
 - `/commit every N` in a user or system message: set the period from there on (the system prompt is the
   natural place for a per-chat default).
 
+**What gets memorized** (`EXL3_MEMT_COMMIT_GENERATED=1`, generator arg `memt_commit_generated`, default
+off). Off: a turn is memorized as the client resends it, reply without reasoning. On: when a reply finishes,
+the generator keeps the exact ids it produced (reasoning, stop token) keyed on the user message and the
+visible answer; when that turn is later memorized and the client's visible answer still matches, the
+generated version is used instead, as the release replays turns. An edited reply falls back to the client's
+copy. The verbose line says "N as generated". Box-tested through Tabby with thinking on: two turns memorized
+as 510 generated tokens against the client's 71. Which recalls better is untested; that is the point of the
+switch.
+
 **Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
 model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
 exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby

@@ -24,6 +24,10 @@ stripped from what the model sees (keys are still taken over the client's untouc
   * a ``<|im_start|>memt\n...<|im_end|>`` turn carrying the same lines, emitted by the chat template from the
     request's ``template_vars`` (``memt_commit``, ``memt_commit_every``), applies to that request only.
 
+With ``commit_generated`` the server keeps the exact ids it generated for each reply (reasoning and stop token
+included, as the release replays them) and commits those instead of the client's re-rendered copy whenever the
+client's visible answer still matches what was generated; an edited reply falls back to the client's version.
+
 Keys are hashes of the client's own rendering, so template differences cannot break matching; an edited
 history matches a shorter prefix and memory rolls back to that point. Snapshots live in RAM (fp32, 40 MiB
 each for MemT-1.0-Nano) in an LRU capped in bytes; the zero state (no committed units) is implicit.
@@ -54,6 +58,7 @@ class MemTConversationMemory:
         tokenizer: Tokenizer,
         context_turns: int = 0,
         commit_every: int = 1,
+        commit_generated: bool = False,
         cache_size: int = 2 * 1024**3,
         verbose: bool = False,
     ):
@@ -62,6 +67,7 @@ class MemTConversationMemory:
         self.tokenizer = tokenizer
         self.context_turns = max(0, context_turns)
         self.commit_every = max(0, commit_every)
+        self.commit_generated = commit_generated
         self.cache_size = cache_size
         self.verbose = verbose
 
@@ -77,6 +83,10 @@ class MemTConversationMemory:
         self.im_end = enc("<|im_end|>")[0]
 
         self.snapshots: OrderedDict[bytes, dict[int, torch.Tensor]] = OrderedDict()
+        # (user-turn hash, visible-answer hash) -> exact unit ids as generated, for commit_generated. Keyed on the
+        # turn alone, not the history, so a reply stays findable after an earlier turn is edited
+        self.generated: OrderedDict[tuple[bytes, bytes], list[int]] = OrderedDict()
+        self.generated_max = 4096
         self.snapshot_bytes = sum(s.numel() * 4 for s in model.memt_zero_state().values())
         self.last = None   # stats of the last prepare(), for tests and logging
         self.last_prompt = None   # token ids the last job actually ran on
@@ -134,6 +144,68 @@ class MemTConversationMemory:
             body = self.tokenizer.encode(stripped, add_bos = False, encode_special_tokens = True)[0].tolist() if stripped else []
             out += seg[:a] + body + seg[b:]
         return now, every, out, bare
+
+    # --- generated-reply store (commit_generated) ------------------------------
+
+    def _segments(self, unit: list[int]) -> list[list[int]]:
+        starts = [i for i, t in enumerate(unit) if t == self.im_start]
+        if not starts:
+            return [unit]
+        segs = [unit[a:b] for a, b in zip(starts, starts[1:] + [len(unit)])]
+        if starts[0] > 0:
+            segs.insert(0, unit[:starts[0]])
+        return segs
+
+    def _user_portion(self, unit: list[int]) -> list[int]:
+        """the leading user turn(s) of a unit, before its first reply: what the live prompt and the later
+        unit have in common, so the generated-reply key is stable across the two"""
+        out = []
+        for seg in self._segments(unit):
+            if self._role_of(seg) != "user":
+                break
+            out += seg
+        return out
+
+    @staticmethod
+    def _visible(text: str) -> str:
+        if "</think>" in text:
+            text = text.split("</think>", 1)[1]
+        text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags = re.DOTALL)
+        return text.strip()
+
+    def _reply_visible(self, unit: list[int]) -> str | None:
+        """visible text of the unit's first assistant turn as the client rendered it, None if there is none"""
+        for seg in self._segments(unit):
+            if self._role_of(seg) == "assistant":
+                a = seg.index(self.newline) + 1
+                b = seg.index(self.im_end) if self.im_end in seg else len(seg)
+                return self._visible(self.tokenizer.decode(torch.tensor(seg[a:b]), decode_special_tokens = True)) if b > a else ""
+        return None
+
+    @staticmethod
+    def _vis_hash(text: str) -> bytes:
+        return hashlib.blake2b(text.encode(), digest_size = 16).digest()
+
+    def record(self, job) -> None:
+        """
+        Called by the generator when a job with a pending entry finishes: store the unit as it was actually
+        generated (live user turn as run + generated ids incl. the stop token + newline) under its pending key.
+        """
+        pending = job.memt_pending
+        job.memt_pending = None
+        if pending is None:
+            return
+        gen = job.sequences[0].sequence_ids.torch()[0].tolist()[pending["prompt_len"]:]
+        if not gen:
+            return
+        body = gen[:-1] if gen[-1] in (self.im_end, self.tokenizer.eos_token_id) else gen
+        text = self.tokenizer.decode(torch.tensor(body), decode_special_tokens = True)
+        if gen[-1] != self.im_end:
+            gen = body + [self.im_end]
+        unit = pending["live"] + gen + [self.newline]
+        self.generated[(pending["key"], self._vis_hash(self._visible(text)))] = unit
+        while len(self.generated) > self.generated_max:
+            self.generated.popitem(last = False)
 
     @staticmethod
     def canned_reply(committed: int, in_memory: int, every: int | None) -> str:
@@ -209,6 +281,7 @@ class MemTConversationMemory:
         system, units, live = self.split_units(ids)
         keys = self.keys_of(system, units)   # over the client's ids, before any command is stripped
         n = len(units)
+        client_units, client_live = units, live
 
         # Commit policy: env default, then commands in the system turn, past user turns, the live turn,
         # and finally the request's own memt turn (from template_vars), each overriding the one before
@@ -249,13 +322,21 @@ class MemTConversationMemory:
         t0 = time.time()
         committed_tokens = 0
         skipped = 0
+        generated = 0   # units committed from the server's own generated ids rather than the client's copy
         for k in range(matched, target):
             if bare[k]:
                 skipped += 1   # a command-only message and its canned reply: not worth remembering
             else:
-                unit = torch.tensor([units[k]], dtype = torch.long)
-                state = self.model.memt_commit(unit, state)
-                committed_tokens += len(units[k])
+                unit = units[k]
+                if self.commit_generated:
+                    vis = self._reply_visible(client_units[k])
+                    if vis is not None:
+                        g = self.generated.get((_chain(b"", self._user_portion(client_units[k])), self._vis_hash(vis)))
+                        if g is not None:
+                            unit = g
+                            generated += 1
+                state = self.model.memt_commit(torch.tensor([unit], dtype = torch.long), state)
+                committed_tokens += len(unit)
             self._put(keys[k + 1], state)
         commit_time = time.time() - t0
 
@@ -268,17 +349,20 @@ class MemTConversationMemory:
         job.memt_rebase(short, state if target > 0 else None, keys[target])
         if live_bare:
             job.memt_canned = self.canned_reply(target - matched - skipped, target, live_every)
+        elif self.commit_generated:
+            job.memt_pending = {"key": _chain(b"", self._user_portion(client_live)), "live": list(live), "prompt_len": len(prompt)}
 
         self.last_prompt = prompt
         self.last = {
             "prompt_tokens": len(ids), "units": n, "matched": matched, "in_memory": target,
             "commit_every": every, "commit_floor": floor,
             "committed": target - matched, "committed_tokens": committed_tokens, "commit_time": commit_time,
-            "skipped": skipped, "canned": job.memt_canned,
+            "skipped": skipped, "canned": job.memt_canned, "generated": generated,
             "short_prompt_tokens": len(prompt), "snapshots": len(self.snapshots),
         }
         if self.verbose:
             print(f" -- memt: {len(ids)} prompt tokens, {n} turns: {matched} matched, "
-                  f"{target - matched} committed ({committed_tokens} tokens, {commit_time:.2f}s), "
+                  f"{target - matched} committed ({committed_tokens} tokens, {commit_time:.2f}s"
+                  f"{f', {generated} as generated' if generated else ''}), "
                   f"{n - target} raw (every {every}, floor {floor}); prompt now {len(prompt)} tokens; "
                   f"{len(self.snapshots)} snapshots", flush = True)
