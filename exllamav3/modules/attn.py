@@ -1279,6 +1279,8 @@ class Attention(Module):
         storage += self.k_proj.storage_size()
         storage += self.v_proj.storage_size() if self.v_proj else 0
         storage += self.o_proj.storage_size()
+        if self.memt is not None:
+            storage += self.memt.weights_numel() * 2   # bf16 memory block, split by head with the attention
         for cl in self.cache_layers:
             storage += cl.storage_size()
         overhead_d = 0
@@ -1339,8 +1341,6 @@ class Attention(Module):
             nonlocal producer
             return child.tp_export(plan, producer) if child is not None else None
 
-        assert self.memt is None, "MemT memory layers do not support tensor parallelism yet"
-
         # Check if q_norm uses span_heads
         q_norm_span_heads = (
             self.q_norm is not None and
@@ -1386,6 +1386,8 @@ class Attention(Module):
             "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
+            # MemT memory block: per head, split along with the query heads on import
+            "memt": self.memt.tp_export(plan, producer) if self.memt is not None else None,
             "device": self.device,
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
@@ -1495,6 +1497,9 @@ class Attention(Module):
                     module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
 
         module.device = device
+        if exported.get("memt") is not None and num_kv_heads:
+            from .arch_specific.memt_memory import MemTMemory
+            module.attach_memt(MemTMemory.tp_import(local_context, exported["memt"], plan, first * n_gqa, last * n_gqa))
         # This rank's kv heads within the layer's full head range: what the CPU/disk cache tiers need to place
         # the shard of a cache page into the layout-independent (canonical) page image
         module.tp_kv_first = first

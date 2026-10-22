@@ -110,8 +110,10 @@ class MemTConversationMemory:
         try:
             layer = next(iter(self.model.memt_zero_state().values()))
             spec = self.model.memt_layout.spec
-            dev = next(blk.attn.memt.device for blk in self.model.modules
-                       if getattr(getattr(blk, "attn", None), "memt", None) is not None)
+            dev = next((blk.attn.memt.device for blk in self.model.modules
+                        if getattr(getattr(blk, "attn", None), "memt", None) is not None), None)
+            if dev is None:   # tensor parallel: the parent's modules are unloaded; compile on the output device
+                dev = getattr(self.model, "tp_output_device", None) or "cuda:0"
             t = m.MEMT_CHUNKED_MIN_TOKENS
             r = lambda: torch.randn(1, t, spec.num_heads, spec.head_dim, device = dev)
             m.memt_update(r(), r(), r().abs(), r().abs(), -r().abs() * 0.01, layer.to(dev), spec)

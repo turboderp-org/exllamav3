@@ -251,6 +251,21 @@ facts in it are recalled. The generator compiles the kernel at startup (~4 s, ra
 long commit of a chat does not stall. The release's separate `document=True` mode (2048-token chunks with no
 attention across chunks) exists in `Model.memt_commit` but is not used by the server.
 
+**Tensor parallelism** (2026-10-22, later). The memory block is per head and its 16 heads line up with the
+attention's query heads, so a rank keeps the memory heads of the query heads it owns (`MemTMemory.tp_import`
+slices `in_proj` sections, `f_down`/`g_down`, `decay_bias`, `decay_scale_log` by head; the two latent rows
+and `o_norm` are replicated) and its readout joins the local attention context before the split `o_proj`,
+summed by the layer's existing all-reduce. States are not shipped per token: the parent registers a state
+once under its snapshot key (`Model.memt_tp_put`, arena + per-rank head slice on the GPU), forwards carry
+only keys (`memt_read = {"tp_keys": [...]}`), the generator evicts (`Generator.MEMT_TP_MAX_STATES`), and
+commits run per rank under temporary keys and gather back (`_memt_commit_tp`, `memt_tp_get`). Tests:
+`util/memt_tp_parity.py` (committed state single vs TP: same greedy text; states agree to ~2% max, evenly
+over heads and growing with depth, i.e. TP's own fp16 reduce-order drift, not a split error),
+`memt_gen_test.py --tp` and `memt_chat_test.py --tp` both ALL PASS (the gen test now judges the reply up to
+the end token; the post-EOS filler can flip on near-ties under TP). Tabby: `--tensor-parallel true`.
+On 2x3090 TP decode is 79 tok/s with memory vs 88 without, against 80 / 86 on the layer split: no real gain
+for this MoE at batch 1, so TP is for people who already run TP, not a speedup to seek.
+
 **Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
 model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
 exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby

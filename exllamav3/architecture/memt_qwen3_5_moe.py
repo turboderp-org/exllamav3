@@ -136,6 +136,8 @@ class MemTQwen3_5MoeModel(Qwen3_5BaseModel):
           state the previous chunk wrote.
         """
         self.memt_check_state(states)
+        if self.loaded_tp:
+            return self._memt_commit_tp(input_ids, states, params, document)
         candidate = {i: s.detach().clone() for i, s in states.items()}
         chunk = self.memt_layout.chunk_tokens if document else input_ids.shape[1]
         for start in range(0, input_ids.shape[1], max(chunk, 1)):
@@ -148,6 +150,29 @@ class MemTQwen3_5MoeModel(Qwen3_5BaseModel):
             self.forward(event, p)
             candidate = write
         return candidate
+
+    def _memt_commit_tp(self, input_ids, states, params, document):
+        """memt_commit under tensor parallelism: states live on the ranks under temporary keys (see
+        model_tp_fn.mp_memt_put_state); each rank scans its own heads; the result is gathered back."""
+        import os
+        chunk = self.memt_layout.chunk_tokens if document else input_ids.shape[1]
+        base = os.urandom(16)
+        self.memt_tp_put(base, states)
+        read_key, write_key, temps = base, base, [base]
+        for start in range(0, input_ids.shape[1], max(chunk, 1)):
+            event = input_ids[:, start:start + chunk]
+            out_key = os.urandom(16)
+            temps.append(out_key)
+            p = dict(params or {})
+            p["memt_read"] = {"tp_keys": [read_key]}
+            p["memt_commit"] = {"tp_in": write_key, "tp_out": out_key}
+            self.forward(event, p)
+            write_key = out_key
+            if document:
+                read_key = out_key
+        result = self.memt_tp_get(write_key)
+        self.memt_tp_drop(temps)
+        return result
 
     def memt_save_state(self, states: dict[int, torch.Tensor], path: str, identity: str = ""):
         """Write the release's snapshot layout: fp32 ``memory.{layer}`` tensors of

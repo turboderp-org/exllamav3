@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import os
 import torch
+from collections import OrderedDict
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
@@ -1420,6 +1421,31 @@ class Generator:
         return draft_ids
 
 
+    MEMT_TP_MAX_STATES = 32   # registered states kept on the ranks (Nano: 20 MiB per rank per state at 2 ranks)
+
+    def _memt_tp_register(self, job) -> None:
+        reg = self.__dict__.setdefault("_memt_tp_keys", OrderedDict())
+        key = job.memt_key
+        if key in reg:
+            reg.move_to_end(key)
+            return
+        self.model.memt_tp_put(key, job.memt_state)
+        reg[key] = True
+        if len(reg) > self.MEMT_TP_MAX_STATES:
+            live = {j.memt_key for j in self.active_jobs + self.pending_jobs if j.memt_state is not None}
+            drop = [k for k in reg if k not in live][: len(reg) - self.MEMT_TP_MAX_STATES]
+            for k in drop:
+                del reg[k]
+            if drop:
+                self.model.memt_tp_drop(drop)
+
+    def memt_job_read(self, job) -> dict:
+        """One job's memt_read parameter for its prefill: per-device tensors, or registry keys under TP"""
+        if self.model.loaded_tp:
+            self._memt_tp_register(job)
+            return {"tp_keys": [job.memt_key] * len(job.sequences)}
+        return job.memt_read_params()
+
     def memt_batch_read(self, batch_jobs: list) -> dict | None:
         """
         {layer_idx: fp32 [bsz, H, D, D]} over the rows of batch_jobs (one row per job sequence), or None when
@@ -1427,6 +1453,14 @@ class Generator:
         """
         if not any(job.memt_state is not None for job in batch_jobs):
             return None
+        if self.model.loaded_tp:
+            # States live on the ranks under the job's key (registered once, evicted by this generator)
+            keys = []
+            for job in batch_jobs:
+                if job.memt_state is not None:
+                    self._memt_tp_register(job)
+                keys += [job.memt_key if job.memt_state is not None else None] * len(job.sequences)
+            return {"tp_keys": keys}
         per_job = [(job.memt_read_params() if job.memt_state is not None else None, len(job.sequences))
                    for job in batch_jobs]
         if len(per_job) == 1 and per_job[0][1] == 1:

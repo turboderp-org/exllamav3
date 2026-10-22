@@ -1664,7 +1664,7 @@ class Job:
                     "mm_span_prefix": mm_span_prefix,
                 }
                 if self.memt_state is not None:
-                    params["memt_read"] = self.memt_read_params()
+                    params["memt_read"] = self.generator.memt_job_read(self)
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:

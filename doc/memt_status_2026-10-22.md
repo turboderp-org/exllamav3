@@ -119,9 +119,16 @@ Tests, run with `~/exl3/qlora-venv/bin/python <script> /mnt/two/weights/MemT-1.0
   mention MemT in the repo's main README. Users then need: this fork installed into Tabby's venv,
   `fla` for fast long commits (optional), and one branch of the HF repo.
 
+## Tensor parallelism (done, later the same day)
+
+Memory works under TP: each card keeps the memory heads of the attention heads it owns, memory states are
+registered on the cards once per snapshot instead of sent every token, and commits gather the per-card
+slices back. Tabby flag: `--tensor-parallel true`. All suites pass under TP. Measured on your two 3090s:
+79 tok/s with memory and 88 without under TP, against 80 and 86 on the usual layer split, so TP is not a
+speedup here; it matters for people who already run TP.
+
 ## Not done
 
-- Tensor parallelism with memory.
 - The generated-vs-rendered recall comparison (run the same chat both ways).
 - Training the memory block (`doc/memt_plan.md` phase 2). That is a research project, not a
   feature for someone using the model.

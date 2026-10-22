@@ -100,7 +100,7 @@ other EXL3 quant of the backbone:
 
 ## Limits
 
-- No tensor parallelism with memory.
+- Tensor parallelism works (`--tensor-parallel true` in Tabby); on two cards it is not faster than the layer split for this model.
 - Batched requests work; each carries its own memory state.
 - The memory block is frozen. Training it is a separate project.
 
