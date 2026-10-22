@@ -85,11 +85,18 @@ through fla's chunked KDA kernel for long turns. Reading memory during decode is
 
 ## Model directory
 
-A serving directory is an ordinary EXL3 quant of the backbone plus the MemT pieces from the
-release: `memt_block.safetensors` (the memory block weights), the MemT `config.json` /
+Ready-made directories are on Hugging Face as `UnstableLlama/MemT-1.0-Nano-exl3`, one branch per
+quantization (`3.00bpw`, `5.00bpw`, `6.00bpw`):
+
+    hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision 6.00bpw --local-dir ./MemT-1.0-Nano-exl3-6.00bpw
+
+Each is a stock EXL3 quant of Qwen3.6-35B-A3B (yeasah's, byte for byte) plus the MemT pieces from the
+release: `memt_block.safetensors` (the memory block weights, bf16), the MemT `config.json` /
 `configuration.json`, and the release `chat_template.jinja` with a small addition that turns
-`template_vars` into a control turn (see `doc/memt_serving_plan.md`, section 5). No requant is
-needed; the backbone weights are byte-identical to the stock quant.
+`template_vars` into a control turn (see `doc/memt_serving_plan.md`, section 5). To build one from any
+other EXL3 quant of the backbone:
+
+    python util/memt_make_sidecar.py /path/to/stock-quant /path/to/out --memt-from /path/to/an-existing-MemT-dir
 
 ## Limits
 
