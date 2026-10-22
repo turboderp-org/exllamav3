@@ -1,4 +1,5 @@
 import torch
+from collections import OrderedDict
 import traceback
 import os
 import signal
@@ -176,6 +177,51 @@ def mp_model_append(local_context: dict, exported: dict):
     if module.caps.get("logits_output"):
         local_context["logits_module"] = module
     return None
+
+
+# --- MemT memory states on the ranks -------------------------------------------------------------
+# A MemT job reads a per-conversation state ([1, H, D, D] per memory layer, 40 MiB for Nano); shipping it
+# through the arena on every forward would cost more than the token. Instead the parent registers a state
+# once under a key (its snapshot key) and the ranks keep their head slices on the GPU in
+# local_context["memt_states"]; forwards then carry only keys (params["memt_read"] = {"tp_keys": [...]},
+# params["memt_commit"] = {"tp_in": key, "tp_out": key}). The parent drives eviction (mp_memt_drop_state).
+
+def mp_memt_put_state(local_context: dict, key: bytes, descs: dict):
+    consumer = local_context["inf_consumer"]
+    reg = local_context.setdefault("memt_states", OrderedDict())
+    if key in reg:
+        reg.move_to_end(key)
+        return None
+    entry = {}
+    for mem in local_context.get("memt_modules", []):
+        d = descs.get(mem.layer_idx)
+        if d is None:
+            continue
+        hl = mem.spec.num_heads
+        entry[mem.layer_idx] = consumer.recv(
+            d, cuda = True, slice_dim = 1, first = mem.tp_head_first, last = mem.tp_head_first + hl
+        ).contiguous()
+    reg[key] = entry
+    return None
+
+
+def mp_memt_drop_state(local_context: dict, keys: list):
+    reg = local_context.get("memt_states")
+    if reg:
+        for k in keys:
+            reg.pop(k, None)
+    return None
+
+
+def mp_memt_get_state(local_context: dict, key: bytes):
+    """{layer_idx: (head_first, raw fp32 bytes, shape)} of this rank's slices of the state under key"""
+    reg = local_context.get("memt_states") or {}
+    entry = reg.get(key)
+    if not entry:
+        return {}
+    firsts = {mem.layer_idx: mem.tp_head_first for mem in local_context.get("memt_modules", [])}
+    return {layer: (firsts[layer], t.detach().to("cpu", torch.float32).contiguous().numpy().tobytes(), tuple(t.shape))
+            for layer, t in entry.items()}
 
 
 def mp_model_append_gather(local_context: dict):

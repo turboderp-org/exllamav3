@@ -72,6 +72,8 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        memt_state: dict | None = None,
+        memt_key: bytes | None = None,
         **kwargs
     ):
         """
@@ -134,6 +136,17 @@ class Job:
 
         :param embeddings:
             Optional list of MMEmbeddings to use, or list of lists for batched generation
+
+        :param memt_state:
+            MemT models only (model.caps["memt"]): the memory snapshot every token of this job reads, as
+            {layer_idx: fp32 tensor [1, H, D, D] or [H, D, D]} on any device (see Model.memt_zero_state /
+            memt_commit). None leaves the memory off (plain backbone). The state is read, never written:
+            committing a turn into memory is a separate model.memt_commit call, outside the generator.
+
+        :param memt_key:
+            16-byte identity of memt_state, used to seed this job's page hash chain so cache pages and
+            recurrent checkpoints are only shared with jobs reading the same snapshot. Default: a unique
+            value (no sharing with any other job).
 
         :param max_rq_tokens:
             Maximum number of tokens before job is requeued. Rounded to nearest page boundary. This limits how
@@ -297,6 +310,19 @@ class Job:
         self.embeddings = embeddings or []
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
+
+        # MemT memory snapshot (read-only for the job's lifetime). memt_key seeds the page hash chain of every
+        # sequence; the per-device copies the forward reads are built lazily (see memt_read_params)
+        self.memt_state = memt_state
+        self.memt_key = memt_key
+        self._memt_dev_state = None
+        self.memt_canned = None   # set by MemTConversationMemory: reply with this text instead of generating
+        self.memt_pending = rq_state.get("memt_pending")   # set by MemTConversationMemory: record the reply when done
+        if memt_state is not None:
+            if self.memt_key is None:
+                self.memt_key = random_hash()
+            for seq in self.sequences:
+                seq.hash_seed = self.memt_key
 
         # Pinned buffer for IDs during sampling, and its device-resident copy for the current step
         self.current_pinned_ids = None
@@ -659,7 +685,7 @@ class Job:
             last_page = seq.allocated_pages[page_idx - 1]
             last_hash = last_page.phash
         else:
-            last_hash = None
+            last_hash = seq.hash_seed
 
         page_ids = seq.sequence_ids.torch_slice(page_idx * PAGE_SIZE, (page_idx + 1) * PAGE_SIZE)
         new_hash = tensor_hash_checksum(page_ids, last_hash)
@@ -1231,6 +1257,7 @@ class Job:
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
+            "memt_pending": self.memt_pending,
         }
 
         serial_number = self.serial_number
@@ -1254,10 +1281,62 @@ class Job:
             max_rq_tokens = self.orig_max_rq_tokens,
             stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
+            memt_state = self.memt_state,
+            memt_key = self.memt_key,
         )
 
         rq_job.prepare_for_queue(generator, serial_number, rq = True)
         return rq_job
+
+
+    def memt_rebase(self, input_ids: torch.Tensor, memt_state: dict | None, memt_key: bytes):
+        """
+        Re-create this not-yet-queued job with another prompt and a memory snapshot, keeping every other
+        setting. Used by the generator's conversation memory, which replaces the client's full history with
+        system turn + recent turns + live turn and a state holding the rest.
+        """
+        assert self.generator is None, "memt_rebase must run before the job is prepared for the queue"
+        stop_conditions = list(self.stop_strings) + list(self.stop_tokens)
+        self.__init__(
+            input_ids = input_ids,
+            max_new_tokens = self.max_new_tokens,
+            min_new_tokens = self.min_new_tokens,
+            max_skips = self.max_skips,
+            sampler = self.sampler,
+            seed = self.seed,
+            stop_conditions = stop_conditions or None,
+            decode_special_tokens = self.decode_special_tokens,
+            return_top_tokens = self.return_top_tokens,
+            return_logits = self.return_logits,
+            return_probs = self.return_probs,
+            filters = self.filters,
+            token_healing = self.prefix_token is not None,
+            identifier = self.identifier,
+            banned_strings = self.banned_strings,
+            embeddings = self.embeddings,
+            max_rq_tokens = self.orig_max_rq_tokens,
+            stop_on_loop = self.stop_on_loop,
+            memt_state = memt_state,
+            memt_key = memt_key,
+        )
+
+
+    def memt_read_params(self) -> dict:
+        """
+        The job's memory snapshot as the forward reads it: {layer_idx: fp32 [1, H, D, D]} with each layer's state
+        on that layer's device. Built once per (re)queue from memt_state and reused for every forward of the job.
+        """
+        if self._memt_dev_state is None:
+            model = self.generator.model
+            assert model.caps.get("memt"), "memt_state given but the model has no memory layers"
+            assert self.generator.draft_model is None, "MemT memory is not supported with a draft model"
+            model.memt_check_state(self.memt_state)
+            shape = model.memt_layout.spec.state_shape
+            self._memt_dev_state = {
+                i: s.to(model.memt_modules[i].device, torch.float32).reshape(1, *shape).contiguous()
+                for i, s in self.memt_state.items()
+            }
+        return self._memt_dev_state
 
 
     def prepare_for_queue(self, generator, serial_number: int, rq: bool = False):
@@ -1461,7 +1540,7 @@ class Job:
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
             if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
-                prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
+                prev_hash = seq.hash_seed if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
                 for page in self.pagetable.all_pages:
@@ -1584,6 +1663,8 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                if self.memt_state is not None:
+                    params["memt_read"] = self.generator.memt_job_read(self)
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:
@@ -1644,7 +1725,7 @@ class Job:
                     page = seq.allocated_pages[local_idx]
                     page.kv_position = min(max(prefill_end - local_idx * PAGE_SIZE, 0), PAGE_SIZE)
                     if local_idx == 0:
-                        page.prev_hash = None
+                        page.prev_hash = seq.hash_seed
                     else:
                         page.prev_hash = seq.allocated_pages[local_idx - 1].phash
                     pf_a = max(local_idx * PAGE_SIZE, prefill_start)

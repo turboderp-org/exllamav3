@@ -6110,3 +6110,39 @@ Proven (don't re-verify):
 Assumed / unverified:
 - That RoPE is the specific 5.x forward bug (strong hypothesis, not yet pinned).
 - final-norm correctness on 5.x.
+
+### Session 64 — MemT-1.0-Nano (native persistent memory): architecture study + Phase 0 inference wiring, CPU-tested
+
+Branch `claude/brave-lovelace-myoqvj`. The user asked whether MemTensor's MemT-1.0 (HF
+`MemTensor/MemT-1.0-Nano`, arXiv 2610.26825, Oct 19 2026) can be supported. HF and arXiv
+were unreachable from the session (egress proxy), so the study used the released code
+(github.com/MemTensor/MemT-1.0, SGLang integration + vendored fla gdn2 kernels) and the
+tech report PDF in that repo. Full write-up: `doc/memt_plan.md`.
+
+Findings: Nano = Qwen3.6-35B-A3B **as released, frozen** + one "native memory block" on
+each of the 10 full-attention layers (16 heads x 256 x 256 fp32 state per layer, 40 MiB per
+session; 451M trainable memory params, 86 MB bf16 per layer). Read = l2norm(q) @ M /
+sqrt(D) -> per-head RMSNorm x softcapped SiLU gate -> ADDED to the gated attention context
+before `o_proj`; every token of a turn reads the snapshot from the turn start. Write =
+"commit", one un-split pass over the finished turn running a symmetrized GDN-2 token
+recurrence (per-k-channel decay, per-channel sqrt-sigmoid erase, sigmoid write gate).
+Zero state = exact backbone forward. The tensor layout was pinned from the SGLang
+`QwenMemoryBlock` and confirmed by reproducing the paper's Table 6 parameter count
+(450,931,360) exactly.
+
+Built: `exllamav3/training/memt.py` (plain-torch differentiable math + strict config
+parser), `tests/test_memt.py` (8 CPU tests, pass: geometry == Table 6, zero-state no-op,
+scan == matrix-form eq. (22), block == port of the release block, stability, fixed-snapshot
+read, parser, fp64 gradcheck), `modules/arch_specific/memt_memory.py` (`MemTMemory`
+module: bf16 tensors through load/convert, `fuse()` before `o_proj`, commit scan),
+`architecture/memt_qwen3_5_moe.py` (config over the release's `backbone_configs` wrapper
+via `Config(config_key=...)`, model attaching memory to the full-attention `Attention`s,
+`memt_zero_state / memt_commit / memt_save_state / memt_load_state`), `Attention(memt=)`
+hook + graph-path bypass + TP assert, registry entry,
+`tests/model_setup/test_memt_config.py` (through the real registry; needs the ext).
+
+Not built: training path (readout/commit in `native_llama`, `memt_*` trainable surface,
+distillation objective), generator per-job state + turn-end commit, fla gdn2 chunked
+commit, MoS, TP. **Nothing box-verified**; the must-verify list (config layout, backbone
+byte-identity with Qwen3.6-35B-A3B for the sidecar route, readout/commit parity vs the
+release server) is `doc/memt_plan.md` section 6, recipe in section 3.

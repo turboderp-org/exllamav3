@@ -747,6 +747,33 @@ class Model_TPMixin:
         return out
 
 
+    # --- MemT memory states (see model_tp_fn.mp_memt_put_state) ---------------------------------
+
+    def memt_tp_put(self, key: bytes, states: dict):
+        """Register a full memory state ({layer_idx: [H, D, D] or [1, H, D, D]}) on every rank under key"""
+        shape = self.memt_layout.spec.state_shape
+        descs = {i: self.tp_producer.send(s.detach().to("cpu", torch.float32).reshape(1, *shape).contiguous())
+                 for i, s in states.items()}
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_memt_put_state, (key, descs))
+        self.tp_producer.clear()
+
+    def memt_tp_drop(self, keys: list):
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_memt_drop_state, (list(keys),))
+
+    def memt_tp_get(self, key: bytes) -> dict:
+        """Gather the state under key back from the ranks: {layer_idx: [H, D, D]} fp32 on the CPU"""
+        results = self.tp_worker_dispatch_wait_multi(self.active_devices, mp_memt_get_state, (key,))
+        H, D, _ = self.memt_layout.spec.state_shape
+        out = {i: torch.zeros(H, D, D, dtype = torch.float32) for i in self.memt_layout.layers}
+        seen = {i: 0 for i in out}
+        for r in results:
+            for layer, (first, buf, shape) in r.items():
+                t = torch.frombuffer(bytearray(buf), dtype = torch.float32).view(shape)
+                out[layer][first:first + shape[1]] = t[0]
+                seen[layer] += shape[1]
+        assert all(n == H for n in seen.values()), f"MemT state gather covered {seen} of {H} heads"
+        return out
+
     def tp_rotate_cache_pages(self, cache_id: int, all_rotations: torch.Tensor):
         all_rotations = self.tp_producer.send(all_rotations)
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_rotate_cache_pages, (

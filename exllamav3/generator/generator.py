@@ -1,6 +1,8 @@
 from __future__ import annotations
 import logging
+import os
 import torch
+from collections import OrderedDict
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
@@ -16,6 +18,7 @@ from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
+from .memt_memory import MemTConversationMemory
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
@@ -56,6 +59,13 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        memt_memory: bool | None = None,
+        memt_context_turns: int | None = None,
+        memt_commit_every: int | None = None,
+        memt_commit_generated: bool | None = None,
+        memt_snapshot_dir: str | None = None,
+        memt_cache_size: int | None = None,
+        memt_verbose: bool | None = None,
         **kwargs
     ):
         """
@@ -192,6 +202,44 @@ class Generator:
             each sequence are not queued: speculative decoding can still rewind them, and the MTP draft cache
             writes the last slot of a page one step later. 0 disables. Default 2.0
 
+        :param memt_memory:
+            MemT models only (model.caps["memt"]): give every job without an explicit memt_state a
+            conversation memory keyed on its prompt content. The prompt (Qwen chat format) is split into
+            turns; completed turns are committed into memory, one snapshot per turn boundary, and the job
+            runs on system turn + live turn reading the snapshot. Full-history resends, edits and
+            regenerations are handled by matching the longest committed prefix. See generator/memt_memory.py.
+            Default None: on for a MemT model (so a server that only passes the model through, like
+            TabbyAPI, serves it with memory), off otherwise. False disables it.
+
+        :param memt_context_turns:
+            With memt_memory, the number of most recent completed turns to keep as raw text in the prompt
+            instead of in memory (they are committed by a later request once they fall out of the window).
+            Default: env EXL3_MEMT_CONTEXT_TURNS, else 0
+
+        :param memt_commit_every:
+            With memt_memory, commit only once this many more turns have completed (recent turns ride raw in
+            the context until then); 1 commits every turn, 0 never commits on its own. Overridden in-band by
+            "/commit" and "/commit every N" lines in user/system messages and by the memt turn a chat template
+            emits from template_vars (memt_commit, memt_commit_every). Default: env EXL3_MEMT_COMMIT_EVERY, else 1
+
+        :param memt_commit_generated:
+            With memt_memory, commit each reply as the server generated it (reasoning and stop token included,
+            like the release replays turns) instead of the client's re-rendered copy, when the client's visible
+            answer still matches. Default: env EXL3_MEMT_COMMIT_GENERATED (non-empty, not "0"), else off
+
+        :param memt_snapshot_dir:
+            With memt_memory, a directory to keep every snapshot in as a file (release layout) so memory survives
+            a restart; RAM misses are filled from it, capped by env EXL3_MEMT_SNAPSHOT_DISK_MB (LRU, default 16 GB).
+            Default: env EXL3_MEMT_SNAPSHOT_DIR, else none (RAM only)
+
+        :param memt_cache_size:
+            With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default: env
+            EXL3_MEMT_CACHE_MB, else 2 GB (~50 snapshots of MemT-1.0-Nano)
+
+        :param memt_verbose:
+            With memt_memory, print one line per request: turns matched, committed, prompt length.
+            Default: env EXL3_MEMT_VERBOSE (non-empty, not "0")
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -286,6 +334,36 @@ class Generator:
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+
+        # MemT conversation memory (content-addressed snapshots), see enqueue()
+        self.memt_memory = None
+        if memt_memory is None:
+            memt_memory = bool(self.model.caps.get("memt"))
+        if memt_memory:
+            assert self.model.caps.get("memt"), "memt_memory requires a MemT model"
+            assert draft_model is None, "memt_memory is not supported with a draft model"
+            if memt_context_turns is None:
+                memt_context_turns = int(os.environ.get("EXL3_MEMT_CONTEXT_TURNS", "0"))
+            if memt_commit_every is None:
+                memt_commit_every = int(os.environ.get("EXL3_MEMT_COMMIT_EVERY", "1"))
+            if memt_commit_generated is None:
+                memt_commit_generated = os.environ.get("EXL3_MEMT_COMMIT_GENERATED", "") not in ("", "0")
+            if memt_snapshot_dir is None:
+                memt_snapshot_dir = os.environ.get("EXL3_MEMT_SNAPSHOT_DIR") or None
+            if memt_cache_size is None:
+                memt_cache_size = int(float(os.environ.get("EXL3_MEMT_CACHE_MB", "2048")) * 1024**2)
+            if memt_verbose is None:
+                memt_verbose = os.environ.get("EXL3_MEMT_VERBOSE", "") not in ("", "0")
+            self.memt_memory = MemTConversationMemory(
+                self.model, tokenizer,
+                context_turns = memt_context_turns,
+                commit_every = memt_commit_every,
+                commit_generated = memt_commit_generated,
+                cache_size = memt_cache_size,
+                snapshot_dir = memt_snapshot_dir,
+                disk_size = int(float(os.environ.get("EXL3_MEMT_SNAPSHOT_DISK_MB", "16384")) * 1024**2),
+                verbose = memt_verbose,
+            )
 
         # Filter threads
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
@@ -587,6 +665,11 @@ class Generator:
                 serials.append(self.enqueue(j))
             return serials
 
+        if self.memt_memory is not None and job.memt_state is None:
+            # Commits the prompt's completed turns and rebases the job onto the short prompt + snapshot. The
+            # commit forwards run here, on the caller's thread: AsyncGenerator serves enqueue and iterate from
+            # one event loop, so no other forward is in flight
+            self.memt_memory.prepare(job)
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
@@ -705,6 +788,7 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+        self.iterate_canned_jobs(results)
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
@@ -773,6 +857,11 @@ class Generator:
         # Disk tier: queue the complete pages of the active sequences (see disk_cache_write_interval)
         if self.disk_page_cache is not None and self.active_jobs and self.disk_cache_write_interval > 0:
             self.write_behind()
+
+        if self.memt_memory is not None and self.memt_memory.commit_generated:
+            for r in results:
+                if r["stage"] == "streaming" and r["eos"] and r["job"].memt_pending is not None:
+                    self.memt_memory.record(r["job"])
 
         # Finished iteration
         return results
@@ -1332,6 +1421,61 @@ class Generator:
         return draft_ids
 
 
+    MEMT_TP_MAX_STATES = 32   # registered states kept on the ranks (Nano: 20 MiB per rank per state at 2 ranks)
+
+    def _memt_tp_register(self, job) -> None:
+        reg = self.__dict__.setdefault("_memt_tp_keys", OrderedDict())
+        key = job.memt_key
+        if key in reg:
+            reg.move_to_end(key)
+            return
+        self.model.memt_tp_put(key, job.memt_state)
+        reg[key] = True
+        if len(reg) > self.MEMT_TP_MAX_STATES:
+            live = {j.memt_key for j in self.active_jobs + self.pending_jobs if j.memt_state is not None}
+            drop = [k for k in reg if k not in live][: len(reg) - self.MEMT_TP_MAX_STATES]
+            for k in drop:
+                del reg[k]
+            if drop:
+                self.model.memt_tp_drop(drop)
+
+    def memt_job_read(self, job) -> dict:
+        """One job's memt_read parameter for its prefill: per-device tensors, or registry keys under TP"""
+        if self.model.loaded_tp:
+            self._memt_tp_register(job)
+            return {"tp_keys": [job.memt_key] * len(job.sequences)}
+        return job.memt_read_params()
+
+    def memt_batch_read(self, batch_jobs: list) -> dict | None:
+        """
+        {layer_idx: fp32 [bsz, H, D, D]} over the rows of batch_jobs (one row per job sequence), or None when
+        no job in the batch reads memory.
+        """
+        if not any(job.memt_state is not None for job in batch_jobs):
+            return None
+        if self.model.loaded_tp:
+            # States live on the ranks under the job's key (registered once, evicted by this generator)
+            keys = []
+            for job in batch_jobs:
+                if job.memt_state is not None:
+                    self._memt_tp_register(job)
+                keys += [job.memt_key if job.memt_state is not None else None] * len(job.sequences)
+            return {"tp_keys": keys}
+        per_job = [(job.memt_read_params() if job.memt_state is not None else None, len(job.sequences))
+                   for job in batch_jobs]
+        if len(per_job) == 1 and per_job[0][1] == 1:
+            return per_job[0][0]
+        first = next(s for s, _ in per_job if s is not None)
+        out = {}
+        for i, ref in first.items():
+            rows = []
+            for s, n in per_job:
+                row = s[i][0] if s is not None else torch.zeros_like(ref[0])
+                rows += [row] * n
+            out[i] = torch.stack(rows, dim = 0)
+        return out
+
+
     def new_recurrent_state(self) -> PairedState:
         """A fresh (cleared) pair of recurrent states for a new sequence, one side per recurrent model"""
         target = draft = None
@@ -1497,6 +1641,11 @@ class Generator:
         if self.target_recurrent:
             batch_states = [job.recurrent_state.target for job in batch_jobs]
 
+        # MemT memory: one snapshot per batch row, stacked per layer in compact-batch order. Rows of jobs
+        # without a snapshot read zeros (exactly the plain backbone). A lone row passes its cached copy
+        # through unstacked. The attention module leaves the graph-captured decode path while this is set
+        memt_read = self.memt_batch_read(batch_jobs) if self.model.caps.get("memt") else None
+
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
             if job.new_tokens < 0: continue
@@ -1521,6 +1670,8 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
+        if memt_read is not None:
+            params["memt_read"] = memt_read
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
@@ -1899,6 +2050,34 @@ class Generator:
             "error": error,
         })
 
+
+    def iterate_canned_jobs(self, results: list):
+        """
+        Finish pending jobs that carry a fixed reply (a MemT command-only message) without running them: one
+        "started" event and one final "streaming" event shaped like a stop-token finish.
+        """
+        for job in self.pending_jobs.copy():
+            if job.memt_canned is None:
+                continue
+            self.pending_jobs.remove(job)
+            now = time.time()
+            text = job.memt_canned
+            ids = self.tokenizer.encode(text, add_bos = False)
+            base = {"job": job, "serial": job.serial_number}
+            if job.identifier is not None:
+                base["identifier"] = job.identifier
+            results.append({**base, "stage": "started", "eos": False})
+            job.is_finished = True
+            job.full_completion = text
+            results.append({
+                **base, "stage": "streaming", "eos": True, "eos_reason": "stop_token",
+                "eos_triggering_token_id": self.tokenizer.eos_token_id,
+                "eos_triggering_token_str": self.tokenizer.get_id_to_piece_list(True)[self.tokenizer.eos_token_id],
+                "text": text, "token_ids": ids, "full_completion": text,
+                "new_tokens": ids.shape[-1], "prompt_tokens": len(job.sequences[0].input_ids),
+                "time_enqueued": now - job.time_enqueue, "time_prefill": 0.0, "time_generate": 0.0,
+                "cached_pages": 0, "cached_tokens": 0,
+            })
 
     def iterate_start_jobs(self, results: list):
         """

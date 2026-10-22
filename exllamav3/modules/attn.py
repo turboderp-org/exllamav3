@@ -194,6 +194,7 @@ class Attention(Module):
         select_hq_bits: int = 0,
         qbits_key: str = "bits",
         qsa_indexer: Module | None = None,
+        memt: Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -216,6 +217,9 @@ class Attention(Module):
         self.rope = None
         self.qsa_indexer = qsa_indexer
         self.register_submodule(qsa_indexer)
+        # MemT native memory block (experimental, see modules/arch_specific/memt_memory.py)
+        self.memt = None
+        self.attach_memt(memt)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
@@ -429,6 +433,15 @@ class Attention(Module):
         v = self.v_proj.optimizer_targets() if self.v_proj is not None else []   # use_k_as_v: no V projection
         o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
+
+
+    def attach_memt(self, memt: Module | None):
+        """Attach a MemT memory block (loads/unloads/converts with this layer; fused before o_proj)"""
+        if memt is None:
+            return
+        assert self.memt is None, f"{self.key}: memory block already attached"
+        self.memt = memt
+        self.register_submodule(memt)
 
 
     def load_local(self, device, **kwargs):
@@ -975,6 +988,8 @@ class Attention(Module):
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        # MemT native memory (experimental): readout added to the gated context before o_proj
+        if self.memt is not None: o = self.memt.fuse(x, o, params)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -1154,8 +1169,11 @@ class Attention(Module):
         # The graph reads the projection trellis directly and never sees a runtime LoRA,
         # so fall back to the python path while one is loaded (guard must sit here, per
         # call: the graph is cached and a LoRA can be attached/detached after build).
+        # A MemT memory read is additive before o_proj, so it rides on top of the graph
+        # output as o_proj(readout); a commit (its token scan) stays on the python path.
         if (
             _bc_attn_enable and non_causal_spans is None and
+            (self.memt is None or params.get("memt_commit") is None) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
             not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
                                  getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
@@ -1163,6 +1181,11 @@ class Attention(Module):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)
             if o is not None:
+                if self.memt is not None and params.get("memt_read") is not None:
+                    out = self.memt.readout(x, params)
+                    if out is not None:
+                        assert self.o_proj.inner.bias is None, "MemT graph-path read needs a bias-free o_proj"
+                        o = o + self.project_o(out.to(torch.half), bsz, seqlen, params).to(o.dtype)
                 return o
 
         if self.qsa_indexer is not None:
@@ -1243,6 +1266,8 @@ class Attention(Module):
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        # MemT native memory (experimental): readout added to the gated context before o_proj
+        if self.memt is not None: o = self.memt.fuse(x, o, params)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -1254,6 +1279,8 @@ class Attention(Module):
         storage += self.k_proj.storage_size()
         storage += self.v_proj.storage_size() if self.v_proj else 0
         storage += self.o_proj.storage_size()
+        if self.memt is not None:
+            storage += self.memt.weights_numel() * 2   # bf16 memory block, split by head with the attention
         for cl in self.cache_layers:
             storage += cl.storage_size()
         overhead_d = 0
@@ -1359,6 +1386,8 @@ class Attention(Module):
             "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
+            # MemT memory block: per head, split along with the query heads on import
+            "memt": self.memt.tp_export(plan, producer) if self.memt is not None else None,
             "device": self.device,
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
@@ -1468,6 +1497,9 @@ class Attention(Module):
                     module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
 
         module.device = device
+        if exported.get("memt") is not None and num_kv_heads:
+            from .arch_specific.memt_memory import MemTMemory
+            module.attach_memt(MemTMemory.tp_import(local_context, exported["memt"], plan, first * n_gqa, last * n_gqa))
         # This rank's kv heads within the layer's full head range: what the CPU/disk cache tiers need to place
         # the shard of a cache page into the layout-independent (canonical) page image
         module.tp_kv_first = first

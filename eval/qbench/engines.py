@@ -75,8 +75,11 @@ class Exl3Backend:
         # they carry state across modules, so each row keeps its own dict
         params_rows = [{} for _ in range(ids.shape[0])]
         states = [self.model.prepare_inputs(row, p) for row, p in zip(ids.split(1), params_rows)]
-        gen = torch.Generator(device = self.device)
-        gen.manual_seed(1)
+        gens = {}   # one generator per device: modules with prefer_cpu run their x on the CPU
+        def gen_for(dev):
+            if dev not in gens:
+                gens[dev] = torch.Generator(device = dev); gens[dev].manual_seed(1)
+            return gens[dev]
 
         sum_bits = sum_numel = head_bits = head_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
@@ -117,7 +120,7 @@ class Exl3Backend:
                     if torch.is_tensor(x):
                         x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
-                        x = apply_mult_noise(x, noise_eps, gen)
+                        x = apply_mult_noise(x, noise_eps, gen_for(x.device))
                     if logits_layer:
                         callback(r, x)
                         states[r] = None

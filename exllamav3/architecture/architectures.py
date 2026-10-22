@@ -35,6 +35,7 @@ from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
 from .lfm2_vl import Lfm2VlTextModel
 from .llama import LlamaModel
+from .memt_qwen3_5_moe import MemTQwen3_5MoeModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
 from .minimax_m2 import MiniMaxM2Model
@@ -109,6 +110,7 @@ ARCHITECTURES = {
         Lfm2MoeModel,
         Lfm2VlTextModel,
         LlamaModel,
+        MemTQwen3_5MoeModel,
         MiMoModel,
         MiMoV2Model,
         MiniMaxM2Model,
