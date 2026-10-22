@@ -220,6 +220,7 @@ python examples/chat.py -h
 | **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
 | **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
 | **Nemotron 3.5 Bolt**                             | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
+| **Nemotron 3.5 Super VL**                        | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input; text-only variants are also supported |
 | **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
 | **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |
 | **Phi3**, **Phi4**                                | `Phi3ForCausalLM`                                                             |            |                       |

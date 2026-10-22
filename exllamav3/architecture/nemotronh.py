@@ -53,22 +53,41 @@ class NemotronHConfig(Config):
         )
 
         # Layer pattern: M = Mamba2, * = attention, - = MLP, E = MoE
+        layer_types = {
+            "mamba": "M",
+            "linear_attention": "M",
+            "attention": "*",
+            "full_attention": "*",
+            "mlp": "-",
+            "moe": "E",
+        }
+
+        def block_pattern(block_types, key):
+            if not isinstance(block_types, list):
+                raise ValueError(f"Expected {key} to be a list of block types")
+            try:
+                return "".join(layer_types[block_type] for block_type in block_types)
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Unsupported {key} block types: {block_types!r}") from exc
+
         block_configs = self.read_cfg(list, "block_configs", None)
-        if block_configs is not None:
-            block_types = self.read_cfg(list, "layers_block_type", None)
+        block_types = self.read_cfg(list, "layers_block_type", None)
+        if block_configs is not None or block_types is not None:
             if block_types is None:
                 block_types = [layer.get("block_type") for layer in block_configs]
-            layer_types = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
-            try:
-                self.hybrid_override_pattern = "".join(layer_types[t] for t in block_types)
-            except (KeyError, TypeError) as exc:
-                raise ValueError(f"Unsupported NemotronH block type in {block_types!r}") from exc
-            if len(block_types) != len(block_configs):
+            self.hybrid_override_pattern = block_pattern(block_types, "layers_block_type")
+            if block_configs is not None and len(block_types) != len(block_configs):
                 raise ValueError("NemotronH block_configs and layers_block_type lengths differ")
             self.layer_moe_configs = block_configs
         else:
-            self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", no_default)
+            self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", None)
+            if self.hybrid_override_pattern is None:
+                raise ValueError("NemotronH config requires block_configs, layers_block_type, or hybrid_override_pattern")
             self.layer_moe_configs = None
+
+        declared_pattern = self.read_cfg(str, "hybrid_override_pattern", None)
+        if declared_pattern is not None and declared_pattern != self.hybrid_override_pattern:
+            raise ValueError("Conflicting layers_block_type and hybrid_override_pattern")
 
         # Attention params (NoPE: the reference model applies no positional embeddings)
         self.head_dim = self.read_cfg(int, "head_dim", None)
@@ -124,9 +143,17 @@ class NemotronHConfig(Config):
         # the mtp.* namespace. The component only exists when the tensors are present (a quant made
         # before MTP support gets them from util/convert_mtp.py)
         self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
-        self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", "")
+        mtp_block_types = self.read_cfg(list, "mtp_layers_block_type", None)
+        self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", None)
+        if mtp_block_types is not None:
+            mtp_pattern = block_pattern(mtp_block_types, "mtp_layers_block_type")
+            if self.mtp_hybrid_override_pattern is not None and self.mtp_hybrid_override_pattern != mtp_pattern:
+                raise ValueError("Conflicting mtp_layers_block_type and mtp_hybrid_override_pattern")
+            self.mtp_hybrid_override_pattern = mtp_pattern
+        elif self.mtp_hybrid_override_pattern is None:
+            self.mtp_hybrid_override_pattern = ""
         if self.num_mtp_layers == 0 or not any(
-            self.stc.has_tensor(f"mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
+            self.stc.has_tensor(f"{self.tensor_prefix}mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
         ):
             del self.model_classes["mtp"]
 
@@ -353,8 +380,8 @@ class NemotronHModel(Model):
 
 class NemotronHOmniConfig(NemotronHConfig):
     """
-    Nemotron 3.5 Omni checkpoints (Bolt): the NemotronH Puzzle text backbone under llm_config, a
-    C-RADIO vision tower and the mlp1 projector
+    Nemotron 3.5 Omni checkpoints: the NemotronH text backbone under llm_config, with an optional
+    C-RADIO vision tower and mlp1 projector when those weights are present.
     """
 
     arch_string = "NemotronH_Omni_Reasoning_V3"
@@ -364,23 +391,54 @@ class NemotronHOmniConfig(NemotronHConfig):
     def __init__(self, directory: str, **kwargs):
         super().__init__(directory, **kwargs)
         self.model_classes["text"] = NemotronHOmniModel
-        self.model_classes["vision"] = NemotronHOmniVisionModel
-
-        self.vision = read_nemotronh_omni_vision_config(self.read_cfg(dict, "vision_config", no_default))
-        self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
         self.assert_cfg(bool, "vision_final_layernorm", False, True)
 
-        prep_path = os.path.join(directory, "processor_config.json")
-        if not os.path.exists(prep_path):
-            prep_path = os.path.join(directory, "preprocessor_config.json")
-        with open(prep_path, encoding = "utf8") as f:
-            self.vision_pp = read_nemotronh_omni_pp_config(json.load(f))
+        # Some Nemotron 3.5 Super VL EXL3 releases contain only the language model and
+        # MTP head. Detect the actual vision weights instead of assuming that a wrapper
+        # config's vision_config means the tower and projector were included.
+        vision_key = "vision_model.radio_model.model.patch_generator.embedder.weight"
+        projector_key = "mlp1.0.weight"
+        has_vision = self.stc.has_tensor(vision_key)
+        has_projector = self.stc.has_tensor(projector_key)
+        if has_vision != has_projector:
+            raise ValueError(
+                "Incomplete NemotronH Omni vision checkpoint: expected both "
+                f"{vision_key!r} and {projector_key!r}"
+            )
+        self.has_vision = has_vision
+        if has_vision:
+            self.model_classes["vision"] = NemotronHOmniVisionModel
+            self.vision = read_nemotronh_omni_vision_config(
+                self.read_cfg(dict, "vision_config", no_default)
+            )
+            self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
+
+            prep_path = os.path.join(directory, "processor_config.json")
+            if not os.path.exists(prep_path):
+                prep_path = os.path.join(directory, "preprocessor_config.json")
+            with open(prep_path, encoding = "utf8") as f:
+                self.vision_pp = read_nemotronh_omni_pp_config(json.load(f))
+            self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
+            self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
+            self.ps_version = self.read_cfg(str, "ps_version", "v2")
+            self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
+        else:
+            self.model_classes.pop("vision", None)
+            self.vision = None
+            self.vision_pp = None
 
         self.image_token_id = self.read_cfg(int, "img_context_token_id", None)
-        self.downsample_ratio = self.read_cfg(float, "downsample_ratio", 0.5)
-        self.projector_hidden_size = self.read_cfg(int, "projector_hidden_size", no_default)
-        self.ps_version = self.read_cfg(str, "ps_version", "v2")
-        self.video_pruning_rate = self.read_cfg(float, "video_pruning_rate", 0.0)
+
+        quant_configs = [
+            self.config_dict.get("quantization_config"),
+            self.config_dict.get("llm_config", {}).get("quantization_config"),
+        ]
+        for quant in quant_configs:
+            if quant and quant.get("quant_method") not in (None, "exl3"):
+                raise ValueError(
+                    "NemotronH Omni currently supports BF16 or EXL3 weights; "
+                    f"unsupported quantization method {quant.get('quant_method')!r}"
+                )
 
 
 def read_nemotronh_omni_vision_config(config_dict: dict):
@@ -441,7 +499,8 @@ class NemotronHOmniVisionModel(Model):
     def get_additional_compiled_tensors(config: NemotronHOmniConfig) -> dict:
         return (
             config.stc.list_tensors(prefix = "vision_model.") |
-            config.stc.list_tensors(prefix = "mlp1.")
+            config.stc.list_tensors(prefix = "mlp1.") |
+            config.stc.list_tensors(prefix = "vision_projector.vision_final_layernorm.")
         )
 
     def __init__(
@@ -520,6 +579,14 @@ class NemotronHOmniVisionModel(Model):
                     ),
                 )
             ]
+
+        if config.stc.has_tensor("vision_projector.vision_final_layernorm.weight"):
+            self.modules.append(LayerNorm(
+                config = config,
+                key = "vision_projector.vision_final_layernorm",
+                layernorm_eps = v.layer_norm_eps,
+                out_dtype = torch.half,
+            ))
 
         self.modules += [
             PixelUnshuffle(

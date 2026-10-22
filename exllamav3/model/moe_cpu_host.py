@@ -675,11 +675,18 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         def fetch(keys):
             out = []
             for k in keys:
-                trellis = stc.get_tensor(k + ".trellis", cpu)
-                suh = stc.get_tensor(k + ".suh", cpu, float2half = True)
-                svh = stc.get_tensor(k + ".svh", cpu, float2half = True)
+                if stc.has_tensor(k + ".trellis"):
+                    weight = stc.get_tensor(k + ".trellis", cpu)
+                    suh = stc.get_tensor(k + ".suh", cpu, float2half = True)
+                    svh = stc.get_tensor(k + ".svh", cpu, float2half = True)
+                else:
+                    # Some EXL3 exports retain a small number of experts as ordinary BF16/FP16
+                    # Linear weights. The CPU backend executes those directly, without EXL3's
+                    # Hadamard transforms, using the same [out, in] checkpoint orientation.
+                    weight = stc.get_tensor(k + ".weight", cpu, allow_bf16 = True)
+                    suh = svh = None
                 bias = stc.get_tensor(k + ".bias", cpu, optional = True, float2half = True)
-                out.append((trellis, suh, svh, bias))
+                out.append((weight, suh, svh, bias))
             return out
 
         # Repack the trellis copies into the packed layout the kernel tier wants for each
@@ -688,6 +695,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         swz = TUNING.swizzle
 
         def rehome_trellis(t):
+            if t.dim() != 3:
+                return arena.rehome(t)
             grp = cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
             pln = grp and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0)
             return arena.rehome(t, band_swizzle = grp, planar = pln)
@@ -759,10 +768,14 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     d += bd
                     blocks += bb
                     auxlocs += ba
+                empty_aux = torch.empty(0, dtype = torch.half)
+                def aux_list(proj, index):
+                    return [t[index] if t[index] is not None else empty_aux for t in proj]
+
                 cext.exl3_moe_cpu_make_layer(
-                    [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
-                    [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
-                    [t[0] for t in d], [t[1] for t in d], [t[2] for t in d],
+                    [t[0] for t in g], aux_list(g, 1), aux_list(g, 2),
+                    [t[0] for t in u], aux_list(u, 1), aux_list(u, 2),
+                    [t[0] for t in d], aux_list(d, 1), aux_list(d, 2),
                     biases(g), biases(u), biases(d),
                     spec["activation"], spec["act_limit"],
                     1 if swz else 0,
@@ -1055,7 +1068,7 @@ class MoeCpuHost:
                   flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None, interm_fp32 = False):
+                       proj_dims = None, aux = None, interm_fp32 = False, streamable = None):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -1077,6 +1090,7 @@ class MoeCpuHost:
             num_experts = len(up_keys),
             proj_dims = proj_dims,
             interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
+            streamable = streamable or [True] * len(up_keys),
         )
         if proj_dims is not None:
             # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
@@ -1819,7 +1833,9 @@ class MoeCpuHost:
             counts1.scatter_add_(0, shifted, torch.ones_like(shifted))
             counts1_h = counts1.tolist()
             neg, counts_h = counts1_h[0], counts1_h[1:]
-            streamed = [e for e in range(E) if counts_h[e] >= st["stream_t"]]
+            streamable = spec.get("streamable", [True] * E)
+            streamed = [e for e in range(E)
+                        if counts_h[e] >= st["stream_t"] and streamable[e]]
             if TUNING.stream_debug:
                 n_str = sum(counts_h[e] for e in streamed)
                 print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
