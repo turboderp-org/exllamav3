@@ -75,7 +75,9 @@ void exl3_rdna3_had_kernel
     float* __restrict__ xcs,
     int size_m,
     int size_k,
-    const uint64_t* __restrict__ suh_tab
+    const uint64_t* __restrict__ suh_tab,
+    const half* __restrict__ A_up,
+    Exl3Rdna3GNorm gn
 )
 {
     const int lane = threadIdx.x & 31;
@@ -90,8 +92,79 @@ void exl3_rdna3_had_kernel
     if (task >= size_m * kblocks) return;
     const int m = task / kblocks;
     const int c = task % kblocks;
-    const half2* ap = (const half2*) (A + (size_t) m * size_k + c * 128 + lane * 4);
-    exl3_rdna3_had::transform_block(ap[0], ap[1], suh, xh, xcs, m, c, size_k, lane);
+    const size_t off = (size_t) m * size_k + c * 128 + lane * 4;
+
+    half2 x01, x23;
+    if (gn.flags & GN_ACTIVE)
+    {
+        // gated_rms_norm (small path, one warp per head): fma sum of squares, xor-reduce 16 .. 1, x * w * rmf,
+        // then * act(g), rounded to fp16
+        auto bf = [] (uint32_t v, int hi) { return __uint_as_float(hi ? (v & 0xffff0000u) : (v << 16)); };
+        const uint2 xr = *(const uint2*) (((const uint16_t*) A) + off);
+        float f[4] = { bf(xr.x, 0), bf(xr.x, 1), bf(xr.y, 0), bf(xr.y, 1) };
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) ss = fmaf(f[i], f[i], ss);
+        #pragma unroll
+        for (int i = 16; i > 0; i >>= 1) ss += __shfl_xor(ss, i);
+        const float rmf = rsqrtf(ss / 128.0f + gn.eps);
+        float w[4], g[4];
+        if (gn.flags & GN_W_BF16)
+        {
+            const uint2 wr = *(const uint2*) (((const uint16_t*) gn.w) + lane * 4);
+            w[0] = bf(wr.x, 0); w[1] = bf(wr.x, 1); w[2] = bf(wr.y, 0); w[3] = bf(wr.y, 1);
+        }
+        else
+        {
+            const float4 wr = *(const float4*) (((const float*) gn.w) + lane * 4);
+            w[0] = wr.x; w[1] = wr.y; w[2] = wr.z; w[3] = wr.w;
+        }
+        if (gn.flags & GN_G_BF16)
+        {
+            const uint2 gr = *(const uint2*) (((const uint16_t*) gn.g) + off);
+            g[0] = bf(gr.x, 0); g[1] = bf(gr.x, 1); g[2] = bf(gr.y, 0); g[3] = bf(gr.y, 1);
+        }
+        else
+        {
+            const float4 gr = *(const float4*) (((const float*) gn.g) + off);
+            g[0] = gr.x; g[1] = gr.y; g[2] = gr.z; g[3] = gr.w;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            const float wi = gn.bias != 0.0f ? w[i] + gn.bias : w[i];
+            const float r = __fdividef(1.0f, 1.0f + __expf(-g[i]));
+            f[i] = f[i] * wi * rmf * ((gn.flags & GN_SIGMOID) ? r : g[i] * r);
+        }
+        x01 = __floats2half2_rn(f[0], f[1]);
+        x23 = __floats2half2_rn(f[2], f[3]);
+    }
+    else
+    {
+        const half2* ap = (const half2*) (A + off);
+        x01 = ap[0];
+        x23 = ap[1];
+    }
+    if (A_up)
+    {
+        const half2* up = (const half2*) (A_up + off);
+        auto sigmoid2 = [] (half2 x) -> half2
+        {
+            const half2 one = __float2half2_rn(1.0f);
+            return h2rcp(__hadd2(one, h2exp(__hneg2(x))));
+        };
+        if (gn.flags & GN_UP_SIGMOID)
+        {
+            x01 = __hmul2(x01, sigmoid2(up[0]));
+            x23 = __hmul2(x23, sigmoid2(up[1]));
+        }
+        else
+        {
+            x01 = __hmul2(__hmul2(x01, sigmoid2(x01)), up[0]);
+            x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
+        }
+    }
+    exl3_rdna3_had::transform_block(x01, x23, suh, xh, xcs, m, c, size_k, lane);
 }
 
 // Rows per pass: smallest instantiated MR >= m (MR 16 with multiple row chunks above that)
@@ -155,7 +228,9 @@ bool exl3_rdna3_gemm
     const half* svh,
     int device,
     cudaStream_t stream,
-    Graph* graph
+    Graph* graph,
+    const half* A_up,
+    const Exl3Rdna3GNorm* gn
 )
 {
     #ifdef __HIP_PLATFORM_AMD__
@@ -171,7 +246,7 @@ bool exl3_rdna3_gemm
         // Rows per launch pair, bounded by the transformed-input workspace
         const int kblocks = size_k / 128;
         const int max_rows = (int) MIN((size_t) EXL3_RDNA3_XH_BYTES / ((size_t) size_k * 2), (size_t) EXL3_RDNA3_XCS_FLOATS / kblocks);
-        if (max_rows < 1 || (graph && size_m > max_rows)) return false;
+        if (max_rows < 1 || ((graph || gn) && size_m > max_rows)) return false;   // the gate is not re-based per pass
 
         if (!g_ws[device]) exl3_rdna3_prepare(device);
 
@@ -190,7 +265,8 @@ bool exl3_rdna3_gemm
             const int had_tasks = m * kblocks;
             exl3_rdna3_had_kernel<<<(had_tasks + 7) / 8, 256, 0, stream>>>
             (
-                A + (size_t) r0 * size_k, suh, g_xh[device], g_xcs[device], m, size_k, nullptr
+                A + (size_t) r0 * size_k, suh, g_xh[device], g_xcs[device], m, size_k, nullptr,
+                A_up ? A_up + (size_t) r0 * size_k : nullptr, gn ? *gn : Exl3Rdna3GNorm {}
             );
             kernel<<<dim3(groups * splits, row_chunks), EXL3_RDNA3_THREADS, 0, stream>>>
             (
@@ -267,7 +343,7 @@ bool exl3_rdna3_mgemm
         const int had_tasks = size_m * kblocks;
         exl3_rdna3_had_kernel<<<dim3((had_tasks + 7) / 8, num_src), 256, 0, stream>>>
         (
-            A, nullptr, g_xh[device], g_xcs[device], size_m, size_k, suh_tab
+            A, nullptr, g_xh[device], g_xcs[device], size_m, size_k, suh_tab, nullptr, Exl3Rdna3GNorm {}
         );
         kernel<<<dim3(groups * splits, row_chunks, num_entries), EXL3_RDNA3_THREADS, 0, stream>>>
         (

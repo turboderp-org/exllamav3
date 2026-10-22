@@ -37,6 +37,23 @@ struct Exl3Rdna3MTab
     const int* src;            // input source (transformed-input slab), or null: e
 };
 
+// Elementwise prologue of the input transform (exl3_gemm_silu_gr / exl3_gemm_gnorm_gr, exl3_rdna3_fused.cu), in
+// place of a separate kernel in front of the matmul, same rounding:
+// - A_up given: the input is silu(A) * A_up (act_mul_kernel_h), or with GN_UP_SIGMOID A * sigmoid(A_up)
+//   (mul_sigmoid_kernel_h, attention output gate)
+// - GN_ACTIVE: gated RMSNorm, one head per 128-element block, y = norm(A) * (w + bias) * act(g) as gated_rms_norm
+//   computes it; A is bf16; GN_W_BF16 / GN_G_BF16 select bf16 weight / gate (else fp32), GN_SIGMOID the gate's
+//   activation (else silu)
+enum { GN_ACTIVE = 1, GN_W_BF16 = 2, GN_G_BF16 = 4, GN_SIGMOID = 8, GN_UP_SIGMOID = 16 };
+struct Exl3Rdna3GNorm
+{
+    const void* w;
+    const void* g;
+    float eps;
+    float bias;
+    int flags;
+};
+
 typedef void (*fp_exl3_rdna3_kernel)
 (
     const uint2* __restrict__ xh,
@@ -83,7 +100,9 @@ bool exl3_rdna3_gemm
     const half* svh,
     int device,
     cudaStream_t stream,
-    Graph* graph
+    Graph* graph,
+    const half* A_up = nullptr,
+    const Exl3Rdna3GNorm* gn = nullptr
 );
 
 // Several matrices sharing one input (MultiLinear / SlicedMultiLinear tables), one launch pair
