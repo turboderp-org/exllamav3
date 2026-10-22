@@ -60,6 +60,7 @@ class Generator:
         hybrid_draft_tokens: int = 0,
         memt_memory: bool | None = None,
         memt_context_turns: int | None = None,
+        memt_commit_every: int | None = None,
         memt_cache_size: int | None = None,
         memt_verbose: bool | None = None,
         **kwargs
@@ -212,6 +213,12 @@ class Generator:
             instead of in memory (they are committed by a later request once they fall out of the window).
             Default: env EXL3_MEMT_CONTEXT_TURNS, else 0
 
+        :param memt_commit_every:
+            With memt_memory, commit only once this many more turns have completed (recent turns ride raw in
+            the context until then); 1 commits every turn, 0 never commits on its own. Overridden in-band by
+            "/commit" and "/commit every N" lines in user/system messages and by the memt turn a chat template
+            emits from template_vars (memt_commit, memt_commit_every). Default: env EXL3_MEMT_COMMIT_EVERY, else 1
+
         :param memt_cache_size:
             With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default: env
             EXL3_MEMT_CACHE_MB, else 2 GB (~50 snapshots of MemT-1.0-Nano)
@@ -324,6 +331,8 @@ class Generator:
             assert draft_model is None, "memt_memory is not supported with a draft model"
             if memt_context_turns is None:
                 memt_context_turns = int(os.environ.get("EXL3_MEMT_CONTEXT_TURNS", "0"))
+            if memt_commit_every is None:
+                memt_commit_every = int(os.environ.get("EXL3_MEMT_COMMIT_EVERY", "1"))
             if memt_cache_size is None:
                 memt_cache_size = int(float(os.environ.get("EXL3_MEMT_CACHE_MB", "2048")) * 1024**2)
             if memt_verbose is None:
@@ -331,6 +340,7 @@ class Generator:
             self.memt_memory = MemTConversationMemory(
                 self.model, tokenizer,
                 context_turns = memt_context_turns,
+                commit_every = memt_commit_every,
                 cache_size = memt_cache_size,
                 verbose = memt_verbose,
             )

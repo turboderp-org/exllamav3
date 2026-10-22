@@ -13,6 +13,15 @@ For each enqueued job this module
      (storing a snapshot at each boundary), leaving the last ``context_turns`` completed units raw,
   4. rebases the job onto system turn + raw recent units + the live unit, reading the matched snapshot.
 
+Commit policy. By default every completed unit is committed (``commit_every`` = 1), minus the last
+``context_turns``. Whatever is already in memory for the history stays there (memory is one-way). ``commit_every`` = N commits only once N more units have completed, so the recent turns
+ride raw in the context until then; 0 never commits on its own. Two in-band controls override it, and are
+stripped from what the model sees (keys are still taken over the client's untouched ids):
+  * ``/commit`` on a line of its own in a user message commits everything before that message;
+    ``/commit every N`` in a user or system message sets the period from there on.
+  * a ``<|im_start|>memt\n...<|im_end|>`` turn carrying the same lines, emitted by the chat template from the
+    request's ``template_vars`` (``memt_commit``, ``memt_commit_every``), applies to that request only.
+
 Keys are hashes of the client's own rendering, so template differences cannot break matching; an edited
 history matches a shorter prefix and memory rolls back to that point. Snapshots live in RAM (fp32, 40 MiB
 each for MemT-1.0-Nano) in an LRU capped in bytes; the zero state (no committed units) is implicit.
@@ -20,6 +29,7 @@ each for MemT-1.0-Nano) in an LRU capped in bytes; the zero state (no committed 
 
 from __future__ import annotations
 import hashlib
+import re
 import time
 from collections import OrderedDict
 import torch
@@ -41,12 +51,15 @@ class MemTConversationMemory:
         model: Model,
         tokenizer: Tokenizer,
         context_turns: int = 0,
+        commit_every: int = 1,
         cache_size: int = 2 * 1024**3,
         verbose: bool = False,
     ):
         assert model.caps.get("memt"), "MemTConversationMemory needs a MemT model"
         self.model = model
+        self.tokenizer = tokenizer
         self.context_turns = max(0, context_turns)
+        self.commit_every = max(0, commit_every)
         self.cache_size = cache_size
         self.verbose = verbose
 
@@ -58,10 +71,65 @@ class MemTConversationMemory:
         self.role_user = start[1]
         self.role_system = enc("<|im_start|>system\n")[1]
         self.role_assistant = enc("<|im_start|>assistant\n")[1]
+        self.newline = start[2]
+        self.im_end = enc("<|im_end|>")[0]
 
         self.snapshots: OrderedDict[bytes, dict[int, torch.Tensor]] = OrderedDict()
         self.snapshot_bytes = sum(s.numel() * 4 for s in model.memt_zero_state().values())
         self.last = None   # stats of the last prepare(), for tests and logging
+        self.last_prompt = None   # token ids the last job actually ran on
+
+    # --- in-band commands ---------------------------------------------------
+
+    COMMAND = re.compile(r"^[ \t]*/commit(?:[ \t]+every[ \t]+(\d+))?[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+    def _parse_commands(self, text: str):
+        """(commit_now, every, stripped_text); every is None when not set"""
+        now, every = False, None
+        for m in self.COMMAND.finditer(text):
+            if m.group(1) is None:
+                now = True
+            else:
+                every = int(m.group(1))
+        if not now and every is None:
+            return False, None, text
+        stripped = "\n".join(l for l in text.split("\n") if not self.COMMAND.fullmatch(l)).strip()
+        return now, every, stripped
+
+    def _role_of(self, seg: list[int]) -> str:
+        if not seg or seg[0] != self.im_start or self.newline not in seg:
+            return ""
+        return self.tokenizer.decode(torch.tensor(seg[1:seg.index(self.newline)])).strip()
+
+    def _scan_unit(self, unit: list[int], roles: tuple[str, ...]):
+        """
+        Read /commit commands from the turns of ``roles`` inside one unit. Returns (commit_now, every,
+        unit_without_the_command_lines_and_without_memt_turns). Turns without commands keep their exact ids.
+        """
+        starts = [i for i, t in enumerate(unit) if t == self.im_start] or [0]
+        segs = [unit[a:b] for a, b in zip(starts, starts[1:] + [len(unit)])]
+        if starts[0] > 0:
+            segs.insert(0, unit[:starts[0]])
+        now, every, out = False, None, []
+        for seg in segs:
+            role = self._role_of(seg)
+            if role not in roles or self.newline not in seg:
+                out += seg
+                continue
+            a = seg.index(self.newline) + 1
+            b = seg.index(self.im_end) if self.im_end in seg else len(seg)
+            text = self.tokenizer.decode(torch.tensor(seg[a:b])) if b > a else ""
+            n, e, stripped = self._parse_commands(text)
+            if role == "memt":
+                now, every = now or n, e if e is not None else every
+                continue   # the whole turn is control, the model never sees it
+            if not n and e is None:
+                out += seg
+                continue
+            now, every = now or n, e if e is not None else every
+            body = self.tokenizer.encode(stripped, add_bos = False, encode_special_tokens = True)[0].tolist() if stripped else []
+            out += seg[:a] + body + seg[b:]
+        return now, every, out
 
     # --- prompt structure ---------------------------------------------------
 
@@ -123,20 +191,42 @@ class MemTConversationMemory:
         """
         ids = job.sequences[0].input_ids.torch()[0].tolist()
         system, units, live = self.split_units(ids)
-        keys = self.keys_of(system, units)
+        keys = self.keys_of(system, units)   # over the client's ids, before any command is stripped
         n = len(units)
-        target = max(0, n - self.context_turns)   # units[:target] in memory, units[target:] raw in context
 
-        # Longest keyed prefix with a snapshot, at or before target
+        # Commit policy: env default, then commands in the system turn, past user turns, the live turn,
+        # and finally the request's own memt turn (from template_vars), each overriding the one before
+        every = self.commit_every
+        floor = 0   # units[:floor] must be in memory because a /commit was issued after them
+        _, e, system = self._scan_unit(system, ("system",))
+        every = e if e is not None else every
+        stripped_units = []
+        for k, u in enumerate(units):
+            now, e, u = self._scan_unit(u, ("user",))
+            stripped_units.append(u)
+            every = e if e is not None else every
+            if now:
+                floor = k
+        units = stripped_units
+        now, e, live = self._scan_unit(live, ("user", "memt"))
+        every = e if e is not None else every
+        if now:
+            floor = n
+        auto = max(0, n - self.context_turns)
+        auto = (auto // every) * every if every > 0 else 0
+
+        # Longest keyed prefix with a snapshot. Memory is one-way: what was committed stays committed, so
+        # the target is the furthest of the policy, a /commit floor and what is already in memory.
         matched = 0
         state = None
-        for k in range(target, 0, -1):
+        for k in range(n, 0, -1):
             state = self._get(keys[k])
             if state is not None:
                 matched = k
                 break
         if state is None:
             state = self.model.memt_zero_state()
+        target = max(floor, auto, matched)   # units[:target] in memory, units[target:] raw in context
 
         t0 = time.time()
         committed_tokens = 0
@@ -154,12 +244,15 @@ class MemTConversationMemory:
         short = torch.tensor([prompt], dtype = torch.long)
         job.memt_rebase(short, state if target > 0 else None, keys[target])
 
+        self.last_prompt = prompt
         self.last = {
             "prompt_tokens": len(ids), "units": n, "matched": matched, "in_memory": target,
+            "commit_every": every, "commit_floor": floor,
             "committed": target - matched, "committed_tokens": committed_tokens, "commit_time": commit_time,
             "short_prompt_tokens": len(prompt), "snapshots": len(self.snapshots),
         }
         if self.verbose:
             print(f" -- memt: {len(ids)} prompt tokens, {n} turns: {matched} matched, "
                   f"{target - matched} committed ({committed_tokens} tokens, {commit_time:.2f}s), "
-                  f"{n - target} raw; prompt now {len(prompt)} tokens; {len(self.snapshots)} snapshots", flush = True)
+                  f"{n - target} raw (every {every}, floor {floor}); prompt now {len(prompt)} tokens; "
+                  f"{len(self.snapshots)} snapshots", flush = True)

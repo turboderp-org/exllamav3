@@ -200,3 +200,46 @@ large budget, otherwise the whole budget is reasoning and `content` is null.
 Open from section 3, unchanged: commit-every-turn vs the release's raw-until-asked policy, replies
 committed as the client re-renders them (no reasoning), the per-token commit scan for long documents,
 decode off the graph path while a state is attached, disk persistence of snapshots.
+
+## 5. Commit policy and in-band controls (2026-10-22)
+
+Section 3's "commit-every-turn" question, resolved as a setting with the release's behaviour reachable.
+No Tabby changes; everything lives in `generator/memt_memory.py` and the sidecar's `chat_template.jinja`.
+
+**Policy.** `commit_every` = N (generator arg `memt_commit_every`, env `EXL3_MEMT_COMMIT_EVERY`, default 1 =
+the old behaviour): completed turns are filed into memory only once N more of them have piled up, and ride
+raw in the context until then. 0 never commits on its own. `context_turns` still applies on top. Whatever
+is already in memory for a given history stays there: memory is one-way, so a commit from any route is
+sticky for that chat (edits still roll back by prefix match, as before).
+
+**Typed controls**, on a line of their own anywhere in a message, stripped before the model sees the turn:
+
+- `/commit` in a user message: file everything before this message now. It stays in the client's history,
+  so later requests keep that point as a floor.
+- `/commit every N` in a user or system message: set the period from there on (the system prompt is the
+  natural place for a per-chat default).
+
+**Request-field route.** The sidecar's chat template emits a `<|im_start|>memt ... <|im_end|>` control turn
+right before the generation prompt when the request carries `template_vars` `memt_commit: true` and/or
+`memt_commit_every: N`; the generator reads it and drops it. Tabby forwards any `template_vars` key, and
+its `template_vars_default` config can set `memt_commit_every` for the model. Applies to that request only
+(plus stickiness of anything it committed).
+
+Precedence, lowest to highest: env default, system prompt, past user turns in order, the live user turn,
+the request's control turn.
+
+Test: `util/memt_commit_test.py` (commit_every 0 + every route above, recall after each, commands stripped,
+regenerate commits nothing). `util/memt_chat_test.py` is the default-policy regression.
+
+The template edit is on the sidecar only (`/mnt/two/weights/MemT-1.0-Nano-exl3-6.00bpw/chat_template.jinja`,
+original kept as `.orig`); it goes right before `{{- '<|im_start|>assistant\n' }}` under `add_generation_prompt`:
+
+    {%- if (memt_commit is defined and memt_commit) or memt_commit_every is defined %}
+        {{- '<|im_start|>memt\n' }}
+        {%- if memt_commit_every is defined %}{{- '/commit every ' ~ memt_commit_every ~ '\n' }}{%- endif %}
+        {%- if memt_commit is defined and memt_commit %}{{- '/commit\n' }}{%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+
+Box-tested 2026-10-22 through Tabby (`EXL3_MEMT_COMMIT_EVERY=0`): raw turns, a `template_vars` commit and a
+typed `/commit` all recall correctly; one ` -- memt:` line per request shows every/floor.
