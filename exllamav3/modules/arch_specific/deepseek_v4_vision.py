@@ -27,7 +27,7 @@ class DeepseekV4VisionAligner(Module):
         vision_dim: int,
         downsample_ratio: int,
         out_hidden_size: int,
-        marker_keys: tuple[str, str, str, str] = ("image_start", "image_pad", "image_newline", "image_end"),
+        marker_keys: tuple[str, ...] = ("image_start", "image_pad", "image_newline", "image_end"),
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
     ):
@@ -68,7 +68,7 @@ class DeepseekV4VisionAligner(Module):
 
     @override
     def weights_numel(self):
-        return self.up.weights_numel() + self.down.weights_numel() + 4 * self.out_size
+        return self.up.weights_numel() + self.down.weights_numel() + len(self.marker_keys) * self.out_size
 
     @override
     def load(self, device: torch.device, **kwargs):

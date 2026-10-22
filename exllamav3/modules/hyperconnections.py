@@ -8,6 +8,7 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
+from ..util.device_copy import to_device
 import os
 import math
 
@@ -87,6 +88,7 @@ class HyperConnection(Module):
         sinkhorn_iters: int,
         hc_eps: float,
         rms_norm_eps: float,
+        carry_pre: bool = False,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
@@ -94,6 +96,7 @@ class HyperConnection(Module):
         self.sinkhorn_iters = sinkhorn_iters
         self.hc_eps = hc_eps
         self.rms_eps = rms_norm_eps
+        self.carry_pre = carry_pre
         self.norm = RMSNorm(config, f"{key}.norm", rms_norm_eps, unweighted = True,
                             out_dtype = torch.float)
         self.register_submodule(self.norm)
@@ -160,7 +163,7 @@ class HyperConnection(Module):
             hc_flush(params)
             pend = None
         if _hc_fold and hc == 4 and b * s <= _HC_FOLD_MAX_R and streams.dtype == torch.float and D % 4 == 0 \
-                and streams.is_contiguous():
+                and streams.is_contiguous() and not self.carry_pre:
             fold_norm = norm is not None and self._fold_norm_ok(norm, D)
             if pend is not None or fold_norm:
                 params.pop("hc_pending", None)
@@ -195,6 +198,8 @@ class HyperConnection(Module):
         if pend is not None:
             hc_flush(params)
         post, comb, y = self._mix_unfused(streams, params)
+        if self.carry_pre and "quant_preserve" in params:
+            params["quant_preserve"]["hc_pre"] = params["hc_pre"]
         return post, comb, y, False
 
     def _mix_unfused(self, streams: torch.Tensor, params: dict):
@@ -223,6 +228,13 @@ class HyperConnection(Module):
                 fn = self.fn_h
             else:
                 fn = self.fn
+            if self.carry_pre:
+                # The kernel collapses with the previous site's pre weights; the first site has none, stream 0 goes on
+                prev, pre = params.get("hc_pre"), torch.empty((R, H), dtype = torch.float, device = dev)
+                ext.hc_mix_carry(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps, self.sinkhorn_iters, partials,
+                                 post, comb, collapsed, None if prev is None else to_device(prev, dev).view(R, H), pre)
+                params["hc_pre"] = pre.view(b, s, H)
+                return post.view(b, s, H), comb.view(b, s, H, H), streams[:, :, 0] if prev is None else collapsed.view(b, s, D)
             ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                        self.sinkhorn_iters, partials, post, comb, collapsed)
             return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
@@ -240,8 +252,14 @@ class HyperConnection(Module):
         for _ in range(self.sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim = -1, keepdim = True) + self.hc_eps)
             comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
+        collapsed = self._carry(streams, pre, params) if self.carry_pre else (pre.unsqueeze(-1) * streams).sum(dim = 2)
         return post, comb, collapsed
+
+    def _carry(self, streams: torch.Tensor, pre: torch.Tensor, params: dict):
+        prev, params["hc_pre"] = params.get("hc_pre"), pre
+        if prev is None:
+            return streams[:, :, 0]
+        return torch.matmul(to_device(prev, streams.device).unsqueeze(-2), streams).squeeze(-2)
 
     def apply_(
         self,
@@ -282,6 +300,7 @@ class HyperConnection(Module):
                 "sinkhorn_iters": self.sinkhorn_iters,
                 "hc_eps": self.hc_eps,
                 "rms_norm_eps": self.rms_eps,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -700,12 +719,13 @@ class HyperHead(Module):
     mean = True (GLM5.3): parameterless unweighted mean over the streams, no tensors."""
 
     def __init__(self, config: Config, key: str, hc_mult: int, rms_norm_eps: float, hc_eps: float,
-                 mean: bool = False):
+                 mean: bool = False, carry_pre: bool = False):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
         self.rms_eps = rms_norm_eps
         self.hc_eps = hc_eps
-        self.mean = mean
+        self.mean = mean or carry_pre
+        self.carry_pre = carry_pre
         self.norm = RMSNorm(config, f"{key}.norm", rms_norm_eps, unweighted = True,
                             out_dtype = torch.float)
         self.register_submodule(self.norm)
@@ -772,6 +792,7 @@ class HyperHead(Module):
                 "hc_eps": self.hc_eps,
                 # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
                 "mean": self.mean,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -797,6 +818,8 @@ class HyperHead(Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         hc_flush(params)
+        if self.carry_pre:
+            return torch.matmul(to_device(params["hc_pre"], x.device).unsqueeze(-2), x).squeeze(-2)
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape

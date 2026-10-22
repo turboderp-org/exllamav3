@@ -62,10 +62,13 @@ class DeepseekV4VisionModel(Model):
         self,
         config: DeepseekV4Config,
         key_prefix = "vision",
+        marker_keys: tuple[str, ...] = ("image_start", "image_pad", "image_newline", "image_end"),
+        load_grid: tuple[int, int] = (48, 72),
         **kwargs
     ):
         super().__init__(config, **kwargs)
         self.config = config
+        self.load_grid = load_grid
         self.caps.update({
             "image_input": True,
             "default_vision_bits": 6,
@@ -150,6 +153,7 @@ class DeepseekV4VisionModel(Model):
                 vision_dim = v.dim,
                 downsample_ratio = v.downsample_ratio,
                 out_hidden_size = config.hidden_size,
+                marker_keys = marker_keys,
                 out_dtype = torch.half,
                 qmap = "block",
             ),
@@ -158,6 +162,10 @@ class DeepseekV4VisionModel(Model):
     @property
     def aligner(self) -> DeepseekV4VisionAligner:
         return self.modules[-1]
+
+    def plan_resize(self, height, width, best_height, best_width):
+        v = self.config.vision
+        return safe_resize(height, width, best_height, best_width, v.patch_size, v.downsample_ratio, v.max_n_token)
 
     def preprocess(self, image: Image, dtype: torch.dtype = torch.half):
         """
@@ -178,8 +186,7 @@ class DeepseekV4VisionModel(Model):
             height = int(height * ratio)
         best_width = math.ceil(width / p) * p
         best_height = math.ceil(height / p) * p
-        n_llm_h, n_llm_w, best_height, best_width = safe_resize(
-            height, width, best_height, best_width, p, v.downsample_ratio, v.max_n_token)
+        n_llm_h, n_llm_w, best_height, best_width = self.plan_resize(height, width, best_height, best_width)
         n_vit_h, n_vit_w = best_height // p, best_width // p
         if v.max_wh_ratio is not None and image.width >= v.max_wh_ratio * image.height:
             image = image.resize((best_width, best_height))
@@ -192,11 +199,12 @@ class DeepseekV4VisionModel(Model):
 
     def default_load_shape_dtype(self, chunk_size):
         v = self.config.vision
-        return ((1, 3456, v.num_channels * v.patch_size ** 2), torch.half)
+        n_h, n_w = self.load_grid
+        return ((1, n_h * n_w, v.num_channels * v.patch_size ** 2), torch.half)
 
     def default_load_params(self, max_chunk_size):
         v = self.config.vision
-        n_h, n_w = 48, 72
+        n_h, n_w = self.load_grid
         return {
             "causal": False,
             "grid_hw": (n_h, n_w),

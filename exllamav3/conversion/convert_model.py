@@ -1383,12 +1383,14 @@ def main(args, job_state):
         state = None
         bad_rows = set()
 
+    # Every pass over a module starts from what the last pass over the previous module preserved
     def get_preserve(si, params_):
-        params_.update(quant_preserves[si])
-        params_["quant_preserve"] = quant_preserves[si]
+        preserve = quant_preserves[si].get(idx - 1, {})
+        params_.update(preserve)
+        params_["quant_preserve"] = dict(preserve)
 
     def put_preserve(si, params_):
-        quant_preserves[si] = params_["quant_preserve"]
+        quant_preserves[si] = {idx - 1: quant_preserves[si].get(idx - 1, {}), idx: params_["quant_preserve"]}
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy

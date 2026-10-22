@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
+from ..util.device_copy import to_device
 from .cache import Cache, CacheLayer
 from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash, host_copy
 
@@ -81,7 +82,7 @@ class CacheLayer_dsa(CacheLayer):
         D_r = attention.rope_head_dim
         self.D_c = D - D_r
         self.D_r = D_r
-        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.D_i = attention.index_head_dim if getattr(attention, "indexer_mode", None) == "full" else 0
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -93,6 +94,7 @@ class CacheLayer_dsa(CacheLayer):
         self.pool_idx = None
         self.device = None
         self._slot_bt = None
+        self.mirrors = {}
 
     @property
     def quant(self) -> bool:
@@ -100,6 +102,7 @@ class CacheLayer_dsa(CacheLayer):
 
     def alloc(self, device: torch.device):
         self.device = device
+        self.mirrors = {}
         if self.k_bits:
             self.pool_q = torch.zeros((self.num_pages, self.epp, self.G * self.k_bits), dtype = torch.int32, device = device)
             self.pool_s = torch.zeros((self.num_pages, self.epp, self.G), dtype = torch.half, device = device)
@@ -113,6 +116,25 @@ class CacheLayer_dsa(CacheLayer):
         self.device = None
         self.pool_c = self.pool_q = self.pool_s = self.pool_r = self.pool_idx = None
         self._slot_bt = None
+        self.mirrors = {}
+
+    def alloc_mirror(self, device: torch.device):
+        """Second copy of the pools for the layers that read them on another device: paged like
+        the pools (copy_page, get_tensors) and filled by pull()."""
+        mirror = CacheLayer_dsa(
+            self.config, self.attention, self.cache_id, self.max_num_tokens, self.k_bits, self.v_bits
+        )
+        mirror.alloc(device)
+        self.mirrors[device] = mirror
+
+    def pull(self, source: CacheLayer_dsa, pages, e0: int, e1: int):
+        """Copy entries [e0, e1) of one sequence from source; pages is its block table row."""
+        if e1 <= e0:
+            return
+        for p in range(e0 // self.epp, (e1 - 1) // self.epp + 1):
+            i, a, b = int(pages[p]), max(e0 - p * self.epp, 0), min(e1 - p * self.epp, self.epp)
+            for dst, src in zip(self.get_tensors(), source.get_tensors()):
+                dst[i, a:b].copy_(to_device(src[i, a:b], self.device))
 
     def pool_c_view(self) -> torch.Tensor:
         """Flat nope pool for the attention kernels: (rows, D_c) fp16, or the packed
@@ -148,9 +170,12 @@ class CacheLayer_dsa(CacheLayer):
         self.pool_r[to_page, :ne].copy_(source.pool_r[from_page, :ne], non_blocking = True)
         if self.pool_idx is not None:
             self.pool_idx[to_page, :ne].copy_(source.pool_idx[from_page, :ne], non_blocking = True)
+        for device, mirror in self.mirrors.items():
+            mirror.copy_page(source.mirrors.get(device, source), from_page, to_page, num_tokens)
 
     def get_tensors(self):
-        return [t for t in [self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx] if t is not None]
+        return [t for t in [self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx] if t is not None] + \
+            [t for mirror in self.mirrors.values() for t in mirror.get_tensors()]
 
     def storage_size(self):
         rows = self.num_pages * self.epp
@@ -331,7 +356,7 @@ class DSV4LayerState:
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
 
-        if self.layer_type in ("csa", "hca"):
+        if module.compressor is not None:
             m = module.compress_rate
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
