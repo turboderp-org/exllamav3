@@ -440,8 +440,8 @@ class NemotronHOmniVisionModel(Model):
     @override
     def get_additional_compiled_tensors(config: NemotronHOmniConfig) -> dict:
         return (
-            config.stc.list_tensors(prefix = "vision_model.") |
-            config.stc.list_tensors(prefix = "mlp1.")
+            config.stc.list_tensors(prefix = "vision_model") |
+            config.stc.list_tensors(prefix = "mlp1")
         )
 
     def __init__(
