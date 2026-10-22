@@ -312,13 +312,18 @@ class Tokenizer:
         ok = getattr(self, "_chunking_verified", None)
         if ok is None:
             ok = True
-            for special in (False, True):
-                self.tokenizer.encode_special_tokens = not special
-                ref = self.tokenizer.encode(_CHUNK_PROBE, add_special_tokens = False).ids
-                parts = _split_chunks(_CHUNK_PROBE, target = 300, max_chunks = 64)
-                encs = self.tokenizer.encode_batch(parts, add_special_tokens = False)
-                if [i for e in encs for i in e.ids] != ref:
-                    ok = False
+            previous_mode = self.tokenizer.encode_special_tokens
+            try:
+                for special in (False, True):
+                    self.tokenizer.encode_special_tokens = not special
+                    ref = self.tokenizer.encode(_CHUNK_PROBE, add_special_tokens = False).ids
+                    parts = _split_chunks(_CHUNK_PROBE, target = 300, max_chunks = 64)
+                    encs = self.tokenizer.encode_batch(parts, add_special_tokens = False)
+                    if [i for e in encs for i in e.ids] != ref:
+                        ok = False
+            finally:
+                # The actual input must still use the mode selected by encode_part_base.
+                self.tokenizer.encode_special_tokens = previous_mode
             self._chunking_verified = ok
         return ok
 
