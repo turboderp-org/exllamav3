@@ -11,7 +11,7 @@ import os, sys, re
 REPO = "UnstableLlama/MemT-1.0-Nano-exl3"
 BASE = "MemTensor/MemT-1.0-Nano"
 BACKBONE = "yeasah/Qwen3.6-35B-A3B-exl3"
-BACKBONE_BRANCH = {"3.00bpw": "3.00bpw-H5", "5.00bpw": "5.00bpw", "6.00bpw": "6.00bpw"}
+BACKBONE_BRANCH = {"3.00bpw": "3.00bpw-H5", "4.00bpw": "4.00bpw", "5.00bpw": "5.00bpw", "6.00bpw": "6.00bpw"}
 FORK = "https://github.com/UnstableLlama/exl3-qlora"
 
 STYLE = """<style>

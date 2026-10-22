@@ -69,6 +69,21 @@ tags:
           </thead>
           <tbody>
             <tr>
+              <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/3.00bpw">3.00bpw</a></td>
+              <td>15.67</td>
+              <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/3.00bpw-H5">3.00bpw-H5</a></td>
+            </tr>
+            <tr>
+              <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/4.00bpw">4.00bpw</a></td>
+              <td>19.64</td>
+              <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/4.00bpw">4.00bpw</a></td>
+            </tr>
+            <tr>
+              <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/5.00bpw">5.00bpw</a></td>
+              <td>23.55</td>
+              <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/5.00bpw">5.00bpw</a></td>
+            </tr>
+            <tr>
               <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/6.00bpw">6.00bpw</a></td>
               <td>27.47</td>
               <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/6.00bpw">6.00bpw</a></td>
@@ -83,7 +98,7 @@ tags:
     <div class="panel-title">Usage</div>
     <div class="panel-body">
       Install the fork into TabbyAPI's venv and launch Tabby on a revision. Memory is on by default for this model.
-      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./venv/bin/python main.py --model-name ./MemT-1.0-Nano-exl3-6.00bpw \
+      <div class="terminal-box">EXL3_MEMT_SNAPSHOT_DIR=./memt_snapshots ./venv/bin/python main.py --model-name ./MemT-1.0-Nano-exl3-3.00bpw \
   --draft-mode disabled --max-seq-len 32768 --cache-size 32768 --gpu-split 20 23 \
   --tool-format auto --reasoning-start-token "&lt;think&gt;" --reasoning-end-token "&lt;/think&gt;"</div>
       <br/>
@@ -97,7 +112,7 @@ tags:
   <div class="content-panel">
     <div class="panel-title">CLI Download</div>
     <div class="panel-body">
-      <div class="terminal-box">hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision "6.00bpw" --local-dir ./MemT-1.0-Nano-exl3-6.00bpw</div>
+      <div class="terminal-box">hf download UnstableLlama/MemT-1.0-Nano-exl3 --revision "3.00bpw" --local-dir ./MemT-1.0-Nano-exl3-3.00bpw</div>
     </div>
   </div>
 
