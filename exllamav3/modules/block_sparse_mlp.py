@@ -799,7 +799,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
         self.cpu_maybe_split_load(device, **kwargs)
-        super().load(device, **kwargs)
+        if self.cpu_split_permuted():
+            # cpu_post_load below permutes the router gate before a deferred fill would land
+            # in it, so the gate alone loads eagerly
+            self.device = device
+            for module in self.modules:
+                if module is self.routing_gate:
+                    with self.config.stc.eager_load():
+                        module.load(device, **kwargs)
+                else:
+                    module.load(device, **kwargs)
+        else:
+            super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
@@ -836,11 +847,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     raise ValueError(f"{self.key}.{self.tid2eid_key}: expert ids span [{lo}, {hi}], "
                                      f"outside the {self.num_experts} routed experts")
         if self.per_expert_scale_key:
+            # no_defer: read right below, by the split permutation and the interm_div fold
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
                 self.device,
                 optional = True,
                 allow_bf16 = True,
+                no_defer = True,
             )
         if device is not None and torch.device(device).type == "cuda":
             self.cpu_post_load()
