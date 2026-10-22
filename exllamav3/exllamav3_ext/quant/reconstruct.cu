@@ -37,7 +37,7 @@ void reconstruct_tile
     __syncthreads();
 
     // Dequant
-    register FragB frag[2];
+    FragB frag[2];
     dq_dispatch<K, cb, HALF>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile
@@ -254,7 +254,7 @@ void reconstruct_had_tile
     {
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
-        register FragB frag[2];
+        FragB frag[2];
         dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
 
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
