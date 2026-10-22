@@ -235,6 +235,13 @@ there, and the directory is an LRU by mtime capped at `EXL3_MEMT_SNAPSHOT_DISK_M
 snapshots). The generated-reply store lives there too (`generated.pt`). Box-tested: memorize, kill Tabby,
 relaunch, ask; the fresh process matched from disk ("1 matched, 0 committed") and recalled.
 
+**Decode speed with memory** (2026-10-22). The readout is additive before `o_proj`, so decode keeps the
+graph-captured attention block and adds `o_proj(readout)` to its output (`attn.py`, exact: same greedy text
+and first-step logits as the python path); only commits take the python path. The readout itself is then
+replayed as a CUDA graph per (bsz, seqlen) captured on the layer's own device (`EXL3_MEMT_GRAPH=0` disables):
+eager 0.45 ms per layer, replay 0.18 ms. Through Tabby: 79 tok/s without memory, 73 with (was 51).
+`util/memt_gen_test.py` (alone/batched/cached parity, zero state == plain) passes.
+
 **Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
 model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
 exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby

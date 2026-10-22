@@ -1169,9 +1169,11 @@ class Attention(Module):
         # The graph reads the projection trellis directly and never sees a runtime LoRA,
         # so fall back to the python path while one is loaded (guard must sit here, per
         # call: the graph is cached and a LoRA can be attached/detached after build).
+        # A MemT memory read is additive before o_proj, so it rides on top of the graph
+        # output as o_proj(readout); a commit (its token scan) stays on the python path.
         if (
             _bc_attn_enable and non_causal_spans is None and
-            (self.memt is None or not self.memt.active(params)) and
+            (self.memt is None or params.get("memt_commit") is None) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
             not has_runtime_lora(self.q_proj, self.k_proj, self.v_proj,
                                  getattr(self, "kv_proj", None), self.o_proj, self.g_proj)
@@ -1179,6 +1181,11 @@ class Attention(Module):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)
             if o is not None:
+                if self.memt is not None and params.get("memt_read") is not None:
+                    out = self.memt.readout(x, params)
+                    if out is not None:
+                        assert self.o_proj.inner.bias is None, "MemT graph-path read needs a bias-free o_proj"
+                        o = o + self.project_o(out.to(torch.half), bsz, seqlen, params).to(o.dtype)
                 return o
 
         if self.qsa_indexer is not None:

@@ -9,6 +9,12 @@ if TYPE_CHECKING:
     from ...training.memt import MemTSpec
 
 
+import os
+_graph_enable = os.environ.get("EXL3_MEMT_GRAPH", "1") != "0"   # CUDA-graph the decode readout
+_GRAPH_MAX_BSZ = 8
+_GRAPH_MAX_QLEN = 4
+
+
 def _math():
     # The math lives with the training code (plain torch, CPU-tested standalone). Imported lazily:
     # the training package is heavy and this module is imported while the exllamav3 package is
@@ -26,6 +32,9 @@ class MemTMemory(Module):
     Nano) and fuses the memory readout into the attention context right before
     ``o_proj`` -- after the backbone's own sigmoid attention gate, exactly
     where the released SGLang integration injects it (``o_proj`` pre-hook).
+    Reading is additive before a linear map, so decode keeps the graph-captured
+    attention block and adds ``o_proj(readout)`` to its output; only commits
+    (prefill-sized anyway) take the python path.
 
     Session state is NOT held here. The caller passes it through ``params``:
 
@@ -43,9 +52,7 @@ class MemTMemory(Module):
     state it is an exact no-op as well: the forward is then the plain
     backbone, which is how the memory-free parity gate runs.
 
-    Limitations of this first cut: python path only (the graph-captured
-    decode block is bypassed while a state is attached), no tensor
-    parallelism, the commit scan is the sequential fp32 reference (fine for
+    Limitations of this first cut: no tensor parallelism, the commit scan is the sequential fp32 reference (fine for
     turn-sized commits; the chunked fla gdn2 kernels are the follow-up), and
     batched requests must all share the state (or pass ``[bsz, H, D, D]``).
     """
@@ -63,6 +70,7 @@ class MemTMemory(Module):
         self.spec = spec
         self.weights = None
         self._numel = _math().memt_param_count(spec)
+        self._graphs = {}   # (bsz, seqlen, dtype) -> (CUDAGraph, static x, static state, static out)
 
     def tensor_keys(self) -> dict[str, str]:
         return {name: f"{self.key}.{name}" for name in _math().memt_param_shapes(self.spec)}
@@ -85,6 +93,7 @@ class MemTMemory(Module):
     def unload(self):
         self.device = None
         self.weights = None
+        self._graphs = {}
 
     @override
     def get_tensors(self):
@@ -105,25 +114,28 @@ class MemTMemory(Module):
     def active(params: dict) -> bool:
         return params.get("memt_read") is not None or params.get("memt_commit") is not None
 
-    def fuse(self, x: torch.Tensor, o: torch.Tensor, params: dict) -> torch.Tensor:
+    def readout(self, x: torch.Tensor, params: dict) -> torch.Tensor | None:
         """
-        ``x``: the attention block's input after its pre-norm, ``[bsz, seqlen,
-        hidden]``; ``o``: the gated attention context, ``[bsz, seqlen, H*D]``.
-        Returns ``o`` plus the memory readout (same dtype), and performs the
-        commit scan when requested.
+        The memory readout for ``x`` (the attention block's input after its pre-norm, ``[bsz, seqlen,
+        hidden]``): ``[bsz, seqlen, H*D]`` in bf16, or None when this forward neither reads nor commits
+        on this layer. Performs the commit scan when requested. The readout is added to the gated
+        attention context before ``o_proj``, so it is also what the graph-captured decode path adds
+        through ``o_proj`` after the fact.
         """
         read = params.get("memt_read")
         commit = params.get("memt_commit")
         if read is None and commit is None:
-            return o
+            return None
         assert self.weights is not None, f"{self.key}: memory block not loaded"
         rs = read.get(self.layer_idx) if read is not None else None
         ws = commit.get(self.layer_idx) if commit is not None else None
         if rs is None and ws is None:
-            return o
+            return None
         dev = x.device
         rs_d = rs.to(dev, torch.float32) if rs is not None else None
         ws_d = ws.to(dev, torch.float32) if ws is not None else None
+        if ws is None and _graph_enable and x.shape[0] <= _GRAPH_MAX_BSZ and x.shape[1] <= _GRAPH_MAX_QLEN:
+            return self._graph_readout(x, rs_d)
         # Projections in bf16 like the release (its block runs bf16 GEMMs and
         # keeps the norm/gate/decay/state math in fp32).
         xb = x.to(torch.bfloat16)
@@ -134,7 +146,49 @@ class MemTMemory(Module):
         )
         if nxt is not None:
             commit[self.layer_idx] = nxt[0] if ws.dim() == 3 else nxt
-        return o + out.to(o.dtype)
+        return out
+
+    def _graph_readout(self, x: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        """
+        Read-only readout replayed as a CUDA graph, one per (bsz, seqlen, dtype): the eager readout is a
+        few dozen small kernels per layer (~0.45 ms each on a 3090, ~4.5 ms per token over the ten memory
+        layers), the replay ~0.18 ms. Inputs are copied into the graph's static buffers, so any state works.
+        """
+        bsz, seqlen, _ = x.shape
+        if state.dim() == 3:
+            state = state.unsqueeze(0)
+        state = state.expand(bsz, *state.shape[1:])
+        key = (bsz, seqlen, x.dtype)
+        g = self._graphs.get(key)
+        if g is None:
+            # Capture on this layer's device (the model is split over several); the default capture
+            # stream would sit on the current device and silently record nothing for the others
+            with torch.cuda.device(x.device):
+                xs = x.clone()
+                ss = state.contiguous().clone()
+                fwd = lambda: _math().memt_block_forward(xs.to(torch.bfloat16), self.weights, self.spec, ss)[0]
+                side = torch.cuda.Stream(device = x.device)
+                side.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        fwd()
+                torch.cuda.current_stream(x.device).wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream = side):
+                    out = fwd()
+                torch.cuda.current_stream(x.device).wait_stream(side)
+            g = self._graphs[key] = (graph, xs, ss, out)
+        graph, xs, ss, out = g
+        with torch.cuda.device(x.device):
+            xs.copy_(x)
+            ss.copy_(state)
+            graph.replay()
+        return out
+
+    def fuse(self, x: torch.Tensor, o: torch.Tensor, params: dict) -> torch.Tensor:
+        """``o`` (the gated attention context, ``[bsz, seqlen, H*D]``) plus the memory readout, same dtype"""
+        out = self.readout(x, params)
+        return o if out is None else o + out.to(o.dtype)
 
     # --- TP (unsupported) ---------------------------------------------------
 
