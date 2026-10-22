@@ -30,11 +30,13 @@ client's visible answer still matches what was generated; an edited reply falls 
 
 Keys are hashes of the client's own rendering, so template differences cannot break matching; an edited
 history matches a shorter prefix and memory rolls back to that point. Snapshots live in RAM (fp32, 40 MiB
-each for MemT-1.0-Nano) in an LRU capped in bytes; the zero state (no committed units) is implicit.
+each for MemT-1.0-Nano) in an LRU capped in bytes; the zero state (no committed units) is implicit. With a
+``snapshot_dir`` every snapshot is also a file there (release layout), so memory survives a restart.
 """
 
 from __future__ import annotations
 import hashlib
+import os
 import re
 import time
 from collections import OrderedDict
@@ -60,6 +62,8 @@ class MemTConversationMemory:
         commit_every: int = 1,
         commit_generated: bool = False,
         cache_size: int = 2 * 1024**3,
+        snapshot_dir: str | None = None,
+        disk_size: int = 16 * 1024**3,
         verbose: bool = False,
     ):
         assert model.caps.get("memt"), "MemTConversationMemory needs a MemT model"
@@ -83,6 +87,11 @@ class MemTConversationMemory:
         self.im_end = enc("<|im_end|>")[0]
 
         self.snapshots: OrderedDict[bytes, dict[int, torch.Tensor]] = OrderedDict()
+        self.disk_hits = 0
+        self.disk_size = disk_size
+        self.snapshot_dir = None
+        if snapshot_dir:
+            self.set_snapshot_dir(snapshot_dir)
         # (user-turn hash, visible-answer hash) -> exact unit ids as generated, for commit_generated. Keyed on the
         # turn alone, not the history, so a reply stays findable after an earlier turn is edited
         self.generated: OrderedDict[tuple[bytes, bytes], list[int]] = OrderedDict()
@@ -206,6 +215,7 @@ class MemTConversationMemory:
         self.generated[(pending["key"], self._vis_hash(self._visible(text)))] = unit
         while len(self.generated) > self.generated_max:
             self.generated.popitem(last = False)
+        self._save_generated()
 
     @staticmethod
     def canned_reply(committed: int, in_memory: int, every: int | None) -> str:
@@ -259,16 +269,85 @@ class MemTConversationMemory:
         s = self.snapshots.get(key)
         if s is not None:
             self.snapshots.move_to_end(key)
-        return s
+            return s
+        if self.snapshot_dir is not None:
+            path = self._snapshot_path(key)
+            if os.path.exists(path):
+                try:
+                    s = self.model.memt_load_state(path)
+                except Exception as e:
+                    print(f" !! memt: unreadable snapshot {path}: {e}", flush = True)
+                    return None
+                os.utime(path)   # most recently used, for the disk LRU
+                self.snapshots[key] = s
+                self._trim_ram()
+                self.disk_hits += 1
+                return s
+        return None
 
     def _put(self, key: bytes, state: dict[int, torch.Tensor]):
         self.snapshots[key] = {i: s.detach().to("cpu", torch.float32) for i, s in state.items()}
         self.snapshots.move_to_end(key)
+        self._trim_ram()
+        if self.snapshot_dir is not None:
+            path = self._snapshot_path(key)
+            if not os.path.exists(path):
+                self.model.memt_save_state(self.snapshots[key], path + ".tmp")
+                os.replace(path + ".tmp", path)
+                self._trim_disk()
+
+    def _trim_ram(self):
         while len(self.snapshots) * self.snapshot_bytes > self.cache_size and len(self.snapshots) > 1:
             self.snapshots.popitem(last = False)
 
     def clear(self):
+        """forget the RAM copies (and the generated-reply store); snapshots on disk stay"""
         self.snapshots.clear()
+        self.generated.clear()
+
+    # --- disk persistence ---------------------------------------------------
+
+    def set_snapshot_dir(self, snapshot_dir: str):
+        """
+        Keep every snapshot as a safetensors file (the release's layout) under snapshot_dir/<model>/, so memory
+        survives a restart: RAM misses are filled from disk, the disk is an LRU by mtime capped at disk_size.
+        The generated-reply store (commit_generated) is kept there too.
+        """
+        tag = hashlib.blake2b(self.model.config.directory.encode(), digest_size = 4).hexdigest()
+        self.snapshot_dir = os.path.join(snapshot_dir, f"{os.path.basename(self.model.config.directory.rstrip('/'))}-{tag}")
+        os.makedirs(self.snapshot_dir, exist_ok = True)
+        self._load_generated()
+
+    def _snapshot_path(self, key: bytes) -> str:
+        return os.path.join(self.snapshot_dir, key.hex() + ".safetensors")
+
+    def _trim_disk(self):
+        files = [(os.path.getmtime(p), p) for p in
+                 (os.path.join(self.snapshot_dir, f) for f in os.listdir(self.snapshot_dir)) if p.endswith(".safetensors")]
+        total = len(files) * self.snapshot_bytes
+        for _, p in sorted(files):
+            if total <= self.disk_size:
+                break
+            os.remove(p)
+            total -= self.snapshot_bytes
+
+    def _generated_path(self) -> str:
+        return os.path.join(self.snapshot_dir, "generated.pt")
+
+    def _load_generated(self):
+        path = self._generated_path()
+        if os.path.exists(path):
+            try:
+                self.generated = OrderedDict(torch.load(path, weights_only = True))
+            except Exception as e:
+                print(f" !! memt: unreadable {path}: {e}", flush = True)
+
+    def _save_generated(self):
+        if self.snapshot_dir is None:
+            return
+        path = self._generated_path()
+        torch.save(dict(self.generated), path + ".tmp")
+        os.replace(path + ".tmp", path)
 
     # --- the hook -----------------------------------------------------------
 
@@ -357,7 +436,7 @@ class MemTConversationMemory:
             "prompt_tokens": len(ids), "units": n, "matched": matched, "in_memory": target,
             "commit_every": every, "commit_floor": floor,
             "committed": target - matched, "committed_tokens": committed_tokens, "commit_time": commit_time,
-            "skipped": skipped, "canned": job.memt_canned, "generated": generated,
+            "skipped": skipped, "canned": job.memt_canned, "generated": generated, "disk_hits": self.disk_hits,
             "short_prompt_tokens": len(prompt), "snapshots": len(self.snapshots),
         }
         if self.verbose:

@@ -228,6 +228,13 @@ copy. The verbose line says "N as generated". Box-tested through Tabby with thin
 as 510 generated tokens against the client's 71. Which recalls better is untested; that is the point of the
 switch.
 
+**Memory survives a restart** (`EXL3_MEMT_SNAPSHOT_DIR=/mnt/two/memt_snapshots`, generator arg
+`memt_snapshot_dir`, default off = RAM only). Every snapshot is also written as a safetensors file in the
+release's layout under `<dir>/<model>-<hash>/<key>.safetensors` (40 MiB each), RAM misses are filled from
+there, and the directory is an LRU by mtime capped at `EXL3_MEMT_SNAPSHOT_DISK_MB` (default 16 GB, ~400
+snapshots). The generated-reply store lives there too (`generated.pt`). Box-tested: memorize, kill Tabby,
+relaunch, ask; the fresh process matched from disk ("1 matched, 0 committed") and recalled.
+
 **Command-only messages.** A message that is nothing but commands gets a fixed reply without running the
 model ("Memorized 5 exchanges.", "Nothing new to memorize (7 exchanges in memory).", "Memorizing every 3
 exchanges from now."), served by `Generator.iterate_canned_jobs` as a normal stop-token finish so Tabby

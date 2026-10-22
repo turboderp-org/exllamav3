@@ -62,6 +62,7 @@ class Generator:
         memt_context_turns: int | None = None,
         memt_commit_every: int | None = None,
         memt_commit_generated: bool | None = None,
+        memt_snapshot_dir: str | None = None,
         memt_cache_size: int | None = None,
         memt_verbose: bool | None = None,
         **kwargs
@@ -225,6 +226,11 @@ class Generator:
             like the release replays turns) instead of the client's re-rendered copy, when the client's visible
             answer still matches. Default: env EXL3_MEMT_COMMIT_GENERATED (non-empty, not "0"), else off
 
+        :param memt_snapshot_dir:
+            With memt_memory, a directory to keep every snapshot in as a file (release layout) so memory survives
+            a restart; RAM misses are filled from it, capped by env EXL3_MEMT_SNAPSHOT_DISK_MB (LRU, default 16 GB).
+            Default: env EXL3_MEMT_SNAPSHOT_DIR, else none (RAM only)
+
         :param memt_cache_size:
             With memt_memory, RAM budget for memory snapshots (LRU), in bytes. Default: env
             EXL3_MEMT_CACHE_MB, else 2 GB (~50 snapshots of MemT-1.0-Nano)
@@ -341,6 +347,8 @@ class Generator:
                 memt_commit_every = int(os.environ.get("EXL3_MEMT_COMMIT_EVERY", "1"))
             if memt_commit_generated is None:
                 memt_commit_generated = os.environ.get("EXL3_MEMT_COMMIT_GENERATED", "") not in ("", "0")
+            if memt_snapshot_dir is None:
+                memt_snapshot_dir = os.environ.get("EXL3_MEMT_SNAPSHOT_DIR") or None
             if memt_cache_size is None:
                 memt_cache_size = int(float(os.environ.get("EXL3_MEMT_CACHE_MB", "2048")) * 1024**2)
             if memt_verbose is None:
@@ -351,6 +359,8 @@ class Generator:
                 commit_every = memt_commit_every,
                 commit_generated = memt_commit_generated,
                 cache_size = memt_cache_size,
+                snapshot_dir = memt_snapshot_dir,
+                disk_size = int(float(os.environ.get("EXL3_MEMT_SNAPSHOT_DISK_MB", "16384")) * 1024**2),
                 verbose = memt_verbose,
             )
 

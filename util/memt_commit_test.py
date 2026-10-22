@@ -167,6 +167,28 @@ r1 = turns[-1][1]
 r2 = chat(SYSTEM, t, turns[-1][0])
 check(r2 == r1 and mem.last["committed"] == 0, f"identical reply, no commit: {mem.last}")
 
+print("== I. snapshots on disk survive a cleared RAM cache (stand-in for a restart)", flush = True)
+import tempfile, os
+tmp = tempfile.mkdtemp(prefix = "memt_snap_")
+mem.set_snapshot_dir(tmp)
+mem.commit_generated = True
+turns6 = []
+chat(SYSTEM, turns6, "Remember: my boat is called Saltwind.")
+r = chat(SYSTEM, turns6, "What is my boat called?\n/commit")
+files = [f for f in os.listdir(mem.snapshot_dir) if f.endswith(".safetensors")]
+check(len(files) == 1 and os.path.exists(os.path.join(mem.snapshot_dir, "generated.pt")), f"snapshot + generated store written: {os.listdir(mem.snapshot_dir)}")
+mem.clear()
+check(len(mem.snapshots) == 0 and len(mem.generated) == 0, "RAM copies dropped")
+mem._load_generated()
+check(len(mem.generated) >= 1, "generated store reloads from disk")
+r = chat(SYSTEM, turns6, "And again, what is my boat called?")
+check(mem.last["matched"] == 1 and mem.last["committed"] == 0 and mem.last["disk_hits"] == 1, f"matched from disk, nothing recommitted: {mem.last}")
+check("Saltwind" in r, "recalls from the disk snapshot")
+r = chat(SYSTEM, turns6, "Thanks.\n/commit")
+check(mem.last["generated"] == 2 and mem.last["committed"] == 2, f"later commits use the reloaded generated replies: {mem.last}")
+mem.commit_generated = False
+mem.snapshot_dir = None
+
 print(f"snapshots held: {len(mem.snapshots)} ({len(mem.snapshots) * mem.snapshot_bytes / 2**20:.0f} MiB)")
 print("ALL PASS" if ok else "SOME CHECKS FAILED", flush = True)
 sys.exit(0 if ok else 1)
