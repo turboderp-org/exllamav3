@@ -74,6 +74,9 @@
 #include "attention.cuh"
 
 #include "sam.h"
+#if defined(USE_ROCM)
+#include "rocm/rdna3_attn.h"
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -89,6 +92,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
     m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
     m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
+    m.attr("HAS_RDNA3_ATTN") = !cuda_only;      // rdna3_attn_split_kernel
 
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
@@ -318,6 +322,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+#if defined(USE_ROCM)
+    m.def("rdna3_attn_split_kernel", &rdna3_attn_split_kernel, "rdna3_attn_split_kernel");
+#endif
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"

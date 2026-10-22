@@ -26,8 +26,13 @@ struct TritonKernel
     int num_warps;
     int shared_bytes;
     int grid_y = 1;     // second launch-grid axis chosen at compile time (sub-tiles), read by the graph launch sites
+    void* scratch0 = nullptr;   // first trailing param (Triton's global scratch, size 0, so null for Triton kernels)
 
     TritonKernel(py::bytes cubin, std::string name, int num_warps, int shared_bytes);
+    // Wrap a kernel compiled into the extension (function handle from hipGetFuncBySymbol), launched
+    // the same way; it must take the two trailing scratch pointer params, the first of which it
+    // receives as scratch0
+    TritonKernel(void* function, std::string name, int num_warps, int shared_bytes, void* scratch0);
     ~TritonKernel();
     TritonKernel(const TritonKernel&) = delete;
     TritonKernel& operator=(const TritonKernel&) = delete;
