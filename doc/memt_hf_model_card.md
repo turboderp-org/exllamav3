@@ -19,6 +19,8 @@ tags:
   .panel-body { padding: 20px; }
   .repo-data-panel { padding: 14px 10px; }
   .repo-data-body { display: flex; flex-direction: column; align-items: center; gap: 20px; width: 100%; --edge-gap: 8px; }
+  .repo-graph { display: block; width: min(1440px, calc(100% - (var(--edge-gap) * 2))); height: auto; margin: 0 auto; }
+  .repo-graph + .repo-graph { margin-top: 1.25rem; }
   .table-wrapper { display: inline-block; margin: 0 auto; border: 1px solid #666a73; border-radius: 4px; overflow: hidden; max-width: calc(100% - (var(--edge-gap) * 2)); }
   .data-table { border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; width: auto; margin: 0; }
   .data-table th { text-align: left; color: #ffffff; background-color: #2d2f34; padding: 9px 12px; border-bottom: 2px solid #666a73; border-right: 1px solid #4a4d53; }
@@ -41,13 +43,13 @@ tags:
   <div class="content-panel">
     <div class="panel-title">Information</div>
     <div class="panel-body">
-      exl3 builds of <b><a class="link-style" href="https://huggingface.co/MemTensor/MemT-1.0-Nano">MemT-1.0-Nano</a></b>
-      for <b><a class="link-style" href="https://github.com/UnstableLlama/exl3-qlora">exl3-qlora</a></b> (an
-      <a class="link-style" href="https://github.com/turboderp-org/exllamav3">exllamav3</a> fork with native MemT memory) and TabbyAPI.
-      <br/>
+      exl3 builds of the <b><a class="link-style" href="https://huggingface.co/MemTensor/MemT-1.0-Nano">MemT-1.0-Nano</a></b>
+      &#9888;&#65039; <b>PERSISTENT MEMORY MODEL</b> &#9888;&#65039; that works with TabbyAPI.
+      ExLlamaV3 fork <b><a class="link-style" href="https://github.com/UnstableLlama/exl3-qlora">exl3-qlora</a></b> required.
+      <br/><br/>
       MemT-1.0-Nano is Qwen3.6-35B-A3B plus a trained memory block on its ten full-attention layers: the model files earlier
       conversation turns into a 40 MiB latent memory and answers from it instead of re-reading the whole chat.
-      <br/>
+      <br/><br/>
       Each revision is the stock backbone quant from
       <a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3">yeasah/Qwen3.6-35B-A3B-exl3</a> (byte for byte, credit yeasah) plus the MemT
       files: <code>memt_block.safetensors</code> (bf16, 0.84 GiB), the MemT configs, and the release chat template with a small
@@ -58,12 +60,16 @@ tags:
   <div class="content-panel">
     <div class="panel-title">Repo Data</div>
     <div class="panel-body repo-data-body repo-data-panel">
+      <img class="repo-graph" src="qb_kld.png" alt="Mean KL divergence vs bits per weight">
+      <img class="repo-graph" src="qb_ppl.png" alt="Perplexity vs bits per weight">
       <div class="table-wrapper">
         <table class="data-table">
           <thead>
             <tr>
               <th>REVISION</th>
               <th>GiB</th>
+              <th>KL DIV</th>
+              <th>PPL</th>
               <th>BACKBONE QUANT</th>
             </tr>
           </thead>
@@ -71,22 +77,37 @@ tags:
             <tr>
               <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/3.00bpw">3.00bpw</a></td>
               <td>15.67</td>
+              <td>0.0215</td>
+              <td>1.3389</td>
               <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/3.00bpw-H5">3.00bpw-H5</a></td>
             </tr>
             <tr>
               <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/4.00bpw">4.00bpw</a></td>
               <td>19.64</td>
+              <td>0.0069</td>
+              <td>1.3207</td>
               <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/4.00bpw">4.00bpw</a></td>
             </tr>
             <tr>
               <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/5.00bpw">5.00bpw</a></td>
               <td>23.55</td>
+              <td>0.0030</td>
+              <td>1.3150</td>
               <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/5.00bpw">5.00bpw</a></td>
             </tr>
             <tr>
               <td><a class="link-style" href="https://huggingface.co/UnstableLlama/MemT-1.0-Nano-exl3/tree/6.00bpw">6.00bpw</a></td>
               <td>27.47</td>
+              <td>0.0018</td>
+              <td>1.3116</td>
               <td><a class="link-style" href="https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3/tree/6.00bpw">6.00bpw</a></td>
+            </tr>
+            <tr>
+              <td><a class="link-style" href="https://huggingface.co/MemTensor/MemT-1.0-Nano">bf16</a></td>
+              <td>63.61</td>
+              <td>0.0000</td>
+              <td>1.3126</td>
+              <td>-</td>
             </tr>
           </tbody>
         </table>
