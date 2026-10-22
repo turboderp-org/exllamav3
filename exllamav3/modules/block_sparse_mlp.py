@@ -1064,6 +1064,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
+        # Calibration with affinity-weighted expert Hessians (convert.py --moe_affinity_eps): with every expert
+        # active, routing_weights is the full router softmax. Keep its per-expert sum over all rows and a fixed
+        # random sample of (expert input, affinities) rows; the per-expert gate/up Hessians are built from the
+        # sample just before quantization (see conversion/moe_affinity.py)
+        aff = params.get("moe_affinity")
+        if aff is not None and params.get("activate_all_experts") and self.routing_gate is not None:
+            st = aff["layers"].setdefault(self.key, {"x": [], "p": [], "psum": 0.0, "rows": 0})
+            # sigmoid routers add the selection bias to the all-experts weights, which can go below zero
+            p = routing_weights.clamp_min(0)
+            st["psum"] = st["psum"] + p.float().sum(0)
+            st["rows"] += bsz
+            keep = (torch.rand(bsz, generator = aff["generator"]) < aff["frac"]).to(y.device)
+            if keep.any():
+                st["x"].append(y[keep].half().cpu())
+                st["p"].append(p[keep].half().cpu())
+
         # Calibration: the experts' output sensitivity is weighted by the routing the model would
         # actually do, which is not the selection in use when every expert is activated
         sens_weights = None
@@ -1119,6 +1135,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             fhs_ext = torch.zeros((y.shape[0] + 1, y.shape[1]), dtype = torch.float, device = y.device)
             final_hidden_states = fhs_ext[:y.shape[0]]
 
+            # Calibration capture with every expert active, output not needed (convert.py
+            # discards the capture pass's output and advances the state with the quantized
+            # layer): only the experts' input statistics matter. Every expert sees every row in
+            # order, so no gather; the down projection only needs its input captured, so no down
+            # matmul, no weighting and no scatter-add. The routed output stays zero, so not with a
+            # latent MoE, whose latent_out projection is calibrated on that output
+            capture_fast = (
+                params.get("capture_only") and params.get("activate_all_experts") and "capture" in params and
+                self.gated and self.latent_out is None and
+                (self.num_local_experts is None or self.num_local_experts == self.num_experts)
+            )
+            if capture_fast:
+                self._capture_all_experts(y, routing_weights, sens_weights, aff, params)
+
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
             #     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
             # else:
@@ -1127,7 +1157,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             #     shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
             #     expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
 
-            if self.num_local_experts is None or self.num_local_experts > 0:
+            if not capture_fast and (self.num_local_experts is None or self.num_local_experts > 0):
 
                 num_ex = self.num_local_experts or self.num_experts
 
@@ -1368,6 +1398,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 a = self.gateless_act(u)
                                 if a.dtype != torch.half:
                                     a = a.half()
+                            if aff is not None and params.get("activate_all_experts"):
+                                # Down Hessian also accumulated weighted by this expert's affinity per row
+                                params["capture_row_w"] = w.view(-1)
+                                try:
+                                    return self.downs[exp_i].forward(a, params)
+                                finally:
+                                    params.pop("capture_row_w", None)
                             return self.downs[exp_i].forward(a, params)
 
                         current_state = mlp(expert_idx, current_state)
@@ -1457,6 +1494,40 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
+
+
+    def _capture_all_experts(self, y, routing_weights, sens_weights, aff, params):
+        """
+        Calibration capture with every expert active when the routed output is not needed: for
+        each expert the gate/up inputs (all rows, as they are) and the down input (the gated
+        activation) are captured exactly as the general path does, with the same per-row affinity
+        weights for the down Hessian and the same output-sensitivity capture, but without the
+        down matmul, the routing weighting and the scatter-add.
+        """
+        num_ex = self.num_local_experts or self.num_experts
+        x = y if y.dtype == torch.half else y.half()
+        weighted = aff is not None
+        for e in range(num_ex):
+            u = self.ups[e].forward(x, params)
+            g = self.gates[e].forward(x, params)
+            if sens_weights is not None:
+                sw = sens_weights[:, e]
+                routed = sw.nonzero().flatten()
+                if routed.numel():
+                    capture_out_sensitivity(
+                        params["capture_sens"], self.gates[e], self.ups[e], self.downs[e],
+                        g[routed], u[routed], self.activation_fn, self.act_limit, sw[routed]
+                    )
+            a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+            self.activation_fn_call(g, u, a, self.act_limit)
+            if a.shape[-1] < self.downs[e].in_features:
+                a = torch.nn.functional.pad(a, (0, self.downs[e].in_features - a.shape[-1]))
+            if weighted:
+                params["capture_row_w"] = routing_weights[:, e]
+            try:
+                self.downs[e].capture_H(a, params)
+            finally:
+                params.pop("capture_row_w", None)
 
 
     @override

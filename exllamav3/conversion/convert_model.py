@@ -16,6 +16,8 @@ from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
 from .ngram import quantize_embedding
+from .moe_affinity import make_store as make_affinity_store, combine_down as combine_affinity_down, \
+    quantize_gate_up as quantize_affinity_gate_up
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
@@ -95,6 +97,8 @@ parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save 
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
+parser.add_argument("-mae", "--moe_affinity_eps", type = float, default = None, help = "Quantize each block-sparse expert against its own Hessian, with calibration tokens weighted by eps + the expert's router affinity relative to its mean (see conversion/moe_affinity.py). Typical eps: 0.1. Default (0): one shared gate/up Hessian per layer, unweighted")
+parser.add_argument("-mar", "--moe_affinity_rows", type = int, default = 262144, help = "With --moe_affinity_eps: sampled calibration tokens per layer for the per-expert gate/up Hessians, default 262144")
 parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
 parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
@@ -286,6 +290,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hessians_reg", False, 0.025),
         ("hessians_one_sided", False, False),
         ("scaled_hessian", False, False),
+        ("moe_affinity_eps", False, 0),  # 0 = off
+        ("moe_affinity_rows", False, 262144),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -950,6 +956,9 @@ def capture_module_parallel(
                     "capture": captures[t_idx],
                     "capture_sens": captures_sens[t_idx],
                     "activate_all_experts": model.calibration_all_experts,
+                    # with every expert active the output is discarded (references are rerun with
+                    # normal routing below), so block-sparse layers may skip computing it
+                    "capture_only": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
                 if slicing:
@@ -1296,6 +1305,15 @@ def main(args, job_state):
     )
     replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
 
+    # Affinity-weighted expert Hessians: per-layer store filled by the capture forward (see moe_affinity.py)
+    moe_aff_eps = args.get("moe_affinity_eps") or None
+    if moe_aff_eps is not None and state is not None:
+        assert not parallel_calib, "--moe_affinity_eps is only implemented for single-device calibration"
+        assert model.calibration_all_experts, "--moe_affinity_eps needs a model calibrated with all experts active"
+        cal_tokens = sum(t.shape[-1] for t in original_input_ids if torch.is_tensor(t))
+        print(f" -- Affinity-weighted expert Hessians: eps {moe_aff_eps}, "
+              f"up to {args['moe_affinity_rows']:,} of {cal_tokens:,} calibration tokens sampled per layer")
+
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -1349,6 +1367,8 @@ def main(args, job_state):
                     print(f"     - Cloned {m.key} from {m.alt_key}")
             module.config.stc.close()
 
+            aff_store = None
+
             # Skip modules without quant targets
             qmaps = module.get_qmaps()
             if len(qmaps) > 0:
@@ -1380,6 +1400,8 @@ def main(args, job_state):
                             rep.unload()
                         free_mem()
                     else:
+                        if moe_aff_eps is not None:
+                            aff_store = make_affinity_store(moe_aff_eps, args["moe_affinity_rows"], cal_tokens, seed = idx)
                         with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
                             capture_H = {}
                             capture_sens = {}
@@ -1393,8 +1415,14 @@ def main(args, job_state):
                                     "capture": capture_H,
                                     "capture_sens": capture_sens,
                                     "activate_all_experts": model.calibration_all_experts,
+                                    # with every expert active the output is discarded (references
+                                    # are rerun with normal routing below), so block-sparse layers
+                                    # may skip computing it
+                                    "capture_only": model.calibration_all_experts,
                                     "input_ids": original_input_ids[i],
                                 }
+                                if aff_store is not None:
+                                    params["moe_affinity"] = aff_store
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice
                                 get_preserve(i, params)
@@ -1437,6 +1465,12 @@ def main(args, job_state):
                             numel = v["num_total"]
                             print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
 
+                    # Affinity-weighted down Hessians
+                    if aff_store is not None:
+                        n_aff = combine_affinity_down(capture_H, moe_aff_eps)
+                        if n_aff:
+                            print(f" -- Affinity-weighted down Hessians: {n_aff}")
+
                     # Swap captured H to system RAM
                     for k, v in capture_H.items():
                         v["H_swap_device"] = v["H"].device
@@ -1463,15 +1497,23 @@ def main(args, job_state):
             # Quantize: one linear per device in parallel when the layer has enough
             # tensors to occupy every device, else tile-split each tensor across devices
             # (single large tensors, e.g. lm_head)
-            if (
-                len(linears) >= len(devices) and
-                all(strategy[l.key] <= 8 for l in linears)
-            ):
-                quantize_linears_parallel(
-                    args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state, out_sens)
-            else:
-                quantize_linears_single(
-                    args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state, out_sens)
+            def quantize_list(linears_, capture_H_):
+                if (
+                    len(linears_) >= len(devices) and
+                    all(strategy[l.key] <= 8 for l in linears_)
+                ):
+                    quantize_linears_parallel(
+                        args, linears_, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H_, state, out_sens)
+                else:
+                    quantize_linears_single(
+                        args, linears_, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H_, state, out_sens)
+
+            # Gate/up projections of experts with affinity-weighted Hessians: per expert, a few at a time
+            if aff_store is not None and aff_store["layers"]:
+                linears = quantize_affinity_gate_up(module, linears, capture_H, aff_store, quantize_list, device)
+                aff_store = None
+            if linears:
+                quantize_list(linears, capture_H)
 
             # Collect converted module tensors
             for m in module:
