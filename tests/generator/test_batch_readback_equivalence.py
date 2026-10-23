@@ -153,9 +153,69 @@ def test_greedy_banned_token(gen, tok, ids, ids1):
 
 
 def test_greedy_rep_penalty(gen, tok, ids):
-    # Needs past token IDs: both runs take the serial loop; the outputs must still agree
+    # Needs past token IDs: both runs take the serial loop; the outputs must still agree. The penalty is
+    # kept mild: a strong one breaks the repetition the n-gram drafter needs, and no window gets verified
     equivalent(gen, tok, input_ids = ids,
-               sampler = CustomSampler([SS_RepP(1.5), SS_Argmax()]))
+               sampler = CustomSampler([SS_RepP(1.05), SS_Argmax()]))
+
+
+class TriggeredAllowSetFilter(AllowSetFilter):
+    """Dormant until its trigger token is emitted, then allows only a fixed set of tokens"""
+    def __init__(self, tokenizer, allowed, trigger):
+        super().__init__(tokenizer, allowed)
+        self.trigger_token = trigger
+        self.is_active = False
+
+
+def run_job_with_event(gen, tok, input_ids, after_tokens, event, no_batch_readback):
+    """Run a greedy job, calling event(job) once after_tokens tokens have streamed; returns the sequence
+    ids and the draft tokens verified"""
+    old = gen_mod._NO_BATCH_READBACK
+    gen_mod._NO_BATCH_READBACK = no_batch_readback
+    try:
+        job = Job(input_ids = input_ids, max_new_tokens = NEW_TOKENS, sampler = ArgmaxSampler())
+        gen.enqueue(job)
+        streamed, fired = 0, False
+        while gen.num_remaining_jobs():
+            for r in gen.iterate():
+                if r["stage"] == "streaming" and r.get("token_ids") is not None:
+                    streamed += r["token_ids"].numel()
+            if not fired and streamed >= after_tokens:
+                event(job)
+                fired = True
+        return (job.sequences[0].sequence_ids.torch()[0].tolist(),
+                job.accepted_draft_tokens + job.rejected_draft_tokens)
+    finally:
+        gen_mod._NO_BATCH_READBACK = old
+
+
+def test_triggered_filter_mid_window(gen, tok, ids, ids1):
+    # A filter installed dormant activates on a token that lands inside a verification window; the
+    # positions after it are constrained on both paths, and the paths agree
+    trigger = ids1[4]                        # the period: emitted every few tokens
+    allowed = [ids1[2], ids1[3]]
+    install = lambda job: job.set_filters([TriggeredAllowSetFilter(tok, allowed, trigger)])
+    n = ids.shape[-1]
+    seq_a, drafts_a = run_job_with_event(gen, tok, ids, 12, install, no_batch_readback = False)
+    seq_b, drafts_b = run_job_with_event(gen, tok, ids, 12, install, no_batch_readback = True)
+    assert drafts_a > 0 and drafts_b > 0, "no draft tokens were verified"
+    gen_a = seq_a[n + 12:]
+    assert trigger in gen_a, "the trigger was never emitted after the filter was installed"
+    constrained = gen_a[gen_a.index(trigger) + 1:]
+    assert constrained and all(t in allowed for t in constrained), "a token escaped the filter"
+    assert seq_a == seq_b, f"readback paths diverged: batched={seq_a} serial={seq_b}"
+
+
+def test_forced_output_mid_window(gen, tok, ids):
+    # constrain_output_now while drafting: every forced token must come out, on both paths
+    forced = " ZEBRA QUARTZ VIOLIN"
+    inject = lambda job: job.constrain_output_now(forced)
+    n = ids.shape[-1]
+    seq_a, drafts_a = run_job_with_event(gen, tok, ids, 6, inject, no_batch_readback = False)
+    seq_b, drafts_b = run_job_with_event(gen, tok, ids, 6, inject, no_batch_readback = True)
+    assert drafts_a > 0 and drafts_b > 0, "no draft tokens were verified"
+    assert forced in tok.decode(torch.tensor(seq_a[n:])), "forced output lost on the batched path"
+    assert seq_a == seq_b, f"readback paths diverged: batched={seq_a} serial={seq_b}"
 
 
 def test_min_new_tokens_window(gen, tok, ids):

@@ -26,10 +26,9 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
-# EXL3_NO_BATCH_READBACK=1: force the per-position serial speculative-window readback instead of the
-# batched (launch-all-samplers, one pinned stage, one synchronize) path. A/B escape hatch, mirrors the
-# EXL3_BC_* switches
-_NO_BATCH_READBACK = os.environ.get("EXL3_NO_BATCH_READBACK") == "1"
+# Test hook: True forces the per-position serial speculative-window readback instead of the batched
+# (launch-all-samplers, one pinned stage, one synchronize) path
+_NO_BATCH_READBACK = False
 
 class Generator:
 
@@ -1777,17 +1776,22 @@ class Generator:
                 # launch up front in serial-loop order (each position's RNG draw is unchanged) and the W
                 # sampled tokens read back through one pinned buffer and one synchronize, as in the
                 # no-draft path, leaving a host-only accept/reject walk. Constrained jobs keep the serial
-                # loop below; EXL3_NO_BATCH_READBACK=1 forces it for A/B.
+                # loop below.
+                # A dormant triggered filter can activate on a token inside the window and constrain the
+                # positions after it, and a pending constrain_output_now injection is consumed one token per
+                # sampled position; both keep the serial loop
                 batchable = (
                     not _NO_BATCH_READBACK
                     and b - a == 1
                     and job.checkpoint is None
+                    and job.forced_ids is None
                     and job.new_tokens >= job.min_new_tokens
-                    and not any(f.is_active for f in job.filters)
+                    and not any(f.is_active or f.trigger_token is not None for f in job.filters)
                     and not job.sampler.reqs_past_ids
                 )
                 staged = None
                 if batchable:
+                    rng_state = job.rng.getstate()
                     staged = []
                     any_cuda = False
                     for i in range(W):
@@ -1808,6 +1812,7 @@ class Generator:
                         torch.cuda.synchronize(batch_logits.device)
 
                 for i in range(W):
+                    positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
                     if staged is not None:
                         (next_token, next_k_tokens, next_k_probs, next_prob), _ = staged[i]
@@ -1893,6 +1898,14 @@ class Generator:
                             # Update masks and past IDs
                             job.prepare_logit_mask()
                             job.prepare_sampling_past_ids()
+
+                if staged is not None and positions_used < W:
+                    # The serial loop would have drawn one sampler seed per position it reached; pass 1 drew
+                    # W. Rewind the job's RNG and replay only the draws that were used, so a seeded stream
+                    # continues exactly as it would have on the serial loop
+                    job.rng.setstate(rng_state)
+                    for _ in range(positions_used):
+                        job.rng.randint(0, (1 << 32) - 1)
 
                 # Make sure outgoing state is valid if entire draft was accepted
                 if batch_states and draft_tokens is not None and rejected == 0:
