@@ -113,6 +113,7 @@ class Gemma3Config(Config):
         if not os.path.exists(prep_path):
             self.vision = None
             self.vision_pp = None
+            del self.model_classes["vision"]
             return
 
         # Vision model settings

@@ -165,12 +165,16 @@ def test_gemma3_text_only_parses_without_processor(tmp_path):
     config = load_config(tmp_path, GEMMA3)
     assert config.vision_pp is None
     assert config.vision is None
+    # Converter and compiler discover components through model_classes; a vision tower that cannot be built is not one
+    assert "vision" not in config.model_classes
+    assert "text" in config.model_classes
 
 
 def test_gemma3_with_processor_parses_as_before(tmp_path):
     config = load_config(tmp_path, GEMMA3, "preprocessor_config.json")
     assert config.vision_pp is not None
     assert config.vision.patch_size == 14
+    assert "vision" in config.model_classes
 
 
 def test_gemma3_vision_refuses_text_only_config(tmp_path):
@@ -191,12 +195,16 @@ def test_gemma4_text_only_parses_without_processor(tmp_path):
     config = load_config(tmp_path, GEMMA4)
     assert config.vision_pp is None
     assert config.vision is None
+    # Converter and compiler discover components through model_classes; a vision tower that cannot be built is not one
+    assert "vision" not in config.model_classes
+    assert "text" in config.model_classes
 
 
 def test_gemma4_with_processor_parses_as_before(tmp_path):
     config = load_config(tmp_path, GEMMA4, "processor_config.json", GEMMA4_PROCESSOR)
     assert config.vision_pp is not None
     assert config.vision.patch_size == 16
+    assert "vision" in config.model_classes
 
 
 def test_gemma4_vision_refuses_text_only_config(tmp_path):

@@ -137,6 +137,7 @@ class Gemma4Config(Config):
             # A text-only checkpoint does not establish a usable vision processor/schema.
             self.vision = None
             self.vision_pp = None
+            del self.model_classes["vision"]
             return
 
         # Vision model settings
