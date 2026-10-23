@@ -27,6 +27,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             "supports_tp": True
         }
         self.active_devices = []
+        # Longest forward the layer split was loaded for (max_chunk_size of an autosplit load)
+        self.max_chunk_size = 0
         self.output_device = None
         self.cache_weakrefs = {}
         self.recurrent_state_cls = None
@@ -376,6 +378,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        if not self.loaded_tp and self.prefill_ls_pipelined(input_ids, params):
+            return None
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -447,6 +451,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         # The loader's open slab blocks must not outlive the tensors sliced from them
         self.config.stc.release_arena()
         self.active_devices = []
+        self.max_chunk_size = 0
         self.unload_tp()
         self.output_device = None
         # Attached caches lose their layer tensors with the modules that allocated them

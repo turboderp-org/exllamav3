@@ -33,6 +33,10 @@ class DeepseekV4MTPModel(Model):
     def __init__(
         self,
         config: DeepseekV4Config,
+        num_experts: int | None = None,
+        num_experts_per_tok: int | None = None,
+        carry_pre: bool = False,
+        q_head_norm: bool = True,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -87,6 +91,7 @@ class DeepseekV4MTPModel(Model):
                 out_dtype = torch.float,
                 qbits_key = "mtp_bits",
                 select_hq_bits = 2,
+                q_head_norm = q_head_norm,
             )
             self.attn_modules.append(attn)
             mlp = BlockSparseMLP(
@@ -94,8 +99,8 @@ class DeepseekV4MTPModel(Model):
                 key = f"{key}.ffn",
                 hidden_size = h,
                 intermediate_size = config.moe_intermediate_size,
-                num_experts = config.num_experts,
-                num_experts_per_tok = config.num_experts_per_tok,
+                num_experts = num_experts or config.num_experts,
+                num_experts_per_tok = num_experts_per_tok or config.num_experts_per_tok,
                 key_up = "experts.{expert_idx}.w3",
                 key_gate = "experts.{expert_idx}.w1",
                 key_down = "experts.{expert_idx}.w2",
@@ -134,6 +139,7 @@ class DeepseekV4MTPModel(Model):
                     sinkhorn_iters = config.hc_sinkhorn_iters,
                     hc_eps = config.hc_eps,
                     rms_norm_eps = config.rms_norm_eps,
+                    carry_pre = carry_pre,
                 )
             self.modules += [
                 TransformerBlock(
@@ -161,6 +167,7 @@ class DeepseekV4MTPModel(Model):
                 hc_mult = config.hc_mult,
                 rms_norm_eps = config.rms_norm_eps,
                 hc_eps = config.hc_eps,
+                carry_pre = carry_pre,
             ),
             RMSNorm(
                 config = config,
