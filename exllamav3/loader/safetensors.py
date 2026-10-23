@@ -11,6 +11,7 @@ import itertools
 from ..util import Timer
 from ..ext import exllamav3_ext as ext
 from functools import cached_property
+from contextlib import contextmanager, ExitStack
 import time
 
 MAX_DEFERRED_LOAD_CHUNK = 4*1024**2
@@ -1052,6 +1053,19 @@ class SafetensorsCollection:
         self.deferred_finalize = []
 
 
+    @contextmanager
+    def eager_load(self):
+        """Load immediately inside an open deferred-load bracket, for tensors whose values are
+        read before the bracket closes (a deferred fill would land after that read). A no-op
+        outside a bracket"""
+        prev = self.deferred_mode
+        self.deferred_mode = False
+        try:
+            yield
+        finally:
+            self.deferred_mode = prev
+
+
     def abort_deferred_load(self):
         self.deferred_mode = False
         self._reset_deferred()
@@ -1262,6 +1276,14 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     def end_deferred_load(self):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.end_deferred_load()
+
+
+    @contextmanager
+    def eager_load(self):
+        with ExitStack() as stack:
+            for stc in [s for _, _, s in self.stcs] + [self.main]:
+                stack.enter_context(stc.eager_load())
+            yield
 
 
     def abort_deferred_load(self):

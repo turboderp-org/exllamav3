@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
@@ -652,19 +651,12 @@ class BlockSparseMLP_CPU:
                 else final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
 
-    @override
-    def can_defer_load(self):
-        # The frequency-permuted expert split reads the router tensors right after load (to
-        # permute them); deferred fills would land after that read and be lost.
-        # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
-        # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
-        # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
-        if int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and (
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-            or os.path.exists(_expert_stats_path(self.config, self.num_experts))
-        ):
-            return False
-        return super().can_defer_load()
+    def cpu_split_permuted(self) -> bool:
+        """True when the split's expert lists were permuted hot-to-cold (a saved profile or an
+        EXL3_MOE_CPU_SPLIT_STATS file). cpu_post_load then permutes the router tensors right
+        after they load, so those must be filled eagerly even inside a deferred-load bracket;
+        the rest of the module (every GPU-resident expert) keeps the batched deferred fill"""
+        return self.cpu_split_first is not None and getattr(self, "_split_perm", None) is not None
 
     def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
         """
