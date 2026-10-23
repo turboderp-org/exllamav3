@@ -359,6 +359,14 @@ class VisionData:
             return messages, []
         return resolver.refs_for_row(row, row_idx, messages)
 
+    def flatten(self, messages, base_dir: Optional[str] = None):
+        """:meth:`prepare` for an in-memory conversation (the realtime
+        coordinator's ``vision.flatten`` contract): image parts name their
+        pixels inline (path / url / base64 / image / image_url), relative
+        paths resolve against ``base_dir`` (else the working directory)."""
+        resolver = ImageResolver(base_dir, self.images_key, name="realtime")
+        return self.prepare(resolver, {}, 0, messages)
+
     def features(self, refs: list) -> dict:
         """``{k: ImageFeatures}`` (with embeds) for the row's refs, encoding on
         a cache miss. Registers each ref's loader for batch-time refetch."""

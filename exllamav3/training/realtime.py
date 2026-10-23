@@ -73,6 +73,30 @@ Sample forms accepted by ``ingest`` (mixable in one call):
     template-driven builders produce this contract -- see
     ``training/realtime_chat.py`` for the wiring).
 
+Image+text samples (VLM bases -- Qwen-VL, Gemma3/4, Mistral3): a
+``messages`` sample (or a preference sample's conversational ``prompt``)
+whose turn contents are OpenAI content-parts lists carrying image parts
+(``{"type": "image", "path"|"url"|"base64"|"image"|"image_url": ...}``)
+trains WITH the pixels when a ``vision`` service is wired in
+(``RealtimeQLoRA(..., vision=...)``; ``training/vision_data.py``'s
+``VisionData`` is the reference implementation, built on the frozen vision
+component the generator serves images through). The exact offline
+``--vision`` recipe applies: the tower runs frozen, its features replace the
+token embeddings at the arch's own image token layout (``<|vision_start|>``
++ N slots + ``<|vision_end|>`` on Qwen-VL, ...), image tokens are masked,
+3-D mRoPE positions / deepstack maps / bidirectional image spans are
+reproduced in the differentiable forward, and a sample whose image layout
+would be cut by ``seq_len`` is skipped rather than truncated through the
+image. Without a ``vision`` service an image-bearing sample is REFUSED
+(``ValueError``): the template would still render its placeholder tokens,
+and an adapter trained on those empty slots learns answers conditioned on
+nothing -- the loss falls, the served behaviour (which sees real features
+in those slots) does not move. Text-only samples train as before on a VLM
+base. The ``vision`` object's surface: ``mrope`` (bool), ``flatten(messages,
+base_dir=None) -> (messages_with_sentinels, refs)`` and
+``encode_segments(segments, refs) -> (input_ids, labels, [(start, k)],
+{k: ImageFeatures})``.
+
 Preference samples (DPO / KTO) mix into the same ``ingest`` call. They use
 TRL's *explicit prompt* format -- the prompt is its own field, never
 repeated inside the completions -- and train the adapter with the same
@@ -139,15 +163,18 @@ so tiny and frequent that the copies ever show up in a profile.
 Aux component parking (``offload_aux_when_training``, default on): a serving
 stack for a multimodal / MTP-capable checkpoint typically loads extra
 component models next to the text trunk -- a vision tower for image input,
-an MTP head as speculative-decoding draft model. Training never touches them
-(the LoRA targets live in the text trunk), so while an ingest runs they are
-dead weight in VRAM. Register them with ``attach_aux_models(vision_model,
-draft_model)`` and every ingest parks them out of VRAM for its duration --
-unloaded going in (KV cache layers of a draft model included), reloaded
-value-exact to the same devices on the way out (through the safetensors
-collection; the OS page cache makes the reload a system-RAM read in
-practice). Restoration is guaranteed even when the ingest itself fails. See
-``aux_offload.py`` for the mechanism and its limits (no TP-loaded models).
+an MTP head as speculative-decoding draft model. The backward never touches
+them (the LoRA targets live in the text trunk; the vision tower only
+produces the frozen features an image sample trains against, and that
+happens while the samples are encoded, BEFORE the training forwards), so
+while the training forwards run they are dead weight in VRAM. Register them
+with ``attach_aux_models(vision_model, draft_model)`` and every ingest parks
+them out of VRAM for its duration -- unloaded after the samples are encoded
+(KV cache layers of a draft model included), reloaded value-exact to the
+same devices on the way out (through the safetensors collection; the OS
+page cache makes the reload a system-RAM read in practice). Restoration is
+guaranteed even when the ingest itself fails. See ``aux_offload.py`` for
+the mechanism and its limits (no TP-loaded models).
 
 CPU-testable: the ingest loop, lock, encoding and checkpoint policy take the
 net/tokenizer through narrow interfaces, so ``tests/test_realtime.py``
@@ -169,6 +196,7 @@ import torch
 
 from .aux_offload import ModelParker
 from .fused_ce import DEFAULT_CHUNK, DEFAULT_VOCAB_CHUNK
+from .vision import build_mm_batch, mrope_position_ids
 from .preference import (dpo_loss, kto_loss, orpo_loss, mismatched_kl_shift,
                          DPO_LOSS_TYPES, KTO_LOSS_TYPES, ORPO_NLL_MODES)
 
@@ -420,6 +448,31 @@ def collate(batch: Sequence[dict], pad_id: int):
             torch.tensor(attn, dtype=torch.long))
 
 
+# -- image samples --------------------------------------------------------------
+
+IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+
+
+def has_image_parts(messages) -> bool:
+    """True when any message's content is a content-parts list holding an
+    image part (the OpenAI multimodal layout). Mirrors
+    ``training/vision_data.py``'s predicate so the coordinator can tell an
+    image sample from a text one without importing the script-side module."""
+    for m in messages or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, (list, tuple)):
+            for p in c:
+                if isinstance(p, dict) and (p.get("type") or "text") in IMAGE_PART_TYPES:
+                    return True
+    return False
+
+
+def image_layout_end(images: Sequence[tuple]) -> int:
+    """One past the last token of the last image layout in ``images``
+    (``[(start, ImageFeatures)]``); 0 without images."""
+    return max((int(s) + len(f.token_ids) for s, f in images), default=0)
+
+
 # -- preference (DPO / KTO) sample helpers ------------------------------------
 
 def completion_text(value) -> str:
@@ -553,10 +606,16 @@ class RealtimeQLoRA:
         render_segments: Optional[Callable[[dict], Sequence[tuple]]] = None,
         base_model_name_or_path: Optional[str] = None,
         render_prompt: Optional[Callable[[dict], Sequence[tuple]]] = None,
+        vision=None,
     ):
         self.config = config or RealtimeConfig()
         self.tokenizer = tokenizer
         self.render_segments = render_segments
+        # Image service for image+text samples (see the module docstring for
+        # its surface; training/vision_data.py's VisionData implements it).
+        # None = text-only: image-bearing samples are refused, not silently
+        # trained against empty image slots.
+        self.vision = vision
         # Preference samples whose ``prompt`` is a message list: sample ->
         # ``[(text, supervised)]`` segments of the prompt rendered WITH the
         # generation prompt (supervision flags are ignored -- a prompt is
@@ -772,6 +831,7 @@ class RealtimeQLoRA:
         samples: Sequence[dict],
         lr: Optional[float] = None,
         lock_timeout: Optional[float] = None,
+        image_base_dir: Optional[str] = None,
     ) -> dict:
         """
         Train through ``samples`` until depleted, then push the adapter into
@@ -786,7 +846,16 @@ class RealtimeQLoRA:
         the step gradient equals one big batch); a kind change or a final
         partial window still steps. ``lr`` overrides the constant learning
         rate for this call onward (it sticks -- "externally controllable"
-        means the last setting wins).
+        means the last setting wins). ``image_base_dir`` resolves relative
+        image ``path`` parts (e.g. the directory of the JSONL file the
+        samples were read from).
+
+        Samples are encoded under the write lock, before the aux models are
+        parked: an image sample runs the (resident) vision tower there, so
+        its features are in hand before the tower leaves VRAM for the
+        training forwards. Image samples are counted in ``image_samples`` /
+        ``image_tokens``; one whose image layout does not fit ``seq_len`` is
+        skipped (never cut through an image).
 
         Returns a stats dict: steps taken, samples/tokens consumed, skipped
         rows, mean SFT loss (token-weighted; ``None`` without SFT samples),
@@ -798,17 +867,6 @@ class RealtimeQLoRA:
         cfg = self.config
         if lr is not None:
             self.lr = lr
-
-        encoded = [self._encode(s) for s in samples]
-        examples = [e for e in encoded
-                    if e is not None and (e["kind"] != "sft" or e["input_ids"])]
-        skipped = len(encoded) - len(examples)
-        if not examples:
-            return {"steps": 0, "samples": 0, "skipped": skipped,
-                    "sft_samples": 0, "supervised_tokens": 0,
-                    "total_tokens": 0, "mean_loss": None, "dpo": None,
-                    "kto": None, "duration_s": 0.0, "lr": self.lr,
-                    "checkpoints": []}
 
         t0 = time.time()
         stats_steps = 0
@@ -822,18 +880,38 @@ class RealtimeQLoRA:
                         "n_d": 0, "reward_d": 0.0, "n_u": 0, "reward_u": 0.0}}
         ckpts: list = []
 
-        # Runs of consecutive same-kind samples: each kind takes a different
-        # forward and loss, so a kind change closes the current micro-batch
-        # AND accumulation window. Order is still preserved.
-        runs: list = []
-        for e in examples:
-            if runs and runs[-1][0] == e["kind"]:
-                runs[-1][1].append(e)
-            else:
-                runs.append((e["kind"], [e]))
-
         with self._lock.write(lock_timeout):
             self._wait_generators_idle()
+            # Encode under the lock, before the aux models are parked: an
+            # image sample runs the vision tower here (serving has drained,
+            # so the tower is idle and resident), and its features ride on
+            # the example from now on -- the tower can leave VRAM for the
+            # training forwards without anything needing it again.
+            encoded = [self._encode(s, image_base_dir) for s in samples]
+            examples = [e for e in encoded
+                        if e is not None and (e["kind"] != "sft" or e["input_ids"])]
+            skipped = len(encoded) - len(examples)
+            img_n = sum(1 for e in examples if e.get("images"))
+            img_tok = sum(f.n_tokens for e in examples
+                          for _, f in e.get("images", ()))
+            if not examples:
+                return {"steps": 0, "samples": 0, "skipped": skipped,
+                        "sft_samples": 0, "supervised_tokens": 0,
+                        "total_tokens": 0, "mean_loss": None, "dpo": None,
+                        "kto": None, "image_samples": 0, "image_tokens": 0,
+                        "duration_s": time.time() - t0, "lr": self.lr,
+                        "checkpoints": []}
+
+            # Runs of consecutive same-kind samples: each kind takes a
+            # different forward and loss, so a kind change closes the current
+            # micro-batch AND accumulation window. Order is still preserved.
+            runs: list = []
+            for e in examples:
+                if runs and runs[-1][0] == e["kind"]:
+                    runs[-1][1].append(e)
+                else:
+                    runs.append((e["kind"], [e]))
+
             # Aux component models (vision tower, MTP/draft head) leave VRAM
             # first, so the training state and activations land in the space
             # they vacate; they come back last, into the space the re-parked
@@ -903,6 +981,8 @@ class RealtimeQLoRA:
                 "reward_d": (k["reward_d"] / k["n_d"]) if k["n_d"] else None,
                 "reward_u": (k["reward_u"] / k["n_u"]) if k["n_u"] else None,
             },
+            "image_samples": img_n,
+            "image_tokens": img_tok,
             "duration_s": time.time() - t0,
             "lr": self.lr,
             "checkpoints": ckpts,
@@ -914,6 +994,10 @@ class RealtimeQLoRA:
         """Backward through one accumulation window of SFT micro-batches.
         Returns ``(window_loss, supervised_tokens, total_tokens)``."""
         batches = [collate(mb, self.pad_id) for mb in window]
+        extras = [self._mm_kwargs([e.get("images", ()) for e in mb],
+                                  [len(e["input_ids"]) for e in mb],
+                                  ids.shape[1])
+                  for mb, (ids, _, _) in zip(window, batches)]
         # Token-weighted accumulation (the offline trainer's --ga-loss token):
         # weight each micro-batch's mean loss by its share of the window's
         # supervised tokens, counted on the SHIFTED labels to match the CE
@@ -922,9 +1006,10 @@ class RealtimeQLoRA:
         total_sup = max(sum(n_sups), 1)
         window_loss = 0.0
         tok = 0
-        for (input_ids, labels, attn), n_sup in zip(batches, n_sups):
+        for (input_ids, labels, attn), n_sup, extra in zip(batches, n_sups, extras):
             loss = self.net.compute_loss(
-                input_ids, labels, attention_mask=attn, chunk=DEFAULT_CHUNK)
+                input_ids, labels, attention_mask=attn, chunk=DEFAULT_CHUNK,
+                **extra)
             w_i = n_sup / total_sup
             (loss * w_i).backward()
             window_loss += loss.item() * w_i
@@ -958,14 +1043,44 @@ class RealtimeQLoRA:
             tok += m["tot"]
         return sup, tok
 
+    def _mm_kwargs(self, images: Sequence, lengths: Sequence[int],
+                   padded_len: int) -> dict:
+        """The image splice for one collated micro-batch: ``{}`` on a
+        text-only batch, else ``{"mm": ...}`` (``vision.build_mm_batch`` over
+        each row's ``[(start, ImageFeatures)]``) plus, on an mRoPE tower,
+        ``{"position_ids": [3, b, t]}`` -- the 3-D positions of every row
+        computed at the row's own length (a preference row's completion
+        follows its prompt's images, so the positions are built per
+        assembled row, not per sample), text-only rows in the batch getting
+        the sequential positions 1-D RoPE reduces to."""
+        if not any(images):
+            return {}
+        rows = [[(int(s), f) for s, f in imgs] for imgs in images]
+        kw = {"mm": build_mm_batch(rows, padded_len,
+                                   self.config.torch_compute_dtype())}
+        if getattr(self.vision, "mrope", False):
+            pos = []
+            for imgs, n in zip(rows, lengths):
+                spans = [(s + f.slot_offsets[0], f.n_tokens, f.grid_thw)
+                         for s, f in imgs]
+                merge = imgs[0][1].merge_size if imgs else 1
+                p = mrope_position_ids(n, spans, merge or 1)        # [3, n]
+                if padded_len > n:
+                    p = torch.cat([p, torch.zeros(3, padded_len - n,
+                                                  dtype=p.dtype)], 1)
+                pos.append(p)
+            kw["position_ids"] = torch.stack(pos, 1).contiguous()  # [3, b, t]
+        return kw
+
     def _logps(self, input_ids, labels, attn, reference: bool = False,
-               per_token: bool = False):
+               per_token: bool = False, extra: Optional[dict] = None):
         """Per-sequence summed completion logps through the net -- as the
         adapted policy, or (``reference=True``, no grad) as the frozen base
         with the adapters disabled: the reference model for DPO/KTO without
         a second model copy. ``per_token=True`` asks for the ``(token_logps,
-        mask)`` form instead (ORPO)."""
-        kw = dict(attention_mask=attn, chunk=DEFAULT_CHUNK)
+        mask)`` form instead (ORPO). ``extra`` carries the image splice /
+        3-D positions of an image batch (:meth:`_mm_kwargs`)."""
+        kw = dict(attention_mask=attn, chunk=DEFAULT_CHUNK, **(extra or {}))
         if per_token:
             kw["return_per_token"] = True
         if not reference:
@@ -981,8 +1096,9 @@ class RealtimeQLoRA:
         rows = ([(e["prompt_ids"], e["chosen_ids"]) for e in batch]
                 + [(e["prompt_ids"], e["rejected_ids"]) for e in batch])
         input_ids, labels, attn = collate(preference_rows(rows), self.pad_id)
-        pol, counts = self._logps(input_ids, labels, attn)
-        ref, _ = self._logps(input_ids, labels, attn, reference=True)
+        extra = self._pref_mm_kwargs(batch + batch, rows, input_ids.shape[1])
+        pol, counts = self._logps(input_ids, labels, attn, extra=extra)
+        ref, _ = self._logps(input_ids, labels, attn, reference=True, extra=extra)
         b = len(batch)
         losses, cr, rr = dpo_loss(
             pol[:b], pol[b:], ref[:b], ref[b:],
@@ -1008,19 +1124,25 @@ class RealtimeQLoRA:
         rows = ([(e["prompt_ids"], e["chosen_ids"]) for e in batch]
                 + [(e["prompt_ids"], e["rejected_ids"]) for e in batch])
         input_ids, labels, attn = collate(preference_rows(rows), self.pad_id)
+        extra = self._pref_mm_kwargs(batch + batch, rows, input_ids.shape[1])
         b = len(batch)
         cmask = labels[:, 1:] != IGNORE_INDEX
         if cfg.orpo_nll == "full":
+            # Image tokens are never supervised: the full-sequence NLL skips
+            # the slot positions the way the SFT mask does.
             full_labels = input_ids.masked_fill(attn == 0, IGNORE_INDEX)
+            if extra:
+                full_labels = full_labels.masked_fill(extra["mm"]["index"] >= 0,
+                                                      IGNORE_INDEX)
             tok_logps, fmask = self._logps(input_ids, full_labels, attn,
-                                           per_token=True)
+                                           per_token=True, extra=extra)
             cmask = cmask.to(tok_logps.device)
             pol = (tok_logps * cmask).sum(dim=-1)
             counts = cmask.sum(dim=-1)
             fm = fmask[:b]
             nll = -(tok_logps[:b] * fm).sum() / fm.sum().clamp(min=1)
         else:
-            pol, counts = self._logps(input_ids, labels, attn)
+            pol, counts = self._logps(input_ids, labels, attn, extra=extra)
             nll = -pol[:b].sum() / counts[:b].sum().clamp(min=1)
         losses, cr, rr, _ = orpo_loss(pol[:b], pol[b:], counts[:b], counts[b:],
                                       beta=cfg.beta)
@@ -1040,24 +1162,28 @@ class RealtimeQLoRA:
         cfg = self.config
         rows = [(e["prompt_ids"], e["completion_ids"]) for e in batch]
         input_ids, labels, attn = collate(preference_rows(rows), self.pad_id)
-        pol, _ = self._logps(input_ids, labels, attn)
-        ref, _ = self._logps(input_ids, labels, attn, reference=True)
+        extra = self._pref_mm_kwargs(batch, rows, input_ids.shape[1])
+        pol, _ = self._logps(input_ids, labels, attn, extra=extra)
+        ref, _ = self._logps(input_ids, labels, attn, reference=True, extra=extra)
 
         pol_kl = ref_kl = None
         if cfg.kto_loss == "kto" and len(batch) > 1:
-            kl_rows = []
+            kl_rows, kl_ex = [], []
             for i, j in enumerate(mismatched_kl_shift(len(batch))):
                 comp = fit_completion(batch[i]["prompt_ids"],
                                       batch[j]["completion_ids"], cfg.seq_len)
                 if comp:
                     kl_rows.append((batch[i]["prompt_ids"], comp))
+                    kl_ex.append(batch[i])        # the prompt's images ride along
             if kl_rows:
                 kl_ids, kl_labels, kl_attn = collate(preference_rows(kl_rows),
                                                      self.pad_id)
+                kl_extra = self._pref_mm_kwargs(kl_ex, kl_rows, kl_ids.shape[1])
                 with torch.no_grad():
-                    pol_kl, _ = self._logps(kl_ids, kl_labels, kl_attn)
+                    pol_kl, _ = self._logps(kl_ids, kl_labels, kl_attn,
+                                            extra=kl_extra)
                 ref_kl, _ = self._logps(kl_ids, kl_labels, kl_attn,
-                                        reference=True)
+                                        reference=True, extra=kl_extra)
 
         des = torch.tensor([e["label"] for e in batch], dtype=torch.bool,
                            device=pol.device)
@@ -1078,13 +1204,53 @@ class RealtimeQLoRA:
 
     # -- sample encoding -------------------------------------------------------
 
-    def _encode(self, sample: dict) -> Optional[dict]:
+    def _pref_mm_kwargs(self, examples: Sequence[dict], rows: Sequence[tuple],
+                        padded_len: int) -> dict:
+        """:meth:`_mm_kwargs` for assembled preference rows: row ``i`` is
+        ``examples[i]``'s prompt (whose images it carries) followed by
+        ``rows[i]``'s completion."""
+        return self._mm_kwargs([e.get("images", ()) for e in examples],
+                               [len(p) + len(c) for p, c in rows], padded_len)
+
+    def _encode_image_segments(self, sample: dict, messages: list,
+                               base_dir: Optional[str], render: Callable):
+        """Encode a conversation that carries image parts: flatten the parts
+        to sentinels (``vision.flatten``), render through the chat template
+        exactly like a text conversation (the sentinels pass through as
+        text), then tokenize around the sentinels with the arch's image
+        token layout in their place and the frozen features attached
+        (``vision.encode_segments``). Returns ``(input_ids, labels, images)``
+        with ``images = [(start, ImageFeatures)]`` -- BOS normalized as
+        :func:`encode_sample_segments` does, so image starts shift with it."""
+        if self.vision is None:
+            raise ValueError(
+                "sample carries image content parts but no vision service is "
+                "wired (RealtimeQLoRA(vision=...)); refusing to train it "
+                "text-only -- the template would render empty image slots and "
+                "the adapter would learn answers conditioned on nothing")
+        flat, refs = self.vision.flatten(messages, base_dir=base_dir)
+        segments = render(flat)
+        ids, labels, images, feats = self.vision.encode_segments(segments, refs)
+        ids, labels = list(ids), list(labels)
+        images = [(int(s), feats[k]) for s, k in images]
+        bos = getattr(self.tokenizer, "bos_token_id", None)
+        if self.config.add_bos and bos is not None and (not ids or ids[0] != bos):
+            ids = [bos] + ids
+            labels = [IGNORE_INDEX] + labels
+            images = [(s + 1, f) for s, f in images]
+        if bos is not None and ids and ids[0] == bos:
+            labels[0] = IGNORE_INDEX
+        return ids, labels, images
+
+    def _encode(self, sample: dict, base_dir: Optional[str] = None) -> Optional[dict]:
         """One ingest sample -> a kind-tagged example: ``{"kind": "sft",
         input_ids, labels}``, ``{"kind": "dpo", prompt_ids, chosen_ids,
         rejected_ids}`` or ``{"kind": "kto", prompt_ids, completion_ids,
-        label}``. ``None`` for a preference row whose prompt alone fills
-        ``seq_len`` (skipped, counted by ``ingest``); malformed samples
-        raise."""
+        label}``, each plus ``images = [(start, ImageFeatures)]`` when the
+        sample (its prompt, for a preference sample) carried images.
+        ``None`` for a preference row whose prompt alone fills ``seq_len``
+        or an image sample whose image layout does not fit it (skipped,
+        counted by ``ingest``); malformed samples raise."""
         cfg = self.config
         if "input_ids" in sample:
             ids = list(sample["input_ids"])[:cfg.seq_len]
@@ -1106,6 +1272,16 @@ class RealtimeQLoRA:
                     "messages samples need a render_segments callable (see "
                     "training/realtime_chat.py for the chat_jinja wiring); or "
                     "render the template yourself and send prompt/response")
+            if has_image_parts(sample["messages"]):
+                ids, labels, images = self._encode_image_segments(
+                    sample, sample["messages"], base_dir,
+                    lambda flat: self.render_segments({**sample, "messages": flat}))
+                if len(ids) > cfg.seq_len:
+                    if image_layout_end(images) > cfg.seq_len:
+                        return None             # never cut through an image
+                    ids, labels = ids[:cfg.seq_len], labels[:cfg.seq_len]
+                return {"kind": "sft", "input_ids": ids, "labels": labels,
+                        "images": images}
             segments = self.render_segments(sample)
             ex = encode_sample_segments(self.tokenizer, segments, cfg.seq_len,
                                         cfg.add_bos)
@@ -1116,21 +1292,22 @@ class RealtimeQLoRA:
             if not chosen or not rejected:
                 raise ValueError("a DPO sample needs non-empty chosen and "
                                  "rejected completions")
-            prompt_ids = self._encode_prompt_ids(sample)
+            prompt_ids, images = self._encode_prompt_ids(sample, base_dir)
             return self._fit_pair(
                 prompt_ids,
                 encode_completion(self.tokenizer, chosen, cfg.eot_text),
-                encode_completion(self.tokenizer, rejected, cfg.eot_text))
+                encode_completion(self.tokenizer, rejected, cfg.eot_text),
+                images)
         if "prompt" in sample and "completion" in sample and "label" in sample:
             completion = completion_text(sample["completion"])
             if not completion:
                 raise ValueError("a KTO sample needs a non-empty completion")
             label = coerce_label(sample["label"])
-            prompt_ids = self._encode_prompt_ids(sample)
+            prompt_ids, images = self._encode_prompt_ids(sample, base_dir)
             return self._fit_kto(
                 prompt_ids,
                 encode_completion(self.tokenizer, completion, cfg.eot_text),
-                label)
+                label, images)
         if "prompt" in sample and "response" in sample:
             segments = [(sample["prompt"], False),
                         (sample["response"] + cfg.eot_text, True)]
@@ -1147,10 +1324,14 @@ class RealtimeQLoRA:
             f"prompt+chosen+rejected (DPO), prompt+completion+label (KTO), or "
             f"their pre-tokenized prompt_ids forms")
 
-    def _encode_prompt_ids(self, sample: dict) -> list:
-        """A preference sample's ``prompt`` -> masked prompt ids. A string is
-        an already-rendered prompt (ending with the assistant-turn opener);
-        a message list goes through ``render_prompt``."""
+    def _encode_prompt_ids(self, sample: dict,
+                           base_dir: Optional[str] = None) -> tuple:
+        """A preference sample's ``prompt`` -> ``(masked prompt ids, images)``.
+        A string is an already-rendered prompt (ending with the
+        assistant-turn opener); a message list goes through
+        ``render_prompt`` -- with its image parts encoded through the vision
+        service when it carries any (``images = [(start, ImageFeatures)]``,
+        empty for a text prompt)."""
         prompt = sample["prompt"]
         if isinstance(prompt, str):
             segments = [(prompt, False)]
@@ -1161,32 +1342,47 @@ class RealtimeQLoRA:
                     "a render_prompt callable (see training/realtime_chat.py "
                     "for the chat_jinja wiring); or render the template "
                     "yourself and send the prompt as a string")
+            if has_image_parts(prompt):
+                ids, _, images = self._encode_image_segments(
+                    sample, prompt, base_dir,
+                    lambda flat: [(t, False) for t, _ in
+                                  self.render_prompt({**sample, "prompt": flat})])
+                # A prompt longer than seq_len leaves no room for a
+                # completion: fit_completion skips the row (so an image is
+                # never cut -- the truncated ids are never trained on).
+                return ids[:self.config.seq_len], images
             segments = [(t, False) for t, _ in self.render_prompt(sample)]
         else:
             raise ValueError("preference prompt must be a rendered string or "
                              "a list of messages")
         ex = encode_sample_segments(self.tokenizer, segments,
                                     self.config.seq_len, self.config.add_bos)
-        return ex["input_ids"]
+        return ex["input_ids"], []
 
     def _fit_pair(self, prompt_ids: list, chosen_ids: list,
-                  rejected_ids: list) -> Optional[dict]:
+                  rejected_ids: list, images: Sequence = ()) -> Optional[dict]:
         seq_len = self.config.seq_len
         chosen_ids = fit_completion(prompt_ids, chosen_ids, seq_len)
         rejected_ids = fit_completion(prompt_ids, rejected_ids, seq_len)
         if chosen_ids is None or rejected_ids is None:
             return None
-        return {"kind": "dpo", "prompt_ids": prompt_ids,
-                "chosen_ids": chosen_ids, "rejected_ids": rejected_ids}
+        ex = {"kind": "dpo", "prompt_ids": prompt_ids,
+              "chosen_ids": chosen_ids, "rejected_ids": rejected_ids}
+        if images:
+            ex["images"] = list(images)
+        return ex
 
     def _fit_kto(self, prompt_ids: list, completion_ids: list,
-                 label: bool) -> Optional[dict]:
+                 label: bool, images: Sequence = ()) -> Optional[dict]:
         completion_ids = fit_completion(prompt_ids, completion_ids,
                                         self.config.seq_len)
         if completion_ids is None:
             return None
-        return {"kind": "kto", "prompt_ids": prompt_ids,
-                "completion_ids": completion_ids, "label": label}
+        ex = {"kind": "kto", "prompt_ids": prompt_ids,
+              "completion_ids": completion_ids, "label": label}
+        if images:
+            ex["images"] = list(images)
+        return ex
 
     # -- checkpointing ---------------------------------------------------------
 

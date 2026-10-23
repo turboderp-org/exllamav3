@@ -6146,3 +6146,57 @@ distillation objective), generator per-job state + turn-end commit, fla gdn2 chu
 commit, MoS, TP. **Nothing box-verified**; the must-verify list (config layout, backbone
 byte-identity with Qwen3.6-35B-A3B for the sidecar route, readout/commit parity vs the
 release server) is `doc/memt_plan.md` section 6, recipe in section 3.
+
+### Session 65 — realtime training with images: the `vision=` service on `RealtimeQLoRA`
+
+Branch `claude/eloquent-planck-2gs7rm`. Trigger: a user training Qwen3.8-27B (VL text tower,
+3.00bpw) through the realtime path on screenshot Q/A pairs saw the SFT/DPO loss fall every
+pass while the served bounding boxes did not move. Root cause, not a bug in the trainer: the
+realtime ingest path was text-only by construction — `_encode` had no image channel,
+`chat_jinja` renders content-parts lists with the template's placeholder tokens and no pixel
+features (documented there), and the vision tower was an aux model parked out of VRAM for the
+whole ingest. So the adapter learned "empty image slots + question -> coordinates" and the
+served forward, with real features in those slots, was off-distribution for it. Loss down,
+behaviour unchanged is exactly that signature.
+
+Built (CPU-tested, 5 new tests in `tests/test_realtime.py`, 30 pass):
+- `RealtimeQLoRA(vision=...)` — a duck-typed image service (`mrope`, `flatten(messages,
+  base_dir)`, `encode_segments(segments, refs)`); `training/vision_data.py`'s `VisionData`
+  implements it (new `flatten()` for in-memory conversations). A `messages` sample whose
+  turns carry image content parts, and a DPO/KTO sample whose conversational `prompt` does,
+  is flattened to sentinels, rendered through the same chat template, tokenized around the
+  sentinels with the arch's image token layout in their place (image tokens masked, BOS
+  normalized with the image starts shifted), and carries `images = [(start, ImageFeatures)]`.
+  The micro-batch assembly builds the `mm` splice (`vision.build_mm_batch`) and, on an mRoPE
+  tower, `[3, b, t]` positions per ASSEMBLED row (prompt + completion on preference rows,
+  the KTO KL rows included; text rows next to it get sequential positions) and passes them
+  to `compute_loss` / `compute_logps` — the offline `--vision` recipe, in place. ORPO's
+  full-sequence NLL skips the image slots. A sample whose image layout does not fit
+  `seq_len` is skipped (never cut through an image); stats gain `image_samples` /
+  `image_tokens`.
+- Encoding moved under the write lock, BEFORE `_park_aux()`: serving has drained, the
+  tower is idle and resident, the features ride on the examples, then the tower leaves VRAM
+  for the training forwards as before. `ingest(..., image_base_dir=)` resolves relative
+  image paths (the `/ingest` file's directory).
+- Without a `vision` service an image-bearing sample now RAISES `ValueError` instead of
+  training text-only (the failure mode above, made loud). Text samples on a VLM base are
+  unchanged.
+- `realtime_chat.py --vision` (+ `--vision-device`, `--image-max-pixels`,
+  `--vision-cache-gb`): loads the tower through `VisionEncoder`; `/image <path>` attaches
+  pictures to the next user turn as OpenAI content parts; generation renders the sentinels
+  to each `MMEmbedding.text_alias` and passes `embeddings=` (imgdesc.py's flow); the same
+  tower forward seeds the training cache (`VisionEncoder.register_mme`), so one pass per
+  image serves both sides. The tower is attached as an aux model. Not combinable with
+  `--mtp` (the generator refuses embeddings while drafting).
+
+Not box-tested — like the offline vision path this awaits its first GPU run. Box checklist:
+(1) `qlora_validate_native.py --image` on the base first (training splice == native
+multimodal forward); (2) `realtime_chat.py --vision`, `/image`, ask for a box, `/learn` the
+corrected answer a few times at `/lr 2e-4`, `/again` — the box should move now, `/unload`
+to compare; (3) VRAM: the tower's features for an ingest are held on CPU, the splice tensors
+move with the batch; (4) a tabbyAPI-style backend passes `vision=VisionData(...)` and its
+content-parts messages straight through — nothing else changes.
+
+Also worth telling users hitting "6 Q/A pairs don't memorize": 4e-5 is the preference LR
+range; SFT memorization wants 1e-4..5e-4 for a handful of steps, and repeated DPO raises the
+margin, not necessarily the chosen answer's likelihood.

@@ -27,7 +27,15 @@ CPU tests for exllamav3/training/realtime.py -- the real-time
     recorded devices afterwards (deferred-load bracketing, stc handle close),
     CPU/unloaded modules left alone, restore guaranteed on ingest failure,
     the offload_aux_when_training switch, and ordering against the idle
-    offload (park before restore, unpark after re-park).
+    offload (park before restore, unpark after re-park);
+  * image+text samples through a stub `vision` service: content parts ->
+    sentinels -> the arch's image token layout with BOS shift and masked
+    image tokens, the mm splice (index / embeds / spans) and 3-D mRoPE
+    positions reaching compute_loss / compute_logps -- per assembled row
+    (prompt + completion) on DPO / KTO rows, the KL rows included, padded
+    next to a text row -- the never-cut-through-an-image skip, the loud
+    refusal without a vision service, image_base_dir pass-through, and
+    encoding BEFORE the aux park (features in hand, then the tower leaves).
 
 The net/tokenizer are stubs implementing only the narrow surface the
 coordinator uses. No GPU / compiled extension / real model needed. Run:
@@ -70,6 +78,7 @@ def _load(name: str):
 
 _load("fused_ce")
 _load("preference")
+vis_mod = _load("vision")
 aux_mod = _load("aux_offload")
 rt_mod = _load("realtime")
 
@@ -112,6 +121,8 @@ class StubNet(nn.Module):
         self.losses = list(losses or [])
         self.seen = []            # (input_ids, labels, attn) tensors per call
         self.logps_calls = []     # (input_ids, labels, attn, adapters_off)
+        self.mm_seen = []         # (mm, position_ids) per compute_loss call
+        self.mm_logps = []        # (mm, position_ids) per compute_logps call
         self.adapters_off = False
         self.applied = 0
         self.removed = 0
@@ -129,8 +140,9 @@ class StubNet(nn.Module):
         return 1
 
     def compute_loss(self, input_ids, labels, attention_mask=None, chunk=0,
-                     position_ids=None, seg_ids=None):
+                     position_ids=None, seg_ids=None, mm=None):
         self.seen.append((input_ids, labels, attention_mask))
+        self.mm_seen.append((mm, position_ids))
         c = self.losses.pop(0) if self.losses else 1.0
         return self.p.sum() * 0.0 + c
 
@@ -140,9 +152,10 @@ class StubNet(nn.Module):
     # (DPO's ln-2 anchor holds exactly), and a longer chosen completion makes
     # the DPO gradient push p UP.
     def compute_logps(self, input_ids, labels, attention_mask=None, chunk=0,
-                      return_per_token=False):
+                      return_per_token=False, position_ids=None, mm=None):
         self.logps_calls.append((input_ids, labels, attention_mask,
                                  self.adapters_off))
+        self.mm_logps.append((mm, position_ids))
         mask = labels[:, 1:] != -100
         if return_per_token:
             per_tok = -1.0 + (0.0 if self.adapters_off else self.p)
@@ -1080,6 +1093,251 @@ def test_ingest_mixed_kinds():
     print("ingest mixed kinds: OK")
 
 
+# ---------------------------------------------------------------------------
+# Image+text samples (the `vision` service)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_IMG_RE = _re.compile(r"(<\$IMG\d+\$>)")
+
+
+class StubVision:
+    """The narrow vision-service surface RealtimeQLoRA drives (VisionData's
+    contract): an image part becomes a 4-token layout [START, slot, slot,
+    END] with 2 frozen feature rows (fp32 constants k+1), on a 1x4x2 patch
+    grid with merge 2 (== 2 tokens, so mRoPE positions are exercised)."""
+    START, END, PH = 90, 91, 92
+
+    def __init__(self, mrope=False, on_encode=None):
+        self.mrope = mrope
+        self.on_encode = on_encode
+        self.flattened = 0
+
+    def flatten(self, messages, base_dir=None):
+        out, refs = [], []
+        for m in messages:
+            c = m.get("content")
+            if not isinstance(c, list):
+                out.append(m)
+                continue
+            pieces = []
+            for p in c:
+                if (p.get("type") or "text") == "text":
+                    pieces.append(p["text"])
+                else:
+                    pieces.append(f"<$IMG{len(refs)}$>")
+                    path = p["path"]
+                    refs.append(types.SimpleNamespace(
+                        key=("path", path, base_dir), load=lambda: None))
+            out.append({**m, "content": "".join(pieces)})
+        self.flattened += 1
+        return out, refs
+
+    def encode_segments(self, segments, refs):
+        if self.on_encode is not None:
+            self.on_encode()
+        feats = {k: vis_mod.ImageFeatures(
+            token_ids=[self.START, vis_mod.IMAGE_SLOT, vis_mod.IMAGE_SLOT, self.END],
+            n_tokens=2, grid_thw=(1, 4, 2), merge_size=2,
+            embeds=torch.full((2, 4), float(k + 1)), deepstack=None)
+            for k in range(len(refs))}
+        ids, labels, images = [], [], []
+        for text, sup in segments:
+            for piece in _IMG_RE.split(text):
+                if not piece:
+                    continue
+                m = _re.fullmatch(r"<\$IMG(\d+)\$>", piece)
+                if m:
+                    k = int(m.group(1))
+                    images.append((len(ids), k))
+                    lay = [self.PH if t == vis_mod.IMAGE_SLOT else t
+                           for t in feats[k].token_ids]
+                    ids += lay
+                    labels += [-100] * len(lay)
+                else:
+                    t = [ord(ch) for ch in piece]
+                    ids += t
+                    labels += t if sup else [-100] * len(t)
+        return ids, labels, images, feats
+
+
+def _img_user(text, *paths):
+    return {"role": "user", "content":
+            [{"type": "image", "path": p} for p in paths]
+            + [{"type": "text", "text": text}]}
+
+
+def _render_pair(sample):
+    m = sample["messages"]
+    return [(m[0]["content"], False), (m[1]["content"], True)]
+
+
+def test_vision_encode_sft():
+    S = StubVision
+    rt = make_rt(render_segments=_render_pair, vision=StubVision())
+    ex = rt._encode({"messages": [_img_user("q", "a.png"),
+                                  {"role": "assistant", "content": "r"}]})
+    # BOS prepended (add_bos; shifts the image start), layout spliced where
+    # the image part sat, image tokens + prompt masked, reply supervised.
+    assert ex["input_ids"] == [1, S.START, S.PH, S.PH, S.END, ord("q"), ord("r")]
+    assert ex["labels"] == [-100, -100, -100, -100, -100, -100, ord("r")]
+    (start, f), = ex["images"]
+    assert start == 1 and f.slot_offsets == [1, 2] and f.n_tokens == 2
+
+    # The splice reaches the forward: index points the two slot positions at
+    # the feature rows, text positions are -1; no positions on a non-mRoPE
+    # tower; a text-only sample carries no mm at all.
+    net = rt.net
+    rt.ingest([{"messages": [_img_user("q", "a.png"),
+                             {"role": "assistant", "content": "r"}]},
+               {"text": "zz"}])
+    (mm, pos), (mm2, pos2) = net.mm_seen
+    assert pos is None and mm2 is None and pos2 is None
+    assert mm["index"].tolist() == [[-1, -1, 0, 1, -1, -1, -1]]
+    assert mm["embeds"].shape == (2, 4) and float(mm["embeds"][0, 0]) == 1.0
+    assert mm["deepstack"] is None
+    assert mm["spans"].tolist() == [[-1, -1, 0, 0, -1, -1, -1]]
+    print("vision encode sft + splice: OK")
+
+
+def test_vision_mrope_batch():
+    """An image row next to a (shorter) text row in one micro-batch on an
+    mRoPE tower: [3, b, t] positions -- the image row's from the kernel
+    mirror at ITS length, the text row sequential -- zero-padded to the
+    batch; the mm index is -1 on the text row."""
+    rt = make_rt(RealtimeConfig(batch_size=2), render_segments=_render_pair,
+                 vision=StubVision(mrope=True))
+    rt.ingest([{"messages": [_img_user("q", "a.png"),
+                             {"role": "assistant", "content": "r"}]},
+               {"text": "xy"}])
+    (mm, pos), = rt.net.mm_seen
+    assert pos.shape == (3, 2, 7)
+    ref = vis_mod.mrope_position_ids(7, [(2, 2, (1, 4, 2))], 2)
+    assert pos[:, 0].tolist() == ref.tolist()
+    assert pos[:, 1].tolist() == [[0, 1, 2, 0, 0, 0, 0]] * 3
+    assert mm["index"].tolist() == [[-1, -1, 0, 1, -1, -1, -1], [-1] * 7]
+    stats = rt.ingest([{"messages": [_img_user("q", "a.png", "b.png"),
+                                     {"role": "assistant", "content": "r"}]}])
+    assert stats["image_samples"] == 1 and stats["image_tokens"] == 4
+    print("vision mrope batch: OK")
+
+
+def test_vision_preference():
+    rt = make_rt(render_segments=_render_pair, render_prompt=_render_prompt,
+                 vision=StubVision(mrope=True))
+    S = StubVision
+    # DPO: the image lives in the prompt; both the chosen and the rejected
+    # row carry it, positions run over prompt + completion per row.
+    ex = rt._encode({"prompt": [_img_user("q", "a.png")],
+                     "chosen": "yes", "rejected": "n"})
+    assert ex["kind"] == "dpo"
+    # layout, the question, then the fake template's assistant opener "<a>"
+    assert ex["prompt_ids"] == ([1, S.START, S.PH, S.PH, S.END, ord("q")]
+                                + [ord(ch) for ch in "<a>"])
+    assert [s for s, _ in ex["images"]] == [1]
+    rt.ingest([{"prompt": [_img_user("q", "a.png")],
+                "chosen": "yes", "rejected": "n"}])
+    (mm, pos), (mm_ref, pos_ref) = rt.net.mm_logps     # policy, reference
+    assert mm is mm_ref and pos is pos_ref
+    assert mm["index"].shape == (2, 12) and pos.shape == (3, 2, 12)
+    assert mm["index"][:, 2:4].tolist() == [[0, 1], [2, 3]]
+    assert mm["embeds"].shape == (4, 4)
+    lens = [9 + 3, 9 + 1]
+    for b, n in enumerate(lens):
+        ref = vis_mod.mrope_position_ids(n, [(2, 2, (1, 4, 2))], 2)
+        assert pos[:, b, :n].tolist() == ref.tolist()
+        assert pos[:, b, n:].abs().sum() == 0
+
+    # KTO rows (batch 2 -> KL rows too) carry the prompt's image on every
+    # assembled row, the mismatched KL rows included.
+    rt = make_rt(RealtimeConfig(batch_size=2), render_prompt=_render_prompt,
+                 vision=StubVision())
+    rt.ingest([{"prompt": [_img_user("q", "a.png")], "completion": "ok",
+                "label": True},
+               {"prompt": [_img_user("q", "b.png")], "completion": "no",
+                "label": False}])
+    assert len(rt.net.mm_logps) == 4            # pol, ref, pol_kl, ref_kl
+    for mm, pos in rt.net.mm_logps:
+        assert pos is None and mm["index"].shape[0] == 2
+        assert (mm["index"] >= 0).sum(dim=1).tolist() == [2, 2]
+    # A string prompt stays a text row (no images key at all).
+    ex = rt._encode({"prompt": "p", "completion": "c", "label": True})
+    assert "images" not in ex
+    print("vision preference rows: OK")
+
+
+def test_vision_skip_and_refuse():
+    # An image layout that would be cut by seq_len skips the sample (the
+    # text after it may be truncated, the image never is).
+    rt = make_rt(RealtimeConfig(seq_len=4), render_segments=_render_pair,
+                 vision=StubVision())
+    sample = {"messages": [_img_user("q", "a.png"),
+                           {"role": "assistant", "content": "r"}]}
+    assert rt._encode(sample) is None
+    stats = rt.ingest([sample])
+    assert stats["steps"] == 0 and stats["skipped"] == 1
+    rt = make_rt(RealtimeConfig(seq_len=6), render_segments=_render_pair,
+                 vision=StubVision())
+    ex = rt._encode(sample)
+    assert len(ex["input_ids"]) == 6 and ex["labels"][-1] == -100
+
+    # Without a vision service an image sample is refused loudly; text
+    # samples on the same coordinator still train.
+    rt = make_rt(render_segments=_render_pair, render_prompt=_render_prompt)
+    for s in (sample, {"prompt": [_img_user("q", "a.png")], "chosen": "a",
+                       "rejected": "b"}):
+        try:
+            rt.ingest([s])
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "vision" in str(e)
+    with rt._lock.read(timeout=1.0):             # lock released after the raise
+        pass
+    assert rt.ingest([{"messages": [{"role": "user", "content": "q"},
+                                    {"role": "assistant", "content": "r"}]}
+                      ])["steps"] == 1
+    # The base dir reaches the service (relative image paths in a file).
+    vis = StubVision()
+    rt = make_rt(render_segments=_render_pair, vision=vis)
+    seen = {}
+    vis.on_encode = lambda: None
+    orig = vis.flatten
+
+    def flatten(messages, base_dir=None):
+        seen["base"] = base_dir
+        return orig(messages, base_dir)
+    vis.flatten = flatten
+    rt.ingest([sample], image_base_dir="/data/imgs")
+    assert seen["base"] == "/data/imgs"
+    print("vision skip / refuse / base dir: OK")
+
+
+def test_vision_encode_before_park():
+    """Image features are produced while the (attached) vision tower is
+    still resident -- encoding runs under the write lock BEFORE the aux park
+    -- and the training forwards then run with it parked."""
+    aux = StubAuxModel(["cuda:0"])
+
+    def on_encode():
+        assert aux.modules[0].device == "cuda:0", \
+            "vision tower parked before the image sample was encoded"
+
+    class Net(StubNet):
+        def compute_loss(self, *a, **kw):
+            assert aux.modules[0].device is None, "tower resident during training"
+            return super().compute_loss(*a, **kw)
+
+    rt = make_rt(net=Net(), render_segments=_render_pair,
+                 vision=StubVision(on_encode=on_encode))
+    rt.attach_aux_models(aux)
+    stats = rt.ingest([{"messages": [_img_user("q", "a.png"),
+                                     {"role": "assistant", "content": "r"}]}])
+    assert stats["steps"] == 1 and stats["image_samples"] == 1
+    assert aux.modules[0].device == "cuda:0"
+    print("vision encode before aux park: OK")
+
+
 if __name__ == "__main__":
     test_rwlock()
     test_encode_prompt_response()
@@ -1106,4 +1364,9 @@ if __name__ == "__main__":
     test_aux_offload_disabled()
     test_internal_net_build_passes_head_vocab_chunk()
     test_unload_reload()
+    test_vision_encode_sft()
+    test_vision_mrope_batch()
+    test_vision_preference()
+    test_vision_skip_and_refuse()
+    test_vision_encode_before_park()
     print("\nALL OK")

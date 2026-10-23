@@ -276,7 +276,18 @@ class VisionEncoder:
         hit = self._cache.get(key)
         if hit is not None and hit.has_embeds():
             return hit
-        feats = self._run(loader())
+        return self._store(key, self._run(loader()), hit)
+
+    def register_mme(self, key, mme) -> ImageFeatures:
+        """Seed the cache from an inference ``MMEmbedding`` the host already
+        computed for serving (one tower forward feeds both generation and
+        training -- the realtime chat's ``/image``). Returns the features."""
+        hit = self._cache.get(key)
+        if hit is not None and hit.has_embeds():
+            return hit
+        return self._store(key, features_from_mme(mme, self.store_dtype), hit)
+
+    def _store(self, key, feats: ImageFeatures, hit: Optional[ImageFeatures]) -> ImageFeatures:
         if hit is not None:
             assert hit.token_ids == feats.token_ids, \
                 f"image {key!r} re-encoded to a different token layout"
