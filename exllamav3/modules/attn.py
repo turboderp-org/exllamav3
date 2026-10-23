@@ -1049,18 +1049,25 @@ class Attention(Module):
         from ..cache.qsa import QSAPlanes
 
         # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
-        # as fp16 K/V in a per-call transient of one fixed size, the pool. The (1, chunk)-at-
-        # context-0 measuring pass runs that allocation like any other prefill chunk, but it
-        # lands here as the same two tensors anyway (K and V scratch of pool_pages pages) so
-        # the budget holds whichever chunk shape the loader measures with. QSA bounds its dense
-        # prefill and stages a small window; MLA/DSA caches have their own measure
+        # as fp16 K/V in a per-call transient of one fixed size, _qc_staging_pages pages per
+        # sequence. The (1, chunk)-at-context-0 measuring pass runs that allocation like any
+        # other prefill chunk, and it always touches the accumulator of the sliced (wider-window)
+        # form too, so the budget holds whichever chunk shape the loader measures with. QSA
+        # bounds its dense prefill and stages a small window; MLA/DSA caches have their own measure
         if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
-            from .attention_fn.triton_paged import _qc_staging
+            from .attention_fn.triton_paged import _qc_staging, _qc_staging_pages
             if _qc_staging == 1:
-                shape = (layer.qk.shape[0], PAGE_SIZE, layer.token_dim)
+                shape = (_qc_staging_pages, PAGE_SIZE, layer.token_dim)
                 kd = torch.empty(shape, dtype = torch.half, device = self.device)
                 vd = torch.empty(shape, dtype = torch.half, device = self.device)
-                del kd, vd
+                # sliced staging carries an fp32 accumulator: one BLOCK_M x hd_pad tile per
+                # (q block, head); the round-up is to 128, the largest BLOCK_M the prefill tile
+                # ladder picks
+                chunk = params["batch_shape"][1]
+                hd_pad = 1 << (self.head_dim - 1).bit_length()
+                acc = torch.empty((((chunk + 127) // 128) * 128, self.num_q_heads, hd_pad),
+                                  dtype = torch.float32, device = self.device)
+                del kd, vd, acc
             return
 
         if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
