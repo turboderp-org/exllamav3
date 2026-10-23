@@ -6,7 +6,7 @@ from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import QKV_SLICE
+from ..util.backend import qkv_slice
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
@@ -15,10 +15,7 @@ from .multilinear import SlicedMultiLinear
 import os
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
-# one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
-# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
-# the cooperative GEMM)
-_qkv_slice_enable = QKV_SLICE
+# one mgemm over equal-width column slices, see attn.py and backend.qkv_slice. EXL3_QKV_SLICE=0 disables it
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
@@ -941,7 +938,7 @@ class GatedDeltaNet(Module):
             # eager path (m <= 32) uses them directly
             self.multi_qkvz = None
             if (
-                _qkv_slice_enable and
+                qkv_slice(self.device) and
                 self.qkv_proj.inner.bias is None and self.z_proj.inner.bias is None and
                 self.qkv_proj.inner.K == self.z_proj.inner.K and
                 self.qkv_proj.in_features == self.z_proj.in_features
