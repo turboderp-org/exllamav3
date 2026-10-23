@@ -6,6 +6,7 @@ from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
 from ....util.hadamard import get_hadamard_dt
+from .hessian_packed import unpack
 from ....util import cuda_sync_active
 from ....util.tensor import save_tensor_image
 from functools import lru_cache
@@ -1030,10 +1031,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
             return True, None, None, su, None
 
-        # Unswap H
+        # Unswap H, and reconstruct the square matrix from the capture's block-packed upper triangle
         if "H_swap_device" in H_data:
             H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
             del H_data["H_swap_device"]
+        if H_data.get("packed"):
+            H_data["H"] = unpack(H_data["H"], H_data["n"])
+            H_data["packed"] = False
 
         H = H_data["H"]
         if H_data["finalized"]:
@@ -1985,6 +1989,10 @@ def quantize_exl3_batch(
             qa = quant_args_list[t]
             if "seed" in qa:
                 torch.manual_seed(qa["seed"])
+            # Unswap and factor on the device doing the quantization rather than on the capture
+            # device, which would otherwise factor every tensor of the layer for all threads
+            if "H_swap_device" in H_datas[t]:
+                H_datas[t]["H_swap_device"] = device
             q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
             if q_fallback:
                 finalized.append(None)
@@ -2090,6 +2098,14 @@ def quantize_exl3_batch(
             del outs
 
         pb.update(tiles_k)
+
+        # Like quantize_exl3, park the stored factor on the CPU once the recursion has run: a layer
+        # of distinct per-expert factors would otherwise accumulate on the device until the layer
+        # is done. Tensors sharing the Hessian keep the per-device copy cached above
+        for t in batch_idx:
+            hd = H_datas[t]
+            if hd.get("L") is not None and hd["L"].is_cuda:
+                hd["L"] = hd["L"].cpu()
 
         # Per-tensor metrics and packing
         Hd = None

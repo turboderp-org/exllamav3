@@ -7,6 +7,7 @@ from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_po
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+from ..ext import exllamav3_ext as ext
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
@@ -297,6 +298,8 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
+        self.stage_arenas = {}
+        self.stage_devices = None
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
@@ -807,6 +810,7 @@ class Generator:
             self.pagetable.cpu_tier = None
         self.sample_pinned = None
         self.staging_buffers = {}
+        self.stage_arenas = {}
         self.draft_input_ids_pinned = None
         self.draft_ids_pinned = None
         self.filter_pool.shutdown(wait = False)
@@ -1425,6 +1429,68 @@ class Generator:
         return buf[:rows]
 
 
+    def _stage_arena(self, rows: int, width: int, with_positions: bool):
+        """
+        Pinned int32 arena holding one step's block index [rows, width], cache_seqlens [rows] and optionally
+        positions [rows] back to back (the layout ext.generator_stage_decode fills), with its views and a device
+        copy per attention device. Keyed by shape, so the views keep their identity from step to step.
+        """
+        key = (rows, width, with_positions)
+        arena = self.stage_arenas.get(key)
+        if arena is None:
+            if len(self.stage_arenas) >= 32:
+                self.stage_arenas.clear()
+            n = rows * width + rows * (2 if with_positions else 1)
+            host = torch.zeros((n,), dtype = torch.int32, pin_memory = True)
+            arena = (host, self._arena_views(host, rows, width, with_positions), {})
+            self.stage_arenas[key] = arena
+        return arena
+
+
+    @staticmethod
+    def _arena_views(t: torch.Tensor, rows: int, width: int, with_positions: bool):
+        nbi = rows * width
+        return (
+            t[:nbi].view(rows, width),
+            t[nbi:nbi + rows],
+            t[nbi + rows:nbi + 2 * rows] if with_positions else None,
+        )
+
+
+    def _upload_arena(self, arena, rows: int, width: int, with_positions: bool, params: dict):
+        """
+        Upload the staged tables to every attention device with one copy each, and seed the forward's per-device
+        tensor cache (util.tensor.get_for_device) with the device views, so the layers find them there instead of
+        uploading each table separately when first touched. The device arena is reused from step to step: its next
+        upload is stream-ordered after the kernels reading this one.
+        """
+        if self.stage_devices is None:
+            # TP forwards ship params to the workers themselves; there the tables stay host-side
+            self.stage_devices = [] if self.model.loaded_tp else \
+                sorted({torch.device(m.device) for m in self.model.get_cache_layers() if m.device is not None and
+                        torch.device(m.device).type == "cuda"}, key = lambda d: d.index)
+        if not self.stage_devices:
+            return
+        host, views, dev = arena
+        dev_cache = {}
+        for device in self.stage_devices:
+            d = dev.get(device)
+            if d is None:
+                darena = torch.empty_like(host, device = device)
+                d = (darena, self._arena_views(darena, rows, width, with_positions))
+                dev[device] = d
+            darena, dviews = d
+            if len(self.stage_devices) > 1:
+                with torch.cuda.device(device):
+                    ext.cuda_memcpy_async(darena.data_ptr(), host.data_ptr(), host.numel() * 4, 1)
+            else:
+                ext.cuda_memcpy_async(darena.data_ptr(), host.data_ptr(), host.numel() * 4, 1)
+            for hv, dv in zip(views, dviews):
+                if hv is not None:
+                    dev_cache[(id(hv), device)] = (hv, dv)
+        params["dev_cache"] = dev_cache
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1449,46 +1515,67 @@ class Generator:
         # since the kernels bound their reads by the cache lengths
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("cache_seqlens", batch_size)
-        batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = self._staging("positions", batch_size) if use_offsets else None
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                if use_offsets:
-                    positions[batch] = seq.kv_position + job.alt_rope_offset
-                batch += 1
+        arena = self._stage_arena(batch_size, max_pages_batch, use_offsets)
+        block_index, cache_seqlens, positions = arena[1]
 
-        # Collect input IDs and indexed embeddings
-        # Jobs may contribute multiple sequence rows. logit_mapping records the slice of the model output that
-        # belongs to each active job, while batch_jobs keeps the corresponding Job objects in compact-batch order.
-        input_ids_list = []
+        # Collect the rows' tables, and their input IDs and indexed embeddings. Jobs may contribute multiple
+        # sequence rows. logit_mapping records the slice of the model output that belongs to each active job, while
+        # batch_jobs keeps the corresponding Job objects in compact-batch order. Single-token decode rows (no draft)
+        # have their input token gathered and recorded in its cache page by the staging call below, together with
+        # the tables; any other row takes the general path through get_input_ids_list
+        seq_bi, seq_kvp, seq_rope = [], [], []
+        dec_ids, dec_pages, dec_offsets = [], [], []
+        decode_rows = draft_tokens is None
         active_embeddings = []
         logit_mapping = []
         batch_jobs = []
+        rows = 0
         for job in self.active_jobs:
-            logit_mapping.append(len(input_ids_list))
+            logit_mapping.append(rows)
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
                 cuda_sync_active()
                 job.time_first_token = time.time()
-            job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
-            input_ids_list += job_ids
+            for seq in job.sequences:
+                kvp = seq.kv_position
+                seq_bi.append(seq.block_index_tensor)
+                seq_kvp.append(kvp)
+                if use_offsets:
+                    seq_rope.append(job.alt_rope_offset)
+                if decode_rows:
+                    decode_rows = len(seq.sequence_ids) - kvp == 1
+            rows += len(job.sequences)
             batch_jobs.append(job)
             active_embeddings += job.embeddings
-        logit_mapping.append(len(input_ids_list))
-        ids_width = input_ids_list[0].shape[-1]
-        if all(ids.shape[-1] == ids_width for ids in input_ids_list):
-            ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
-            batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+        logit_mapping.append(rows)
+
+        if decode_rows:
+            for job in batch_jobs:
+                for seq in job.sequences:
+                    page = seq.allocated_pages[seq.kv_position // PAGE_SIZE]
+                    assert page.ref_count == 1
+                    dec_ids.append(seq.sequence_ids.tensor)
+                    dec_pages.append(page.sequence)
+                    dec_offsets.append(page.kv_position)
+                    page.kv_position += 1
+                    page.can_revert = False
+            batch_ids = self._staging("batch_ids", rows, 1, torch.long)
         else:
-            batch_ids = torch.cat(input_ids_list, dim = 0)
+            batch_ids = None
+        ext.generator_stage_decode(
+            arena[0], max_pages_batch, seq_bi, seq_kvp, seq_rope, batch_ids, dec_ids, dec_pages, dec_offsets
+        )
+        if not decode_rows:
+            input_ids_list = []
+            for job in batch_jobs:
+                input_ids_list += job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
+            ids_width = input_ids_list[0].shape[-1]
+            if all(ids.shape[-1] == ids_width for ids in input_ids_list):
+                ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
+                batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+            else:
+                batch_ids = torch.cat(input_ids_list, dim = 0)
 
         # Collect recurrent states for batch
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
@@ -1521,6 +1608,7 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
+        self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(

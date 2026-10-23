@@ -219,7 +219,7 @@ python examples/chat.py -h
 | **Mistral**, **Ministral 3**, **Mistral-4** etc.  | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration`                    |     ✓     |                       |
 | **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
 | **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
-| **Nemotron 3.5 Bolt**                             | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
+| **Nemotron 3.5 Bolt**, **Nemotron 3.5 Super VL**  | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
 | **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
 | **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |
 | **Phi3**, **Phi4**                                | `Phi3ForCausalLM`                                                             |            |                       |
