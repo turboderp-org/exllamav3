@@ -136,8 +136,15 @@ class Generator:
             drafting. Fewer rows also means a shorter verification pass, so the ceiling costs nothing on
             acceptance when the draft is good. The draft model's cache stays aligned either way (accepted
             positions are still written back from the target's hidden states each round), so the window can
-            change from round to round as streams come and go. The useful ceiling depends on the model: a
-            sparse MoE spends far less on the extra rows than a dense model of the same size.
+            change from round to round as streams come and go. The useful ceiling depends on the model, and
+            on the kernels behind it. Measured on two 4 bpw models at 32K context: a dense 27B verifies a
+            four-token draft for ~1.2 single-token times and keeps gaining from drafting up to 40 rows
+            (+41% aggregate at four streams, +30% at eight), while a 256-expert MoE verifies the same draft
+            for ~2.0 token times because each extra position selects its own experts, so it only pays off at
+            one or two streams; above eight rows it also drops off the fused MoE decode kernel
+            (MAX_BSZN), which costs 15-26% rather than the gradual loss the arithmetic alone would
+            predict. A ceiling around the fused kernel's row capacity is the safe choice for a sparse MoE
+            (8 for the current MAX_BSZN); dense models can go much wider (32-64) or uncapped.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
