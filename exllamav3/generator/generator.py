@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import torch
+import os
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
@@ -23,6 +24,11 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+# EXL3_NO_BATCH_READBACK=1: force the per-position serial speculative-window readback instead of the
+# batched (launch-all-samplers, one pinned stage, one synchronize) path. A/B escape hatch, mirrors the
+# EXL3_BC_* switches
+_NO_BATCH_READBACK = os.environ.get("EXL3_NO_BATCH_READBACK") == "1"
 
 class Generator:
 
@@ -1646,12 +1652,53 @@ class Generator:
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+                W = batch_logits.shape[1]
 
-                for i in range(batch_logits.shape[1]):
+                # Positions within a job are independent when no per-position constraint advances between
+                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
+                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
+                # window (token healing, new_tokens < 0, is covered by the last test). Then all samplers
+                # launch up front in serial-loop order (each position's RNG draw is unchanged) and the W
+                # sampled tokens read back through one pinned buffer and one synchronize, as in the
+                # no-draft path, leaving a host-only accept/reject walk. Constrained jobs keep the serial
+                # loop below; EXL3_NO_BATCH_READBACK=1 forces it for A/B.
+                batchable = (
+                    not _NO_BATCH_READBACK
+                    and b - a == 1
+                    and job.checkpoint is None
+                    and job.new_tokens >= job.min_new_tokens
+                    and not any(f.is_active for f in job.filters)
+                    and not job.sampler.reqs_past_ids
+                )
+                staged = None
+                if batchable:
+                    staged = []
+                    any_cuda = False
+                    for i in range(W):
+                        token_logits = job_logits[:, i:i + 1, :]
+                        sampled = job.receive_logits(token_logits)
+                        is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
+                        staged.append((sampled, is_cuda))
+                        any_cuda |= is_cuda
+                    if any_cuda:
+                        pinned_w = getattr(self, "draft_sample_pinned", None)
+                        if pinned_w is None or pinned_w.shape[1] < W:
+                            pinned_w = torch.empty((1, max(W, 8)), dtype = torch.long, pin_memory = True)
+                            self.draft_sample_pinned = pinned_w
+                        for i, (sampled, is_cuda) in enumerate(staged):
+                            if is_cuda:
+                                pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                                staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
+                        torch.cuda.synchronize(batch_logits.device)
+
+                for i in range(W):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if staged is not None:
+                        (next_token, next_k_tokens, next_k_probs, next_prob), _ = staged[i]
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
