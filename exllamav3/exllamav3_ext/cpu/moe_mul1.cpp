@@ -2161,10 +2161,14 @@ M1_ALWAYS_INLINE void avx2_pair_rows_accum(const __m256i (&preg)[bits], const in
 {
     if constexpr (p < 8)
     {
-        const __m256i st_lo = _mm256_blend_epi16(avx2_half_state_planar<bits, 2 * p, 0, false>(preg),
-                                                 avx2_half_state_planar<bits, 2 * p + 1, 0, true>(preg), 0xAA);
-        const __m256i st_hi = _mm256_blend_epi16(avx2_half_state_planar<bits, 2 * p, 1, false>(preg),
-                                                 avx2_half_state_planar<bits, 2 * p + 1, 1, true>(preg), 0xAA);
+        // Clang's _mm256_blend_epi16 is a macro: the template argument commas would split its
+        // arguments, so the halves are named first
+        const __m256i lo_even = avx2_half_state_planar<bits, 2 * p, 0, false>(preg);
+        const __m256i lo_odd = avx2_half_state_planar<bits, 2 * p + 1, 0, true>(preg);
+        const __m256i hi_even = avx2_half_state_planar<bits, 2 * p, 1, false>(preg);
+        const __m256i hi_odd = avx2_half_state_planar<bits, 2 * p + 1, 1, true>(preg);
+        const __m256i st_lo = _mm256_blend_epi16(lo_even, lo_odd, 0xAA);
+        const __m256i st_hi = _mm256_blend_epi16(hi_even, hi_odd, 0xAA);
         const __m256i s_lo = avx2_bytesum16(st_lo, C);
         const __m256i s_hi = avx2_bytesum16(st_hi, C);
         #pragma GCC unroll 4
