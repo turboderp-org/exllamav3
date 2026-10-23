@@ -730,14 +730,7 @@ class BlockSparseMLP_CPU:
         # model's worker has started, so it gets its own child (which loads only its own
         # layers from the same checkpoint)
         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        hosts = getattr(self.config, "moe_cpu_hosts", None)
-        if hosts is None:
-            hosts = {}
-            self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
-        if host is None:
-            host = MoeCpuHost(self.config)
-            hosts[comp] = host
+        host = MoeCpuHost.for_config(self.config)
         self.cpu_host = host
         self.cpu_component = comp
         def dims_of(l):
@@ -877,14 +870,7 @@ class BlockSparseMLP_CPU:
 
         from ..model.moe_cpu_host import MoeCpuHost
         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        hosts = getattr(self.config, "moe_cpu_hosts", None)
-        if hosts is None:
-            hosts = {}
-            self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
-        if host is None:
-            host = MoeCpuHost(self.config)
-            hosts[comp] = host
+        host = MoeCpuHost.for_config(self.config)
         self.cpu_host = host
         self.cpu_component = comp
 

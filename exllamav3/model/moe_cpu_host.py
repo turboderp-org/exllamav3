@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import multiprocessing
 from multiprocessing import shared_memory
 import numpy as np
@@ -666,8 +667,12 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             pass
 
     shm = None
+    t_entry = time.time()
     try:
         stc = SafetensorsCollection(model_dir)
+        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(f" -- worker: entered main at {t_entry:.3f}, checkpoint index ready at {time.time():.3f} "
+                  f"({time.time() - t_entry:.2f} s)", flush = True)
         cpu = torch.device("cpu")
         # Pinned mode: memfd-backed chunks, published to the parent as they are created
         arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None)
@@ -737,13 +742,48 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         # install, so the workers never observe a torn write
         layer_views = []
 
+        # The pipe is drained by its own thread into a queue: the parent registers layers as
+        # fast as it loads its own, and a send that had to wait for a child busy rehoming the
+        # previous layer would couple the two loads through the socket buffer
+        import queue
+        import threading
+        inbox = queue.Queue()
+        def receive():
+            while True:
+                try:
+                    m = conn.recv()
+                except EOFError:
+                    m = ("quit",)
+                inbox.put(m)
+                if m[0] == "quit":
+                    return
+        threading.Thread(target = receive, daemon = True).start()
+        # Rehoming one batch overlaps the deferred fetch of the next (the loader releases the
+        # GIL while its engine runs); a single worker thread keeps the arena writes in order
+        from concurrent.futures import ThreadPoolExecutor
+        rehome_pool = ThreadPoolExecutor(max_workers = 1)
+        debug = bool(os.environ.get("EXL3_MOE_ARENA_DEBUG"))
+        if debug:
+            print(f" -- worker: affinity {len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else '?'} cpus, "
+                  f"torch threads {torch.get_num_threads()}, loader stage threads {stage_threads}", flush = True)
         while True:
-            msg = conn.recv()
+            t_wait = time.perf_counter()
+            msg = inbox.get()
+            t_wait = time.perf_counter() - t_wait
             if msg[0] == "layer":
+                t_layer = time.perf_counter()
                 spec = msg[1]
                 num_experts = len(spec["up_keys"])
                 batch = TUNING.load_batch_experts or num_experts
                 g, u, d, blocks, auxlocs = [], [], [], [], []
+                pending = None
+                def collect(fut):
+                    bg_, bu_, bd_, bb, ba = fut.result()
+                    g.extend(bg_)
+                    u.extend(bu_)
+                    d.extend(bd_)
+                    blocks.extend(bb)
+                    auxlocs.extend(ba)
                 for e0 in range(0, num_experts, batch):
                     sl = slice(e0, e0 + batch)
                     stc.begin_deferred_load()
@@ -752,13 +792,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     bd = fetch(spec["down_keys"][sl])
                     stc.end_deferred_load()
                     # Copy into the hugepage-backed arena now that the deferred reads have
-                    # actually populated these tensors; the loader tensors die with this batch
-                    bg, bu, bd, bb, ba = rehome_experts(bg, bu, bd)
-                    g += bg
-                    u += bu
-                    d += bd
-                    blocks += bb
-                    auxlocs += ba
+                    # actually populated these tensors; the loader tensors die with this batch.
+                    # The copy runs on the rehome thread while the next batch is fetched
+                    if pending is not None:
+                        collect(pending)
+                    pending = rehome_pool.submit(rehome_experts, bg, bu, bd)
+                if pending is not None:
+                    collect(pending)
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -768,12 +808,17 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     1 if swz else 0,
                 )
                 layer_views.append((g, u, d))
-                # Reclaim this layer's now-discarded loader tensors immediately (rehome_experts
-                # copied everything into the arena)
-                try:
-                    ctypes.CDLL(None).malloc_trim(0)
-                except Exception:
-                    pass
+                if debug:
+                    print(f" -- worker: layer {len(layer_views) - 1}: waited {t_wait * 1000:.0f} ms for the spec, "
+                          f"loaded in {(time.perf_counter() - t_layer) * 1000:.0f} ms, done at {time.time():.3f}", flush = True)
+                # Reclaim the discarded loader tensors (rehome_experts copied everything into the
+                # arena); every few layers rather than every layer, the trim itself takes a
+                # noticeable slice of a layer's load
+                if len(layer_views) % 4 == 3:
+                    try:
+                        ctypes.CDLL(None).malloc_trim(0)
+                    except Exception:
+                        pass
                 # The ack carries the expert block locations (only meaningful to a parent that
                 # maps the arena)
                 conn.send(("ok", blocks if pinned else None, auxlocs if pinned else None))
@@ -831,10 +876,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         threading.Thread(target = arena.promote_hugepages, daemon = True).start()
 
         while True:
-            try:
-                msg = conn.recv()
-            except EOFError:
-                break
+            msg = inbox.get()
             if msg[0] == "install":
                 try:
                     install(msg[1], msg[2], msg[3])
@@ -882,6 +924,21 @@ def _pinning_exhausted(e: Exception) -> bool:
 
 
 class MoeCpuHost:
+
+    @classmethod
+    def for_config(cls, config):
+        """The worker host of this config's component (infer_params.moe_cpu_component), created
+        on first use and shared by every offloaded layer of the component"""
+        comp = getattr(config.infer_params, "moe_cpu_component", "text")
+        hosts = getattr(config, "moe_cpu_hosts", None)
+        if hosts is None:
+            hosts = {}
+            config.moe_cpu_hosts = hosts
+        host = hosts.get(comp)
+        if host is None:
+            host = cls(config)
+            hosts[comp] = host
+        return host
 
     def __init__(self, config):
         self.config = config
@@ -950,6 +1007,23 @@ class MoeCpuHost:
         )
         self.proc.start()
         child_conn.close()
+        # Parent -> child messages go through a queue and a sender thread: a layer spec is tens
+        # of KB, and a direct send would block the loading thread until the child's receiver
+        # takes it, which it only gets to do between its own loader calls
+        import queue
+        import threading
+        self._send_queue = queue.Queue()
+        def sender():
+            while True:
+                msg = self._send_queue.get()
+                if msg is None:
+                    return
+                try:
+                    self.conn.send(msg)
+                except Exception:
+                    return
+        self._sender = threading.Thread(target = sender, daemon = True)
+        self._sender.start()
         # Cleanupper fires at the end of the __main__ scope, before interpreter teardown breaks
         # the shm views and pipe machinery that shutdown() needs; PDEATHSIG in the child covers
         # the paths where no Python hook runs at all
@@ -1094,24 +1168,21 @@ class MoeCpuHost:
         self.by_key[key] = idx
         if aux is not None:
             self.aux[idx] = aux
-        self.conn.send(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
+        self._send_queue.put(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
         return idx
 
     def commit_module(self, module_key):
         """
-        Called by the loader after a top-level module has committed on the GPU side: block until
-        the child has loaded every layer registered under that module, keeping load progress
-        honest and the child at most one layer behind.
+        Called by the loader after a top-level module has committed on the GPU side: take whatever
+        the child has sent so far (acks, pinned-arena chunks, errors) without waiting for it. The
+        child loads behind the parent at its own pace and the parent only waits for it in
+        ensure_started, before the first forward; an error in the child still surfaces within a
+        module of happening
         """
-        if self.proc is None:
+        if self.proc is None or self.conn is None:
             return
-        idxs = [i for k, i in self.by_key.items()
-                if k == module_key or k.startswith(module_key + ".")]
-        if not idxs:
-            return
-        need = max(idxs) + 1
-        while self.acked < need:
-            self._pump(1.0)
+        while self.conn.poll(0):
+            self._pump(0)
 
     def ensure_started(self):
         if self.started or not self.specs:
@@ -1210,7 +1281,7 @@ class MoeCpuHost:
         # Per-device CUDA state for the streamed-prefill path (copy stream, VRAM ring, events)
         self.sstate = {}
 
-        self.conn.send(("start", self.shm.name, self.layout))
+        self._send_queue.put(("start", self.shm.name, self.layout))
 
         import time
         t0 = time.time()
@@ -1785,7 +1856,7 @@ class MoeCpuHost:
         checkpoint tensors at `keys` (per-projection prefixes, gate first when gated). The
         caller must have quiesced (full stream sync => job ring drained, worker idle) before
         calling; blocks until the child acks the in-place arena copy."""
-        self.conn.send(("install", layer_idx, local_idx, keys))
+        self._send_queue.put(("install", layer_idx, local_idx, keys))
         msg = self.conn.recv()
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
@@ -2207,9 +2278,11 @@ class MoeCpuHost:
                     # The child's main thread serves the pipe at runtime (expert installs);
                     # the flag stops its compute thread, the message unblocks the recv loop
                     if self.conn is not None:
-                        self.conn.send(("quit",))
+                        self._send_queue.put(("quit",))
                 elif self.conn is not None:
-                    self.conn.send(("quit",))
+                    self._send_queue.put(("quit",))
+                self._send_queue.put(None)
+                self._sender.join(timeout = 5)
                 self.proc.join(timeout = 5)
                 if self.proc.is_alive():
                     self.proc.terminate()

@@ -584,6 +584,15 @@ class Model(Model_TPMixin, Model_LSMixin):
             # shares the config but loads after the main model's worker has already started)
             self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
 
+            # CPU-offloaded experts: start the worker process now, so its own startup (the
+            # interpreter, torch, the checkpoint index) overlaps the first modules' loading
+            # instead of holding up the first offloaded layer. It idles if no layer ends up
+            # offloaded; unload shuts it down either way
+            ip = self.config.infer_params
+            if int(getattr(ip, "moe_cpu_split", 0) or 0) or int(getattr(ip, "moe_cpu_offload", 0) or 0):
+                from .moe_cpu_host import MoeCpuHost
+                MoeCpuHost.for_config(self.config)._spawn()
+
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
 
