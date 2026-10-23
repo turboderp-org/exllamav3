@@ -40,7 +40,7 @@ class Generator:
         max_batch_size: int = 256,
         max_chunk_size: int = 2048,
         shared_chunk_size: int | None = None,
-        prefill_cooldown: int = 4,
+        prefill_cooldown: int | None = 4,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -281,6 +281,8 @@ class Generator:
             shared_chunk_size = (max_chunk_size // 2 + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
         assert 0 < shared_chunk_size <= max_chunk_size and shared_chunk_size % PAGE_SIZE == 0, \
             "shared_chunk_size must be a multiple of the page size (256) and no larger than max_chunk_size"
+        if prefill_cooldown is None:
+            prefill_cooldown = 4
         assert prefill_cooldown >= 0, \
             "prefill_cooldown must not be negative"
         self.shared_chunk_size = shared_chunk_size
