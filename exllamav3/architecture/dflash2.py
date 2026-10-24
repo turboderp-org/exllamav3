@@ -355,7 +355,7 @@ class DFlash2Model(Model):
         # Encoder norm (stored in DFlashInputLayer under a key that doesn't match the fc module
         # prefix), conv base kernels and selector codebooks: raw tensors outside any Linear
         tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
-        tensors.update(config.stc.list_tensors(prefix = "candidate_selector."))
+        tensors.update(config.stc.list_tensors(prefix = "candidate_selector"))
         for idx in range(config.num_hidden_layers):
             for conv in ("attention_conv", "mlp_conv"):
                 tensors.update(config.stc.list_tensors(
