@@ -19,7 +19,7 @@ import torch
 
 from ..constants import PAGE_SIZE
 from ..version import __version__
-from ..cache.recurrent import host_pool, new_checkpoint_handle
+from ..cache.recurrent import host_pool, new_checkpoint_handle, wait_stashes
 from ..model.model_tp_fn import (
     mp_disk_layout, mp_disk_set_layout, mp_disk_write, mp_disk_read,
     mp_disk_state_describe, mp_disk_state_write, mp_disk_state_read, pack_stash, unpack_stash,
@@ -1391,6 +1391,7 @@ class DiskPageCache:
 
 
     def _do_write_state(self, conn, phash, stashed, size, layout):
+        wait_stashes()  # the stash's copies to host may still be in flight
         tmp, path = layout["tmp"], layout["path"]
         if layout["markers"] is None:
             data_offset = self._create_state_file(tmp, layout["header"], layout["image_size"])
