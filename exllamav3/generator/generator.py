@@ -56,6 +56,7 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        draft_max_rows: int = 0,
         **kwargs
     ):
         """
@@ -124,6 +125,32 @@ class Generator:
             own guess. The intent is to catch verbatim repetition of context (reciting a drafted reply, editing
             source) and gamble a long verification pass on advancing many tokens at prefill speed. A recurrent
             model's cache needs max_history of at least this many tokens.
+
+        :param draft_max_rows:
+            Ceiling on the number of decoding rows in a speculative round, counting the verified draft
+            positions, i.e. bsz * (1 + draft tokens) (0 disables the ceiling). Drafting turns one weight sweep
+            into several, which a lone stream spends well but a wide batch does not, so instead of switching
+            drafting off at some batch size the round shrinks its draft window to keep the row count under the
+            ceiling: with 15 draft tokens and 32 rows, one stream still drafts 15, two draft 15, four draft 7,
+            eight draft 3 and a batch that would reach the ceiling on the target pass alone decodes without
+            drafting. Fewer rows also means a shorter verification pass, so the ceiling costs nothing on
+            acceptance when the draft is good. The draft model's cache stays aligned either way (accepted
+            positions are still written back from the target's hidden states each round), so the window can
+            change from round to round as streams come and go.
+
+            What the right ceiling is depends on the model, the kernels behind it, and how fast acceptance
+            decays with window length, not on what a row costs alone. Measured on two 4 bpw models at 32K
+            context: a dense 27B verifies a four-token draft for ~1.2 single-token times and keeps gaining
+            from drafting up to 40 rows (+41% aggregate at four streams, +30% at eight), so 32-64 rows, or no
+            ceiling, is reasonable there. A 256-expert MoE verifies the same draft for ~2.0 token times
+            because each extra position selects its own experts, and it only profits at one or two streams:
+            at eight streams a four-token window cost 19% and a fifteen-token window 36%, per-position
+            acceptance falling from 50% to 21% over the same span. Dropping off the fused MoE decode kernel's
+            row capacity costs a step on top of that (15-26% at two streams), and beyond it the loss grows
+            smoothly with row count instead of turning around. Wide rounds become cheap only once router
+            saturation makes the extra rows memory-bound rather than compute-bound, which takes far more rows
+            than a small box can hold at long context. So ~8 rows is a sensible sparse-MoE default on 24 GB
+            cards, but it is a starting point rather than a rule: measure it.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -263,6 +290,8 @@ class Generator:
         self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
         self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
+        self.draft_max_rows = max(0, draft_max_rows or 0)
+        self._draft_window_last = None
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
@@ -743,14 +772,15 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
-        # Generation with draft model
-        if self.draft_model:
+        # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
+        draft_window = self.row_limited(self.num_draft_tokens)
+        if self.draft_model and draft_window > 0:
             if self.dflash_draft:
-                draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+                draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results, draft_window)
             else:
-                draft_tokens = self.iterate_draftmodel_gen(results)
+                draft_tokens = self.iterate_draftmodel_gen(results, draft_window)
 
         # Generation with n-gram draft
         elif self.ngram_match_min:
@@ -762,7 +792,9 @@ class Generator:
 
         # Long suffix-match draft over the regular one, when a job is repeating its context
         if self.hybrid_draft_tokens:
-            draft_tokens = self.iterate_hybrid_gen(draft_tokens)
+            draft_tokens = self.iterate_hybrid_gen(
+                draft_tokens, self.row_limited(self.hybrid_draft_tokens)
+            )
 
         self.iterate_gen(results, draft_tokens)
 
@@ -980,7 +1012,7 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
-    def iterate_draftmodel_gen(self, results: list):
+    def iterate_draftmodel_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
 
@@ -989,7 +1021,7 @@ class Generator:
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + window + 1)
             batch_size += 1
         if batch_size == 0:
             return None
@@ -1065,7 +1097,6 @@ class Generator:
             return p
 
         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
-        window = self.num_draft_tokens
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -1101,7 +1132,7 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
-    def iterate_draftmodel_mtp_gen(self, results: list):
+    def iterate_draftmodel_mtp_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
 
@@ -1110,7 +1141,7 @@ class Generator:
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + window + 1)
             batch_size += 1
         if batch_size == 0:
             return None
@@ -1155,7 +1186,6 @@ class Generator:
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
-        window = self.num_draft_tokens
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -1199,7 +1229,7 @@ class Generator:
 
 
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list):
+    def iterate_draftmodel_dflash_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
 
@@ -1210,15 +1240,15 @@ class Generator:
             if not job.is_prefill_done(): continue
             max_seq_len = max(
                 max_seq_len,
-                job.get_max_seq_len() + self.num_draft_tokens + 1,
+                job.get_max_seq_len() + window + 1,
                 job.get_max_seq_len() + self.draft_model.config.block_size + 1
             )
             batch_size += 1
         if batch_size == 0:
             return None
 
-        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
-        window = self.num_draft_tokens
+        # The diffusion drafter always runs at its fixed block size; the row ceiling and the dynamic
+        # window only truncate the verified part of the drafted block
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1362,7 +1392,26 @@ class Generator:
             raise
 
 
-    def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None):
+    def row_limited(self, window: int) -> int:
+        """
+        Trim a draft window so that bsz * (1 + window) rows stay under draft_max_rows (see the constructor).
+        """
+        if not self.draft_max_rows or not window:
+            return window
+        rows = 0
+        for job in self.active_jobs:
+            if job.is_prefill_done():
+                rows += len(job.sequences)
+        if rows < 1:
+            return window
+        limited = min(window, max(0, self.draft_max_rows // rows - 1))
+        if window == self.num_draft_tokens and limited != self._draft_window_last:
+            self._draft_window_last = limited
+            logger.debug("draft_max_rows %d, %d rows: draft window %d",
+                         self.draft_max_rows, rows, limited)
+        return limited
+
+    def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None, H: int):
         """
         Replace the round's draft with hybrid_draft_tokens tokens of suffix-match continuation when some job's
         current suffix matches at least that many tokens of its earlier context and the continuation agrees
@@ -1370,11 +1419,11 @@ class Generator:
         when any row takes the long draft every row does: rows without a qualifying match keep their regular
         draft and are padded with whatever continuation their longest match offers, then with repeats of
         their last token, which verification rejects at the first mismatch. Returns the (rows, width) draft
-        for iterate_gen, or the regular draft unchanged.
+        for iterate_gen, or the regular draft unchanged. H is that length for this round, already trimmed
+        to the row ceiling.
         """
-        H = self.hybrid_draft_tokens
         jobs = [job for job in self.active_jobs if job.is_prefill_done()]
-        if not jobs:
+        if not jobs or not H:
             return draft_tokens
         rows = []
         fire = False
