@@ -46,6 +46,14 @@ struct MoeCpuLayer
     int interm_size;      // n of gate/up, k of down
     int activation;       // 0 = silu, 1 = gelu, 2 = relu2 (gateless), 3 = swiglu_oai
     float act_limit;      // swiglu_oai clamp
+    // NUMA column-split views (exl3_moe_cpu_forward_raw_numa): a view layer's gate/up matrices
+    // span this node's half of the intermediate columns and its down matrices this node's half
+    // of the hidden rows, all as pointer ranges inside the layer's full packed tensors. The
+    // offsets are in 128-column blocks: where this view's gate/up GEMV outputs (and the down
+    // input row they feed) begin in the full intermediate, and where its down outputs begin in
+    // the full hidden. Zero on normally registered (unsplit) layers
+    int gu_blk_off = 0;
+    int d_blk_off = 0;
 };
 
 // Register a layer: per-expert tensor lists (CPU, contiguous). Returns a handle.
@@ -102,6 +110,25 @@ void exl3_moe_cpu_forward_raw
     int threads
 );
 
+// NUMA column-split variant: the layer's expert weights are split by 128-column blocks across
+// two nodes (node 0 taking the low gate/up columns and low down rows), each node's pool reading
+// only its node-local half, so both sockets' memory bandwidth stack on the same job. Bitwise
+// identical to exl3_moe_cpu_forward_raw on the same inputs. threads is PER NODE; the layer must
+// have been registered with the swizzled packed layout and a rate whose swizzle group is
+// nonzero (K8 and EXL3_MOE_CPU_SWIZZLE=0 layers are rejected), and both halves of `out` are
+// written. Requires x86 and a non-scalar ISA tier.
+void exl3_moe_cpu_forward_raw_numa
+(
+    int64_t handle,
+    const at::Half* x,
+    const int32_t* sel,
+    const at::Half* w,
+    float* out,
+    int rows,
+    int topk,
+    int threads_per_node
+);
+
 // Copy `count` experts' packed trellis tensors (gate, up, down order; gate absent when
 // gateless) of a registered layer into a staging buffer, expert-major, parallelized over the
 // worker pool. Offsets are deterministic from the layer's matrix dims so the parent can compute
@@ -124,6 +151,23 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);  
 // Pool topology for host placement: physical-core-first encoded LP order and the physical core
 // count; empty when EXL3_MOE_CPU_PIN=0.
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order();
+
+// Per-NUMA-node physical-core-first LP orders (Linux; one entry per node as (order, n_phys),
+// derived from /sys/devices/system/node/*/cpulist). Empty when the topology is unreadable or
+// the host is single-node.
+std::vector<std::pair<std::vector<int64_t>, int64_t>> exl3_moe_cpu_numa_core_orders();
+
+// at::Tensor variant of exl3_moe_cpu_forward_raw_numa for direct testing: same contract, with
+// the usual tensor checks. num_threads is PER NODE.
+void exl3_moe_cpu_forward_numa
+(
+    int64_t handle,
+    const at::Tensor& x,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    at::Tensor& out,
+    int64_t num_threads
+);
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
 bool exl3_moe_cpu_has_avx2();

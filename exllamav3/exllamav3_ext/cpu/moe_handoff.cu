@@ -361,7 +361,8 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t numa_threads_per_node
 )
 {
     // GIL is released by the binding's call_guard; do not release it again here
@@ -442,7 +443,10 @@ void exl3_moe_cpu_worker_run
 
     const char* prime_env = getenv("EXL3_MOE_POOL_PRIME");
     const bool prime_pool = !prime_env || prime_env[0] != '0';
-    if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
+    // NUMA mode: the single pool stays empty (compute jobs go to the per-node pools); priming
+    // it with the full thread count would spawn a second, unused set of pinned workers
+    const int prime_threads = numa_threads_per_node > 0 ? 1 : (int) threads;
+    if (prime_pool) exl3_moe_cpu_pool_prime(prime_threads);
     store_release_u32(ready, 1);
 
     uint32_t head = load_acquire_u32(jobs_head);
@@ -457,7 +461,7 @@ void exl3_moe_cpu_worker_run
         {
             last_wake = wake;
             idle = 0;
-            if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
+            if (prime_pool) exl3_moe_cpu_pool_prime(prime_threads);
         }
 
         if (load_acquire_u32(jobs_tail) == head)
@@ -514,16 +518,30 @@ void exl3_moe_cpu_worker_run
                 }
             }
             if (run)
-                exl3_moe_cpu_forward_raw(
-                    static_cast<int64_t>(job.layer),
-                    reinterpret_cast<const at::Half*>(slot + off_x),
-                    reinterpret_cast<const int32_t*>(slot + off_sel),
-                    reinterpret_cast<const at::Half*>(slot + off_w),
-                    reinterpret_cast<float*>(slot + off_out),
-                    static_cast<int>(job.rows),
-                    static_cast<int>(job.topk),
-                    static_cast<int>(threads)
-                );
+            {
+                if (numa_threads_per_node > 0)
+                    exl3_moe_cpu_forward_raw_numa(
+                        static_cast<int64_t>(job.layer),
+                        reinterpret_cast<const at::Half*>(slot + off_x),
+                        reinterpret_cast<const int32_t*>(slot + off_sel),
+                        reinterpret_cast<const at::Half*>(slot + off_w),
+                        reinterpret_cast<float*>(slot + off_out),
+                        static_cast<int>(job.rows),
+                        static_cast<int>(job.topk),
+                        static_cast<int>(numa_threads_per_node)
+                    );
+                else
+                    exl3_moe_cpu_forward_raw(
+                        static_cast<int64_t>(job.layer),
+                        reinterpret_cast<const at::Half*>(slot + off_x),
+                        reinterpret_cast<const int32_t*>(slot + off_sel),
+                        reinterpret_cast<const at::Half*>(slot + off_w),
+                        reinterpret_cast<float*>(slot + off_out),
+                        static_cast<int>(job.rows),
+                        static_cast<int>(job.topk),
+                        static_cast<int>(threads)
+                    );
+            }
         }
 
         store_release_flag(done + size_t(job.slot) * 16, job);
