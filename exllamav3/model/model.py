@@ -407,8 +407,24 @@ class Model(Model_TPMixin, Model_LSMixin):
                 params["draft_conf"] = conf
             return ids
         lm = self.modules[self.logit_layer_idx]
+        # Draft-only sparse subset of the vocabulary, selected by the caller through params so the
+        # verification forward can never take it
+        sh = lm.sparse_head
+        flag = params.get("sparse_head") if sh is not None else None
+        if flag is True and sh.ready:
+            ids, conf, emb = sh.argmax(lm.prepare_for_device(state, params), embedding = True)
+            if export:
+                params["draft_conf"] = conf
+            if emb is not None:
+                params["draft_embedding"] = emb
+            return ids
         logits = lm.forward(lm.prepare_for_device(state, params), params)
         logits = logits[..., :self.config.vocab_size]
+        if flag == "probe":
+            # Probe round: full head answers, the sparse pick is recorded alongside for the drift statistics
+            full_ids = torch.argmax(logits, dim = -1)
+            sparse_ids, _ = sh.argmax(lm.prepare_for_device(state, params))
+            sh.record_probe(full_ids, sparse_ids)
         if export:
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf

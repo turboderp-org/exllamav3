@@ -102,6 +102,10 @@ class LinearFP16:
     def get_weight_tensor(self) -> torch.Tensor:
         return self.weight
 
+    def reconstruct_columns(self, cols: torch.Tensor, out: torch.Tensor):
+        """Weight columns (in_features, len(cols)) for the given column indices, written into out"""
+        torch.index_select(self.weight, 1, cols, out = out)
+
     def get_bias_tensor(self) -> torch.Tensor | None:
         return self.bias
 

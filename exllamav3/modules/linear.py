@@ -104,6 +104,9 @@ class Linear(Module):
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
+        # regular forward never consults it
+        self.sparse_head = None
 
         # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
         # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose
@@ -529,11 +532,21 @@ class Linear(Module):
             self.inner.unload()
         self.device = None
         self.inner = None
+        self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
 
 
     @override
+    def make_sparse_head(self, capacity: int, vocab_size: int | None = None, **kwargs):
+        """Attach a SparseHead mirroring this layer's columns (requires a loaded inner with column extraction)"""
+        from .sparse_head import SparseHead
+        assert self.inner is not None and hasattr(self.inner, "reconstruct_columns"), \
+            f"{self.key}: sparse head needs a loaded EXL3 or fp16 layer"
+        self.sparse_head = SparseHead(self, capacity, vocab_size or self.out_features_unpadded, **kwargs)
+        return self.sparse_head
+
+
     def get_tensors(self):
         if self.device:
             return self.inner.get_tensors(self.key)

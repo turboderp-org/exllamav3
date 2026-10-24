@@ -185,6 +185,12 @@ class Embedding(Module):
         if "input_ids" not in params:
             params["input_ids"] = x
 
+        # A drafting loop that already holds the rows for these ids (the sparse draft head hands back the
+        # winning tokens' embeddings) skips the table lookup, and with it the host round trip of the ids
+        draft_emb = params.get("draft_embedding")
+        if draft_emb is not None and tuple(draft_emb.shape[:-1]) == tuple(x.shape):
+            return to2(draft_emb, out_dtype, self.out_dtype)
+
         indexed_emb = params.get("indexed_embeddings")
         input_ids = x
         out_dtype = out_dtype or self.out_dtype or x.dtype

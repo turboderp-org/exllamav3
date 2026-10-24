@@ -284,6 +284,8 @@ def _isolated_expert_profiles(tmp_path_factory):
     # XDG_CACHE_HOME: torch's extension build root follows it too, and would rebuild the extension per session)
     import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
     bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
+    from exllamav3.modules import sparse_head
+    sparse_head.TOKEN_STATS_DIR = str(tmp_path_factory.mktemp("token_stats"))
     yield
 
 

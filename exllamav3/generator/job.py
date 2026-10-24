@@ -278,6 +278,7 @@ class Job:
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
+        self.sparse_head_seeded = False
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False

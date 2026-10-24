@@ -92,6 +92,7 @@ def main(args):
         hybrid_draft_tokens = args.hybrid_draft_tokens,
         ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
+        sparse_draft_head = args.sparse_draft_head,
         draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         disk_cache_dir = args.disk_cache_dir,

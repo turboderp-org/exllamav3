@@ -230,6 +230,39 @@ class LinearEXL3:
         else:
             ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
 
+    def reconstruct_columns(self, cols: torch.Tensor, out: torch.Tensor, max_blocks: int = 64):
+        """
+        Original-basis weight columns (in_features, len(cols)) for the given column indices, written into out.
+        A column leaves the trellis only together with its 128-wide output Hadamard block, so the blocks holding
+        at least one requested column are reconstructed (rotated basis) into a stacked buffer, the Hadamards and
+        sign/scale vectors are applied to the stack as in get_weight_tensor, and the columns are gathered. Blocks
+        are processed in groups to bound the fp32 transient
+        """
+        k = self.in_features
+        order = torch.argsort(cols)
+        sorted_cols = cols[order]
+        blocks = torch.unique_consecutive(sorted_cols // 128)
+        block_list = blocks.tolist()
+        suh = self.suh.unsqueeze(1)
+        for g in range(0, len(block_list), max_blocks):
+            grp = block_list[g:g + max_blocks]
+            # The kernel writes a contiguous (k, 128) slab; the stack is re-laid as (k, blocks * 128) afterwards
+            stack = torch.empty((len(grp), k, 128), dtype = torch.half, device = self.trellis.device)
+            for bi, b in enumerate(grp):
+                ext.reconstruct_slice(stack[bi], self.trellis, self.K, self.mcg, self.mul1, b * 128)
+            w = stack.permute(1, 0, 2).reshape(k, 128 * len(grp))
+            w = preapply_had_l(w, had_k)
+            w *= suh
+            w = preapply_had_r(w, had_n)
+            svh_idx = (torch.tensor(grp, device = w.device).unsqueeze(1) * 128 + torch.arange(128, device = w.device)).view(-1)
+            w *= self.svh[svh_idx].unsqueeze(0)
+            # Requested columns inside this group: block index -> stacked offset
+            lo, hi = grp[0] * 128, (grp[-1] + 1) * 128
+            sel = ((sorted_cols >= lo) & (sorted_cols < hi)).nonzero().squeeze(1)
+            pos = torch.searchsorted(torch.tensor(grp, device = w.device), sorted_cols[sel] // 128) * 128 + sorted_cols[sel] % 128
+            out[:, order[sel]] = w[:, pos]
+
+
     def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
         self._reconstruct_inner(w, 0)

@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
+from ..util.device_copy import to_device
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
@@ -31,6 +32,11 @@ from ..util import profile_opt
 _NO_BATCH_READBACK = False
 
 class Generator:
+
+    # Sparse drafting head and its per-round flag (set up in the constructor when enabled; class-level
+    # defaults keep iterate() valid on stubbed instances)
+    sparse_head = None
+    _sparse_flag = False
 
     def __init__(
         self,
@@ -63,6 +69,7 @@ class Generator:
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
         draft_max_rows: int = 0,
+        sparse_draft_head: int = 0,
         **kwargs
     ):
         """
@@ -136,6 +143,11 @@ class Generator:
             Ceiling on the number of decoding rows in a speculative round, counting the verified draft
             positions, i.e. bsz * (1 + draft tokens) (0 disables the ceiling). Draft length is capped when
             possible to keep the batch from exceeding the ceiling.
+
+        :param sparse_draft_head:
+            Number of vocabulary columns in a dynamic sparse LM head for drafters that borrow the target's
+            lm_head (MTP, DFlash), 0 to disable. The subset follows the frequencies of the tokens seen in
+            prompts and generated text; verification always uses the full head, so output is unaffected.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -422,6 +434,20 @@ class Generator:
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
+        self.sparse_head = None
+        self._sparse_flag = False
+        if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
+            from ..modules.sparse_head import token_stats_path
+            lm = model.modules[model.logit_layer_idx]
+            self.sparse_head = lm.make_sparse_head(
+                sparse_draft_head,
+                model.config.vocab_size,
+                profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
+                embedding = model.modules[0] if self.mtp_draft else None,
+            )
+            self.sparse_head.benchmark()
 
 
     def num_remaining_jobs(self):
@@ -763,6 +789,10 @@ class Generator:
 
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
         draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
+        round_start = None
+        if self.sparse_head is not None and draft_window > 0:
+            self._sparse_flag = self.sparse_head.round_flag()
+            round_start = time.perf_counter()
         if self.draft_model and draft_window > 0:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
@@ -786,6 +816,10 @@ class Generator:
             )
 
         self.iterate_gen(results, draft_tokens)
+        if round_start is not None and draft_tokens is not None:
+            # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
+            drafted = draft_tokens.shape[-1]
+            self.sparse_head.note_round(time.perf_counter() - round_start, drafted, drafted if self.mtp_draft else 1)
 
         # Visualization
         if self.visualizer:
@@ -963,6 +997,8 @@ class Generator:
         glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
         in the arenas for the whole idle period.
         """
+        if self.sparse_head is not None:
+            self.sparse_head.save_profile()
         if self.disk_page_cache is not None and self.disk_cache_flush_on_idle and \
                 not self.disk_page_cache.write_disabled:
             # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
@@ -1179,6 +1215,12 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # The drafted ids stay on the device inside the loop: each step's argmax feeds the next step's
+        # input directly (with the sparse head, together with the token's embedding row, so the embedding
+        # table is never consulted), and the window comes back to pinned memory in one copy at the end
+        draft_cols = []
+        draft_emb = None
+        embed_device = self.model.modules[0].device
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1187,15 +1229,21 @@ class Generator:
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
+                "sparse_head": self._sparse_flag,
             }
             if cal is not None:
                 params["export_draft_conf"] = True
+            if draft_emb is not None:
+                params["draft_embedding"] = draft_emb
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            draft_cols.append(new_ids)
+            draft_emb = params.get("draft_embedding")
+            # Without a row from the sparse head, the next step looks the token up in the embedding table,
+            # which wants the ids on its own device (a host round trip for a CPU-resident table, as before)
+            batch_ids = new_ids if draft_emb is not None else to_device(new_ids, embed_device)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -1207,6 +1255,7 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+        self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1282,6 +1331,7 @@ class Generator:
             params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+        params["sparse_head"] = self._sparse_flag
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
@@ -1448,6 +1498,23 @@ class Generator:
         self._draft_conf_round = None
         self.hybrid_rounds += 1
         return out
+
+
+    def _sparse_head_update(self, jobs: list, accepted_lengths: list[int]):
+        """
+        Feed this step's target tokens to the sparse head. A job's first step contributes its whole context
+        (prompt and anything generated so far) at prompt weight, since the identifiers a reply reuses are
+        mostly already in its prompt; later steps contribute the tokens the target just accepted or sampled
+        """
+        sh = self.sparse_head
+        for job, n in zip(jobs, accepted_lengths):
+            seq = job.sequences[0]
+            if not job.sparse_head_seeded:
+                job.sparse_head_seeded = True
+                sh.observe(seq.sequence_ids.torch(), sh.prompt_weight)
+            elif n > 0:
+                sh.observe(seq.sequence_ids.torch_slice(len(seq.sequence_ids) - n, None), 1.0)
+        sh.maintain()
 
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
@@ -1926,6 +1993,9 @@ class Generator:
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+
+        if self.sparse_head is not None:
+            self._sparse_head_update(batch_jobs, accepted_lengths)
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)
