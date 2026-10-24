@@ -49,6 +49,15 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)
 the regular dispatch path by design. Unexpected errors while building the path are raised, not
 swallowed. Set to `0` to disable the path entirely.
 
+### `EXL3_RDNA3_ATTN` (ROCm, gfx11; default: `1`)
+
+On RDNA3 (gfx11) the BC-attn decode and verify path replaces the Triton split kernel with HIP flash-decoding split
+kernels (`rocm/rdna3_attn.cu`, adapted from exllamav3-rocm) where they apply: causal full attention without
+window, softcap or sinks, head_dim 128 or 256, fp16 or 8-bit K and V, softmax scale 1/sqrt(head_dim), a GQA group of
+2, 4, 6 or 8 and at most 64 query rows per kv head. q_len 1 scores with `v_dot2`, verify rows on an 8-bit cache run
+on WMMA. They take the Triton kernel's arguments and write its partial layout, so the Triton combine reduces their
+output. Qwen3.8-27B on a 7900 XTX: -4 % per speculative round at 8k context, -16 % at 32k. `0` keeps Triton.
+
 ### `EXL3_BC_ATTN_TRACE` (default: `0`)
 
 Print one line per attention module/cache-layer pair when the graph-captured decode path is
