@@ -27,14 +27,16 @@ _CHUNK_TARGET_CHARS = 16384
 _CHUNK_MAX = 128
 _CHUNK_PROBE = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n    def f(x):\n        return x  \n\n\n"
-    "Tabs\there\r\nand CRLF.\n  leading spaces\ntrailing spaces   \n\n日本語のテキスト\n\nЁлки-палки, 12345 678\n"
+    "Tabs\there\r\nand CRLF.\r\n\r\nCRLF blank line.\n  leading spaces\ntrailing spaces   \n\n日本語のテキスト\n\nЁлки-палки, 12345 678\n"
     "<|im_start|>user\nmixed <s> markup </s>\n\n\n\nend"
 ) * 3
 
 
 def _split_chunks(text: str, target: int = _CHUNK_TARGET_CHARS, max_chunks: int = _CHUNK_MAX) -> list[str]:
     """Cut text after complete newline runs, about every `target` characters. Text without a newline
-    past a cut point simply runs on into the next chunk"""
+    past a cut point simply runs on into the next chunk. A run takes in carriage returns too: a CRLF
+    blank line is one token to some tokenizers, and a cut inside it would make the chunked encoding
+    (and so a growing prompt's prefix) differ from the whole-text encoding (issue #564)"""
     n = len(text)
     k = min(max_chunks, max(1, n // target))
     if k <= 1:
@@ -45,7 +47,7 @@ def _split_chunks(text: str, target: int = _CHUNK_TARGET_CHARS, max_chunks: int 
         p = text.find("\n", start + step)
         if p < 0:
             break
-        while p < n and text[p] == "\n":
+        while p < n and text[p] in "\r\n":
             p += 1
         if p > start:
             out.append(text[start:p])
@@ -307,8 +309,10 @@ class Tokenizer:
 
     # Encode string with added, unspecial tokens
     def _chunking_ok(self) -> bool:
-        """Whether cutting at newline runs reproduces this tokenizer's single-sequence ids, decided
-        once on the probe text with cuts every few hundred characters (both special-token modes)"""
+        """Whether cutting at newline runs reproduces this tokenizer's single-sequence ids, decided once
+        on the probe text, cut after every one of its newline runs (both special-token modes). Cutting
+        at every run rather than at a few length-dependent positions exercises each boundary kind the
+        probe contains (indented lines, trailing spaces, CRLF runs, markup) whatever the probe's length"""
         ok = getattr(self, "_chunking_verified", None)
         if ok is None:
             ok = True
@@ -317,7 +321,7 @@ class Tokenizer:
                 for special in (False, True):
                     self.tokenizer.encode_special_tokens = not special
                     ref = self.tokenizer.encode(_CHUNK_PROBE, add_special_tokens = False).ids
-                    parts = _split_chunks(_CHUNK_PROBE, target = 300, max_chunks = 64)
+                    parts = _split_chunks(_CHUNK_PROBE, target = 1, max_chunks = len(_CHUNK_PROBE))
                     encs = self.tokenizer.encode_batch(parts, add_special_tokens = False)
                     if [i for e in encs for i in e.ids] != ref:
                         ok = False
