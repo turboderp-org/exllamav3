@@ -136,15 +136,21 @@ class Generator:
             drafting. Fewer rows also means a shorter verification pass, so the ceiling costs nothing on
             acceptance when the draft is good. The draft model's cache stays aligned either way (accepted
             positions are still written back from the target's hidden states each round), so the window can
-            change from round to round as streams come and go. The useful ceiling depends on the model, and
-            on the kernels behind it. Measured on two 4 bpw models at 32K context: a dense 27B verifies a
-            four-token draft for ~1.2 single-token times and keeps gaining from drafting up to 40 rows
-            (+41% aggregate at four streams, +30% at eight), while a 256-expert MoE verifies the same draft
-            for ~2.0 token times because each extra position selects its own experts, so it only pays off at
-            one or two streams; above eight rows it also drops off the fused MoE decode kernel
-            (MAX_BSZN), which costs 15-26% rather than the gradual loss the arithmetic alone would
-            predict. A ceiling around the fused kernel's row capacity is the safe choice for a sparse MoE
-            (8 for the current MAX_BSZN); dense models can go much wider (32-64) or uncapped.
+            change from round to round as streams come and go.
+
+            What the right ceiling is depends on the model, the kernels behind it, and how fast acceptance
+            decays with window length, not on what a row costs alone. Measured on two 4 bpw models at 32K
+            context: a dense 27B verifies a four-token draft for ~1.2 single-token times and keeps gaining
+            from drafting up to 40 rows (+41% aggregate at four streams, +30% at eight), so 32-64 rows, or no
+            ceiling, is reasonable there. A 256-expert MoE verifies the same draft for ~2.0 token times
+            because each extra position selects its own experts, and it only profits at one or two streams:
+            at eight streams a four-token window cost 19% and a fifteen-token window 36%, per-position
+            acceptance falling from 50% to 21% over the same span. Dropping off the fused MoE decode kernel's
+            row capacity costs a step on top of that (15-26% at two streams), and beyond it the loss grows
+            smoothly with row count instead of turning around. Wide rounds become cheap only once router
+            saturation makes the extra rows memory-bound rather than compute-bound, which takes far more rows
+            than a small box can hold at long context. So ~8 rows is a sensible sparse-MoE default on 24 GB
+            cards, but it is a starting point rather than a rule: measure it.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
