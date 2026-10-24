@@ -140,8 +140,8 @@ class Lfm2VlVisionModel(Model):
     @override
     def get_additional_compiled_tensors(config: Lfm2VlConfig) -> dict:
         return (
-            config.stc.list_tensors(prefix = "model.vision_tower.") |
-            config.stc.list_tensors(prefix = "model.multi_modal_projector.")
+            config.stc.list_tensors(prefix = "model.vision_tower") |
+            config.stc.list_tensors(prefix = "model.multi_modal_projector")
         )
 
     def __init__(

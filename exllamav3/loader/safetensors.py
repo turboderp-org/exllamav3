@@ -561,6 +561,9 @@ class SafetensorsCollection:
         only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None
+        # The prefix names a module ("vision_model"); with a trailing separator the trie lookup below
+        # would ask for "vision_model.." and silently match nothing (the pre-trie search accepted both)
+        prefix = prefix.rstrip(".")
         if prefix in self.tensor_file_map:
             keys = [prefix]
         else:
@@ -1182,6 +1185,7 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
+        prefix = prefix.rstrip(".")
         if prefix in self.main.tensor_file_map:
             keys = [prefix]
         else:
