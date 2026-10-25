@@ -75,6 +75,8 @@ def measure(generator, tokenizer, sampler, max_new_tokens, stats_sink = None):
         while generator.num_remaining_jobs():
             results = generator.iterate()
             for result in results:
+                if result["stage"] == "error":
+                    raise result["error"]
                 if result["stage"] == "prefill":
                     curr_progress = result["curr_progress"]
                     max_progress = result["max_progress"]
