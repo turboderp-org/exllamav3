@@ -921,6 +921,7 @@ def _paged_attn_decode_split_kernel(
     HAS_SINKS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FIXED_SPLITS: tl.constexpr = False,
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
     kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
@@ -952,7 +953,7 @@ def _paged_attn_decode_split_kernel(
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
     q_abs = total_k_len - q_len + row_q
 
-    if WINDOW_LEFT >= 0:
+    if WINDOW_LEFT >= 0 and not FIXED_SPLITS:
         # Sliding-window layers only need keys >= (first query position - window): split that range, not the whole
         # sequence, across the programs. Splitting the sequence and skipping the tiles below the window leaves the
         # window to the one or two splits that cover it (10x slower at 64K than at 16K for a 2048 window). The
@@ -1186,10 +1187,19 @@ def paged_attn_triton_decode(
     n_kv_heads_override: int | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    split_size: int | None = None,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
-    second pass. GQA sibling q heads share K/V tiles within a program."""
+    second pass. GQA sibling q heads share K/V tiles within a program.
+
+    split_size optionally fixes the KV partition length in tokens, including for sliding
+    windows, instead of adapting it to the launch shape or window span. It must be a
+    positive multiple of every KV tile candidate and is exclusive with num_splits.
+    Validation precedes cached tile selection, so cache history cannot change admission.
+    For page-rebased caches, use a length that divides the rebase distance (e.g. page_size)
+    to keep the same keys grouped together. This does not normalize multi-token queries.
+    """
     _check_tensor("q", q)
     _check_tensor("block_table", block_table, None)
     _check_tensor("cache_seqlens", cache_seqlens, None)
@@ -1253,6 +1263,11 @@ def paged_attn_triton_decode(
     if num_stages is None:
         num_stages = cfg_stages
     candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
+    if split_size is not None:
+        if type(split_size) is not int or split_size <= 0 or any(split_size % bn for bn in candidates):
+            raise ValueError("split_size must be a positive multiple of every KV tile candidate")
+        if num_splits is not None:
+            raise ValueError("split_size and num_splits are mutually exclusive")
 
     group_size = n_q_heads // n_kv_heads
     block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
@@ -1273,10 +1288,18 @@ def paged_attn_triton_decode(
 
     def prepare(block_n):
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""
-        splits = num_splits
-        if splits is None:
-            splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
-        split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
+        if split_size is not None:
+            if type(split_size) is not int or split_size <= 0 or split_size % block_n:
+                raise ValueError("split_size must be a positive multiple of block_n")
+            if num_splits is not None:
+                raise ValueError("split_size and num_splits are mutually exclusive")
+            split_len = split_size
+            splits = max(1, triton.cdiv(max_k_len, split_len))
+        else:
+            splits = num_splits
+            if splits is None:
+                splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
+            split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
         if splits > 1:
             partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
             partial_ml = torch.empty(programs * splits * block_rows * 2, dtype = torch.float32, device = q.device)
@@ -1290,13 +1313,15 @@ def paged_attn_triton_decode(
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_rows, block_n,
+            splits == 1, has_sinks, block_rows, block_n, split_size is not None,
         )
         return args, splits, partial_o, partial_ml
 
     with torch.cuda.device(q.device):
         pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_rows, h_blocks, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
+        if split_size is not None:
+            pick_key += (True,)
         block_n = pick_config(
             q.device, "paged_attn_decode", pick_key, candidates,
             lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
