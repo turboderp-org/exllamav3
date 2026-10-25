@@ -111,6 +111,7 @@ def main(args):
         draft_model = draft_model,
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
+        sparse_draft_head = args.sparse_draft_head,
     )
 
     # Load the image component model

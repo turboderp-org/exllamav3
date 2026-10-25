@@ -75,6 +75,8 @@ def measure(generator, tokenizer, sampler, max_new_tokens, stats_sink = None):
         while generator.num_remaining_jobs():
             results = generator.iterate()
             for result in results:
+                if result["stage"] == "error":
+                    raise result["error"]
                 if result["stage"] == "prefill":
                     curr_progress = result["curr_progress"]
                     max_progress = result["max_progress"]
@@ -244,6 +246,7 @@ def main(args):
             draft_cache = draft_cache,
             tokenizer = tokenizer,
             num_draft_tokens = args.num_draft_tokens,
+            sparse_draft_head = getattr(args, 'sparse_draft_head', 0),
             hybrid_draft_tokens = args.hybrid_draft_tokens,
             draft_confidence = args.draft_confidence,
             dynamic_draft_tokens = args.dynamic_draft,
@@ -251,6 +254,11 @@ def main(args):
             max_chunk_size = args.chunk_size,
         )
         result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
+        if generator.sparse_head is not None:
+            st = generator.sparse_head.stats()
+            print(f" -- sparse draft head: {st['active']} columns, mode sparse {st['mode_sparse']} ({st['mode_switches']} switches), "
+                  f"miss rate {st['miss_rate'] * 100:.2f}% (break-even {(st['breakeven_miss_rate'] or 0) * 100:.2f}%), "
+                  f"rounds {st['rounds']}, probes {st['probes']} ({st['probe_disagree_inside']} inside / {st['probe_disagree_outside']} outside)")
         if args.temperature:
             result_draft_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
 

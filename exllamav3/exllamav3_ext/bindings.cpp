@@ -14,6 +14,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "sparse_head.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
@@ -58,6 +59,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
@@ -114,6 +116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
+    m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_group", &routing_ds3_group, "routing_ds3_group");
@@ -321,6 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"

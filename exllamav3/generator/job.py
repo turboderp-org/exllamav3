@@ -278,6 +278,7 @@ class Job:
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
+        self.sparse_head_seeded = False
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -1586,12 +1587,15 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                if self.generator.mtp_draft:
+                dm = self.generator.draft_model
+                if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
                 else:
+                    # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
+                    # through that layer)
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:

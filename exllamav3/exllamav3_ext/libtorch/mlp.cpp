@@ -22,16 +22,10 @@ void BC_GatedMLP::run_bszN_gr
     // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
     // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
     // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
-    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
-    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
-    at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
-    if (!guh_n_ref.defined())
-        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
-    at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
-    if (!gu_n_ref.defined())
-        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
-    at::Tensor guh_n     = guh_n_ref;
-    at::Tensor gu_n      = gu_n_ref;
+    // use exactly-shaped views instead (a/down_xh have no such issue: their slot dim is size 1,
+    // so slicing the token dim -- the true leading dim there -- stays contiguous)
+    at::Tensor guh_n     = slot_pair_view(guh, num_tokens);
+    at::Tensor gu_n      = slot_pair_view(gu, num_tokens);
     at::Tensor a_n       = a.slice(1, 0, num_tokens);
     at::Tensor down_xh_n = down_xh.slice(1, 0, num_tokens);
 
@@ -126,7 +120,7 @@ void BC_GatedMLP::run_bszN
         }
         else
         {
-            at::Tensor gu_n = gu_cache[num_tokens - 1];
+            at::Tensor gu_n = slot_pair_view(gu, num_tokens);
             // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection

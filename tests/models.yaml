@@ -46,6 +46,17 @@ models:
     path: qwen3.8-27b-dflash2/exl3/4.00bpw
     tags: [draft, dflash, swa]
 
+  # Gemma4 assistant drafter: a separate checkpoint that attends over the target's K/V cache
+  gemma4-assistant-target:
+    path: gemma4-31b-it/exl3/4.00bpw_mul1
+    tags: [gemma4-assistant]    # a role for the assistant cases only
+    draft: gemma4-assistant
+    vram: 24
+
+  gemma4-assistant:
+    path: gemma4-31b-it-assistant/hf
+    tags: [draft, mtp]
+
   moe:
     path: qwen3-30b-a3b/exl3/4.0bpw
     tags: [moe, attention]

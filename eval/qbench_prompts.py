@@ -376,6 +376,7 @@ def main(args):
         draft_model = draft_model,
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
+        sparse_draft_head = getattr(args, 'sparse_draft_head', 0),
         ngram_match_min = args.ngram_match_min,
         ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
