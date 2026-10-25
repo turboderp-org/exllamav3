@@ -258,7 +258,9 @@ class Embedding(Module):
             if isinstance(self.embedding, TableEmbedding):
                 x = self.embedding.forward(x, bool(params.get("pinned_staging")))
             else:
-                x = self.embedding.forward(x)
+                # Drafting loops hand over device-resident ids; a CPU-resident table gathers on the host
+                w_dev = self.embedding.weight.device
+                x = self.embedding.forward(x if x.device == w_dev else x.to(w_dev))
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)

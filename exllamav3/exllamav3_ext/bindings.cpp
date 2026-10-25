@@ -59,6 +59,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
@@ -323,6 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"

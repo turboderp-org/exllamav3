@@ -440,7 +440,10 @@ class Generator:
         self._sparse_flag = False
         if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
             from ..modules.sparse_head import token_stats_path
-            lm = model.modules[model.logit_layer_idx]
+            # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
+            # target's head and the subset mirrors it
+            own = getattr(self.draft_model, "sparse_head_linear", None)
+            lm = own() if own is not None else model.modules[model.logit_layer_idx]
             self.sparse_head = lm.make_sparse_head(
                 sparse_draft_head,
                 model.config.vocab_size,
@@ -1221,16 +1224,28 @@ class Generator:
         draft_cols = []
         draft_emb = None
         embed_device = self.model.modules[0].device
+        # A drafter without K/V of its own reads the target's cache (and window rings) at the K/V position
+        # of the round; its query position stays at the last accepted token for every step, as the
+        # reference implementation drafts
+        target_kv = self.draft_model.caps.get("draft_uses_target_cache", False)
+        if target_kv:
+            kv_seqlens = cache_seqlens.clone()
+            target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
+                if self.target_recurrent else None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens,
+                "cache": self.cache if target_kv else self.draft_cache,
+                "cache_seqlens": kv_seqlens if target_kv else cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
                 "sparse_head": self._sparse_flag,
             }
+            if target_kv:
+                params["positions"] = kv_seqlens
+                if target_states is not None:
+                    params["source_recurrent_states"] = target_states
             if cal is not None:
                 params["export_draft_conf"] = True
             if draft_emb is not None:
@@ -1245,7 +1260,8 @@ class Generator:
             # which wants the ids on its own device (a host round trip for a CPU-resident table, as before)
             batch_ids = new_ids if draft_emb is not None else to_device(new_ids, embed_device)
             cache_seqlens += 1
-            temp_hidden = batch_state
+            # Drafters that re-project their state for the next step hand it back through params
+            temp_hidden = params["next_target_hidden"] if "next_target_hidden" in params else batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
                 c = draft_conf.float().cpu()

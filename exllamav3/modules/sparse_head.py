@@ -103,9 +103,10 @@ class SparseHead:
         :param profile_path:
             File the counts are restored from and saved to (None: no persistence)
         :param embedding:
-            The model's Embedding module. When given, the subset's embedding rows are mirrored on the head's
-            device and the argmax hands back the winning token's embedding, so an MTP drafting loop never has
-            to round-trip ids through the host for the next step's lookup
+            The Embedding module the drafting loop would look the next token up in (the target's). When given,
+            the subset's embedding rows are mirrored on the head's device and the argmax hands back the winning
+            token's embedding, so an MTP drafting loop never has to round-trip ids through the host for the
+            next step's lookup. Its width may differ from the head's input width
         """
         self.linear = linear
         self.device = linear.device
@@ -128,7 +129,8 @@ class SparseHead:
         self.member = torch.full((vocab_size,), -1, dtype = torch.long, device = dev)
         bias = linear.inner.get_bias_tensor() if hasattr(linear.inner, "get_bias_tensor") else None
         self.full_bias = bias
-        self.embedding = embedding if embedding is not None and getattr(embedding, "hidden_size", None) == self.k else None
+        self.embedding = embedding if embedding is not None and getattr(embedding, "hidden_size", None) else None
+        self.emb_dim = self.embedding.hidden_size if self.embedding is not None else 0
         self.n_alloc = 0
         self.weight = None
         self.bias = None
@@ -200,7 +202,7 @@ class SparseHead:
                 bias[:self.n_alloc] = self.bias
             self.bias = bias
         if self.embedding is not None:
-            rows = torch.zeros((n_alloc, self.k), dtype = torch.half, device = self.device)
+            rows = torch.zeros((n_alloc, self.emb_dim), dtype = torch.half, device = self.device)
             if self.emb_rows is not None:
                 rows[:self.n_alloc] = self.emb_rows
             self.emb_rows = rows
@@ -380,7 +382,7 @@ class SparseHead:
             # The module's own forward, so scaling and normalization come along; ids go through the host as
             # the table lookup requires, once per installed column
             rows = self.embedding.forward(ids.cpu().view(1, -1), {}, out_dtype = torch.half)
-            self.emb_rows[slots] = rows.view(-1, self.k).to(self.device)
+            self.emb_rows[slots] = rows.view(-1, self.emb_dim).to(self.device)
         self.n_active = max(self.n_active, top)
         self.swapped += ids.numel()
 
@@ -517,7 +519,7 @@ class SparseHead:
             x = x.contiguous()
             ids = torch.empty((m,), dtype = torch.long, device = self.device)
             conf = torch.empty((m,), dtype = torch.float, device = self.device)
-            emb = torch.empty((m, self.k), dtype = torch.half, device = self.device) if want_emb else None
+            emb = torch.empty((m, self.emb_dim), dtype = torch.half, device = self.device) if want_emb else None
             ext.sparse_head_argmax(
                 x, self.weight, self.bias, self.n_active, self.cols, ids, conf, self._scratch,
                 self.emb_rows if want_emb else None, emb,
@@ -528,7 +530,7 @@ class SparseHead:
             emb = self.emb_rows[idx] if want_emb else None
         ids, conf = ids.view(shape), self._transform(conf).view(shape)
         if embedding:
-            return ids, conf, emb.view(*shape, self.k) if emb is not None else None
+            return ids, conf, emb.view(*shape, self.emb_dim) if emb is not None else None
         return ids, conf
 
 

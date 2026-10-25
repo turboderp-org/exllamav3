@@ -47,6 +47,9 @@ DRAFT_CASES = {
     # longer than the drafter's window in one chunk, so the ring writer drops the chunk's own leading pages
     "dflash2-rings": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-chunk_size", "4096"], REFERENCE_TEXT * 16),
     "dflash2-swa-full": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-swa_full"], REFERENCE_TEXT),
+    # Gemma4 assistant: reads the target's window rings, or its paged sliding layers with -swa_full
+    "gemma4-assistant": ("gemma4-assistant-target", lambda dirs: ["-dm", dirs["gemma4-assistant"]], REFERENCE_TEXT),
+    "gemma4-assistant-swa-full": ("gemma4-assistant-target", lambda dirs: ["-dm", dirs["gemma4-assistant"], "-swa_full"], REFERENCE_TEXT),
 }
 LONG_PROMPT_CASES = {"dflash2-rings"}
 EXTRA_MODELS = {"ar-recurrent": ["recurrent"]}
@@ -86,7 +89,7 @@ def test_drafting_is_lossless(case, model_registry, device):
     assert_greedy_equivalent(ref_tokens, ref_logits, tokens, NEAR_TIE, tag = case)
 
 
-@pytest.mark.parametrize("case", ["mtp", "dflash", "dflash2-swa-full"])
+@pytest.mark.parametrize("case", ["mtp", "dflash", "dflash2-swa-full", "gemma4-assistant"])
 @torch.inference_mode()
 def test_sparse_head_drafting_is_lossless(case, model_registry, device):
     """
