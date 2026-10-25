@@ -2,6 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import copy
 import json
 
 import torch
@@ -302,6 +303,165 @@ TOOL_USER_FOLLOWUPS_ZH = [
     None,
 ]
 
+# --domain literature: close reading, criticism and writing in verse and prose (no tools)
+CONVERSATIONS_LIT = [
+    ("Give a close reading of Shelley's \"Ozymandias\": how the nested narrators (the speaker, the "
+     "traveller, the sculptor, the king) frame its irony, and what the sonnet form contributes.",
+     ["Compare it with Horace Smith's sonnet on the same subject, written in the same contest. Why "
+      "is Shelley's the one that lasted?",
+      "Write your own Petrarchan sonnet on a ruined modern monument, then annotate its rhyme scheme "
+      "and the volta."]),
+    ("Emily Dickinson's dashes and slant rhymes are often called unconventional. Using \"Because I "
+     "could not stop for Death\" and \"I heard a Fly buzz – when I died\", explain what they do "
+     "that conventional punctuation and full rhyme could not.",
+     ["How did her early editors 'correct' these poems, and what was lost in the process?",
+      "Write three short poems in her manner about modern objects: a phone, a parking lot, a "
+      "smoke alarm."]),
+    ("Explain the difference between free verse, blank verse and accentual verse, with a short "
+     "example passage of each that you write yourself, scanned to show the stresses.",
+     ["Now scan the opening four lines of Milton's Paradise Lost and point out every place where "
+      "the iambic pentameter is varied.",
+      "Rewrite your free-verse example as a villanelle, keeping its central image."]),
+    ("Discuss the narrative voice in Moby-Dick: how reliable is Ishmael, why does he sometimes "
+     "narrate scenes he cannot have witnessed, and what do the cetology chapters do for the novel?",
+     ["Contrast Ahab's speeches with Ishmael's narration. Where does Melville borrow from "
+      "Shakespeare, and to what effect?",
+      "Write a 300-word scene in Melville's style in which Starbuck confronts Ahab one last time."]),
+    ("Trace the development of the haiku from the hokku of renga through Bashō, Buson and Issa to "
+     "Shiki's reforms, and explain the roles of the kigo and the kireji.",
+     ["Why is the 5-7-5 syllable count a poor fit for English, and what do English-language haiku "
+      "poets do instead?",
+      "Compose a sequence of six haiku following one day in late autumn, with a note on each "
+      "seasonal word."]),
+    ("Compare the endings of Austen's Persuasion and Pride and Prejudice: how does each novel "
+     "bring its lovers to an understanding, and what does the difference say about Austen's "
+     "development as a writer?",
+     ["Austen famously uses free indirect discourse. Pick a passage you remember and show how "
+      "it works line by line.",
+      "Write a letter from Anne Elliot to her sister Mary, in period style, about Captain "
+      "Wentworth's return."]),
+    ("What makes Borges's \"The Garden of Forking Paths\" both a spy story and a philosophical "
+     "essay? Walk through how the labyrinth metaphor operates on each level.",
+     ["Relate the story to his other labyrinths: \"The Library of Babel\" and \"The House of "
+      "Asterion\".",
+      "Write a 250-word Borgesian fable about an infinite archive of unsent letters."]),
+    ("Analyze T. S. Eliot's \"The Love Song of J. Alfred Prufrock\": the epigraph from Dante, the "
+     "fragmented imagery, the refrains, and why the poem is considered a turning point for "
+     "modernist verse.",
+     ["How does Eliot's \"objective correlative\" from his Hamlet essay help explain Prufrock's "
+      "technique?",
+      "Write a dramatic monologue in which Prufrock, now old, revisits the same streets."]),
+    ("Compare three English translations of the opening of Homer's Odyssey (Chapman, Pope, and "
+     "a modern one such as Fagles or Wilson) from memory as best you can, and discuss what each "
+     "translator prioritizes.",
+     ["Emily Wilson rendered polytropos as 'complicated'. Defend and criticize that choice.",
+      "Translate the same opening yourself into unrhymed English hexameters and explain your "
+      "compromises."]),
+    ("Discuss the role of the unreliable narrator in Kazuo Ishiguro's The Remains of the Day: how "
+     "does Stevens reveal what he refuses to say, and how does the novel's structure as a road "
+     "trip support that?",
+     ["Compare Stevens with the narrator of Ford Madox Ford's The Good Soldier.",
+      "Write the diary entry Miss Kenton might have written the evening after their final meeting "
+      "at the bus stop."]),
+]
+
+
+def longctx_conversations():
+    """--domain longctx: long documents (fiction, technical documentation, source code) as the
+    first user turn, followed by questions that need the whole document. Excerpts are cut at
+    paragraph boundaries to about 30k characters"""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def excerpt(paths, start = 0, chars = 30000):
+        text = ""
+        for path in paths.split("+"):
+            with open(os.path.join(root, path), "r", encoding = "utf-8") as f:
+                text += f.read() + "\n\n"
+        a = text.find("\n\n", start) + 2 if start else 0
+        b = text.rfind("\n\n", a, a + chars)
+        return text[a:b if b > a else a + chars].strip()
+
+    fiction = [
+        "Summarize this excerpt scene by scene, naming every character who appears in each scene.",
+        "Trace how the relationship between the two most important characters changes over the "
+        "excerpt, quoting the passages where it turns.",
+        "Which details early in the excerpt pay off later? List them with both the setup and the "
+        "payoff.",
+    ]
+    technical = [
+        "Summarize this document section by section, and explain who it is written for.",
+        "List every configuration option, flag or environment variable mentioned, with what it "
+        "does in one line each.",
+        "Where is the document unclear, inconsistent or likely out of date? Point to the exact "
+        "passages and propose corrected wording.",
+    ]
+    code = [
+        "Explain what this code does, module by module and function by function, and how the "
+        "pieces fit together.",
+        "Find the three places most likely to hide a bug or an edge case the code doesn't handle, "
+        "and explain the failure in each.",
+        "Write docstrings for the five most important functions that currently lack a complete "
+        "one, matching the existing style.",
+    ]
+    docs = [
+        ("an excerpt from a work of fiction", "eval/eval_texts/pride_prejudice_mod.txt", 0, fiction),
+        ("an excerpt from a work of fiction", "eval/eval_texts/pride_prejudice_mod.txt", 330000, fiction),
+        ("an excerpt from a work of fiction", "eval/eval_texts/variable_man_mod.txt", 0, fiction),
+        ("an excerpt from a work of fiction", "eval/eval_texts/variable_man_mod.txt", 70000, fiction),
+        ("an excerpt from a work of fiction", "eval/eval_texts/illustrious_client.txt", 0, fiction),
+        ("a technical document", "doc/env_vars.md", 0, technical),
+        ("a technical document", "README.md+doc/convert.md", 0, technical),
+        ("a source file", "exllamav3/tokenizer/tokenizer.py", 0, code),
+    ]
+    convs = []
+    for kind, path, start, questions in docs:
+        doc = excerpt(path, start)
+        seed = f"Here is {kind}:\n\n```\n{doc}\n```\n\n{questions[0]}"
+        convs.append((seed, questions[1:]))
+    return convs
+
+
+def conversations_for_domain(domain: str, lang: str):
+    """(base conversations, tool conversations) for --domain and --lang"""
+    if domain == "general":
+        return conversations_for_lang(lang)
+    assert lang == "en", "--lang zh is only available for --domain general"
+    if domain == "literature":
+        return CONVERSATIONS_LIT, []
+    if domain == "tools":
+        return [], TOOL_CONVERSATIONS
+    assert domain == "longctx", domain
+    return longctx_conversations(), []
+
+
+# --domain tools: besides the scripted tool conversations, real agentic sessions (the spec_decode
+# prompts) cut before each assistant turn whose templated context fits --max_context; the model
+# samples its own next action there
+AGENTIC_TRANSCRIPTS = ["eval/prompts/agentic_code_29.json", "eval/prompts/agentic_curl_16.json"]
+
+def agentic_conversations(tokenizer, template_vars: dict, max_context: int):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    convs = []
+    for path in AGENTIC_TRANSCRIPTS:
+        with open(os.path.join(root, path), "r") as f:
+            data = json.load(f)
+        messages = data["messages"]
+        for msg in messages:
+            for tc in msg.get("tool_calls") or []:
+                func = tc.get("function", {})
+                if isinstance(func.get("arguments"), str):
+                    func["arguments"] = json.loads(func["arguments"])
+        for i, msg in enumerate(messages):
+            if msg["role"] != "assistant" or i < 2:
+                continue
+            ids = tokenizer.hf_chat_template(messages[:i], add_generation_prompt = True,
+                                             tools = data.get("tools"), **template_vars)
+            if ids.shape[-1] > max_context:
+                break
+            last = messages[i - 1]
+            convs.append({"tools": data.get("tools"), "messages": list(messages[:i - 1]),
+                          "turns": [(last["role"], last["content"])], "prefilled": True})
+    return convs
+
 
 def conversations_for_lang(lang: str):
     """(base conversations, tool conversations) for --lang"""
@@ -390,12 +550,14 @@ def main(args):
 
     # Base conversations plus an optional tool-calling portion (~args.tool_frac of the total),
     # interleaved evenly so a small token budget that stops early still samples both kinds
-    CONVS, TOOL_CONVS = conversations_for_lang(args.lang)
+    CONVS, TOOL_CONVS = conversations_for_domain(args.domain, args.lang)
     base = [{"tools": None, "messages": [],
              "turns": [("user", seed)] + [("user", fu) for fu in fus]}
             for seed, fus in CONVS]
     convs = []
-    if args.tool_frac >= 1.0:
+    if not TOOL_CONVS:
+        convs = base
+    elif args.domain == "tools" or args.tool_frac >= 1.0:
         # Tools only
         convs = [{"tools": tools, "messages": [],
                   "turns": [("user", seed)] + list(fus)}
@@ -417,6 +579,10 @@ def main(args):
         convs += tool_convs
     else:
         convs = base
+    if args.domain == "tools":
+        convs += agentic_conversations(tokenizer, TEMPLATE_VARS, args.max_context)
+    # Independent resamples of the whole set (each repeat continues its own conversations)
+    convs = [copy.deepcopy(c) for _ in range(args.repeats) for c in convs]
 
     rows = []
     total_in = total_out = 0
@@ -438,7 +604,8 @@ def main(args):
                 # Scripted tool result: only meaningful if the previous response actually
                 # contained a tool invocation
                 prev = messages[-1]["content"] if messages else ""
-                if not any(m in prev for m in TOOL_CALL_MARKERS):
+                prefilled = conv.get("prefilled") and t_idx == 0
+                if not prefilled and not any(m in prev for m in TOOL_CALL_MARKERS):
                     continue
                 messages.append({"role": "tool", "content": content})
             else:
@@ -525,5 +692,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 4096, help = "Per-turn generation cap")
     parser.add_argument("--tool_frac", type = float, default = 0.3, help = "Approximate fraction of conversations that define tools and elicit tool calls, default: 0.3; 0 disables")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
+    parser.add_argument("--domain", type = str, default = "general", choices = ["general", "literature", "longctx", "tools"], help = "Conversation set: general (default; mixed reasoning tasks plus --tool_frac tool calls), literature (poetry and literary criticism, no tools), longctx (questions over long documents, no tools), tools (scripted tool conversations plus agentic-session cut points up to --max_context)")
+    parser.add_argument("--max_context", type = int, default = 12288, help = "--domain tools: longest templated context of an agentic cut point, default: 12288")
+    parser.add_argument("--repeats", type = int, default = 1, help = "Sample the whole conversation set this many times (independent samples per repeat), default: 1")
     parser.add_argument("--lang", type = str, default = "en", choices = ["en", "zh"], help = "Language of the user turns: en (default) or zh (same conversations in Chinese; tool specs/results stay English)")
     main(parser.parse_args())
