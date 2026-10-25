@@ -612,3 +612,63 @@ def test_prune_keeps_the_last_checkpoint_of_each_chain(device, tmp_path):
     assert disk.has_state(phash(41))
     disk.close()
     tier.close()
+
+
+def test_make_room_terminates_when_only_anchored_checkpoints_remain(device, tmp_path):
+    # A checkpoint whose page is in the CPU tier but not on disk is not in any chain the order walks; with no
+    # budget left it must still be evictable, and _make_room must return instead of spinning
+    tier, disk, tensor = build(4, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    stashed = {"position": 256, "checkpoint_size": 64, "x": torch.ones(16)}
+    assert disk.write_state(phash(1), stashed)
+    disk.flush()
+    with disk._lock:
+        disk._drop("page", phash(1))          # page leaves the disk, stays in the CPU tier: the state is anchored there
+    disk.flush()
+    assert disk.has_state(phash(1)) and not disk.has_page(phash(1))
+    disk.max_size = 0
+    with disk._lock:
+        fits = disk._make_room(1)
+    assert not fits
+    disk.flush()
+    assert disk.total_size == 0 and not disk.has_state(phash(1))
+    disk.close()
+    tier.close()
+
+
+def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device, tmp_path):
+    # Directory A is in use (its tier is open) and holds a chain of four. B opens with a root budget that
+    # leaves it no share; its writes make room by taking A's least recently used leaf pages, tail first, and
+    # A's owner finds the taken page gone on its next read
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    prev = None
+    for tag in range(1, 5):
+        tier_a.store(page(tag, tag, prev), serial = tag)
+        prev = phash(tag)
+    disk_a.flush()
+    page_bytes = disk_a.image_size + 512
+    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes
+    root = DiskPageCache._dir_size(disk_a.dir) + page_bytes // 2
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
+    assert os.path.isdir(disk_a.dir) and 0 <= disk_b.max_size < page_bytes
+    tier_b.store(page(11, 11 % NUM_PAGES), serial = 11)             # skipped for the budget: the reclaim is queued
+    disk_b.flush()                                                  # the reclaim has run
+    assert disk_b.metrics.get("skipped_budget", 0) == 1 and not disk_b.has_page(phash(11))
+    assert disk_b.metrics.get("pages_reclaimed", 0) >= 1
+    assert disk_b.max_size >= page_bytes
+    tier_b.store(page(12, 12 % NUM_PAGES), serial = 12)
+    disk_b.flush()
+    assert disk_b.has_page(phash(12))
+    # A lost its tail, never its root; the files and the index rows went together
+    assert not os.path.exists(disk_a._page_path(phash(4)))
+    assert os.path.exists(disk_a._page_path(phash(1)))
+    assert disk_a.has_page(phash(4))                                # A's mirror has not noticed yet
+    assert disk_a.read_page_into(phash(4), None) is None            # ... and drops it when the read misses
+    assert not disk_a.has_page(phash(4))
+    disk_b.close(); tier_b.close()
+    disk_a.close(); tier_a.close()
+    # Reopened, A's index agrees with its files
+    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
+    disk_a2.close(); tier_a2.close()
