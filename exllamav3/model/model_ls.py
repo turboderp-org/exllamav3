@@ -84,6 +84,7 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        export_state_layers: set[int] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -94,6 +95,10 @@ class Model_LSMixin(ABC):
         # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
         # compute (CPU-offloaded experts) can skip the host work when they see this flag
         params["autosplit_measure"] = True
+        # Layers a draft model taps: their exported states accumulate in params over the measuring
+        # forwards, so each stays allocated on its device as it does through a real forward
+        if export_state_layers:
+            params["export_state_layers"] = set(export_state_layers)
 
         # Simulate cached/recurrent path while loading with cache
         cl = [m for m in self if m.caps.get("kv_cache")]
@@ -175,6 +180,8 @@ class Model_LSMixin(ABC):
                         else:
                             backup_shape = dummy_state.shape
                             backup_dtype = dummy_state.dtype
+
+                        num_exports = len(params.get("export_states") or [])
 
                         # Load module
                         defer = module.can_defer_load()
@@ -291,6 +298,9 @@ class Model_LSMixin(ABC):
                     if fail:
                         module.unload()
                         dummy_state = None
+                        # States the failed attempt exported belong to the module now retried elsewhere
+                        if params.get("export_states"):
+                            del params["export_states"][num_exports:]
                         if "recurrent_states" in params:
                             for rs in params["recurrent_states"]:
                                 rs.reset()

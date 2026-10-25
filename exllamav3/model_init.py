@@ -400,6 +400,7 @@ def init(
         max_batch_size = args.autosplit_max_batch_size,
         autosplit_no_forward = args.autosplit_no_forward,
         max_chunk_size = args.chunk_size,
+        draft_model = draft_model,
         **kwargs
     )
 
