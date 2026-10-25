@@ -1,7 +1,7 @@
 import os
 
 import torch
-from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config
+from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config, gfx_arch
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -42,6 +42,10 @@ while building the path raise.
 """
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
+
+# RDNA3 (gfx11): HIP flash-decoding split kernels (rocm/rdna3_attn.cu) in place of the Triton split kernel
+# for the plain causal full-attention case; EXL3_RDNA3_ATTN=0 keeps Triton
+_rdna3_attn_enable = os.environ.get("EXL3_RDNA3_ATTN", "1") != "0"
 
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
@@ -352,8 +356,26 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
-                                  pointer_range_32 = self._pointer_range_32())
+        k_split = None
+        if ROCM and _rdna3_attn_enable and getattr(ext, "HAS_RDNA3_ATTN", False) and gfx_arch(dev).startswith("gfx11"):
+            # Same arguments and partial layout as the Triton kernel, so the Triton combine reduces its
+            # output. Covers causal full attention, no softcap / sinks, q_len <= 16, head_dim 128 / 256,
+            # fp16 or 8-bit K and V, softmax scale 1/sqrt(head_dim); reads the kv range in 32-token tiles
+            kb, vb = (self.k_bits, self.v_bits) if self.quant else (0, 0)
+            if (
+                causal and window_left < 0 and window_right < 0 and not self.softcap and
+                self.sinks is None and q_len <= 16 and hd in (128, 256) and hd_pad == hd and
+                self.v_head_dim == hd and kb == vb and kb in (0, 8) and
+                abs(float(self.sm_scale) - hd ** -0.5) < 1e-6
+            ):
+                k_split = ext.rdna3_attn_split_kernel(kb, hd, q_len, kvh, group_size)
+            if k_split is not None:
+                # 32-token tiles, 16 kv splits per CU, at most 128 per program
+                block_n = 32
+                splits_cap = max(1, min(16 * _get_sm_count(dev) // programs, 128))
+        if k_split is None:
+            k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
+                                      pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
