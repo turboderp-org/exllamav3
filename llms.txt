@@ -1,0 +1,12 @@
+# exllamav3
+
+> A Python inference library for running local LLMs on modern consumer GPUs, with EXL3 quantization, parallel inference, CPU offloading, and an OpenAI-compatible API via TabbyAPI.
+
+Requires PyTorch 2.6.0+ with CUDA 12.4 or later; install via prebuilt wheels from the releases page, from PyPI (needs CUDA toolkit and build tools), or build from source with uv or pip. Windows additionally requires the triton-windows package. Models are converted to EXL3 format with convert.py, and example scripts demonstrate the backend and generator.
+
+## Docs
+
+- [exllamav3 README](README.md): Overview of ExLlamaV3 features, supported models, installation methods, quantization, and the TabbyAPI server.
+- [Convert](doc/convert.md): Reference of convert.py arguments for EXL3 conversion: directories, shard size, bits, head and MTP bits.
+- [Environment variables](doc/env_vars.md): Runtime and build-time environment variables for attention, debugging and platform workarounds, with defaults and behavior notes.
+- [Optimized quantization recipes](doc/optimize.md): Experimental pipeline for per-tensor bitrate recipes and in-domain calibration data, with rationale and runtime estimates.
