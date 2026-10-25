@@ -310,6 +310,11 @@ class SparseHead:
         for weight, parts in by_weight.items():
             ids = torch.cat(parts) if len(parts) > 1 else parts[0]
             ids = ids.to(self.device, non_blocking = False)
+            # Only vocabulary ids count: a sequence also carries multimodal embedding indices (far past the
+            # vocabulary) and may carry padding, neither of which the head can draft
+            ids = ids[(ids >= 0) & (ids < self.vocab_size)]
+            if ids.numel() == 0:
+                continue
             if populated and weight >= 1.0:
                 self._interval_ids.append(ids)
             self.counts.index_add_(0, ids, torch.full(ids.shape, weight, dtype = torch.float, device = self.device))
