@@ -1191,35 +1191,45 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert. With few enough total assignments no
-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                # Count how many assignments per expert without a host sync (torch.bincount syncs to size its
+                # output). A token picks each expert at most once, so with no more rows than the fused
+                # kernel's row capacity no expert can exceed it: the counts stay on the device and everything
+                # is fused, which keeps the GPU fed through decode-sized batches. Larger batches read the
+                # counts back to plan the tiers (one sync per layer), with the planning vectorized so the gap
+                # between the readback and the launches stays short
+                A = flat_expert_local.shape[0]
+                expert_count = torch.zeros((E + 1,), dtype = torch.long, device = y.device)
+                expert_count.scatter_add_(0, flat_expert_local, torch.ones_like(flat_expert_local))
+                fused_ok = self.fused_mode_buffers is not None
+                if fused_ok and num_tokens <= self.fused_rows:
                     expert_count_list = None
+                    cnt = None
                 else:
-                    expert_count_list = expert_count.tolist()
-
-                # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
-                # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
+                    cnt = expert_count.cpu().numpy()
+                    expert_count_list = cnt.tolist()
+                # Tier plan: fused kernel for experts up to self.fused_rows rows, batched reconstruct groups
+                # above that up to the tile cap, per-expert reconstruct beyond
                 recon = None
                 groups = []
                 min_rows = 0
+                fmask = None
                 if expert_count_list is None:
                     fused_total = num_tokens * top_k
                 else:
+                    import numpy as np
+                    cf = cnt[:num_ex]
                     fused_total = 0
-                    if self.fused_mode_buffers is not None:
+                    if fused_ok:
                         min_rows = self.fused_rows
-                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
+                        fmask = (cf > 0) & (cf <= self.fused_rows)
+                        fused_total = int(cf[fmask].sum())
                     recon = self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
-                        heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
+                        heavy = np.nonzero((cf > lim) & (cf <= recon.max_rows))[0].tolist()
                         if heavy:
                             from .moe_batch_recon import plan_groups
                             groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
-
                 # Deterministic accumulation (FUSED_DET): every assignment of the fused and
                 # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
                 # weighted by the kernel; batched experts: their group's padded row count each,
@@ -1231,7 +1241,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # what the atomic index_add_ path moved
                 scratch = tables = inv_order = None
                 if FUSED_DET and (fused_total or groups):
-                    A = flat_expert_local.shape[0]
                     inv_order = torch.empty_like(order).scatter_(
                         0, order, torch.arange(A, device = order.device))
                     if expert_count_list is None:
@@ -1242,17 +1251,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
                         n_slots = fused_total
                     else:
-                        import numpy as np
                         E1 = len(expert_count_list)
                         base = np.zeros(E1, dtype = np.int64)
                         kind = np.zeros(E1, dtype = np.int64)
-                        starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
+                        starts_np = np.concatenate(([0], np.cumsum(cnt[:-1]))).astype(np.int64)
                         n_slots = 0
-                        if self.fused_mode_buffers is not None:
-                            for e in range(num_ex):
-                                c = expert_count_list[e]
-                                if 0 < c <= self.fused_rows:
-                                    base[e] = n_slots; kind[e] = 1; n_slots += c
+                        if fused_ok:
+                            # Fused experts take count rows each, in expert order
+                            fc = np.where(fmask, cf, 0)
+                            base[:num_ex] = np.cumsum(fc) - fc
+                            kind[:num_ex] = fmask.astype(np.int64)
+                            n_slots = fused_total
                         for grp in groups:
                             cmax = max(expert_count_list[e] for e in grp)
                             for b, e in enumerate(grp):
@@ -1260,7 +1269,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             n_slots += len(grp) * cmax
                         tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
-
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
@@ -1299,18 +1307,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         scratch, tables[0] if tables is not None else None,
                         count_lo, count_hi, m_tile
                     )
-
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
-                if self.fused_mode_buffers is not None:
+                if fused_ok:
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
-                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
-                        t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
-                        t2 = sum(1 for c in counts if c > MTILE_T2)
+                        cfm = cf[fmask]
+                        t1 = int(((cfm > MTILE_T1) & (cfm <= MTILE_T2)).sum())
+                        t2 = int((cfm > MTILE_T2).sum())
                         if self.mtile_ok and (t1 or t2):
                             # One launch per row tile over its expert range, largest first
-                            t0 = len(counts) - t1 - t2
+                            t0 = int(cfm.shape[0]) - t1 - t2
                             if t2:
                                 run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
                             if t1:
@@ -1318,19 +1325,150 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             if t0:
                                 run_fused(t0, 1, MTILE_T1, 16)
                         else:
-                            run_fused(len(counts))
-
+                            run_fused(int(cfm.shape[0]))
                 # Batched reconstruct tier (into slots when deterministic, else accumulating)
                 batched = ()
                 if groups:
                     batched = self._run_batch_recon(
                         recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                         scratch, tables)
-
                 # One fixed-order gather over every slot
                 if scratch is not None:
                     ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
                                         tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
+                else:
+                    expert_count_list = expert_count.tolist()
+                    # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
+                    # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
+                    recon = None
+                    groups = []
+                    min_rows = 0
+                    if expert_count_list is None:
+                        fused_total = num_tokens * top_k
+                    else:
+                        fused_total = 0
+                        if self.fused_mode_buffers is not None:
+                            min_rows = self.fused_rows
+                            fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
+                        recon = self._batch_recon_layer(y)
+                        if recon is not None:
+                            lim = max(min_rows, TEMP_ROWS_GRAPH)
+                            heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
+                            if heavy:
+                                from .moe_batch_recon import plan_groups
+                                groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
+
+                    # Deterministic accumulation (FUSED_DET): every assignment of the fused and
+                    # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
+                    # weighted by the kernel; batched experts: their group's padded row count each,
+                    # unweighted) and one exl3_moe_gather per layer sums each token's slots in k
+                    # order, so identical inputs give identical outputs. The atomic alternative adds
+                    # contributions in arrival order. Slot tables come from the host-side counts, the
+                    # all-fused fast path builds them on the device. Scratch is prefill-shaped and per
+                    # call. Its traffic (written once by the GEMMs, read once by the gather) matches
+                    # what the atomic index_add_ path moved
+                    scratch = tables = inv_order = None
+                    if FUSED_DET and (fused_total or groups):
+                        A = flat_expert_local.shape[0]
+                        inv_order = torch.empty_like(order).scatter_(
+                            0, order, torch.arange(A, device = order.device))
+                        if expert_count_list is None:
+                            # Row num_ex of expert_count is the sentinel bucket for picks outside this
+                            # module's expert slice (TP shard, CPU split). Its slots are never written,
+                            # so the gather below is restricted to the first num_ex table rows
+                            expert_start = torch.cumsum(expert_count, 0) - expert_count
+                            tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
+                            n_slots = fused_total
+                        else:
+                            import numpy as np
+                            E1 = len(expert_count_list)
+                            base = np.zeros(E1, dtype = np.int64)
+                            kind = np.zeros(E1, dtype = np.int64)
+                            starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
+                            n_slots = 0
+                            if self.fused_mode_buffers is not None:
+                                for e in range(num_ex):
+                                    c = expert_count_list[e]
+                                    if 0 < c <= self.fused_rows:
+                                        base[e] = n_slots; kind[e] = 1; n_slots += c
+                            for grp in groups:
+                                cmax = max(expert_count_list[e] for e in grp)
+                                for b, e in enumerate(grp):
+                                    base[e] = n_slots + b * cmax; kind[e] = 2
+                                n_slots += len(grp) * cmax
+                            tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
+                        scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
+
+                    def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
+                        # Gateless: the up module stands in for the gate pointer tables (the kernel
+                        # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
+                        multi_gate = self.multi_gate if self.gated else self.multi_up
+                        ext.exl3_moe(
+                            y,
+                            final_hidden_states,
+                            expert_count,
+                            token_sorted,
+                            weight_sorted,
+                            self.fused_mode_buffers.temp_state_g,
+                            self.fused_mode_buffers.temp_state_u,
+                            self.fused_mode_buffers.temp_intermediate_g,
+                            self.fused_mode_buffers.temp_intermediate_u,
+                            self.activation_fn_idx,
+                            multi_gate.K,
+                            self.multi_up.K,
+                            self.multi_down.K,
+                            multi_gate.ptrs_trellis,
+                            multi_gate.ptrs_suh,
+                            multi_gate.ptrs_svh,
+                            self.multi_up.ptrs_trellis,
+                            self.multi_up.ptrs_suh,
+                            self.multi_up.ptrs_svh,
+                            self.multi_down.ptrs_trellis,
+                            self.multi_down.ptrs_suh,
+                            self.multi_down.ptrs_svh,
+                            multi_gate.mcg,
+                            multi_gate.mul1,
+                            self.multi_up.mcg,
+                            self.multi_up.mul1,
+                            self.multi_down.mcg,
+                            self.multi_down.mul1,
+                            self.act_limit,
+                            num_active,
+                            scratch, tables[0] if tables is not None else None,
+                            count_lo, count_hi, m_tile
+                        )
+
+                    # num_active -1 = unknown (all fused), kernel launches at max concurrency
+                    if self.fused_mode_buffers is not None:
+                        if expert_count_list is None:
+                            run_fused(-1)
+                        else:
+                            counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                            t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
+                            t2 = sum(1 for c in counts if c > MTILE_T2)
+                            if self.mtile_ok and (t1 or t2):
+                                # One launch per row tile over its expert range, largest first
+                                t0 = len(counts) - t1 - t2
+                                if t2:
+                                    run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                                if t1:
+                                    run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
+                                if t0:
+                                    run_fused(t0, 1, MTILE_T1, 16)
+                            else:
+                                run_fused(len(counts))
+
+                    # Batched reconstruct tier (into slots when deterministic, else accumulating)
+                    batched = ()
+                    if groups:
+                        batched = self._run_batch_recon(
+                            recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
+                            scratch, tables)
+
+                    # One fixed-order gather over every slot
+                    if scratch is not None:
+                        ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
+                                            tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
 
                 out_state = None
                 interm = None
