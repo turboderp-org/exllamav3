@@ -1888,24 +1888,23 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
-            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+            W = batch_logits.shape[1]
+            # Pass 1 over the batch: every job whose positions are independent (see batchable below) launches
+            # its W samplers now, staging the device results in one pinned buffer, (bsz, W); the whole batch
+            # then pays one synchronize instead of one per job, and the per-job walk below is host-only. A
+            # per-job synchronize would drain the GPU sixty times a round at large batch sizes, with the host's
+            # bookkeeping for each job falling into the drained gap
+            staged_jobs = {}
+            pinned_w = getattr(self, "draft_sample_pinned", None)
+            if pinned_w is None or pinned_w.shape[0] < batch_size or pinned_w.shape[1] < W:
+                pinned_w = torch.empty((max(batch_size, 32), max(W, 8)), dtype = torch.long, pin_memory = True)
+                self.draft_sample_pinned = pinned_w
+            any_cuda = False
+            row = 0
+            for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a == b: continue
-                job_logits = batch_logits[a:b, :, :]
-                accepted_length = 1
-                rejected = 0
-                W = batch_logits.shape[1]
-
-                # Positions within a job are independent when no per-position constraint advances between
-                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
-                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
-                # window (token healing, new_tokens < 0, is covered by the last test). Then all samplers
-                # launch up front in serial-loop order (each position's RNG draw is unchanged) and the W
-                # sampled tokens read back through one pinned buffer and one synchronize, as in the
-                # no-draft path, leaving a host-only accept/reject walk. Constrained jobs keep the serial
-                # loop below.
-                # A dormant triggered filter can activate on a token inside the window and constrain the
-                # positions after it, and a pending constrain_output_now injection is consumed one token per
-                # sampled position; both keep the serial loop
+                r = row
+                row += 1
                 batchable = (
                     not _NO_BATCH_READBACK
                     and b - a == 1
@@ -1915,28 +1914,41 @@ class Generator:
                     and not any(f.is_active or f.trigger_token is not None for f in job.filters)
                     and not job.sampler.reqs_past_ids
                 )
-                staged = None
-                if batchable:
-                    rng_state = job.rng.getstate()
-                    staged = []
-                    any_cuda = False
-                    for i in range(W):
-                        token_logits = job_logits[:, i:i + 1, :]
-                        sampled = job.receive_logits(token_logits)
-                        is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
-                        staged.append((sampled, is_cuda))
-                        any_cuda |= is_cuda
-                    if any_cuda:
-                        pinned_w = getattr(self, "draft_sample_pinned", None)
-                        if pinned_w is None or pinned_w.shape[1] < W:
-                            pinned_w = torch.empty((1, max(W, 8)), dtype = torch.long, pin_memory = True)
-                            self.draft_sample_pinned = pinned_w
-                        for i, (sampled, is_cuda) in enumerate(staged):
-                            if is_cuda:
-                                pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
-                                staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
-                        torch.cuda.synchronize(batch_logits.device)
+                if not batchable:
+                    continue
+                job_logits = batch_logits[a:b, :, :]
+                rng_state = job.rng.getstate()
+                staged = []
+                for i in range(W):
+                    sampled = job.receive_logits(job_logits[:, i:i + 1, :])
+                    is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
+                    if is_cuda:
+                        pinned_w[r:r + 1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                        sampled = (pinned_w[r:r + 1, i:i + 1],) + sampled[1:]
+                        any_cuda = True
+                    staged.append((sampled, False))
+                staged_jobs[id(job)] = (staged, rng_state)
+            if any_cuda:
+                torch.cuda.synchronize(batch_logits.device)
+            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                if a == b: continue
+                job_logits = batch_logits[a:b, :, :]
+                accepted_length = 1
+                rejected = 0
 
+                # Positions within a job are independent when no per-position constraint advances between
+                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
+                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
+                # window (token healing, new_tokens < 0, is covered by the last test). Such jobs had their
+                # samplers launched in pass 1 above, in serial-loop order (each position's RNG draw is
+                # unchanged), and read back with the batch; the walk here is host-only. Constrained jobs
+                # take the serial loop: a dormant triggered filter can activate on a token inside the window
+                # and constrain the positions after it, and a pending constrain_output_now injection is
+                # consumed one token per sampled position
+                staged = None
+                st = staged_jobs.get(id(job))
+                if st is not None:
+                    staged, rng_state = st
                 for i in range(W):
                     positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
