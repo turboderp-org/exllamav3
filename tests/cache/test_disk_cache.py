@@ -13,6 +13,7 @@ slot size and something to copy. The fingerprint is overridden so no model is ne
 import errno
 import os
 import shutil
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -652,11 +653,12 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     root = DiskPageCache._dir_size(disk_a.dir) + page_bytes // 2
     tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
     assert os.path.isdir(disk_a.dir) and 0 <= disk_b.max_size < page_bytes
-    tier_b.store(page(11, 11 % NUM_PAGES), serial = 11)             # skipped for the budget: the reclaim is queued
+    # Over B's share but within the reclaim chunk: written, with the reclaim queued behind it
+    tier_b.store(page(11, 11 % NUM_PAGES), serial = 11)
     disk_b.flush()                                                  # the reclaim has run
-    assert disk_b.metrics.get("skipped_budget", 0) == 1 and not disk_b.has_page(phash(11))
+    assert disk_b.metrics.get("skipped_budget", 0) == 0 and disk_b.has_page(phash(11))
     assert disk_b.metrics.get("pages_reclaimed", 0) >= 1
-    assert disk_b.max_size >= page_bytes
+    assert disk_b.max_size >= disk_b.total_size + page_bytes        # back within the root, with room for more
     tier_b.store(page(12, 12 % NUM_PAGES), serial = 12)
     disk_b.flush()
     assert disk_b.has_page(phash(12))
@@ -672,3 +674,101 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
     assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
     disk_a2.close(); tier_a2.close()
+
+
+def _chain(tier, tags, prev = None):
+    for tag in tags:
+        tier.store(page(tag, tag % NUM_PAGES, prev), serial = tag)
+        prev = phash(tag)
+    return prev
+
+
+def test_new_directory_takes_the_siblings_older_space_before_its_own(device, tmp_path):
+    # A holds a chain of four from earlier. B opens with a share of about two pages and writes four: the
+    # least recently used entries of the root are A's, so B keeps all of its pages and A gives up its tail,
+    # instead of B evicting its own newer pages to stay within the share it was given at open
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    _chain(tier_a, range(1, 5))
+    disk_a.flush()
+    disk_a.close(); tier_a.close()
+    time.sleep(0.01)
+    page_bytes = disk_a.image_size + 512
+    root = DiskPageCache._dir_size(disk_a.dir) + 2 * page_bytes
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
+    assert disk_b._sibling_oldest is not None
+    prev = None
+    for tag in range(11, 15):
+        prev = _chain(tier_b, [tag], prev)
+        disk_b.flush()
+    assert all(disk_b.has_page(phash(t)) for t in range(11, 15))
+    assert disk_b.metrics["evictions"] == 0 and disk_b.metrics.get("pages_reclaimed", 0) >= 2
+    assert not os.path.exists(disk_a._page_path(phash(4))) and os.path.exists(disk_a._page_path(phash(1)))
+    # Back within the root once the reclaims have run
+    assert disk_b.total_size <= disk_b.max_size
+    disk_b.close(); tier_b.close()
+
+
+def test_directory_evicts_its_own_entries_when_the_siblings_hold_newer_ones(device, tmp_path):
+    # B's pages are from an earlier session; A wrote its pages since. B is over its share, and its own least
+    # recently used page is older than anything of A's, so B evicts that one and leaves A alone
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "bbbb")
+    _chain(tier_b, range(11, 13))
+    disk_b.flush()
+    disk_b.close(); tier_b.close()
+    time.sleep(0.01)
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    _chain(tier_a, range(1, 3))
+    disk_a.flush()
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "bbbb")
+    assert len(disk_b) == 2 and disk_b._sibling_oldest is not None
+    # Shrink the root so that B's share leaves room for half a page beyond what it holds (the index files
+    # make a budget from directory sizes imprecise)
+    others = disk_b.root_size - disk_b.max_size
+    disk_b.max_size = disk_b.total_size + disk_b.page_file_size // 2
+    disk_b.root_size = others + disk_b.max_size
+    tier_b.store(page(13, 13 % NUM_PAGES), serial = 13)
+    disk_b.flush()
+    assert disk_b.has_page(phash(13)) and disk_b.metrics["evictions"] >= 1
+    assert disk_b.metrics.get("pages_reclaimed", 0) == 0
+    assert disk_a.has_page(phash(1)) and disk_a.has_page(phash(2))
+    assert os.path.exists(disk_a._page_path(phash(2)))
+    disk_b.close(); tier_b.close()
+    disk_a.close(); tier_a.close()
+
+
+def test_idle_flush_ends_when_vram_holds_more_pages_than_the_disk_budget(device, tmp_path):
+    # Twelve complete pages in VRAM, a CPU tier of four slots and a disk budget of three pages. Each flush
+    # step used to list the VRAM pages again, find the ones the disk tier had just evicted, and write them
+    # again: the idle flush never ended and rewrote the same pages for as long as the server sat idle. One
+    # pass over a list taken at its start ends, and writes no more than the budget holds
+    from exllamav3.constants import PAGE_SIZE as KV_PAGE_SIZE
+    from exllamav3.generator.generator import Generator
+
+    tier, disk, _ = build(4, device, tmp_path, disk_size = 1 << 40)
+    root = 3 * disk.page_file_size + 4096
+    disk.close(); tier.close()
+    tier, disk, _ = build(4, device, tmp_path, disk_size = root)
+
+    def vram_page(tag):
+        p = page(tag, tag % NUM_PAGES)
+        return SimpleNamespace(phash = p.phash, prev_hash = None, page_index = p.page_index, sequence = p.sequence,
+                               persistable = True, kv_position = KV_PAGE_SIZE, access_serial = tag)
+
+    pages = {phash(t): vram_page(t) for t in range(1, 13)}
+    gen = Generator.__new__(Generator)
+    gen.disk_page_cache, gen.cpu_page_cache, gen.recurrent_cache = disk, tier, None
+    gen.pagetable = SimpleNamespace(unreferenced_pages = pages, referenced_pages = {}, access_serial = 100)
+    gen.pending_jobs, gen.active_jobs = [], []
+    gen._flush_pass = None
+
+    gen.flush_cache_to_disk(max_pages = 1)
+    steps = 0
+    while gen.has_idle_work() and steps < 100:
+        gen.idle_work()
+        disk.flush()
+        steps += 1
+    assert not gen.has_idle_work(), "the idle flush did not end"
+    assert disk.metrics["page_writes"] <= 3
+    # The pages the pass kept are the most recently used ones
+    assert all(disk.has_page(phash(t)) or phash(t) in tier for t in (10, 11, 12))
+    disk.close(); tier.close()

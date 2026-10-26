@@ -24,6 +24,7 @@ from .visualizer import CacheVisualizer
 import time
 from ..util.device_copy import to_device
 import threading
+from collections import deque
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
@@ -349,6 +350,8 @@ class Generator:
         self.disk_cache_flush_on_idle = disk_cache_flush_on_idle
         self.disk_cache_write_interval = disk_cache_write_interval
         self._write_behind_time = 0.0
+        # Pages still to queue in the idle flush in progress (see flush_cache_to_disk), None between passes
+        self._flush_pass = None
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
@@ -882,7 +885,13 @@ class Generator:
         max_pages limits the number of pages queued in one call. Each page takes a CPU-tier slot until its
         write is complete. If the pages are more than the free slots, the tier must wait for the writer, and
         this call stops the generator for that time. With a limit, the call stops early and sets "more" in the
-        result. The idle loop then calls again (see idle_work).
+        result. The idle loop then calls again (see idle_work), and the next call continues the same pass: the
+        pages are listed once, at the first call, so the pass ends even when the tiers below VRAM hold fewer
+        pages than VRAM does. (Listing them again on every call would find the pages the pass itself evicted
+        from the disk tier, write them again, and never end.) on_queue_drained starts a new pass.
+
+        One pass writes at most what the disk tier's root budget holds: the most recently used pages that
+        fit, since any more would only evict pages written by the same pass.
         """
         disk = self.disk_page_cache
         tier = self.cpu_page_cache
@@ -890,8 +899,15 @@ class Generator:
         if disk is None:
             return queued
         pt = self.pagetable
-        pages = list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
-        queued["pages"], queued["more"] = self._queue_pages_to_disk(pages, max_pages)
+        if max_pages is None:
+            queued["pages"], _ = self._queue_pages_to_disk(self._flush_candidates(), None)
+            self._flush_pass = None
+        else:
+            if getattr(self, "_flush_pass", None) is None:
+                self._flush_pass = deque(self._flush_candidates())
+            queued["pages"], queued["more"] = self._queue_pages_to_disk(self._flush_pass, max_pages, consume = True)
+            if not queued["more"]:
+                self._flush_pass = None
         rc = self.recurrent_cache
         if rc is not None and rc.disk_tier is not None:
             # Checkpoints follow their pages: every complete page is queued above, so an anchored checkpoint
@@ -923,25 +939,50 @@ class Generator:
         return queued
 
 
-    def _queue_pages_to_disk(self, pages, budget: int | None) -> tuple[int, bool]:
+    def _flush_candidates(self) -> list:
+        """
+        The pages a full flush would queue now (see _queue_pages_to_disk), in page table order, limited to
+        the most recently used ones that fit in the disk tier's root budget
+        """
+        disk, pt = self.disk_page_cache, self.pagetable
+        pages = [
+            page for page in list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
+            if self._page_needs_flush(page)
+        ]
+        limit = disk.root_size // max(disk.page_file_size, 1)
+        if len(pages) > limit:
+            keep = set(map(id, sorted(pages, key = lambda p: p.access_serial, reverse = True)[:limit]))
+            pages = [page for page in pages if id(page) in keep]
+        return pages
+
+
+    def _page_needs_flush(self, page) -> bool:
+        """A complete, content-hashed, persistable page in VRAM that is in neither the CPU nor the disk tier"""
+        disk, tier = self.disk_page_cache, self.cpu_page_cache
+        h = page.phash
+        if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
+            return False
+        return not (h in tier or disk.has_page(h) or h in disk.pending_pages)
+
+
+    def _queue_pages_to_disk(self, pages, budget: int | None, consume: bool = False) -> tuple[int, bool]:
         """
         Queue the complete, content-hashed, persistable pages among `pages` that are in VRAM but in neither the
         CPU nor the disk tier, through the CPU tier (its store is the write-through point; the copy to host
         memory goes on the current stream, after the kernels that wrote the page and before any that could
-        write it again). Stops after `budget` pages. Returns (pages queued, stopped early).
+        write it again). Stops after `budget` pages. Returns (pages queued, stopped early). With consume,
+        `pages` is a deque and the pages looked at are taken from it, so the next call continues after them.
         """
-        disk, tier, pt = self.disk_page_cache, self.cpu_page_cache, self.pagetable
+        tier, pt = self.cpu_page_cache, self.pagetable
         queued = 0
-        for page in pages:
-            h = page.phash
-            if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
-                continue
-            if h in tier or disk.has_page(h) or h in disk.pending_pages:
-                continue
-            if budget is not None and queued >= budget:
-                return queued, True
-            tier.store(page, pt.access_serial)
-            queued += 1
+        for page in (pages if not consume else list(pages)):
+            if self._page_needs_flush(page):
+                if budget is not None and queued >= budget:
+                    return queued, True
+                tier.store(page, pt.access_serial)
+                queued += 1
+            if consume:
+                pages.popleft()
         return queued, False
 
 
@@ -1005,7 +1046,9 @@ class Generator:
         if self.disk_page_cache is not None and self.disk_cache_flush_on_idle and \
                 not self.disk_page_cache.write_disabled:
             # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
-            # step only; the async generator does the rest while idle (idle_work)
+            # step only; the async generator does the rest while idle (idle_work). A new pass, over what the
+            # jobs since the last one have left in VRAM
+            self._flush_pass = None
             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
