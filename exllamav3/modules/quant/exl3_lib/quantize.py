@@ -429,28 +429,56 @@ _HAD_MAX_GEMM_ROWS = 1 << 19
 
 def preapply_had_l(x: torch.Tensor, had_dim):
     k, n = x.shape
-    x_dtype = x.dtype
-    x = x.to(torch.float)
-    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
-    x = (had @ x.view(-1, had_dim, n)).view(k, n)
-    x = x.to(x_dtype)
-    return x
+    out = torch.empty_like(x)
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(had_dim, 2048)
+    rows = (rows // had_dim) * had_dim
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        out[i:i + actual_rows] = (
+            had @ x[i:i + actual_rows].float().reshape(-1, had_dim, n)
+        ).view(-1, n)
+    return out
 
 
 def preapply_had_r(x: torch.Tensor, had_dim):
     k, n = x.shape
-    x_dtype = x.dtype
-    x = x.to(torch.float)
-    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    out = torch.empty_like(x)
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
     rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
-    if rows >= k:
-        x = (x.view(k, -1, had_dim) @ had).view(k, n)
-    else:
-        x = torch.cat([
-            (x[i:i + rows].reshape(-1, had_dim) @ had).view(-1, n)
-            for i in range(0, k, rows)
-        ], dim = 0)
-    x = x.to(x_dtype)
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        out[i:i + actual_rows] = (
+            x[i:i + actual_rows].float().reshape(-1, had_dim) @ had
+        ).view(-1, n)
+    return out
+
+def preapply_had_l_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(had_dim, 2048)
+    rows = (rows // had_dim) * had_dim
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        x[i:i + actual_rows] = (
+            had @ x[i:i + actual_rows].float().reshape(-1, had_dim, n)
+        ).view(-1, n)
+    return x
+
+
+def preapply_had_r_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        x[i:i + actual_rows] = (
+            x[i:i + actual_rows].float().reshape(-1, had_dim) @ had
+        ).view(-1, n)
     return x
 
 
@@ -1601,16 +1629,15 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
     k, n = weight_q.shape
     Q = weight_q
-    su = su.float().to(dev).view(k, 1)
-    sv = sv.float().to(dev).view(1, n)
+    su = su.float().to(dev).view(k, 1).clone()
+    sv = sv.float().to(dev).view(1, n).clone()
     # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
-    HW = torch.empty((k, n), dtype = torch.float, device = dev)
     den = 0.0
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         wc = cols(weight, a, b)
-        HW[:, a:b] = H @ wc
-        den += (wc * HW[:, a:b]).sum().item()
+        HW_chunk = H @ wc
+        den += (wc * HW_chunk).sum().item()
     den_err = den
     if H_err is not H:
         den_err = 0.0
@@ -1628,23 +1655,37 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     e_before = err(Q)
     for _ in range(rounds):
         # output-side scales
-        num = torch.zeros(n, device = dev); dn = torch.zeros(n, device = dev)
+        num = torch.zeros(n, device=dev)
+        dn = torch.zeros(n, device=dev)
+        
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            HW_chunk = H @ wc # Recompute on the fly
+            
             HQ = H @ Q[:, a:b]
-            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            num[a:b] = (Q[:, a:b] * HW_chunk).sum(0)
             dn[a:b] = (Q[:, a:b] * HQ).sum(0)
-        c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
-        Q = Q * c.view(1, n)
-        sv = sv * c.view(1, n)
+            
+        c = torch.where(dn > 1e-30, num / dn.clamp(min=1e-30), torch.ones_like(num))
+        Q *= c.view(1, n)
+        sv *= c.view(1, n)
+        
         # input-side scales
-        A = (Q @ Q.T) * H
-        b_ = (Q * HW).sum(1)
+        A = (Q @ Q.T) * H # Keep this out-of-place to prevent fp16/fp32 dtype casting bugs
         A.diagonal().add_(1e-6 * A.diagonal().mean())
+
+        b_ = torch.zeros(k, device=dev)
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            HW_chunk = H @ wc
+            b_ += (Q[:, a:b] * HW_chunk).sum(1)
+        
         r = torch.linalg.solve(A, b_)
         r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
-        Q = Q * r.view(k, 1)
-        su = su * r.view(k, 1)
+        Q *= r.view(k, 1)
+        su *= r.view(k, 1)
     e_after = err(Q)
     return Q, su, sv, e_before, e_after
 
@@ -1824,9 +1865,9 @@ def quantize_exl3(
         # free_mem()
 
         weight_q = weight_q.to(device)
-        weight_q = preapply_had_l(weight_q, had_k)
+        weight_q = preapply_had_l_(weight_q, had_k)
         weight_q *= su
-        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q = preapply_had_r_(weight_q, had_n)
         weight_q *= sv
 
         # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
@@ -2134,9 +2175,9 @@ def quantize_exl3_batch(
             # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
             if not qa.get("no_refit"):
                 wq = weight_qs[bi].to(device)
-                wq = preapply_had_l(wq, had_k)
+                wq = preapply_had_l_(wq, had_k)
                 wq *= su
-                wq = preapply_had_r(wq, had_n)
+                wq = preapply_had_r_(wq, had_n)
                 wq *= sv
                 H_orig = unrotate_H(Hd, H_datas[t]["su"])
                 _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
