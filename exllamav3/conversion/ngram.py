@@ -300,6 +300,43 @@ class NgramSource:
         return h.clamp(0, self.num_heads - 1)
 
 
+def copy_tensors_streamed(stc, names: list[str], out_path: str, chunk: int = 256 << 20):
+    """Copy tensors from the checkpoint into one safetensors file without reading them into memory
+    whole (an Engram table is tens of GB). Skipped when the file already holds them at full size"""
+    entries = []
+    for name in names:
+        src = stc.tensor_file_map[name]
+        with open(src, "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            info = json.loads(f.read(hlen))[name]
+        a, b = info["data_offsets"]
+        entries.append((name, src, 8 + hlen + a, b - a, info["dtype"], info["shape"]))
+    total = sum(e[3] for e in entries)
+    header, off = {}, 0
+    for name, _, _, size, dtype, shape in entries:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + size]}
+        off += size
+    hb = json.dumps(header).encode()
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    if os.path.exists(out_path) and os.path.getsize(out_path) == 8 + len(hb) + total:
+        print(f" -- N-gram table already in place: {out_path}")
+        return
+    bpw = 8 * total / max(sum(e[3] for e in entries if not e[0].endswith(".scale")), 1)
+    print(f" -- Copying n-gram table ({total >> 20} MiB) to {out_path}, kept as stored: {bpw:.2f} bpw")
+    with open(out_path + ".tmp", "wb") as out:
+        out.write(struct.pack("<Q", len(hb)))
+        out.write(hb)
+        for name, src, start, size, _, _ in entries:
+            with open(src, "rb") as f:
+                f.seek(start)
+                left = size
+                while left:
+                    buf = f.read(min(chunk, left))
+                    out.write(buf)
+                    left -= len(buf)
+    os.replace(out_path + ".tmp", out_path)
+
+
 def read_table_tensor(path: str, name: str, dtype: torch.dtype) -> torch.Tensor | None:
     """Read one (small) tensor from a quantized table file, tolerating a truncated stream."""
     try:
@@ -610,13 +647,28 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
     ngram_modules = [m for mod in model.modules for m in mod if isinstance(m, NGramEmbedding)]
     if not ngram_modules:
         return None
-    assert len(ngram_modules) == 1, "multiple n-gram tables not supported by the conversion step yet"
-    prefix = ngram_modules[0].key
 
     out_path = os.path.join(args["out_dir"], "ngram_embedding.safetensors")
     os.makedirs(args["out_dir"], exist_ok = True)
 
     ngram_file = args.get("ngram_file")
+    stc = config.stc
+    fixed = [m.key for m in ngram_modules
+             if not stc.has_tensor(f"{m.key}.shard_0.weight") and stc.has_tensor(f"{m.key}.weight")]
+    if not ngram_file and fixed:
+        # Fixed-width tables stored as one (fp8 + E8M0 scale) tensor each (DeepSeek-V4.1's Engram layers)
+        # have no trellis codec yet: they go into the output as they are, streamed file to file
+        assert len(fixed) == len(ngram_modules), "mixed n-gram table formats are not supported"
+        if args.get("ngram_bits"):
+            print(f" !! --ngram_bits ignored: {', '.join(fixed)} are fixed-width tables and are copied unquantized")
+        names = []
+        for prefix in fixed:
+            names += [f"{prefix}.weight"] + ([f"{prefix}.scale"] if stc.has_tensor(f"{prefix}.scale") else [])
+        copy_tensors_streamed(stc, names, out_path)
+        config.stc.add_tensor_files(out_path, warn_if_override = False)
+        return out_path
+    assert len(ngram_modules) == 1, "multiple n-gram tables not supported by the conversion step yet"
+    prefix = ngram_modules[0].key
     if ngram_file:
         with open(ngram_file, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]

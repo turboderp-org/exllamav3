@@ -843,34 +843,51 @@ def calibration_row_shards(num_rows, devices, device_ratios):
     return shards
 
 
-def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source = None):
+def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source = None, need_bytes = 0):
     """
-    Load replicas of module idx onto secondary devices for parallel calibration passes. Returns the list of
-    replica modules, or None if replication is unavailable (caller falls back to the serial path).
+    Load replicas of module idx onto secondary devices for parallel calibration passes. A device without room
+    for the module's weights (need_bytes, plus headroom for the pass) is left out, as is one whose load fails;
+    the rows are then split over the devices that hold a replica. Returns (replica modules or None when no
+    device took one, the devices holding the module with the primary first).
     """
+    used = [devices[0]]
     if not replica_models:
-        return None
+        return None, used
     replicas = []
-    try:
-        for rm, dev in zip(replica_models, devices[1:]):
-            rep = rm.modules[idx]
+    for rm, dev in zip(replica_models, devices[1:]):
+        rep = rm.modules[idx]
+        d = torch.device(dev)
+        if need_bytes and d.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(d)
+            if free < need_bytes + (1 << 30):
+                print(f" !! No calibration replica of module {idx} on {dev}: {need_bytes >> 20} MiB of weights, "
+                      f"{free >> 20} MiB free")
+                continue
+        try:
             if source is None and rep.can_defer_load():
                 rm.config.stc.begin_deferred_load()
                 try:
-                    rep.load(torch.device(dev), load_slice = load_slice)
+                    rep.load(d, load_slice = load_slice)
                 finally:
                     rm.config.stc.end_deferred_load()
             else:
-                rep.load(torch.device(dev), load_slice = load_slice,
-                         **({"source": source} if source is not None else {}))
+                rep.load(d, load_slice = load_slice, **({"source": source} if source is not None else {}))
             replicas.append(rep)
-        return replicas
-    except Exception as e:
-        print(f" !! Parallel calibration disabled for module {idx}: {e}")
-        for rep in replicas:
+            used.append(dev)
+        except Exception as e:
+            print(f" !! No calibration replica of module {idx} on {dev}: {str(e).splitlines()[0][:160]}")
+            rm.config.stc.abort_deferred_load()
             rep.unload()
-        free_mem()
-        return None
+            free_mem()
+    return (replicas or None), used
+
+
+def _weight_bytes(module, tensors = None) -> int:
+    """Bytes a replica of the module will hold: the quantized tensors it loads from, else the linears' storage"""
+    if tensors:
+        vals = tensors.values() if isinstance(tensors, dict) else tensors
+        return sum(t.numel() * t.element_size() for t in vals if hasattr(t, "numel"))
+    return sum(m.storage_size() for m in module if isinstance(m, Linear))
 
 
 def run_row_workers(title, num_rows, workers, progress_count):
@@ -1282,10 +1299,13 @@ def main(args, job_state):
     # workload reports per-device busy times, and subsequent modules divide work in proportion
     # to the measured speeds (see AutoSplit). Workload kinds are tracked separately since
     # per-unit costs differ between quantization and calibration forwards
-    def eff_ratios(kind):
-        if device_ratios is not None or len(devices) == 1:
-            return device_ratios
-        return auto_split.ratios(kind, devices)
+    def eff_ratios(kind, devs = None):
+        devs = devices if devs is None else devs
+        if device_ratios is not None:
+            return [device_ratios[devices.index(d)] for d in devs] if devs is not devices else device_ratios
+        if len(devs) == 1:
+            return None
+        return auto_split.ratios(kind, devs)
 
     last_auto_split = [None]
     def report_auto_split():
@@ -1383,12 +1403,14 @@ def main(args, job_state):
         state = None
         bad_rows = set()
 
+    # Every pass over a module starts from what the last pass over the previous module preserved
     def get_preserve(si, params_):
-        params_.update(quant_preserves[si])
-        params_["quant_preserve"] = quant_preserves[si]
+        preserve = quant_preserves[si].get(idx - 1, {})
+        params_.update(preserve)
+        params_["quant_preserve"] = dict(preserve)
 
     def put_preserve(si, params_):
-        quant_preserves[si] = params_["quant_preserve"]
+        quant_preserves[si] = {idx - 1: quant_preserves[si].get(idx - 1, {}), idx: params_["quant_preserve"]}
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
@@ -1460,14 +1482,15 @@ def main(args, job_state):
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
                 if state is not None:
-                    capture_replicas = None
+                    capture_replicas, calib_devices = None, [module.device]
                     if parallel_calib and not module.caps.get("prefer_cpu"):
-                        capture_replicas = load_parallel_calib_modules(
-                            replica_models, idx, devices, current_slice if slicing else None)
+                        capture_replicas, calib_devices = load_parallel_calib_modules(
+                            replica_models, idx, devices, current_slice if slicing else None,
+                            need_bytes = _weight_bytes(module))
                     # Hessians that will not fit beside the weights are captured in passes, each
                     # swapped to system RAM before the next (see capture_passes)
                     free_mem()
-                    passes = capture_passes(module, devices if capture_replicas is not None else [module.device])
+                    passes = capture_passes(module, calib_devices if capture_replicas is not None else [module.device])
                     capture_H = {}
                     capture_sens = {}
                     ref_states = {}
@@ -1478,8 +1501,8 @@ def main(args, job_state):
                             pass_H, pass_sens, pass_ref = capture_module_parallel(
                                 model,
                                 [module] + capture_replicas,
-                                devices,
-                                eff_ratios("calib"),
+                                calib_devices,
+                                eff_ratios("calib", calib_devices),
                                 state,
                                 original_input_ids,
                                 get_preserve,
@@ -1599,10 +1622,10 @@ def main(args, job_state):
             source = q_tensors,
             keep_source_weights = True
         )
-        advance_replicas = None
+        advance_replicas, calib_devices = None, [module.device]
         if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
-            advance_replicas = load_parallel_calib_modules(
-                replica_models, idx, devices, None, source = q_tensors)
+            advance_replicas, calib_devices = load_parallel_calib_modules(
+                replica_models, idx, devices, None, source = q_tensors, need_bytes = _weight_bytes(module, q_tensors))
         config.stc.set_new_tensors(None)
         del q_tensors
 
@@ -1615,8 +1638,8 @@ def main(args, job_state):
                 error, cos_error, sqnr_, num_measured = advance_state_parallel(
                     model,
                     [module] + advance_replicas,
-                    devices,
-                    eff_ratios("calib"),
+                    calib_devices,
+                    eff_ratios("calib", calib_devices),
                     state,
                     original_input_ids,
                     get_preserve,
