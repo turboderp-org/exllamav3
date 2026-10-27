@@ -81,6 +81,8 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        self._reconstruct_cache = None
+        self._reconstruct_cache_original = False
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -96,8 +98,37 @@ class LinearEXL3:
 
 
     def unload(self):
-        # g_tensor_cache.drop(*self.bsz1_xh_args)
-        pass
+        self.clear_reconstruct_cache()
+
+    def clear_reconstruct_cache(self):
+        """Release optional prefill weights. Do not call during graph replay."""
+        self._reconstruct_cache = None
+        self._reconstruct_cache_original = False
+
+    def prepare_reconstruct_cache(self, original_basis: bool = True):
+        """Retain FP16 prefill weights and return their resident byte count.
+
+        Call after loading, before graph capture. Small-row/decode dispatch still
+        uses packed weights. Placement does not reserve this extra memory.
+        Original-basis reconstruction folds in Hadamards and changes rounding;
+        rotated-basis caching retains the ordinary small-prefill arithmetic.
+        """
+        if self.out_features > MAX_RECONSTRUCT_SLICE_N:
+            raise ValueError("Reconstruction cache does not support sliced wide matrices")
+        if original_basis and (self.in_features % 128 or self.out_features % 128):
+            raise ValueError("Original-basis reconstruction needs 128-divisible dimensions")
+        if self._reconstruct_cache is not None and self._reconstruct_cache_original == original_basis:
+            return self._reconstruct_cache.numel() * self._reconstruct_cache.element_size()
+        w = torch.empty((self.in_features, self.out_features), dtype=torch.half,
+                        device=self.trellis.device)
+        if original_basis:
+            ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh,
+                                      self.K, self.mcg, self.mul1, 0)
+        else:
+            self._reconstruct_inner(w, 0)
+        self._reconstruct_cache = w
+        self._reconstruct_cache_original = original_basis
+        return w.numel() * w.element_size()
 
 
     def get_tensors(self, key: str):
@@ -187,6 +218,8 @@ class LinearEXL3:
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
         # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
         use_fused = self._fused_reconstruct and rows >= 1024
+        if self._reconstruct_cache is not None:
+            use_fused = self._reconstruct_cache_original
 
         if use_fused:
             xh = x
@@ -194,7 +227,9 @@ class LinearEXL3:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
 
-        if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
+        if self._reconstruct_cache is not None:
+            ext.hgemm_recon(xh, self._reconstruct_cache, y_)
+        elif self.out_features <= MAX_RECONSTRUCT_SLICE_N:
             w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
             if use_fused:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
@@ -290,6 +325,7 @@ class LinearEXL3:
     def swap_cpu(self):
         if self.swap_device is not None:
             return
+        self.clear_reconstruct_cache()
         self.swap_device = self.trellis.device
         if self.su is not None: self.su = self.su.cpu()
         if self.sv is not None: self.sv = self.sv.cpu()

@@ -196,6 +196,7 @@ def test_qwen38_optimizer_topology_has_expected_unique_groups_and_linears() -> N
         block = block_class()
         block.attn = attn
         block.mlp = mlp
+        block.post_mlp = None
         blocks.append(block)
 
     groups = [
@@ -219,3 +220,34 @@ def test_qwen38_optimizer_topology_has_expected_unique_groups_and_linears() -> N
     assert len(linears) == 400
     assert len({id(linear) for linear in linears}) == 400
     assert len(targets) == len(set(targets)) == 400
+
+
+def test_gemma4_ple_optimizer_groups_include_each_projection_once() -> None:
+    ple_class = _optimizer_probe_class(
+        "exllamav3/modules/arch_specific/gemma4_e.py", "Gemma4PerLayerInput"
+    )
+    block_class = _optimizer_probe_class(
+        "exllamav3/modules/transformer.py", "TransformerBlock"
+    )
+    ple = ple_class()
+    ple.gate = _linear("ple.gate")
+    ple.proj = _linear("ple.proj")
+    block = block_class()
+    block.attn = None
+    block.mlp = None
+    block.post_mlp = ple
+    assert _flatten_measure_targets(block.optimizer_targets(), 3) == [
+        ["ple.gate"], ["ple.proj"]
+    ]
+    assert _flatten_measure_targets(block.optimizer_targets(), 2) == [
+        ["ple.gate", "ple.proj"]
+    ]
+    projection_class = _optimizer_probe_class(
+        "exllamav3/modules/arch_specific/gemma4_e.py", "Gemma4PerLayerProjection"
+    )
+    projection = projection_class()
+    projection.proj = _linear("ple.input_projection")
+    for depth in [1, 2, 3]:
+        assert _flatten_measure_targets(projection.optimizer_targets(), depth) == [
+            ["ple.input_projection"]
+        ]

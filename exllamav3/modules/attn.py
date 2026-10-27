@@ -868,6 +868,10 @@ class Attention(Module):
         return q, k
 
 
+    def publish_kv(self, k, v, params):
+        """Architecture hook for layers whose normalized, rotated K/V are reused."""
+        pass
+
     def decode_flash_attn_nc(
         self,
         x: torch.Tensor,
@@ -917,6 +921,8 @@ class Attention(Module):
                 self.norm_constant_bias,
                 inv_freq,
             )
+
+        self.publish_kv(k, v, params)
 
         if simulate_kv_quant:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
@@ -1172,6 +1178,8 @@ class Attention(Module):
             sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
+
+        self.publish_kv(k, v, params)
 
         if qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)

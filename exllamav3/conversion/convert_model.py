@@ -17,6 +17,7 @@ from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
 from .ngram import quantize_embedding
+from .preserved_state import save_preserved_state, load_preserved_state
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
@@ -1372,6 +1373,9 @@ def main(args, job_state):
                 [{} for _ in range(len(state))]
             )
         quant_preserves = [{} for _ in range(len(state))]
+        if model.caps.get("quant_preserve_tensors") and job_state["next_module_idx"] > 0:
+            quant_preserves = load_preserved_state(
+                os.path.join(args["work_dir"], "ckpt/preserved_state.safetensors"), len(state))
         # Rows whose hidden state (or unquantized reference) has gone non-finite are excluded
         # from all further capture, state advancement and error measurement. Persisted through
         # checkpoints; the job aborts if more than 10% of all rows break
@@ -1696,6 +1700,8 @@ def main(args, job_state):
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
+            if model.caps.get("quant_preserve_tensors"):
+                save_preserved_state(quant_preserves, os.path.join(ckpt_dir_new, "preserved_state.safetensors"))
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
             os.rename(ckpt_dir, ckpt_dir_old)
