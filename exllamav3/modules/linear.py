@@ -643,12 +643,30 @@ class Linear(Module):
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
             # Drop the affected rows; the inf_nan counter above still reports them
             finite = torch.isfinite(x).all(dim = 1)
+            row_w = params.get("capture_row_w")
             if not finite.all():
                 x = x[finite]
                 rows = x.shape[0]
+                if row_w is not None:
+                    row_w = row_w[finite]
 
             accumulate_(params["capture"][self.qmap]["H"], x)
             params["capture"][self.qmap]["count"] += rows
+
+            # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
+            # conversion/moe_affinity.py), combined with it before quantization. The weights are an
+            # expert's routing weights, so most rows are zero and only the routed ones accumulate
+            if row_w is not None:
+                hd = params["capture"][self.qmap]
+                if "H_aff" not in hd:
+                    hd["H_aff"] = torch.zeros_like(hd["H"])
+                    hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
+                row_w = row_w.to(torch.float).clamp_min(0)
+                routed = row_w.nonzero().flatten()
+                if routed.numel():
+                    xw = x[routed] * row_w[routed].sqrt().unsqueeze(1).to(x.dtype)
+                    accumulate_(hd["H_aff"], xw)
+                    hd["aff_sum"] += row_w.sum()
 
 
     @override
