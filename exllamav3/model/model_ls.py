@@ -30,13 +30,33 @@ class Model_LSMixin(ABC):
         ...
 
 
+    @staticmethod
+    def _load_attached(modules: list, device: torch.device, max_chunk_size: int | None = None):
+        """
+        Load another model's modules (a drafter placed by this model's loader, see Model.load_gen) on a
+        device, through their own checkpoint's deferred-load arena
+        """
+        for module in modules:
+            defer = module.can_defer_load()
+            with gc_paused():
+                if defer:
+                    module.config.stc.begin_deferred_load(arena = True)
+                if max_chunk_size is not None:
+                    module.load(device, max_chunk_size = max_chunk_size)
+                else:
+                    module.load(device)
+                if defer:
+                    module.config.stc.end_deferred_load()
+
+
     def _load_single(
         self,
         progressbar: bool,
         device: torch.device,
         config: Config,
         modules: list,
-        verbose: bool
+        verbose: bool,
+        attached_modules: dict[int, list] | None = None,
     ):
         pin = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
@@ -56,6 +76,8 @@ class Model_LSMixin(ABC):
                     module.pin_linears()
                 for h in getattr(config, "moe_cpu_hosts", {}).values():
                     h.commit_module(module.key)
+                if attached_modules:
+                    self._load_attached(attached_modules.get(idx, ()), device)
                 progress.update(idx + 1)
 
 
@@ -85,6 +107,7 @@ class Model_LSMixin(ABC):
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
         export_state_layers: set[int] | None = None,
+        attached_modules: dict[int, list] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -99,6 +122,10 @@ class Model_LSMixin(ABC):
         # forwards, so each stays allocated on its device as it does through a real forward
         if export_state_layers:
             params["export_state_layers"] = set(export_state_layers)
+        # Modules of a drafter that loads alongside (Model.load_gen), keyed by the module here they
+        # follow onto its device. They take their share of the device's budget right after it, and
+        # go with it when it moves on
+        attached_modules = attached_modules or {}
 
         # Simulate cached/recurrent path while loading with cache
         cl = [m for m in self if m.caps.get("kv_cache")]
@@ -262,6 +289,20 @@ class Model_LSMixin(ABC):
                                         f"margin (EXL3_AUTOSPLIT_MARGIN_MB)"
                                     )
 
+                        # Modules riding along on this device: loaded now, so the headroom check
+                        # below sees them (they run no measuring forward of their own)
+                        attached = attached_modules.get(idx, ())
+                        if attached:
+                            self._load_attached(attached, load_device, max_chunk_size)
+                            if load_device.type == "cuda" and max_transient.get(load_device.index):
+                                i = load_device.index
+                                if torch.cuda.memory_allocated(load_device) + max_transient[i] > device_budget[i]:
+                                    raise torch.cuda.OutOfMemoryError(
+                                        f"autosplit: cuda:{i} has no headroom left for the largest "
+                                        f"transient measured on it ({max_transient[i] >> 20} MiB) with "
+                                        f"the attached modules loaded"
+                                    )
+
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
                         if is_logits_layer:
@@ -297,6 +338,9 @@ class Model_LSMixin(ABC):
                     # Module failed to load with an OoM error, so advance to the next device if possible
                     if fail:
                         module.unload()
+                        for am in attached_modules.get(idx, ()):
+                            am.config.stc.abort_deferred_load()
+                            am.unload()
                         dummy_state = None
                         # States the failed attempt exported belong to the module now retried elsewhere
                         if params.get("export_states"):

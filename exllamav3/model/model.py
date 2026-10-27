@@ -583,10 +583,28 @@ class Model(Model_TPMixin, Model_LSMixin):
             For debug purposes, skip reference forward pass during autosplit load.
 
         :param draft_model:
-            (optional, autosplit only) Draft model that will verify against this model, loaded first. When it
-            taps hidden states of this model (DFlash), the copies of the tapped layers' states stay resident on
-            their devices for the whole forward, and the split budgets for them.
+            (optional) Draft model that will verify against this model. Loaded first, except when its caps say
+            load_with_target: such a drafter (the Gemma4 assistant) reads this model's cache layers in place and
+            cannot load on its own; its modules are loaded here, each on the device of the layer it reads (see
+            its modules_with_target), within the same budget. When the drafter taps hidden states of this model
+            (DFlash), the copies of the tapped layers' states stay resident on their devices for the whole
+            forward, and the split budgets for them.
         """
+
+        if self.caps.get("load_with_target"):
+            raise RuntimeError(
+                f"{self.config.architecture} loads with its target model: pass it as draft_model to the target's "
+                f"load() instead of loading it on its own"
+            )
+        attached = None
+        if draft_model is not None and draft_model.caps.get("load_with_target"):
+            if tensor_p:
+                raise NotImplementedError(
+                    f"{draft_model.config.architecture} drafting is not currently implemented for tensor-parallel "
+                    f"targets: the drafter reads the target's K/V cache layers, which a TP load shards across devices"
+                )
+            draft_model.attach_to(self)
+            attached = draft_model.modules_with_target(self)
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
         # allocated on any device yet (the usual first load) there is none, and a full collection
@@ -628,7 +646,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     "Cannot specify reserve_per_device or use_per_device when loading to single device."
                 assert not tensor_p, \
                     "Cannot use tensor_p when loading to single device."
-                self._load_single(progressbar, device, self.config, self.modules, verbose)
+                self._load_single(progressbar, device, self.config, self.modules, verbose, attached)
                 self.output_device = self.modules[-1].device
 
             # Use/reserve
@@ -684,6 +702,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         self.cache_weakrefs,
                         autosplit_no_forward,
                         draft_model.draft_verifier_params.get("export_state_layers") if draft_model else None,
+                        attached,
                     )
                     self.output_device = self.modules[-1].device
 
@@ -745,13 +764,21 @@ class Model(Model_TPMixin, Model_LSMixin):
             g_tensor_cache.drop_all()
 
             # Mark every attached cache usable.
-            for ref in self.cache_weakrefs.values():
-                cache = ref()
-                if cache is not None:
-                    cache.initialized = True
+            self._mark_caches_initialized()
+            # A drafter loaded alongside: finished the way its own load would have
+            if attached is not None:
+                draft_model.output_device = draft_model.modules[-1].device
+                draft_model._mark_caches_initialized()
         finally:
             if freeze:
                 gc.unfreeze()
+
+
+    def _mark_caches_initialized(self):
+        for ref in self.cache_weakrefs.values():
+            cache = ref()
+            if cache is not None:
+                cache.initialized = True
 
 
     @torch.inference_mode

@@ -374,8 +374,10 @@ def init(
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
 
-    # Load draft model
-    if draft_model_dir:
+    # Load draft model (one that reads the target's cache in place loads with the target below)
+    if draft_model_dir and draft_model.caps.get("load_with_target"):
+        printp(not quiet, f" -- Loading {draft_model_dir} with the target model")
+    elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
             use_per_device = split,
