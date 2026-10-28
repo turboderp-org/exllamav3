@@ -150,6 +150,7 @@ class PLELayer(Module):
         stream_from_disk: bool | None = None,
         out_dtype: torch.dtype | None = None,
         mm_token_id: int | None = None,
+        mm_gate_off: bool = False,
         submodules: dict | None = None,
         stub: bool = False,
         ngram_key: str | None = None,
@@ -177,6 +178,8 @@ class PLELayer(Module):
         self.rms_norm_eps = rms_norm_eps
         self.hc_mult = hc_mult
         self.mm_token_id = mm_token_id
+        # Image rows take no update (the reference Engram shuts its gate inside an image span)
+        self.mm_gate_off = mm_gate_off
         self.conv_kernel_size = conv_kernel_size
         self.conv_dilation = ngram_size
         self.conv_state_len = max(conv_kernel_size - 1, 0) * self.conv_dilation
@@ -364,6 +367,7 @@ class PLELayer(Module):
                 "rms_norm_eps": self.rms_norm_eps,
                 "out_dtype": self.out_dtype,
                 "mm_token_id": self.mm_token_id,
+                "mm_gate_off": self.mm_gate_off,
                 "ngram_key": self.ngram_key,
                 "kv_proj_key": self.kv_proj_key,
                 "norm_keys": self.norm_keys,
@@ -472,6 +476,9 @@ class PLELayer(Module):
                     self.norm_key.rms_norm_eps, self.gate_scale, self.conv_dilation,
                     delta, conv_stream,
                 )
+                keep = params.get("ple_keep_rows")
+                if keep is not None:
+                    delta.mul_(keep[:, t0:t1, None, None])
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
             return None, conv_stream
@@ -492,6 +499,9 @@ class PLELayer(Module):
                     self.norm_key.weight.data, self.norm_query.weight.data,
                     self.norm_key.rms_norm_eps, self.norm_key.constant_bias, self.gate_scale, delta,
                 )
+                keep = params.get("ple_keep_rows")
+                if keep is not None:
+                    delta.mul_(keep[:, t0:t1, None, None])
                 streams[:, t0:t1].add_(delta)
             return None, None
         return self.forward_streams_reference(streams, emb, params, conv_state)
@@ -607,6 +617,11 @@ class PLELayer(Module):
             # autosplit measuring forward: no token ids in params; a dummy history gives the
             # same memory profile (the real n-gram gather is a few hundred rows at most)
             ids = torch.zeros((bsz, seq), dtype = torch.long)
+        params.pop("ple_keep_rows", None)
+        if self.mm_gate_off and self.mm_token_id is not None and int(ids.max()) >= FIRST_MM_EMBEDDING_INDEX:
+            # Rows inside an image span: hashed as the placeholder (context for the text after them) but
+            # left untouched themselves
+            params["ple_keep_rows"] = (ids < FIRST_MM_EMBEDDING_INDEX).to(x.device, torch.float)
         ids = self._prepare_ids(ids)
         ctx = self.ple_embedding.context_len
         win = self.conv_state_len
@@ -630,6 +645,9 @@ class PLELayer(Module):
                     id_state[s, :ctx].copy_(history[i, -ctx:])
         else:
             delta, _ = self.forward_streams(x, history, params)
+        keep = params.pop("ple_keep_rows", None)
+        if delta is not None and keep is not None:
+            delta = delta * keep[:, :, None, None]
         out = x if delta is None else x + delta
         if self.tp_owner is not None:
             self.tp_collect(params["backend"], out)

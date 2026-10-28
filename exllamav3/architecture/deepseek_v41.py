@@ -7,6 +7,7 @@ import torch
 from ..model.config import no_default
 from ..modules import PLELayer
 from ..modules.ngram_embedding import _find_nth_prime_after
+from ..modules.attn import prepare_for_attn
 from .deepseek_v4 import DeepseekV4Config, DeepseekV4Model
 
 # DeepSeek-V4.1: DeepSeek-V4 blocks with the settings nested under text_config, where runs of layers
@@ -136,9 +137,10 @@ class DeepseekV41Model(DeepseekV4Model):
     ):
         self.kv_owners = {}
         super().__init__(config, **kwargs)
-        # The pool readers must load on their owner's device (DSV4Attention.load), and the
-        # tensor-parallel loader shards the pools: not supported for this model yet
-        self.caps.update({"supports_tp": False})
+        # Tensor parallel: every rank holds every attention layer with the pools replicated, so a
+        # reader finds its owner on its own rank (DSV4Attention.tp_import); the Engram layers are
+        # replicated like the Qwen3.8 PLE layers
+        self.caps.update({"supports_tp": True})
 
     @override
     def make_attn(self, idx: int, key: str, **extra):
@@ -187,6 +189,7 @@ class DeepseekV41Model(DeepseekV4Model):
                 rms_norm_eps = config.rms_norm_eps,
                 # Image spans hash as the pad token (no n-gram spans one)
                 mm_token_id = config.engram_pad_token_id,
+                mm_gate_off = True,
                 ngram_key = f"{key}.engram.embed",
                 kv_proj_key = "wkv",
                 norm_keys = ("k_weight", "q_weight", "norm_conv"),
@@ -196,6 +199,15 @@ class DeepseekV41Model(DeepseekV4Model):
                 hash_params = config.engram_hash_params[idx],
             )
         ]
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # V4.1 attends causally inside an image span (the V4 vision-exp non-causal image chunk does not
+        # apply), so the span needs no chunk check and no nc_chunk flag
+        params["input_ids"] = input_ids
+        if self.hc_carry_pre:
+            params["hc_pre"] = None
+        return prepare_for_attn(input_ids, params)
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
