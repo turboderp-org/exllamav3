@@ -492,6 +492,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
         draft_model: Model | None = None,
+        attn_device: torch.device | str | int | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -589,6 +590,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             its modules_with_target), within the same budget. When the drafter taps hidden states of this model
             (DFlash), the copies of the tapped layers' states stay resident on their devices for the whole
             forward, and the split budgets for them.
+
+        :param attn_device:
+            (optional, split load) Device for the modules the architecture pins together (caps["attn_device"]:
+            the attention layers of DeepSeek-V4.1, whose layers read K/V pools and index selections owned by
+            earlier layers, so a layer split cannot place them per layer). They load there first, every other
+            module splits over the remaining budget, and a block whose attention sits elsewhere moves the
+            attention input and output across. Default: the first device of the split
         """
 
         if self.caps.get("load_with_target"):
@@ -703,6 +711,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         autosplit_no_forward,
                         draft_model.draft_verifier_params.get("export_state_layers") if draft_model else None,
                         attached,
+                        attn_device,
                     )
                     self.output_device = self.modules[-1].device
 

@@ -135,6 +135,9 @@ void hc_mix_finalize_kernel
     const float rms_eps,
     const float hc_eps,
     const int sinkhorn_iters,
+    const float* __restrict__ pre_in,    // (R, H) carried pre weights (carry 1), may be null
+    float* __restrict__ pre_out,         // (R, H) this site's own pre weights, written when non-null
+    const int carry,                     // collapse with 0: own pre, 1: pre_in, 2: stream 0 (first carried site)
     const HcNormArgs norm = {}
 )
 {
@@ -175,6 +178,10 @@ void hc_mix_finalize_kernel
     if (threadIdx.x < H)
         pre_s[threadIdx.x] = sigmoidf_(fmaf(mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x])) + hc_eps;
     __syncthreads();
+    // Carried pre weights (mHC with carry_pre): a site collapses with the previous site's pre weights and
+    // hands its own on through pre_out
+    if (pre_out && blockIdx.x == 0 && threadIdx.x < H)
+        pre_out[(size_t) r * H + threadIdx.x] = pre_s[threadIdx.x];
 
     // Sinkhorn + post/comb writes: chunk-0 block only, one lane per comb element. Runs in
     // a dedicated warp, concurrent with the other warps' phase C: the ~20-iteration
@@ -222,7 +229,8 @@ void hc_mix_finalize_kernel
     // block the first warp is excluded, so the remaining threads re-cover its lanes
     float pre_r[H];
     #pragma unroll
-    for (int h = 0; h < H; ++h) pre_r[h] = pre_s[h];
+    for (int h = 0; h < H; ++h)
+        pre_r[h] = carry == 0 ? pre_s[h] : carry == 1 ? pre_in[(size_t) r * H + h] : (h == 0 ? 1.0f : 0.0f);
 
     const bool shrunk = !HEAD && blockIdx.x == 0;
     const int tid = shrunk ? threadIdx.x - 32 : threadIdx.x;
@@ -874,7 +882,10 @@ static void hc_mix_launch
     at::Tensor& collapsed,
     Graph* graph,
     const HcPendingApply* pend = nullptr,      // fold a preceding hc_apply on these streams into the partials
-    const HcNormArgs* nrm = nullptr            // fold the following RMSNorm into the finalize
+    const HcNormArgs* nrm = nullptr,           // fold the following RMSNorm into the finalize
+    const float* pre_in = nullptr,             // carried pre weights (see hc_mix_carry)
+    float* pre_out = nullptr,
+    int carry = 0
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -921,7 +932,7 @@ static void hc_mix_launch
         (const float*) streams.data_ptr(), (const float*) partials.data_ptr(), \
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
-        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
+        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry
     if (pend || nrm)
     {
         // The pending apply runs inside the partials kernel when each stream is a whole number of
@@ -969,7 +980,7 @@ static void hc_mix_launch
                 (const float*) streams.data_ptr(), (const float*) partials.data_ptr(),
                 (const float*) base.data_ptr(), (const float*) scale.data_ptr(),
                 post_p, comb_p, collapsed.data_ptr(),
-                D, n_chunks_a, chunk_cols_c_n, rms_eps, hc_eps, sinkhorn_iters, *nrm
+                D, n_chunks_a, chunk_cols_c_n, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry, *nrm
             );
         }
         else
@@ -1045,6 +1056,45 @@ void hc_mix
         &comb,
         collapsed,
         nullptr
+    );
+}
+
+// hc_mix for a site with carried pre weights (mHC carry_pre, DeepSeek-V4.1): the collapse uses pre_in, the
+// previous site's pre weights, or stream 0 when there is none (the first site), and this site's own pre
+// weights are written to pre_out for the next site
+void hc_mix_carry
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor collapsed,
+    const c10::optional<at::Tensor>& pre_in,   // (R, H) float, or none
+    at::Tensor pre_out                         // (R, H) float out
+)
+{
+    const int R = streams.size(0);
+    const int H = streams.size(1);
+    TORCH_CHECK_DTYPE(pre_out, kFloat);
+    TORCH_CHECK(pre_out.is_contiguous() && pre_out.numel() == (int64_t) R * H, "hc_mix_carry: pre_out shape");
+    const float* pre_in_p = nullptr;
+    if (pre_in.has_value())
+    {
+        TORCH_CHECK_DTYPE(pre_in.value(), kFloat);
+        TORCH_CHECK(pre_in->is_contiguous() && pre_in->numel() == (int64_t) R * H, "hc_mix_carry: pre_in shape");
+        pre_in_p = (const float*) pre_in->data_ptr();
+    }
+    hc_mix_launch
+    (
+        streams, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
+        partials, &post, &comb, collapsed, nullptr, nullptr, nullptr,
+        pre_in_p, (float*) pre_out.data_ptr(), pre_in_p ? 1 : 2
     );
 }
 

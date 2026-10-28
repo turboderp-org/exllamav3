@@ -19,6 +19,19 @@ from .config import Config
 from abc import ABC, abstractmethod
 
 
+def _unload_keep_pinned(module):
+    """Unload a module but leave its children placed on the split's attention device (caps["attn_device"],
+    loaded ahead of it by _load_autosplit) where they are"""
+    keep = [(i, m) for i, m in enumerate(module.modules) if m.caps.get("attn_device") and m.device is not None]
+    for _, m in reversed(keep):
+        module.modules.remove(m)
+    try:
+        module.unload()
+    finally:
+        for i, m in keep:
+            module.modules.insert(i, m)
+
+
 class Model_LSMixin(ABC):
 
     def __init__(self):
@@ -108,6 +121,7 @@ class Model_LSMixin(ABC):
         autosplit_no_forward: bool,
         export_state_layers: set[int] | None = None,
         attached_modules: dict[int, list] | None = None,
+        attn_device: torch.device | str | int | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -159,6 +173,47 @@ class Model_LSMixin(ABC):
         autosplit_margin = int(os.environ.get("EXL3_AUTOSPLIT_MARGIN_MB", 256)) << 20
         autosplit_prepare = os.environ.get("EXL3_AUTOSPLIT_PREPARE", "1") != "0"
 
+        # Modules the architecture pins to one device (caps["attn_device"]: attention layers that read
+        # K/V pools and selections owned by earlier layers) load first, all on the attention device, and
+        # the main loop below leaves them where they are: Module.load skips a placed child, and a block
+        # rolled back after an OoM keeps them (_unload_keep_pinned). Their transients are measured on
+        # that device during the blocks' measuring forwards, since a block's forward runs its attention
+        # there wherever the block itself lands
+        pinned = [sm for module in modules for sm in module if sm.caps.get("attn_device")]
+        attn_dev = None
+        if pinned:
+            attn_dev = torch.device(active_devices[0]) if attn_device is None else torch.device(attn_device)
+            if attn_dev.type != "cuda" or attn_dev.index not in active_devices:
+                raise ValueError(f"attn_device {attn_dev} is not one of the split's devices {active_devices}")
+            i = attn_dev.index
+            touched_devices.append(i)
+            if reserve_per_device is not None:
+                device_budget[i] = set_memory_fraction_reserve(reserve_per_device[i], i)
+            elif use_per_device is not None:
+                device_budget[i] = set_memory_fraction_use(use_per_device[i], i)
+            else:
+                raise RuntimeError("Logic error")
+            try:
+                with gc_paused():
+                    for sm in pinned:
+                        defer = sm.can_defer_load()
+                        if defer:
+                            config.stc.begin_deferred_load()
+                        sm.load(attn_dev, max_chunk_size = max_chunk_size)
+                        if defer:
+                            config.stc.end_deferred_load()
+            except Exception as e:
+                config.stc.abort_deferred_load()
+                if e.__class__.__name__ == "OutOfMemoryError" or "out of memory" in str(e):
+                    raise RuntimeError(
+                        f"Insufficient VRAM on {attn_dev} for the {len(pinned)} attention modules pinned there: "
+                        f"{str(e).splitlines()[0][:200]}"
+                    ) from e
+                raise
+            if verbose:
+                print(f" -- autosplit: {len(pinned)} pinned modules on {attn_dev}, "
+                      f"{torch.cuda.memory_allocated(attn_dev) >> 20} MiB allocated")
+
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
             for idx, module in enumerate(modules):
@@ -192,7 +247,8 @@ class Model_LSMixin(ABC):
                         if load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
-                            touched_devices.append(i)
+                            if i not in touched_devices:
+                                touched_devices.append(i)
                             i = active_devices[current_device_i]
                             if reserve_per_device is not None:
                                 device_budget[i] = set_memory_fraction_reserve(reserve_per_device[i], i)
@@ -236,6 +292,10 @@ class Model_LSMixin(ABC):
                             if autosplit_prepare:
                                 for sm in module:
                                     sm.autosplit_prepare(params)
+                            attn_measure = attn_dev is not None and attn_dev != load_device
+                            if attn_measure:
+                                torch.cuda.reset_peak_memory_stats(attn_dev)
+                                attn_alloc_before = torch.cuda.memory_allocated(attn_dev)
                             if measure:
                                 torch.cuda.reset_peak_memory_stats(load_device)
                                 alloc_before = torch.cuda.memory_allocated(load_device)
@@ -245,6 +305,23 @@ class Model_LSMixin(ABC):
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
                                 sm.autosplit_extra_measure(params)
+                            if attn_measure:
+                                # The pinned attention ran on its own device: its transient counts
+                                # there, and moving this block elsewhere would not help, so a
+                                # shortfall is final
+                                ai = attn_dev.index
+                                transient = max(0, torch.cuda.max_memory_allocated(attn_dev) - attn_alloc_before)
+                                max_transient[ai] = max(max_transient.get(ai, 0), transient)
+                                free_now, _ = device_mem_info(attn_dev)
+                                reusable = free_now + torch.cuda.memory_reserved(attn_dev) - \
+                                    torch.cuda.memory_allocated(attn_dev)
+                                if torch.cuda.memory_allocated(attn_dev) + max_transient[ai] > device_budget[ai] or \
+                                    reusable < max_transient[ai] + autosplit_margin:
+                                    raise RuntimeError(
+                                        f"Insufficient VRAM on attention device cuda:{ai}: {reusable >> 20} MiB of "
+                                        f"headroom left for the largest transient measured on it "
+                                        f"({max_transient[ai] >> 20} MiB) plus the {autosplit_margin >> 20} MiB margin"
+                                    )
                             if measure:
                                 i = load_device.index
                                 transient = max(0, torch.cuda.max_memory_allocated(load_device) - alloc_before)
@@ -328,6 +405,16 @@ class Model_LSMixin(ABC):
                         if e.__class__.__name__ == "OutOfMemoryError" or \
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):
+                            # An allocation that failed on the attention device (the block's pinned
+                            # attention ran there) is not cured by moving the block: that device is short
+                            if attn_dev is not None and attn_dev != load_device and (
+                                f"GPU {attn_dev.index} " in str(e) or
+                                torch.cuda.max_memory_allocated(attn_dev) + autosplit_margin >= device_budget[attn_dev.index]
+                            ):
+                                raise RuntimeError(
+                                    f"Insufficient VRAM on attention device {attn_dev} for the pinned attention "
+                                    f"modules and their transients: {str(e).splitlines()[0][:200]}"
+                                ) from e
                             # Exception object will hold references to tensors so we can't free them here
                             fail = True
                             if verbose:
@@ -337,7 +424,7 @@ class Model_LSMixin(ABC):
 
                     # Module failed to load with an OoM error, so advance to the next device if possible
                     if fail:
-                        module.unload()
+                        _unload_keep_pinned(module)
                         for am in attached_modules.get(idx, ()):
                             am.config.stc.abort_deferred_load()
                             am.unload()

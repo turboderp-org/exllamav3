@@ -133,8 +133,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ple_forward_streams_fused", &ple_forward_streams_fused, "ple_forward_streams_fused");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");

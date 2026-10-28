@@ -665,7 +665,8 @@ class DSV4Attention(Module):
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
 
         # (During conversion the owner is already unloaded and its pool arrives through the preserved params)
-        if self.kv_owner is not None and self.kv_owner.device is not None and self.kv_owner.device != torch.device(device):
+        if self.kv_owner is not None and self.kv_owner.device is not None and \
+            torch.device(self.kv_owner.device) != torch.device(device):
             raise RuntimeError(
                 f"{self.key}: reads the compressed KV pool of layer {self.kv_source} ({self.kv_owner.key}), which "
                 f"loaded on {self.kv_owner.device}; a split has to keep every layer of a pool group on one device "
@@ -1303,7 +1304,8 @@ class DSV4Attention(Module):
                 # True = dropped block; unreachable blocks (score -inf) stay dropped
                 shared["cand"] = torch.ones_like(blk, dtype = torch.bool).scatter_(1, top.indices, top.values == ninf)
             else:
-                drop = shared["cand"]
+                # Preserved from the source layer's conversion pass; a resumed job holds it on the host
+                drop = shared["cand"] = to_device(shared["cand"], x.device)
                 full.masked_fill_(drop[:, :nf, None], ninf)
                 tail.masked_fill_(drop[:, nf:], ninf)
         k = min(self.index_topk, ec)
@@ -1696,9 +1698,12 @@ class DSV4Attention(Module):
         _, seq, _ = x.shape
 
         # Whole-step graph path (EXL3_BC_DSA=1); not used when the batched path already
-        # projected this job's rows (pre)
-        if pre is None and self.q_head_norm and \
-                bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
+        # projected this job's rows (pre). The graph knows a layer's own pool, ring and indexer
+        # (it takes a layer without the per-head q norm): V4.1's pool readers, the owners whose
+        # index keys come from idx_wk, the shared top-k and the candidate blocks are not in it
+        if pre is None and bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous() \
+                and (self.kv_source is None or (self.kv_source == self.layer_idx and self.idx_wk is None)) \
+                and self.candidate_mode is None:
             if not hasattr(self, "_bc_dsa"):
                 self._bc_dsa = {}
             key = (id(rsl), rs.slot)

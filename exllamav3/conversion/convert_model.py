@@ -139,6 +139,38 @@ def load_dict(filename, args):
         return json.load(f)
 
 
+def _preserve_to_cpu(o):
+    if torch.is_tensor(o):
+        return o.detach().to("cpu")
+    if isinstance(o, dict):
+        return {k: _preserve_to_cpu(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(_preserve_to_cpu(v) for v in o)
+    return o
+
+
+def save_preserves(quant_preserves, idx, filename: str, args):
+    """
+    What the last completed module preserved for the modules after it (params["quant_preserve"]: shared
+    K/V pools and index selections, carried mHC pre-weights, ...), per calibration row, so a resumed job can
+    start at a module that reads them. Nothing is written for models that preserve nothing
+    """
+    rows = [_preserve_to_cpu(qp.get(idx, {})) for qp in quant_preserves]
+    if any(rows):
+        torch.save({"idx": idx, "rows": rows}, os.path.join(args["work_dir"], filename))
+
+
+def load_preserves(args, job_state, num_rows):
+    """Preserved tensors of the checkpoint being resumed, as save_preserves wrote them, else empty"""
+    path = os.path.join(args["work_dir"], "ckpt", "preserve.pt")
+    if not job_state.get("next_module_idx") or not os.path.exists(path):
+        return [{} for _ in range(num_rows)]
+    saved = torch.load(path, map_location = "cpu")
+    assert saved["idx"] == job_state["next_module_idx"] - 1 and len(saved["rows"]) == num_rows, \
+        "ckpt/preserve.pt does not match the checkpoint"
+    return [{saved["idx"]: row} for row in saved["rows"]]
+
+
 def load_tensor(filename, args):
     path = os.path.join(args["work_dir"], filename)
     with safe_open(path, framework = "pt", device = "cpu") as f:
@@ -1419,7 +1451,7 @@ def main(args, job_state):
                 if job_state["next_module_idx"] == 0 else
                 [{} for _ in range(len(state))]
             )
-        quant_preserves = [{} for _ in range(len(state))]
+        quant_preserves = load_preserves(args, job_state, len(state))
         # Rows whose hidden state (or unquantized reference) has gone non-finite are excluded
         # from all further capture, state advancement and error measurement. Persisted through
         # checkpoints; the job aborts if more than 10% of all rows break
@@ -1782,6 +1814,7 @@ def main(args, job_state):
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
+            save_preserves(quant_preserves, idx, "ckpt_new/preserve.pt", args)
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
             os.rename(ckpt_dir, ckpt_dir_old)

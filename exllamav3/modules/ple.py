@@ -475,6 +475,25 @@ class PLELayer(Module):
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
             return None, conv_stream
+        if self.kv_proj is not None and not self.conv_kernel_size \
+                and self.kv_proj.quant_type == "fp16" and self.kv_proj.inner.bias is None \
+                and streams.dtype == torch.float and streams.is_contiguous():
+            # Conv-less, one fused projection (DeepSeek-V4.1 Engram): the ext call runs the whole gate and
+            # the delta is added into the streams in place, slab by slab as above
+            emb = emb.contiguous()
+            sub = _ple_sub_range if _ple_sub_range > 0 else seq
+            slabs = [(0, seq)] if bsz > 1 or seq <= sub else [(t0, min(t0 + sub, seq)) for t0 in range(0, seq, sub)]
+            delta = None
+            for t0, t1 in slabs:
+                if delta is None or delta.shape[1] != t1 - t0:
+                    delta = torch.empty((bsz, t1 - t0, H, D), dtype = torch.float, device = streams.device)
+                ext.ple_forward_streams_fused(
+                    streams[:, t0:t1], emb[:, t0:t1], self.kv_proj.inner.weight,
+                    self.norm_key.weight.data, self.norm_query.weight.data,
+                    self.norm_key.rms_norm_eps, self.norm_key.constant_bias, self.gate_scale, delta,
+                )
+                streams[:, t0:t1].add_(delta)
+            return None, None
         return self.forward_streams_reference(streams, emb, params, conv_state)
 
     def forward_streams_reference(self, streams, emb, params, conv_state = None):

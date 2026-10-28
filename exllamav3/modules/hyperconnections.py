@@ -231,14 +231,22 @@ class HyperConnection(Module):
                 fn = self.fn_h
             else:
                 fn = self.fn
+            if self.carry_pre:
+                # The kernel collapses with the previous site's pre weights (stream 0 at the first site)
+                # and hands this site's own on. Conversion keeps what it publishes per row, so it gets a
+                # fresh tensor rather than the per-site static
+                prev = params.get("hc_pre")
+                pre_in = to_device(prev, dev).reshape(R, H).contiguous() if prev is not None else None
+                if "capture" in params or "quant_preserve" in params:
+                    pre_out = torch.empty((R, H), dtype = torch.float, device = dev)
+                else:
+                    pre_out = g_tensor_cache.get_scratch(dev, R * H, torch.float, f"hc_pre:{self.key}", R).view(R, H)
+                ext.hc_mix_carry(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                                 self.sinkhorn_iters, partials, post, comb, collapsed, pre_in, pre_out)
+                params["hc_pre"] = pre_out.view(b, s, H)
+                return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
             ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                        self.sinkhorn_iters, partials, post, comb, collapsed)
-            if self.carry_pre:
-                # The kernel collapsed with this site's own pre weights; recompute those (its first
-                # H mix rows) to hand on, and collapse with the carried ones instead
-                pre = torch.sigmoid(F.linear(self.norm.forward(streams.flatten(2), params), self.fn[:H])
-                                    * self.scale[0] + self.base[:H]) + self.hc_eps
-                return post.view(b, s, H), comb.view(b, s, H, H), self._carry(streams, pre, params)
             return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
         flat = self.norm.forward(streams.flatten(2), params)
         mix = F.linear(flat, self.fn)

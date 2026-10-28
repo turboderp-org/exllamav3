@@ -218,7 +218,12 @@ class DeepseekV4MTPModel(Model):
             "attach_target": True,
             "dflash_draft": True,
             "default_draft_size": config.dspark_block_size,
+            # The drafter's main-kv rows live in the attention layers' window rings (DSparkAttention),
+            # a draft-side recurrent state paired with the target's
+            "recurrent_states": True,
         })
+        from ..cache.dsa import DSV4State
+        self.recurrent_state_cls = DSV4State
         self.attached_model = None
         # Private trunk embedding/head instances, loaded lazily by attach_to when the
         # target is tensor-parallel (its own embedding and head then live in the rank
@@ -297,7 +302,11 @@ class DeepseekV4MTPModel(Model):
     ):
         """Write main-kv rows for freshly accepted/prefilled target positions: concat the
         trunk tap states, project through main_proj/main_norm once, then per block derive
-        and store that block's kv rows (paged, aligned with the target block tables)."""
+        that block's kv rows and write them into its window ring at the rows' positions
+        (params["recurrent_states"]: the jobs' draft-side states, moved past the rows once
+        every block has written)."""
+        rsg = params.get("recurrent_states")
+        assert rsg is not None, "DSpark: update_kv_from_target needs the draft-side recurrent states"
         if lengths is not None:
             max_length = max(lengths)
             target_hidden = [t[:, :max_length] for t in target_hidden]
@@ -306,11 +315,13 @@ class DeepseekV4MTPModel(Model):
             target_hidden[i] = to_device(target_hidden[i], device)
         th = torch.cat(target_hidden, dim = -1)
         params = dict(params)
-        params["cache"] = cache
         params["dspark_main_x"] = self.input_layer.project_taps(th, {})
+        positions = params["cache_seqlens"].tolist()
+        plan = self.attn_modules[0].plan_state_rows(rsg, positions, lengths, th.shape[1])
         for attn in self.attn_modules:
             mx = get_for_device(params, "dspark_main_x", attn.device)
-            attn.update_kv_rows(mx, params)
+            attn.write_state_rows(rsg, plan, attn.project_rows(mx, params))
+        DSparkAttention.commit_state_rows(rsg, plan)
 
 
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:

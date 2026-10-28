@@ -52,6 +52,37 @@ def _run_fused(streams, pend, fn, base, scale, rms_eps, hc_eps, iters, norm):
     return post, comb, collapsed, normed
 
 
+@pytest.mark.parametrize("R", [1, 3, 32])
+@pytest.mark.parametrize("D", [1024, 4096])
+@pytest.mark.parametrize("carried", [True, False])
+def test_carry(device, R, D, carried):
+    """hc_mix_carry: post/comb as hc_mix, the collapse with the carried pre weights (or stream 0 without
+    any), this site's own pre weights handed out"""
+    torch.manual_seed(R * 7 + D)
+    streams = torch.randn((R, H, D), dtype = torch.float, device = device)
+    fn = torch.randn((M, H * D), dtype = torch.float, device = device) * 0.02
+    base = torch.randn(M, dtype = torch.float, device = device)
+    scale = torch.rand(3, dtype = torch.float, device = device) + 0.5
+    rms_eps, hc_eps, iters = 1e-6, 1e-6, 20
+    post_ref, comb_ref, _ = _run_mix(streams, fn, base, scale, rms_eps, hc_eps, iters)
+    pre_in = (torch.rand((R, H), dtype = torch.float, device = device) + 0.1) if carried else None
+    chunks = ext.hc_mix_num_chunks(R, H * D)
+    partials = torch.empty((R, chunks, M + 1), dtype = torch.float, device = device)
+    post = torch.empty((R, H), dtype = torch.float, device = device)
+    comb = torch.empty((R, H, H), dtype = torch.float, device = device)
+    collapsed = torch.empty((R, D), dtype = torch.half, device = device)
+    pre_out = torch.empty((R, H), dtype = torch.float, device = device)
+    ext.hc_mix_carry(streams, fn, base, scale, rms_eps, hc_eps, iters, partials, post, comb, collapsed, pre_in, pre_out)
+    assert torch.equal(post, post_ref) and torch.equal(comb, comb_ref)
+    flat = streams.flatten(1)
+    normed = flat * torch.rsqrt(flat.square().mean(-1, keepdim = True) + rms_eps)
+    pre_exp = torch.sigmoid(normed @ fn[:H].T * scale[0] + base[:H]) + hc_eps
+    torch.testing.assert_close(pre_out, pre_exp, rtol = 1e-4, atol = 1e-5)
+    w = pre_in if carried else torch.tensor([1.0, 0.0, 0.0, 0.0], device = device).expand(R, H)
+    coll_exp = (w.unsqueeze(-1) * streams).sum(dim = 1)
+    torch.testing.assert_close(collapsed.float(), coll_exp, rtol = 2e-3, atol = 2e-3)
+
+
 @pytest.mark.parametrize("R", [1, 2, 3, 8, 32])
 @pytest.mark.parametrize("D", [1024, 2048, 4096])
 @pytest.mark.parametrize("fn_half", [True, False])

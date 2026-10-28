@@ -45,7 +45,7 @@ struct BC_DSV4Attention
 
     // Tables
     at::Tensor q_norm_w;         // (q_lora)
-    at::Tensor q_ones;           // (hd) unweighted q head norm
+    at::Tensor q_ones;           // (hd) unweighted q head norm; no elements: no q head norm (V4.1)
     at::Tensor kv_norm_w;        // (hd)
     at::Tensor inv_freq;         // (rd / 2) fp32, layer's rope table
     at::Tensor inv_freq_neg;     // negated (derot)

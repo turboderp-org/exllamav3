@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..util.tensor import to2
+from ..util.device_copy import to_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
@@ -175,7 +176,13 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
-            y = self.attn.forward(y, params)
+            if self.attn.device != self.device:
+                # Attention pinned to the split's attention device (Model.load attn_device): its fp16
+                # input and output are what crosses, the residual streams stay here
+                y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+                y = to_device(y, self.device)
+            else:
+                y = self.attn.forward(y, params)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:

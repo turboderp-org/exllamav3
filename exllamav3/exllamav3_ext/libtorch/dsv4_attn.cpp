@@ -120,12 +120,24 @@ void BC_DSV4Attention::run_gr
         c10::optional<at::Tensor> no_pid = {};
         c10::optional<at::Tensor> qn = q_ones;
         c10::optional<at::Tensor> kn = kv_norm_w;
-        rope_gr
-        (
-            q4, q4, k_in, k_out, inv_freq, 0, positions, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
-            1, D - rope_dim, graph
-        );
+        if (q_ones.numel() == 0)
+        {
+            // No per-head q norm (V4.1): the q rope slice rotates on its own, kv takes its norm in the
+            // kernel's q slot (it only normalizes k alongside a normalized q)
+            at::Tensor q_sl = q4.narrow(3, D - rope_dim, rope_dim);
+            c10::optional<at::Tensor> none = {};
+            rope_gr(q_sl, q_sl, none, none, inv_freq, 0, positions, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, none, none, 1e-6f, 0.0f, 0.0f, 0, 1, 0, graph);
+            rope_gr(kv4, kv4, none, none, inv_freq, 0, positions, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, kn, none, rms_norm_eps, 0.0f, 0.0f, 0, 1, D - rope_dim, graph);
+        }
+        else
+            rope_gr
+            (
+                q4, q4, k_in, k_out, inv_freq, 0, positions, no_pid,
+                ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
+                1, D - rope_dim, graph
+            );
     }
 
     // Compressors: emitted entries into the paged pools via the per-job block table
@@ -430,12 +442,23 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
         c10::optional<at::Tensor> no_pid = {};
         c10::optional<at::Tensor> qn = q_ones;
         c10::optional<at::Tensor> kn = kv_norm_w;
-        rope_gr
-        (
-            q4, q4, k_in, k_out, inv_freq, 0, pos_opt, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
-            1, D - rope_dim, graph
-        );
+        if (q_ones.numel() == 0)
+        {
+            // No per-head q norm (V4.1), see BC_DSV4Attention::run_gr
+            at::Tensor q_sl = q4.narrow(3, D - rope_dim, rope_dim);
+            c10::optional<at::Tensor> none = {};
+            rope_gr(q_sl, q_sl, none, none, inv_freq, 0, pos_opt, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, none, none, 1e-6f, 0.0f, 0.0f, 0, 1, 0, graph);
+            rope_gr(kv4, kv4, none, none, inv_freq, 0, pos_opt, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, kn, none, rms_norm_eps, 0.0f, 0.0f, 0, 1, D - rope_dim, graph);
+        }
+        else
+            rope_gr
+            (
+                q4, q4, k_in, k_out, inv_freq, 0, pos_opt, no_pid,
+                ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
+                1, D - rope_dim, graph
+            );
     }
 
     // Compressors on the fan outputs: grid.y-batched, entries written to the paged pools

@@ -157,6 +157,9 @@ class DeepseekV41Model(DeepseekV4Model):
             candidate_block_size = config.candidate_block_size,
             **extra,
         )
+        # Pools and selections are read across layers (every layer past 20 reads layer 20's), so a
+        # split loads all attention layers on one device (Model.load attn_device)
+        attn.caps["attn_device"] = True
         self.kv_owners[idx] = attn
         return attn
 
@@ -196,8 +199,10 @@ class DeepseekV41Model(DeepseekV4Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = ""
+        # The checkpoint's template in chat mode (no reasoning header): the assistant turn opens
+        # with a closed think tag; without it the model ends its turn at once
+        p = "<｜begin▁of▁sentence｜>"
         if system_prompt:
-            p += f"{system_prompt}\n\n"
-        p += f"<｜User｜>{prompt}<｜Assistant｜>"
+            p += f"<｜System｜>{system_prompt}"
+        p += f"<｜User｜>{prompt}<｜Assistant｜></think>"
         return p
