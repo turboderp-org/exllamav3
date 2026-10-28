@@ -251,9 +251,9 @@ class LinearEXL3:
             for bi, b in enumerate(grp):
                 ext.reconstruct_slice(stack[bi], self.trellis, self.K, self.mcg, self.mul1, b * 128)
             w = stack.permute(1, 0, 2).reshape(k, 128 * len(grp))
-            w = preapply_had_l(w, had_k)
+            w = preapply_had_l_(w, had_k)
             w *= suh
-            w = preapply_had_r(w, had_n)
+            w = preapply_had_r_(w, had_n)
             svh_idx = (torch.tensor(grp, device = w.device).unsqueeze(1) * 128 + torch.arange(128, device = w.device)).view(-1)
             w *= self.svh[svh_idx].unsqueeze(0)
             # Requested columns inside this group: block index -> stacked offset
