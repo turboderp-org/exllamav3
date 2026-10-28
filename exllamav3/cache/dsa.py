@@ -198,6 +198,8 @@ class DSV4ExportedState:
     serial: int
     wshift: int = 0
     last_history: int = 0
+    # Marks the handle a TP worker holds, for modules that look their layer state up by cache id (PLE)
+    exported = True
 
 
 class DSV4State:

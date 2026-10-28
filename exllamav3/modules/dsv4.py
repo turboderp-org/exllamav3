@@ -342,6 +342,9 @@ class DSV4Compressor:
 
 class DSV4Attention(Module):
 
+    # Query rows per indexer score slab
+    SCORE_SLAB = 256
+
     def __init__(
         self,
         config: Config,
@@ -823,6 +826,9 @@ class DSV4Attention(Module):
                 "candidate_topk_blocks": self.candidate_topk_blocks,
                 "candidate_block_size": self.candidate_block_size,
             },
+            # A reader links to its pool owner's rank-local instance on import (every rank holds every
+            # attention layer, the pools replicated)
+            "kv_owner_key": self.kv_owner.key if self.kv_owner is not None else None,
             "num_q_heads": self.num_q_heads,
             "o_groups": self.o_groups,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -834,6 +840,8 @@ class DSV4Attention(Module):
                 "wo_b",
                 "idx_wq_b",
                 "idx_weights",
+                "idx_wk",
+                "idx_k_norm",
             )},
             "wo_a": [l.tp_export(plan, producer) for l in self.wo_a],
             "sinks": producer.send(self.sinks),
@@ -900,6 +908,15 @@ class DSV4Attention(Module):
             tp_defer_compressors = True,
         )
         module.tp_mode = True
+        # V4.1's pool owner with a full indexer and no indexer compressor keys the indexer from the pool
+        # itself; the constructor makes these only next to a compressor, which TP attaches afterwards
+        module.idx_wk = _import("idx_wk")
+        module.idx_k_norm = _import("idx_k_norm")
+        # A layer reading another layer's pool links to that layer's rank-local instance, imported before it
+        owner_key = exported.get("kv_owner_key")
+        if owner_key is not None:
+            module.kv_owner = next((sm for m in local_context["modules"] for sm in m if sm.key == owner_key), None)
+            assert module.kv_owner is not None, f"{key}: no module {owner_key} in this TP worker to read the pool of"
 
         if num_groups:
             consumer = local_context["consumer"]
@@ -946,7 +963,9 @@ class DSV4Attention(Module):
         self.kv_norm_w = self.kv_norm.weight.data
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
         if self.compressor is not None:
-            self.compressor.make_bc(self.inv_freq_compress)
+            # A V4.1 pool owner that keys its indexer from the pool rotates nothing here, as in load()
+            freq = torch.zeros_like(self.inv_freq_compress) if self.idx_wk is not None else self.inv_freq_compress
+            self.compressor.make_bc(freq)
         if self.indexer is not None:
             self.indexer.make_bc(self.inv_freq_compress)
         for rl in self.recurrent_layers:
@@ -1287,32 +1306,84 @@ class DSV4Attention(Module):
             q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, self.index_n_heads, self.index_head_dim).contiguous()
         _ext_rope(q_idx[..., -self.rope_head_dim:], self.inv_freq_compress, position = pos0)
         wts = self.idx_weights.forward(x, params)
-        scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
-                                    block_table = block_table, epp = epp)
+        # Two-level selection (V4.1): the candidate source keeps its best candidate_topk_blocks blocks
+        # of entries per query (the block holding the query's newest entry pinned in), and later index
+        # sources select inside them. True in the mask = dropped block
         bs = self.candidate_block_size
-        if self.candidate_mode is not None and ec > self.candidate_topk_blocks * bs:
-            # Two-level selection (V4.1): the candidate source keeps its best candidate_topk_blocks
-            # blocks of entries per query (the block holding the query's newest entry pinned in),
-            # and later index sources select inside them
-            nf, ninf = ec // bs, -float("inf")
-            full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
-            if self.candidate_mode == "source":
-                tail_max = F.pad(tail, (0, bs), value = ninf).amax(dim = -1, keepdim = True)
-                blk = torch.cat((full.amax(dim = -1), tail_max), dim = 1)
-                last = ((pos0 + 1 + torch.arange(seq, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
-                top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
-                # True = dropped block; unreachable blocks (score -inf) stay dropped
-                shared["cand"] = torch.ones_like(blk, dtype = torch.bool).scatter_(1, top.indices, top.values == ninf)
-            else:
-                # Preserved from the source layer's conversion pass; a resumed job holds it on the host
-                drop = shared["cand"] = to_device(shared["cand"], x.device)
-                full.masked_fill_(drop[:, :nf, None], ninf)
-                tail.masked_fill_(drop[:, nf:], ninf)
+        mode = self.candidate_mode if ec > self.candidate_topk_blocks * bs else None
+        if mode == "source":
+            shared["cand"] = torch.ones((seq, ec // bs + 1), dtype = torch.bool, device = x.device)
+        elif mode == "use":
+            # Preserved from the source layer's conversion pass; a resumed job holds it on the host
+            shared["cand"] = to_device(shared["cand"], x.device)
         k = min(self.index_topk, ec)
         K_pad = -(-k // 32) * 32
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
-        ext.dsa_topk(scores, indices, k, None, 0)
+
+        def slab(r0, r1):
+            sel, ninf = indices[r0:r1], -float("inf")
+            if mode == "use":
+                # A row selects inside its candidate blocks: score only the blocks any row of the slab
+                # kept, then map the selection back to pool entry ids
+                drop = shared["cand"][r0:r1]
+                ent = ((~drop).any(dim = 0).nonzero() * bs + torch.arange(bs, device = x.device)).flatten()
+                ent = ent[ent < ec]
+                rows = ent if block_table is None else block_table.reshape(-1)[ent // epp].long() * epp + ent % epp
+                scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows], ent.numel() * self.compress_rate,
+                                            self.compress_rate, ent.numel())
+                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
+                scores.masked_fill_(drop[:, ent // bs], ninf)
+                scores.masked_fill_(ent >= vis[:, None], ninf)
+                ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
+                sel.copy_(torch.where(sel < 0, sel, ent.int()[sel.clamp(min = 0)]))
+                return
+            scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
+                                        block_table = block_table, epp = epp)
+            if mode == "source":
+                nf = ec // bs
+                full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
+                tail_max = F.pad(tail, (0, bs), value = ninf).amax(dim = -1, keepdim = True)
+                blk = torch.cat((full.amax(dim = -1), tail_max), dim = 1)
+                last = ((pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
+                top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
+                # unreachable blocks (score -inf) stay dropped
+                shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
+            ext.dsa_topk(scores, sel, k, None, 0)
+
+        # Row slabs bound the transient score matrix (selection is per row); the last slab absorbs
+        # the tail so no slab is left with the few rows that would take the decode kernels
+        cuts = list(range(0, max(seq - 16, 1), self.SCORE_SLAB))
+        for r0, r1 in zip(cuts, cuts[1:] + [seq]):
+            slab(r0, r1)
         return indices, k
+
+
+    def autosplit_extra_measure(self, params):
+        """Indexer score matrix at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach: allocated (and dropped) here for the device budget"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        cache = params.get("cache")
+        if cache is None or self.device is None or self.indexer_mode != "full":
+            return
+        rows = params["batch_shape"][1]
+        ec = cache.layers[self.kv_source, params.get("layer_instance") or 0].capacity
+        if ec <= self.index_topk:
+            return   # cache too small to ever reach the top-k regime
+        slab = min(rows, self.SCORE_SLAB + 16)
+        n = slab * max(128, 1 << (ec - 1).bit_length())
+        # Attention and indexer queries, live while it is scored
+        n += rows * (self.num_q_heads * self.head_dim + self.index_n_heads * self.index_head_dim)
+        bs = self.candidate_block_size
+        if self.candidate_mode == "source" and ec > self.candidate_topk_blocks * bs:
+            # Block maxima of a slab, live twice while the tail block is appended, and the candidate mask
+            n += 2 * slab * (ec // bs + 1) + rows * (ec // bs + 1) // 2
+        elif self.candidate_mode == "use" and ec > self.candidate_topk_blocks * bs:
+            # Candidate mask, one byte per block, when its source is on another device; then, per slab,
+            # the keys of the candidate entries, the mask over them and their ids
+            n += rows * (ec // bs + 1) // 2 + ec * (self.index_head_dim + slab // 2 + 8)
+        t = torch.empty((n,), dtype = torch.half, device = self.device)
+        del t
 
 
     def _forward_cached(self, x, params, out_dtype):

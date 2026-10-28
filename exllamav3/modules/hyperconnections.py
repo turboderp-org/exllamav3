@@ -222,7 +222,9 @@ class HyperConnection(Module):
             partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
             post = ws(R * H, torch.float, "hc_post").view(R, H)
             comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
-            collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
+            # The collapse stays fp32 on the carry path: the residual streams can carry values past the
+            # fp16 range at a few positions (massive activations), and the block normalizes from here
+            collapsed = ws(R * D, torch.float if self.carry_pre else torch.half, "hc_coll").view(R, D)
             # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
             # dominant traffic and the kernel dots it in fp32 either way
             if R <= 32:
