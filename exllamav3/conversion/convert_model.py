@@ -689,6 +689,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             time_str = f"  [{t.interval / len(group):4.2f} s]"
             for linear, quant_args, proxy_err in zip(group, quant_args_list, proxy_errs):
                 print_quantized_linear(config, linear, quant_args, proxy_err, time_str)
+            malloc_trim()
             continue
 
         linear = group[0]
@@ -722,6 +723,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 assert isinstance(linear.inner, LinearEXL3)
                 linear.inner.swap_cpu()
             print_quantized_linear(config, linear, quant_args, proxy_err, f"  [{t.interval:4.2f} s]")
+            malloc_trim()
 
 
 def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state,
@@ -792,6 +794,9 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                         print_quantized_linear(config, linear, quant_args_local, proxy_err)
                         with progress_lock:
                             curr_progress += 1
+                    # The originals the group consumed are freed, but the host heap only hands them back
+                    # from its top: return what can be returned now rather than at the end of the module
+                    malloc_trim()
                     continue
 
                 linear = group[0]
@@ -813,6 +818,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 print_quantized_linear(config, linear, quant_args_local, proxy_err)
                 with progress_lock:
                     curr_progress += 1
+                malloc_trim()
 
             # The device is idle from here until the slowest thread finishes; its measured speed
             # steers the next module's split
