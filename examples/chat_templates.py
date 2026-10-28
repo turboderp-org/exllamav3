@@ -1085,7 +1085,7 @@ class PromptFormat_ds4(PromptFormat):
     def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
-            context += f"<｜begin▁of▁sentence｜>{system_prompt}"
+            context += f"<｜begin▁of▁sentence｜>{system_prompt}\n\n"
         for (u, a) in messages:
             context += f"<｜User｜>{u}"
             context += f"<｜Assistant｜>"
@@ -1095,14 +1095,14 @@ class PromptFormat_ds4(PromptFormat):
                 context += f"</think>{a}"
                 context += f"<｜end▁of▁sentence｜>"
             else:
-                context += f"<think>" if think else f"</think>"
+                context += f"" if think else f"</think>"
         return context
 
     def add_bos(self):
         return False
 
     def thinktag(self):
-        return "<think>\n", "</think>"
+        return "<think>", "</think>"
 
     def stop_conditions(self, tokenizer):
         return tokenizer.config.eos_token_id_list + [
