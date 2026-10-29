@@ -987,6 +987,9 @@ class MoeCpuHost:
         # memory (WDDM and WSL2 budget the pinnable memory at about half of RAM) ends the pinning,
         # and experts in it and every later chunk stream through the staged path instead
         self.arena_registered = None
+        # The chunk the worker may still be writing: (index, size, name, mapping), page-locked
+        # once the next chunk appears or loading is done (see _attach_chunk)
+        self._arena_pending = None
         self.layer_blocks = []
         self.layer_auxloc = []
         # Promote-on-miss transfers (see BlockSparseMLP_CPU._split_promote_step): per device a
@@ -1072,12 +1075,16 @@ class MoeCpuHost:
 
     def _attach_chunk(self, index, size, name):
         """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
-        ("chunk", ...) message; Windows: section `name`) and page-lock it for DMA. Registration
-        is done here, per chunk as it appears during loading, so its cost overlaps the rest of
-        the load instead of stacking up at startup. Any failure closes the mapping before the
-        error leaves this frame."""
+        ("chunk", ...) message; Windows: section `name`) and page-lock the chunk before it. The
+        worker fills its chunks strictly in order, so a chunk is complete once its successor is
+        published; the last one is page-locked when loading is done (ensure_started). A chunk is
+        never page-locked while the worker writes it: on Windows the driver's per-page probe
+        rewrites each page's first byte, and a concurrent write there is lost. Registration still
+        overlaps the rest of the load. Any failure closes the mapping before the error leaves
+        this frame."""
         import mmap
         import socket
+        self._pin_pending_chunk()
         assert index == len(self.arena_maps), "arena chunk published out of order"
         if name is not None:
             # Opening by name fails loudly if the worker already dropped the section
@@ -1098,6 +1105,14 @@ class MoeCpuHost:
             self.arena_maps.append(None)
             self.arena_views.append(None)
             return
+        self._arena_pending = (index, size, name, m)
+
+    def _pin_pending_chunk(self):
+        """Page-lock the chunk published last (see _attach_chunk), once the worker has finished it"""
+        if self._arena_pending is None:
+            return
+        index, size, name, m = self._arena_pending
+        self._arena_pending = None
         view = None
         try:
             # count = size // 2: a section opened by name reports its page-rounded size, and
@@ -1189,6 +1204,7 @@ class MoeCpuHost:
             return
         while self.acked < len(self.specs):
             self._pump(1.0)
+        self._pin_pending_chunk()
 
         max_hi = max(s["hi"] for s in self.specs)
         max_ho = max(s["ho"] for s in self.specs)
@@ -2340,6 +2356,9 @@ class MoeCpuHost:
         self.layer_auxloc = []
         self._promo = {}
         maps, self.arena_maps = self.arena_maps, []
+        if self._arena_pending is not None:
+            maps.append(self._arena_pending[3])
+            self._arena_pending = None
         if maps:
             import gc
             gc.collect()
