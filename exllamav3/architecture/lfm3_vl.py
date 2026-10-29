@@ -17,12 +17,13 @@ from ..modules import (
     GatedMLP,
 )
 from ..modules.arch_specific.lfm3_vl import (
-    Lfm3VlAxialRope,
     Lfm3VlProjector,
     Lfm3VlVisionConv,
 )
 from ..tokenizer.mm_embedding import MMEmbedding
+from ..util.rope import RopeSettings, RopeStyle
 from .lfm3 import Lfm3Config, Lfm3Model, read_lfm3_layer_types
+from .mm_processing.qwen2 import qwen2_position_embedding_grid_2d
 
 
 def lfm3_vl_smart_resize(
@@ -48,23 +49,6 @@ def lfm3_vl_smart_resize(
         h_bar = math.ceil(height * beta / factor) * factor
         w_bar = math.ceil(width * beta / factor) * factor
     return h_bar, w_bar
-
-
-def lfm3_vl_position_ids(grid_thw: tuple, spatial_merge_size: int) -> torch.Tensor:
-    """
-    Row and column index of every patch, laid out block-major over the merge blocks (the order the
-    patches arrive in).
-    """
-    position_ids = []
-    for t, h, w in grid_thw:
-        hpos = torch.arange(h).unsqueeze(1).expand(-1, w)
-        wpos = torch.arange(w).unsqueeze(0).expand(h, -1)
-        hpos = hpos.reshape(h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size)
-        wpos = wpos.reshape(h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size)
-        hpos = hpos.permute(0, 2, 1, 3).reshape(h * w)
-        wpos = wpos.permute(0, 2, 1, 3).reshape(h * w)
-        position_ids.append(torch.stack([hpos, wpos], dim = -1))
-    return torch.cat(position_ids, dim = 0)
 
 
 class Lfm3VlVisionConfig:
@@ -156,63 +140,17 @@ class Lfm3VlTextModel(Lfm3Model):
         super().__init__(config, key_prefix = key_prefix, **kwargs)
 
 
-class Lfm3VlVisionAttention(Attention):
-    """
-    Attention over the patches of one frame: bidirectional, grouped-query, with an axial 2D rope that
-    uses the same frequencies for the row and the column axis.
-    """
-
-    def __init__(
-        self,
-        config: Config,
-        key: str,
-        layer_idx: int,
-        hidden_size: int,
-        head_dim: int,
-        num_q_heads: int,
-        num_kv_heads: int,
-        rope_theta: float,
-        q_norm: RMSNorm,
-        k_norm: RMSNorm,
-        qmap: str | None = "block.attn",
-        out_dtype: torch.dtype | None = None,
-    ):
-        super().__init__(
-            config = config,
-            key = key,
-            layer_idx = layer_idx,
-            hidden_size = hidden_size,
-            head_dim = head_dim,
-            num_q_heads = num_q_heads,
-            num_kv_heads = num_kv_heads,
-            rope_settings = None,
-            sm_scale = None,
-            key_q = "q_proj",
-            key_k = "k_proj",
-            key_v = "v_proj",
-            key_o = "out_proj",
-            qmap = qmap,
-            q_norm = q_norm,
-            k_norm = k_norm,
-            out_dtype = out_dtype,
-            use_cu_seqlens = True,
-        )
-        self.rope_theta = rope_theta
-        self.norm_eps = q_norm.rms_norm_eps
-
-    @override
-    def load(self, device: torch.device, **kwargs):
-        super().load(device, **kwargs)
-        self.rope = Lfm3VlAxialRope(device, self.head_dim, self.rope_theta)
-
-    @override
-    def unload(self):
-        super().unload()
-        self.rope = None
-
-
 class Lfm3VlVisionModel(Model):
     config_class = Lfm3VlConfig
+
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: Lfm3VlConfig) -> dict:
+        # The tower and the projector ride along unquantized unless --vision_bits quantizes them
+        return (
+            config.stc.list_tensors(prefix = "model.vision_tower") |
+            config.stc.list_tensors(prefix = "model.multi_modal_projector")
+        )
 
     def __init__(
         self,
@@ -221,6 +159,11 @@ class Lfm3VlVisionModel(Model):
         **kwargs,
     ):
         super().__init__(config, **kwargs)
+        self.caps.update({
+            "image_input": True,
+            # The tower quantizes cleanly at 6 bpw (validated on LFM3-VL-2B)
+            "default_vision_bits": 6,
+        })
 
         v = config.vision
 
@@ -252,7 +195,10 @@ class Lfm3VlVisionModel(Model):
                     out_dtype = torch.float,
                 )
             else:
-                attn = Lfm3VlVisionAttention(
+                # Bidirectional GQA over one frame. The axial 2D rope (the same frequencies over half the
+                # head dim for the row and the column axis, laid out [h, w] and NEOX-paired) is the Qwen2
+                # grid table, handed to the rope kernel per patch through params["inv_freq"]
+                attn = Attention(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.self_attn",
                     layer_idx = idx,
@@ -260,7 +206,16 @@ class Lfm3VlVisionModel(Model):
                     head_dim = v.head_dim,
                     num_q_heads = v.num_attention_heads,
                     num_kv_heads = v.num_key_value_heads,
-                    rope_theta = v.rope_theta,
+                    rope_settings = RopeSettings(
+                        head_dim = v.head_dim,
+                        rope_style = RopeStyle.NEOX,
+                    ),
+                    sm_scale = None,
+                    key_q = "q_proj",
+                    key_k = "k_proj",
+                    key_v = "v_proj",
+                    key_o = "out_proj",
+                    use_cu_seqlens = True,
                     q_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.q_layernorm",
@@ -328,6 +283,33 @@ class Lfm3VlVisionModel(Model):
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         return input_ids
+
+    def make_vision_params(self, grid_thw: tuple) -> dict:
+        """Forward params for one frame grid: bidirectional attention over the frame, the axial rope
+        angles per patch and the grid shape for the convolution's block reorder"""
+        v = self.config.vision
+        t, h, w = grid_thw
+        return {
+            "causal": False,
+            "inv_freq": qwen2_position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta),
+            "frame_shapes": [(h, w)] * t,
+            "use_cu_seqlens": True,
+            "cu_seqlens": torch.arange(0, t * h * w + 1, h * w, dtype = torch.int32),
+            "max_seqlen": h * w,
+        }
+
+    def _measure_grid(self) -> tuple:
+        # The autosplit loader's measuring forward: a square frame of 32 x 32 patches
+        m = self.config.vision.spatial_merge_size
+        side = 32 // m * m
+        return (1, side, side)
+
+    def default_load_shape_dtype(self, chunk_size):
+        t, h, w = self._measure_grid()
+        return (1, t * h * w, self.config.vision.patch_dim), torch.half
+
+    def default_load_params(self, max_chunk_size):
+        return self.make_vision_params(self._measure_grid())
 
     def preprocess(
         self,
@@ -408,67 +390,27 @@ class Lfm3VlVisionModel(Model):
 
         if isinstance(image, list):
             assert text_alias is None, "Cannot apply single alias to list of images"
-            image_tensor = []
-            grids = []
-            for i in image:
-                t, prep_image_size, grid_thw = self.preprocess(i)
-                image_tensor.append(t.unsqueeze(0))
-                grids.append(grid_thw)
-            image_tensor = torch.cat(image_tensor, dim = 0)
-            return_batch = True
-        else:
-            image_tensor, prep_image_size, grid_thw = self.preprocess(image)
-            image = [image]
-            image_tensor = image_tensor.unsqueeze(0)
-            grids = [grid_thw]
-            return_batch = False
+            return [self.get_image_embeddings(tokenizer, i) for i in image]
 
-        position_ids = lfm3_vl_position_ids(grids, v.spatial_merge_size)
-        params = {
-            "causal": False,
-            "position_ids": position_ids.unsqueeze(0),
-            "frame_shapes": [(h, w) for t, h, w in grids],
-            "use_cu_seqlens": True,
-        }
-        cu_seqlens = torch.tensor(
-            [0] + [h * w for t, h, w in grids],
-            dtype = torch.int32,
-            device = image_tensor.device,
+        image_tensor, prep_image_size, grid_thw = self.preprocess(image)
+        params = self.make_vision_params(grid_thw)
+        embedding_tensor = self.forward(image_tensor.unsqueeze(0), params = params).cpu()
+        embedding_tensor = embedding_tensor.reshape(-1, embedding_tensor.shape[-1])
+        num_emb_tokens = embedding_tensor.shape[0]
+
+        # The span the chat template renders around an image: <|vision_start|> image tokens <|vision_end|>
+        id_start = self.config.vision_start_token_id
+        id_end = self.config.vision_end_token_id
+        token_string = torch.tensor([[id_start] + [-1] * num_emb_tokens + [id_end]], dtype = torch.long)
+        mme = MMEmbedding(
+            embeddings = embedding_tensor,
+            text_alias = text_alias,
+            token_string = token_string,
+            grid_thw = grid_thw,
         )
-        params["cu_seqlens"] = cu_seqlens
-        params["max_seqlen"] = max(h * w for t, h, w in grids)
-
-        embedding_tensor = self.forward(image_tensor, params = params).cpu()
-
-        merge = v.spatial_merge_size
-        split_sizes = [(t * h * w) // (merge * merge) for t, h, w in grids]
-        if embedding_tensor.dim() == 3 and embedding_tensor.shape[0] == len(split_sizes):
-            chunks = [embedding_tensor[i] for i in range(len(split_sizes))]
-        else:
-            if embedding_tensor.dim() == 3:
-                embedding_tensor = embedding_tensor.reshape(-1, embedding_tensor.shape[-1])
-            chunks = list(torch.split(embedding_tensor, split_sizes, dim = 0))
-
-        mmes = []
-        for i in range(len(chunks)):
-            num_emb_tokens = chunks[i].shape[0]
-            # The vision start/end tokens are part of the prompt text (the chat template renders
-            # "<|vision_start|><|image|><|vision_end|>"), so only the image tokens are replaced here
-            token_string = torch.tensor(
-                [[-1] * num_emb_tokens],
-                dtype = torch.long,
-            )
-            mme = MMEmbedding(
-                embeddings = chunks[i],
-                text_alias = text_alias,
-                token_string = token_string,
-                grid_thw = grids[i],
-            )
-            mme.metadata.update({
-                "original_size": image[i].size,
-                "preprocessed_size": prep_image_size,
-                "model_architecture": self.config.architecture,
-            })
-            mmes.append(mme)
-
-        return mmes if return_batch else mmes[0]
+        mme.metadata.update({
+            "original_size": image.size,
+            "preprocessed_size": prep_image_size,
+            "model_architecture": self.config.architecture,
+        })
+        return mme

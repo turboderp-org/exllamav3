@@ -7,71 +7,7 @@ from ...model.config import Config
 from .. import Module
 from ..layernorm import LayerNorm
 from ..linear import Linear
-from ...util.rope import RopeStyle
 from ...util.tensor import to2
-
-
-class Lfm3VlAxialRope:
-    """
-    Axial 2D rope for the LFM3-VL vision tower.
-
-    The reference builds the inverse frequencies over half the head dim (head_dim // 2) and uses the same
-    set for the row and the column axis, then lays the angles out over the head dim as [h, w, h, w]. The
-    rotation itself is the usual NEOX pairing of the two halves of the head dim, so the first half of the
-    head dim pairs with the second half.
-    """
-
-    def __init__(self, device, head_dim: int, rope_theta: float):
-        self.device = device
-        self.head_dim = head_dim
-        self.rope_style = RopeStyle.NEOX
-        self.attn_factor = 1.0
-        spatial_dim = head_dim // 2
-        self.inv_freq = 1.0 / (
-            rope_theta **
-            (torch.arange(0, spatial_dim, 2, dtype = torch.float, device = device) / spatial_dim)
-        )
-
-    def apply(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor | None = None,
-        position: int = 0,
-        positions: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        in_place = False,
-        q_norm: torch.Tensor | None = None,
-        k_norm: torch.Tensor | None = None,
-        norm_eps: float = 1e-6,
-        norm_constant_bias: float = 0.0,
-        inv_freq: torch.Tensor | None = None,
-    ):
-        # q: (bsz, seq, heads, head_dim); position_ids: (bsz, seq, 2), row and column
-        assert position_ids is not None, "LFM3-VL axial rope needs position ids"
-        bsz, seq, _, head_dim = q.shape
-        inv_freq = self.inv_freq if inv_freq is None else inv_freq
-        pos = position_ids.reshape(bsz, seq, 1, 2).float()
-        ang = torch.cat(
-            [pos[..., 0:1] * inv_freq, pos[..., 1:2] * inv_freq],
-            dim = -1
-        )
-        ang = torch.cat([ang, ang], dim = -1)
-        cos = ang.cos()
-        sin = ang.sin()
-
-        def norm_rotate(x: torch.Tensor, w: torch.Tensor | None) -> torch.Tensor:
-            xf = x.float()
-            if w is not None:
-                xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim = True) + norm_eps)
-                xf = xf * w.float()
-            x1 = xf[..., :head_dim // 2]
-            x2 = xf[..., head_dim // 2:]
-            rot = torch.cat([-x2, x1], dim = -1)
-            return (xf * cos + rot * sin).to(x.dtype)
-
-        out_q = norm_rotate(q, q_norm)
-        out_k = norm_rotate(k, k_norm) if k is not None else None
-        return out_q, out_k
 
 
 class Lfm3VlVisionConv(Module):

@@ -291,12 +291,13 @@ class Lfm3Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        # ChatML turns; the template opens the assistant turn with <think> (thinking on by default)
         p = ""
         if system_prompt:
-            p += f"system\n"
-            p += f"{system_prompt}\n"
-        p += f"user\n"
-        p += f"{prompt}\n"
-        p += f"assistant\n"
+            p += f"<|im_start|>system\n"
+            p += f"{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n"
+        p += f"{prompt}<|im_end|>\n"
+        p += f"<|im_start|>assistant\n"
         p += f"<think>"
         return p

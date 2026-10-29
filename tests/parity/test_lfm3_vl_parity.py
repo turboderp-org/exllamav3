@@ -76,8 +76,10 @@ def _exl3_logits(model_dir, image, device):
     text = Model.from_config(config, component = "text")
     text.load(device)
     try:
+        # The embedding's token string carries <|vision_start|> and <|vision_end|> itself
         mme = vision.get_image_embeddings(tokenizer, image, text_alias = "<|image|>")
-        ids = tokenizer.encode(PROMPT, embeddings = [mme], encode_special_tokens = True)
+        prompt = PROMPT.replace("<|vision_start|><|image|><|vision_end|>", "<|image|>")
+        ids = tokenizer.encode(prompt, embeddings = [mme], encode_special_tokens = True)
         params = {"indexed_embeddings": [mme], "attn_mode": "flash_attn_nc"}
         with torch.inference_mode():
             logits = text.forward(ids, params)[0]
