@@ -36,6 +36,8 @@ from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
 from .lfm2_vl import Lfm2VlTextModel
+from .lfm3 import Lfm3Model
+from .lfm3_vl import Lfm3VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
@@ -112,6 +114,8 @@ ARCHITECTURES = {
         Lfm2Model,
         Lfm2MoeModel,
         Lfm2VlTextModel,
+        Lfm3Model,
+        Lfm3VlTextModel,
         LlamaModel,
         MiMoModel,
         MiMoV2Model,

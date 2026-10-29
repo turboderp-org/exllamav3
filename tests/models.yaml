@@ -156,3 +156,15 @@ models:
     tags: [hf_reference, mistral4, mla, moe]
     vram: 48
     notes: Mistral-Small-4-119B-2603 release (fp8); parity tests run its first layers
+
+  lfm3-hf:
+    path: lfm3-1.7b/hf
+    tags: [hf_reference, lfm3, conv, attention, swa, small]
+    notes: LFM3-1.7B release (bf16, native tensor names, bundled modeling_lfm3.py); transformers has no native
+      LFM3 class yet, so the parity test loads the checkpoint's own reference code
+
+  lfm3-vl-hf:
+    path: lfm3-vl-2b/hf
+    tags: [hf_reference, lfm3, lfm3_vl, conv, attention, swa, vision, small]
+    notes: LFM3-VL-2B release (bf16, native tensor names, bundled modeling_lfm3_vl.py); transformers has no native
+      LFM3-VL class yet, so the parity test loads the checkpoint's own reference code
