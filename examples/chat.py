@@ -524,7 +524,7 @@ def main(args):
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
-            stop_on_loop = (args.loop_window, args.loop_min_reps),
+            stop_on_loop = True,
             identifier = n,
         ) for n in range(num_completions)]
         generator.enqueue(jobs)
@@ -666,8 +666,6 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
-    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
-    parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()

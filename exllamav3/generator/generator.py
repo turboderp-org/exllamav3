@@ -2295,7 +2295,7 @@ class Generator:
         return_last_results: bool = False,
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
         max_rq_tokens: int | None = None,
-        stop_on_loop: tuple[int, int] = None,
+        stop_on_loop: bool | dict | tuple = False,
         **kwargs
     ):
         """
@@ -2362,8 +2362,9 @@ class Generator:
             the full cache size without limiting concurrency for other jobs.
 
         :param stop_on_loop:
-            Tuple of (window_size: int, min_reps: int), or None. If enabled, generation will end if the last
-            window_size tokens sampled make up >= min_reps consecutive instances of a looping string.
+            End generation when the output settles into repeating the same text, exactly or nearly. True enables it
+            with default settings, a dict passes LoopDetector keyword arguments; the legacy (window_size, min_reps)
+            tuple is treated as True. See Job and generator/loop_detect.py.
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)

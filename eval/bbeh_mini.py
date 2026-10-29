@@ -165,7 +165,7 @@ def main(args):
                 sampler = sampler,
                 identifier = idx,
                 max_rq_tokens = 512,
-                stop_on_loop = (300, 3),
+                stop_on_loop = True,
             )
             generator.enqueue(job)
             progress.update(idx + 1)
