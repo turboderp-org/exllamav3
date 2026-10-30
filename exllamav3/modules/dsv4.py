@@ -8,6 +8,7 @@ from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
 from .module import Module
 from .linear import Linear
+from .quant import LinearFP16, LinearFP16Packed
 from .rmsnorm import RMSNorm
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle, yarn_inv_freq
@@ -186,7 +187,7 @@ class DSV4Compressor:
         for tag, inner in [("wkv", wkv_i), ("wgate", wgate_i)]:
             if isinstance(inner, LinearEXL3):
                 args[f"{tag}_exl3"] = inner.bc
-            elif hasattr(inner, "weight") and inner.weight.dtype == torch.half:
+            elif isinstance(inner, LinearFP16) and not isinstance(inner, LinearFP16Packed) and inner.weight.dtype == torch.half:
                 args[f"{tag}_fp16"] = ext.BC_LinearFP16(inner.weight, getattr(inner, "bias", None))
             else:
                 return

@@ -290,18 +290,23 @@ class HyperConnection(Module):
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
         hc_flush(params)
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
-            # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
-            # partials kernel. Not while states are exported or under TP, where other readers see the streams
-            if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
-                params["hc_pending"] = (x, y, post, comb)
-                return x
+            if converting:
+                # The stored input state stays as it is: the fused update runs on a copy (one stream-sized
+                # allocation, against the three full-width fp32 temporaries of the torch expression below)
+                x = x.clone()
+            else:
+                # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
+                # partials kernel. Not while states are exported or under TP, where other readers see the streams
+                if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
+                    params["hc_pending"] = (x, y, post, comb)
+                    return x
             ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
             return x
-        return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
+        return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x) ###
 
     def tp_export(self, plan, producer):
         # Streams are replicated across TP workers (like the residual), so plain replication

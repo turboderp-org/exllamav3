@@ -7,6 +7,8 @@ from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib import quantize as exl3_quantize
+from ..util.memory import is_integrated_device
 from ..modules.quant.exl3_lib.hessian_packed import packed_numel
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
@@ -103,6 +105,7 @@ parser.add_argument("-mar", "--moe_affinity_rows", type = int, default = 262144,
 parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
 parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
+parser.add_argument("--no_swap", action = "store_true", help = "Keep weights, Hessians and factors on the device between uses instead of swapping them to system memory (unified-memory systems, where a swap is a second copy in the same pool). Default on integrated GPUs")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
@@ -325,6 +328,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("scaled_hessian", False, False),
         ("moe_affinity_eps", False, 0),  # 0 = off
         ("moe_affinity_rows", False, 262144),
+        ("no_swap", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -405,6 +409,9 @@ def prepare(args) -> (dict, dict, bool, str):
 
 def get_base_model(args):
     config = Config.from_directory(args["in_dir"])
+    # Block-scaled fp4/fp8 checkpoint tensors stay packed in VRAM and dequantize per use (the capture and
+    # advance forwards run one projection at a time anyway); lossless, see LinearFP16Packed
+    config.infer_params.packed_fp16_source = True
     print(f" -- Loaded model config")
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
@@ -685,7 +692,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 )
                 for linear in group:
                     assert isinstance(linear.inner, LinearEXL3)
-                    linear.inner.swap_cpu()
+                    if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
             time_str = f"  [{t.interval / len(group):4.2f} s]"
             for linear, quant_args, proxy_err in zip(group, quant_args_list, proxy_errs):
                 print_quantized_linear(config, linear, quant_args, proxy_err, time_str)
@@ -721,7 +728,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                     save_reg = sr,
                 )
                 assert isinstance(linear.inner, LinearEXL3)
-                linear.inner.swap_cpu()
+                if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
             print_quantized_linear(config, linear, quant_args, proxy_err, f"  [{t.interval:4.2f} s]")
             malloc_trim()
 
@@ -790,7 +797,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                     )
                     for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
                         assert isinstance(linear.inner, LinearEXL3)
-                        linear.inner.swap_cpu()
+                        if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
                         print_quantized_linear(config, linear, quant_args_local, proxy_err)
                         with progress_lock:
                             curr_progress += 1
@@ -813,7 +820,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                     override_swap_device = device_idx
                 )
                 assert isinstance(linear.inner, LinearEXL3)
-                linear.inner.swap_cpu()
+                if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
 
                 print_quantized_linear(config, linear, quant_args_local, proxy_err)
                 with progress_lock:
@@ -1355,6 +1362,12 @@ def main(args, job_state):
 
     devices = [int(d) for d in args["devices"].split(",")]
     device = torch.device(devices[0])
+
+    # Unified memory: the host-memory parking below would copy within one pool
+    no_swap = bool(args.get("no_swap")) or all(is_integrated_device(d) for d in devices)
+    exl3_quantize.NO_SWAP = no_swap
+    if no_swap:
+        print(f" -- Swapping to system memory disabled (" + ("--no_swap" if args.get("no_swap") else "integrated GPU") + ")")
     if args.get("device_ratios"):
         device_ratios = [int(d) for d in args["device_ratios"].split(",")]
         assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
@@ -1622,7 +1635,8 @@ def main(args, job_state):
                         # Swap captured H to system RAM
                         for k, v in pass_H.items():
                             v["H_swap_device"] = v["H"].device
-                            v["H"] = v["H"].cpu()
+                            if not no_swap:
+                                v["H"] = v["H"].cpu()
                         capture_H.update(pass_H)
                         merge_out_sensitivity(capture_sens, pass_sens)
                         ref_states.update(pass_ref)
@@ -1665,7 +1679,7 @@ def main(args, job_state):
 
             # Move original tensors to system RAM (load to GPU one by one when quantizing)
             for linear in linears:
-                linear.inner.swap_cpu()
+                if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
 
             # Output sensitivity of the gate and up projections (auto output scales)
             out_sens = finalize_out_sensitivity(capture_sens) if capture_sens else None
@@ -1716,7 +1730,10 @@ def main(args, job_state):
         num_bits = num_bytes * 8
         final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
 
-        # Reload module from memory
+        # Reload module from memory. The quantizer's per-device workspaces are done with: release them so the
+        # state-advance replicas find the room (they are rebuilt when the next module quantizes)
+        get_temp_buffers.cache_clear()
+        free_mem()
         config.stc.set_new_tensors(q_tensors)
         module.load(
             torch.device("cpu") if module.caps.get("prefer_cpu") else device,
@@ -1864,7 +1881,7 @@ def main(args, job_state):
 
             # Move original tensors to system RAM (load to GPU one by one when quantizing)
             for linear in linears:
-                linear.inner.swap_cpu()
+                if not exl3_quantize.NO_SWAP: linear.inner.swap_cpu()
 
             # Quantize (same dispatch as the main loop)
             if (

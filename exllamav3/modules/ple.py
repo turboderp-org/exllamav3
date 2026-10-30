@@ -469,7 +469,7 @@ class PLELayer(Module):
                                           dtype = torch.half, device = streams.device)
                 ext.ple_forward_streams(
                     streams[:, t0:t1], emb[:, t0:t1],
-                    self.key_proj.inner.weight, self.value_proj.inner.weight,
+                    self.key_proj.inner.staged_weight(), self.value_proj.inner.staged_weight(),
                     self.norm_key.weight.data, self.norm_query.weight.data,
                     self.norm_conv.weight.data, self.conv_w,
                     cs,
@@ -495,7 +495,7 @@ class PLELayer(Module):
                 if delta is None or delta.shape[1] != t1 - t0:
                     delta = torch.empty((bsz, t1 - t0, H, D), dtype = torch.float, device = streams.device)
                 ext.ple_forward_streams_fused(
-                    streams[:, t0:t1], emb[:, t0:t1], self.kv_proj.inner.weight,
+                    streams[:, t0:t1], emb[:, t0:t1], self.kv_proj.inner.staged_weight(),
                     self.norm_key.weight.data, self.norm_query.weight.data,
                     self.norm_key.rms_norm_eps, self.norm_key.constant_bias, self.gate_scale, delta,
                 )

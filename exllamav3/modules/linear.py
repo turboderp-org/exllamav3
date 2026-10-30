@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from ..model.config import Config
 from . import Module
-from .quant import LinearFP16, LinearEXL3
+from .quant import LinearFP16, LinearFP16Packed, PackedSegment, packed_fmt, LinearEXL3
 from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
@@ -139,6 +139,18 @@ class Linear(Module):
         return padded.contiguous()
 
 
+    def _packed_source(self) -> bool:
+        """Conversion with packed_fp16_source: natively quantized tensors stay packed (LinearFP16Packed)"""
+        return bool(getattr(self.config.infer_params, "packed_fp16_source", False)) and not self.is_sliced
+
+    def _make_packed(self, segments: list, bias: torch.Tensor | None) -> bool:
+        self.inner = LinearFP16Packed(
+            self.in_features, self.out_features, segments, bias, self.pad_out,
+            global_scale = self.weight_scale, out_dtype = self.out_dtype, key = self.key,
+        )
+        self.quant_type = "fp16"
+        return True
+
     # Row scales (Transformers-specific?)
     def apply_fp8_scales_(self, weight: torch.Tensor, scale: torch.Tensor):
         ws = weight.shape
@@ -204,6 +216,22 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
+                if self._packed_source() and self.transposed_load:
+                    segs, col0, ok = [], 0, True
+                    for k in key:
+                        w = self.config.stc.get_tensor(k + ".weight", dev, no_defer = True, arena = False)
+                        fmt = packed_fmt(w)
+                        if fmt is None or fmt == 1:
+                            ok = False
+                            break
+                        si = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, optional = True, no_defer = True)
+                        block = (128, 128) if si is not None and si.dim() == 2 else None
+                        segs.append(PackedSegment(w, si, fmt, col0 = col0, block = block))
+                        col0 += w.shape[0]
+                    if ok:
+                        bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
+                        bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
+                        return self._make_packed(segs, self.pad_out(bias))
                 weight = []
                 for k in key:
                     # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
@@ -230,6 +258,10 @@ class Linear(Module):
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
                     w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                    if self._packed_source() and self.transposed_load and scale_q.dtype == torch.uint8 \
+                            and packed_fmt(w_raw) is not None:
+                        # Conversion: keep the bytes packed, dequantize per use (LinearFP16Packed)
+                        return self._make_packed([PackedSegment(w_raw, scale_q, packed_fmt(w_raw))], None)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -237,6 +269,21 @@ class Linear(Module):
                     bias = None
                     scale = scale_inv = None
                 else:
+                    if self._packed_source() and self.transposed_load:
+                        # fp8 with a per-tensor / per-row weight_scale or a block weight_scale_inv (Transformers
+                        # finegrained fp8, DeepSeek-V3 style): the fp8 bytes stay packed
+                        w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                        fmt = packed_fmt(w_raw)
+                        if fmt is not None and fmt != 1:
+                            sc_ = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                            si_ = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, optional = True, no_defer = True)
+                            assert sc_ is None or si_ is None
+                            block = (128, 128) if si_ is not None and si_.dim() == 2 else None
+                            sc_ = sc_ if sc_ is not None else si_
+                            if sc_ is None or sc_.dim() <= 2:
+                                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = True)
+                                return self._make_packed([PackedSegment(w_raw, sc_, fmt, block = block)], bias)
+                        del w_raw
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
@@ -351,6 +398,10 @@ class Linear(Module):
                 scales = scales[sl].contiguous()
                 if bias is not None:
                     bias = bias[sl].contiguous()
+            if self._packed_source():
+                # (out, G, 16) bytes are (out, in / 2) nibble pairs in row order, scales (out, G) E8M0
+                seg = PackedSegment(blocks.reshape(blocks.shape[0], -1), scales, 1, block = (1, 32))
+                return self._make_packed([seg], self.pad_out(bias.half() if bias is not None else None))
             weight = _mxfp4_dequant(blocks, scales)
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
@@ -392,6 +443,16 @@ class Linear(Module):
                 # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
                 # whole tensor before slicing out this group's rows
                 scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
+                if scale_q is not None and scale_q.dim() == 2 and self._packed_source() and self.ftranspose_after_load \
+                        and packed_fmt(weight) is not None and scale_q.dtype == torch.uint8:
+                    r0, r1 = self.frange
+                    br = weight.shape[0] // scale_q.shape[0]
+                    if r0 % br == 0 and r1 % br == 0:
+                        bias = self.config.stc.get_tensor(self.fkey + ".bias", self.device, optional = True, no_defer = True)
+                        if bias is not None:
+                            bias = self.pad_out(bias[r0:r1].contiguous())
+                        seg = PackedSegment(weight[r0:r1].contiguous(), scale_q[r0 // br:r1 // br].contiguous(), packed_fmt(weight))
+                        return self._make_packed([seg], bias)
                 if scale_q is not None and scale_q.dim() == 2:
                     weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
@@ -516,7 +577,7 @@ class Linear(Module):
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 
-        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+        if isinstance(inner, LinearFP16) and inner.swap_device is None and not isinstance(inner, LinearFP16Packed):
             inner._pinned_store, inner.weight = pin_alias(inner.weight)
             inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
         elif isinstance(inner, LinearEXL3):
@@ -752,6 +813,9 @@ class Linear(Module):
         else:
             return 2 * self.in_features * self.out_features
     def storage_size(self):
+        # A packed conversion-time inner holds the checkpoint bytes, not the fp16 form the size was planned for
+        if self.inner is not None and hasattr(self.inner, "storage_bytes"):
+            return self.inner.storage_bytes()
         return self._storage_size
 
 

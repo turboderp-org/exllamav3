@@ -21,6 +21,7 @@ softmax router the latter barely distinguishes the selected experts from the res
     time, just before quantizing them: H_e = eps * mean_t p_te * H_shared / N + sum_s p_se x_s x_s^T / n
 """
 import torch
+from ..modules.quant.exl3_lib import quantize as exl3_quantize
 from ..modules.quant.exl3_lib.hessian_packed import unpack
 
 EXPERT_BATCH = 16
@@ -125,7 +126,7 @@ def quantize_gate_up(module, linears: list, capture_H: dict, store: dict, quanti
                 qmap = f"{shared_qmap}.aff{e}"
                 # Swapped like the captured Hessians, so the quantization thread moves it to its own device
                 local[qmap] = {
-                    "H": H.cpu(), "H_swap_device": device, "first_key": g.key, "count": 1, "finalized": False,
+                    "H": H if exl3_quantize.NO_SWAP else H.cpu(), "H_swap_device": device, "first_key": g.key, "count": 1, "finalized": False,
                     "num_total": 0, "inf_nan": torch.zeros(2, dtype = torch.long, device = device), "device": device,
                 }
                 del B, H
