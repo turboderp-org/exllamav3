@@ -11,7 +11,8 @@ from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
-from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
+from .moe_cpu_affinity import (plan_host_cpus, default_worker_threads, apply_process_affinity,
+                               process_cpus, node_sibling_groups)
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -115,6 +116,17 @@ class MoeCpuTuning:
         self.num_wslots = min(int(os.environ.get("EXL3_MOE_CPU_WSLOTS", 2)), MOE_MAX_WSLOTS)
         self.wslot_size = int(os.environ.get("EXL3_MOE_CPU_WSLOT_MB", 32)) * 1024 * 1024
         self.stage_threads = int(os.environ.get("EXL3_MOE_CPU_STAGE_THREADS", 4))
+        # EXL3_MOE_CPU_NUMA: column-split the CPU experts across NUMA nodes -- two node pools,
+        # each reading only its node's half of every expert (see moe_mul1.cpp's numa section).
+        # "auto" enables it when the host exposes two or more nodes with a readable topology;
+        # 0/off forces it off; 1/on forces it on (startup fails loudly when unavailable)
+        self.numa = os.environ.get("EXL3_MOE_CPU_NUMA", "auto").strip().lower()
+        assert self.numa in ("auto", "0", "1", "off", "on", "false", "true"), \
+            "EXL3_MOE_CPU_NUMA must be auto, 0/1 (or off/on/false/true)"
+        # Per-node thread count override; the default (computed in MoeCpuHost.__init__ from the
+        # reported topology) is the smaller node's physical core count minus the host
+        # reservation, so both pools are the same size and nothing runs on the host's core
+        self.numa_threads = int(os.environ.get("EXL3_MOE_CPU_NUMA_THREADS", 0))
         # madvise(MADV_HUGEPAGE) on the expert-weight arena chunks: with defrag=madvise (the
         # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
         # region once easily-compactable free memory runs low, which can stall loading badly.
@@ -211,7 +223,12 @@ def _apply_host_affinity(threads: int, host_cores: int):
         print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
         return
     _HOST_ORIG_CPUS = orig
-    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
+    # Scope: the calling thread only (Linux) -- an API server or eval driver carries dozens of
+    # unrelated threads (CUDA driver, executors, torch pools) that must not inherit the 2-4 LP
+    # host mask, and sweeping them onto it is what poisoned every non-worker phase
+    detail = ("process mask: all threads" if os.name == "nt" else
+              "mask applied to 1 thread (the caller); threads it spawns inherit")
+    print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]} ({detail})")
 
 
 # memfd_create only ships in CPython when the interpreter was built against glibc >= 2.27; conda
@@ -224,6 +241,43 @@ MFD_HUGE_2MB = 21 << 26
 MFD_HUGE_1GB = 30 << 26
 _MEMFD_SYSCALL = {"x86_64": 319, "aarch64": 279, "riscv64": 279, "loongarch64": 279,
                   "ppc64le": 360, "ppc64": 360, "s390x": 350, "i686": 356, "armv7l": 385}
+
+
+def _numa_topo():
+    """[(order, n_phys), ...] per NUMA node from the extension, or [] when unavailable"""
+    try:
+        return ext.exl3_moe_cpu_numa_core_orders()
+    except Exception:
+        return []
+
+
+def _numa_decide():
+    """(numa_nodes, threads_per_node) for this host, honouring EXL3_MOE_CPU_NUMA and
+    EXL3_MOE_CPU_NUMA_THREADS. (0, 0) when the NUMA path is off or unavailable."""
+    if os.name != "posix" or not hasattr(os, "sched_setaffinity"):
+        if TUNING.numa in ("1", "on", "true"):
+            raise RuntimeError("EXL3_MOE_CPU_NUMA=1 but the NUMA offload path is Linux-only")
+        return 0, 0
+    if TUNING.numa in ("0", "off", "false"):
+        return 0, 0
+    orders = _numa_topo()
+    if len(orders) < 2 or any(not o or not n for o, n in orders):
+        if TUNING.numa in ("1", "on", "true"):
+            raise RuntimeError("EXL3_MOE_CPU_NUMA=1 but the host does not expose two NUMA nodes "
+                               "with a readable topology")
+        return 0, 0
+    n_phys = [int(n) for _, n in orders]
+    hc = max(0, TUNING.host_cores)
+    # Each pool must leave host_cores physical cores free on its own node (the numa host
+    # affinity reserves them on every node), so an explicit EXL3_MOE_CPU_NUMA_THREADS
+    # override may not exceed the ceiling either
+    ceiling = max(1, min(n_phys) - hc)
+    tpn = TUNING.numa_threads or ceiling
+    if tpn > ceiling:
+        print(f" -- CPU MoE worker numa: clamping threads/node {tpn} -> {ceiling} "
+              f"(EXL3_MOE_HOST_CORES={hc} reserved for the host on every node)")
+        tpn = ceiling
+    return len(orders), int(tpn)
 
 
 def _memfd_via_libc(name: str, flags: int) -> int:
@@ -391,6 +445,27 @@ def _win32_large_page_alloc(size: int, min_size: int):
     return buf
 
 
+def _copy_repacked_range(dst, tensor, group, planar, nt0, nt1):
+    """_copy_repacked restricted to output-tile columns [nt0, nt1) of the source. The banded
+    layouts store whole 128-column blocks contiguously and never mix columns across a block,
+    so a block-aligned range repacks identically whether it is cut before or after the
+    permutation -- which is what lets the loader first-touch each node's slice from that
+    node's own threads."""
+    tk, tn, ps = tensor.shape
+    assert nt0 % 8 == 0 and nt1 % 8 == 0 and 0 <= nt0 < nt1 <= tn, \
+        "trellis ranges must be whole 128-column blocks"
+    if not group:
+        dst.view(tk, tn, ps)[:, nt0:nt1, :].copy_(tensor[:, nt0:nt1, :])
+    elif planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8)[nt0 // group: nt1 // group].copy_(
+            tensor.view(torch.int32).view(tk, tn // group, group, 8, wd // 8)
+            .permute(1, 0, 2, 4, 3)[nt0 // group: nt1 // group])
+    else:
+        dst.view(tn // group, tk, group, ps)[nt0 // group: nt1 // group].copy_(
+            tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3)[nt0 // group: nt1 // group])
+
+
 def _copy_repacked(dst, tensor, group, planar):
     """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
     CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
@@ -434,14 +509,17 @@ class _HugeArena:
     WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
     CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
-    def __init__(self, shared = False, huge = "", conn = None):
+    def __init__(self, shared = False, huge = "", conn = None, nohuge = False):
         """shared: back each chunk with shared memory and publish it over `conn` as
         ("chunk", index, size, name) so the parent can map the same pages and page-lock them
         for DMA: Linux sends a memfd descriptor after the message (SCM_RIGHTS, name = None),
-        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux)."""
+        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux).
+        nohuge: keep THP off the chunks (NUMA mode: placement must stay 4K-exact, see
+        _new_chunk)."""
         self.shared = shared
         self.huge = huge
         self.conn = conn
+        self.nohuge = nohuge
         self.chunks = []
         self.cur = None
         self.cur_off = 0
@@ -543,6 +621,17 @@ class _HugeArena:
                 m = mmap.mmap(-1, size)
         else:
             m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
+        if self.nohuge:
+            # NUMA mode: with THP [always], the first fault in each 2 MiB region claims the
+            # whole region for that node -- and the two per-node halves of every trellis meet
+            # mid-region, so one node's huge fault would swallow the other's slice (~77/23).
+            # khugepaged would keep re-collapsing the 4K boundary regions onto whichever node
+            # it runs on afterwards. 4K placement is exact; revisit 2 MiB-aligned per-node
+            # runs in the layout if the prof line ever shows a TLB cost
+            try:
+                m.madvise(getattr(mmap, "MADV_NOHUGEPAGE", 14))
+            except Exception:
+                pass
         self.chunks.append(m)
         self.cur = m
         self.cur_off = 0
@@ -598,6 +687,49 @@ class _HugeArena:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
                   f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
+    def rehome_numa(self, tensor, band_swizzle = 0, planar = False, splits = ()):
+        """rehome() with the copy split over NUMA nodes: splits is a list of
+        (nt0, nt1, lps) trellis column ranges, each copied by a thread pinned to that node's
+        LPs so first-touch faults place the pages there (MADV_HUGEPAGE-backed regions take
+        2 MiB faults on the copying node). The returned view is over the same arena storage
+        rehome() would have used."""
+        import threading
+        if tensor is None or tensor.numel() == 0:
+            return tensor
+        nbytes = tensor.numel() * tensor.element_size()
+        aligned = (nbytes + 63) & ~63
+        if self.lazy:
+            if self.written + aligned > self.checked:
+                step = max(aligned, self.CHECK_STEP)
+                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                self.checked = self.written + step
+            self.written += aligned
+        if self.cur is None or self.cur_off + aligned > len(self.cur):
+            self._new_chunk(aligned)
+        off = self.cur_off
+        self.cur_off += aligned
+        buf = memoryview(self.cur)[off : off + nbytes]
+        dst = torch.frombuffer(buf, dtype = torch.uint8).view(tensor.dtype).view(tensor.shape)
+        try:
+            orig = set(os.sched_getaffinity(0))
+        except OSError:
+            orig = None
+        def work(nt0, nt1, lps):
+            try:
+                os.sched_setaffinity(0, set(lps))
+            except OSError:
+                pass
+            _copy_repacked_range(dst, tensor, band_swizzle, planar, nt0, nt1)
+        ths = [threading.Thread(target = work, args = s, daemon = True) for s in splits]
+        for th in ths: th.start()
+        for th in ths: th.join()
+        if orig is not None:
+            try:
+                os.sched_setaffinity(0, orig)
+            except OSError:
+                pass
+        return dst
+
     def rehome(self, tensor, band_swizzle = 0, planar = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
@@ -631,11 +763,16 @@ class _HugeArena:
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
-def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None):
+def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None, numa_tpn = 0):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
     worker loop. Errors are reported over the pipe before exiting.
+
+    numa_tpn > 0: the NUMA column-split mode (two node pools). The process mask is widened to
+    all nodes (a numactl-confined parent is inherited, which would strand node 1's pool and
+    its memory), and each expert's trellis is first-touched by per-node threads so the slices
+    the pools read are node-local.
     """
     import ctypes
     import signal
@@ -652,10 +789,71 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
     if cpus is not None:
         # Spawned after the host was confined: drop the inherited host mask, or the pool's
-        # worker pins fail (Windows refuses a thread mask outside the process mask)
+        # worker pins fail (Windows refuses a thread mask outside the process mask). Linux:
+        # this re-binds the calling thread only -- every thread this child spawns from now on
+        # (loader first-touch threads, the pools' workers) inherits the widened mask
         err = apply_process_affinity(cpus)
         if err is not None:
             print(f" !! CPU MoE worker affinity: {err}; worker confined to the host's LPs")
+
+    numa_lps = []
+    numa_nphys = []
+    if numa_tpn:
+        # The pools pin workers per node and the loader first-touches each node's weight
+        # slices; both need the process to span every node. numactl confinement is inherited
+        # from the parent, so widen it here explicitly
+        try:
+            topo = cext.exl3_moe_cpu_numa_core_orders()
+            numa_lps = [list(o) for o, _ in topo]
+            numa_nphys = [int(n) for _, n in topo]
+            all_lps = {lp for lps in numa_lps for lp in lps}
+            cur = set(os.sched_getaffinity(0))
+            if not all_lps <= cur:
+                err = apply_process_affinity(sorted(all_lps))
+                if err is not None:
+                    raise RuntimeError(err)
+                print(f" -- CPU MoE worker numa: mask widened to {len(all_lps)} LPs across "
+                      f"{len(numa_lps)} nodes on the calling thread (was {len(cur)} LPs)")
+        except Exception as e:
+            numa_lps = []
+            numa_nphys = []
+            print(f" !! CPU MoE worker numa: could not widen the process mask ({e}); "
+                  f"node-1 pool and memory placement will be remote")
+
+        # Worker-picker sanity, before anything loads: the kernel's own SMT relation must
+        # partition every node's LPs, leave numa_tpn + host_cores distinct physical cores, and
+        # agree with the extension's core orders. A mis-derived pool would silently double-park
+        # workers on one core (the straggler at every per-phase barrier) -- crash loudly instead
+        if numa_lps:
+            hc = max(1, TUNING.host_cores)
+            try:
+                for i, lps in enumerate(numa_lps):
+                    try:
+                        groups = node_sibling_groups(i)
+                    except Exception as e:
+                        raise RuntimeError(f"node {i}: unreadable SMT topology: {e}") from e
+                    distinct = len(groups)
+                    if distinct != numa_nphys[i]:
+                        raise RuntimeError(
+                            f"node {i}: extension reports {numa_nphys[i]} physical cores, "
+                            f"sysfs SMT groups show {distinct} ({sorted(groups)})")
+                    if numa_tpn + hc > distinct:
+                        raise RuntimeError(
+                            f"node {i}: {distinct} distinct physical cores; pool wants "
+                            f"{numa_tpn} threads + {hc} host core(s) reserved")
+                    in_node = {lp for g in groups.values() for lp in g}
+                    misplaced = sorted(lp for lp in lps[:numa_tpn] if lp not in in_node)
+                    if misplaced:
+                        raise RuntimeError(
+                            f"node {i}: pool LPs {misplaced} are not on node {i} -- "
+                            f"stale exllamav3_ext build (rebuild the extension)")
+                    print(f" -- CPU MoE worker numa: node {i} pool on LPs {lps[:numa_tpn]} "
+                          f"({distinct} cores/node, host reserves "
+                          f"{lps[numa_nphys[i] - hc:numa_nphys[i]]})")
+            except Exception as e:
+                print(f" !! CPU MoE worker numa: bad pool topology: {e}; refusing to start "
+                      f"with a mis-shaped worker pool", flush = True)
+                raise
 
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
@@ -674,8 +872,20 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             print(f" -- worker: entered main at {t_entry:.3f}, checkpoint index ready at {time.time():.3f} "
                   f"({time.time() - t_entry:.2f} s)", flush = True)
         cpu = torch.device("cpu")
+        if numa_tpn:
+            # The per-node loader threads pin only THEMSELVES: a torch copy_ over a trellis
+            # half still executes on the shared intra-op OpenMP pool, whose threads inherited
+            # the child's full-machine mask when they were created and never re-bind per
+            # caller -- first-touch then follows the OMP scheduler, not the intended per-node
+            # slices (observed as a stable ~30/70 arena split regardless of every knob).
+            # Serial copies run on the pinned caller itself, so the splits place exactly.
+            # Loading is disk-bound anyway; the single-threaded copies cost little. Restored
+            # once placement completes (runtime installs would otherwise copy single-threaded)
+            _load_threads = torch.get_num_threads()
+            torch.set_num_threads(1)
         # Pinned mode: memfd-backed chunks, published to the parent as they are created
-        arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None)
+        arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None,
+                           nohuge = bool(numa_tpn))
 
         def fetch(keys):
             out = []
@@ -689,12 +899,20 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         # Repack the trellis copies into the packed layout the kernel tier wants for each
         # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
-        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers).
+        # NUMA mode: the two 128-column-block halves of each trellis are first-touched by
+        # per-node threads (the C++ view builder cuts at the same block, so the slices line up)
         swz = TUNING.swizzle
 
         def rehome_trellis(t):
             grp = cext.exl3_moe_cpu_swizzle_group(t.shape[2] / 16.0) if swz else 0
             pln = grp and cext.exl3_moe_cpu_planar_layout(t.shape[2] / 16.0)
+            if numa_lps and len(numa_lps) >= 2 and t.dim() == 3:
+                tn = t.shape[1]
+                nblk0 = (tn // 8 + 1) // 2
+                cut = nblk0 * 8
+                return arena.rehome_numa(t, band_swizzle = grp, planar = pln,
+                                         splits = [(0, cut, numa_lps[0]), (cut, tn, numa_lps[1])])
             return arena.rehome(t, band_swizzle = grp, planar = pln)
 
         def nbytes(t):
@@ -828,6 +1046,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             elif msg[0] == "quit":
                 return
 
+        if numa_tpn:
+            # Placement is done: hand the cores back before the worker loop starts
+            torch.set_num_threads(_load_threads)
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
         base = np.frombuffer(shm.buf, dtype = np.uint8).ctypes.data
@@ -863,6 +1084,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 layout["max_hi"], layout["max_ho"], layout["max_topk"],
                 layout["wstage_off"], layout["num_wslots"], layout["wslot_size"],
                 threads, stage_threads,
+                layout.get("numa_tpn", 0),
             ),
             daemon = True,
         )
@@ -872,8 +1094,15 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         # the whole arena into 2 MiB pages (tens of seconds for a 50+ GiB arena, minutes when
         # free memory is fragmented and the kernel has to compact first), and the parent's
         # startup wait must not depend on it. Page migration is transparent to the compute
-        # threads, so the worker serves requests on 4K pages until each chunk lands
-        threading.Thread(target = arena.promote_hugepages, daemon = True).start()
+        # threads, so the worker serves requests on 4K pages until each chunk lands.
+        # NUMA mode skips the collapse: COLLAPSE may allocate the replacement huge page on
+        # either node, silently undoing the per-node first-touch placement. Pure regions are
+        # still 2 MiB-backed from the node-local huge faults during the load
+        if numa_tpn:
+            print(" -- CPU MoE arena: MADV_COLLAPSE skipped in NUMA mode (collapse can repatriate "
+                  "pages cross-node); node-local 2 MiB faults already back pure regions")
+        else:
+            threading.Thread(target = arena.promote_hugepages, daemon = True).start()
 
         while True:
             msg = inbox.get()
@@ -941,6 +1170,7 @@ class MoeCpuHost:
         return host
 
     def __init__(self, config):
+        self.numa_nodes, self.numa_tpn = _numa_decide()
         self.config = config
         self.model_dir = config.directory
         self.specs = []
@@ -1005,7 +1235,8 @@ class MoeCpuHost:
         self.proc = ctx.Process(
             target = _moe_cpu_child_main,
             args = (child_conn, self.model_dir, self.threads, self.stage_threads,
-                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS),
+                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS,
+                    self.numa_tpn),
             daemon = True,
         )
         self.proc.start()
@@ -1230,6 +1461,11 @@ class MoeCpuHost:
         self.layout["num_wslots"] = self.num_wslots
         self.layout["wslot_size"] = self.wslot_size
         self.layout["cpu_prof"] = TUNING.cpu_prof
+        self.layout["numa_tpn"] = self.numa_tpn
+        if self.pinned and self.numa_tpn:
+            raise RuntimeError("EXL3_MOE_CPU_NUMA is not supported with EXL3_MOE_PINNED_ARENA=1 "
+                               "(the node-split expert storage is incompatible with the shared "
+                               "DMA arena); unset one of the two")
         size = MOE_CTRL_SIZE + self.num_slots * slot_size + self.num_wslots * self.wslot_size
         check_shm_capacity(size, "The CPU MoE offload handoff segment")
         self.shm = shared_memory.SharedMemory(create = True, size = size)
@@ -1319,9 +1555,44 @@ class MoeCpuHost:
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
-        print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
-        # The worker was spawned before this and pins its own threads; keep the host off them
-        _apply_host_affinity(self.threads, TUNING.host_cores)
+        if self.numa_tpn:
+            print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, "
+                  f"NUMA column-split {self.numa_tpn}+{self.numa_tpn} threads "
+                  f"(EXL3_MOE_CPU_NUMA=0 disables)")
+        else:
+            print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
+        # The worker was spawned before this and pins its own threads; keep the host off them.
+        # NUMA mode: reserve host_cores physical cores at the tail of EVERY node's core order
+        # (each pool leaves them free) and float the host across both nodes. The parent runs
+        # the model, the CUDA launches and the prefill staging -- one core cannot feed the
+        # pools at prefill shapes, and starving it stalls dispatch so the pools idle too.
+        if self.numa_tpn:
+            try:
+                hc = max(1, TUNING.host_cores)
+                host_lps = []
+                for order_i, nphys_i in _numa_topo():
+                    take = min(hc, nphys_i)
+                    # Core orders are physical-core-first: [phys..., siblings...]
+                    host_lps.extend(order_i[nphys_i - take:nphys_i])
+                    host_lps.extend(order_i[2 * nphys_i - take:2 * nphys_i])
+                err = apply_process_affinity(host_lps)
+                # Scope: the calling thread only (Linux) -- the forward-pass driver. The
+                # process's other threads (CUDA driver, API executors, torch pools) stay on
+                # their own masks; sweeping them onto the host LPs starved every non-worker
+                # phase of the process (load, tokenization, API handling)
+                where = ("the process mask (all threads)" if os.name == "nt" else
+                         "1 thread (the caller; threads it spawns inherit)")
+                print(f" -- CPU MoE host affinity: host on {len(host_lps)} LPs "
+                      f"(numa mode: {hc} core(s) reserved per node); applied to {where}"
+                      + ("" if err is None else f"; {err}"))
+                if err is None:
+                    # The intra-op pool was sized for the full machine; match it to the host
+                    # mask or every fat parent-side op (prefill staging) oversubscribes
+                    torch.set_num_threads(max(1, len(host_lps) // 2))
+            except Exception as e:
+                print(f" !! CPU MoE host affinity: {e}; host threads left unpinned")
+        else:
+            _apply_host_affinity(self.threads, TUNING.host_cores)
 
     def _start_watchdog(self):
         """
