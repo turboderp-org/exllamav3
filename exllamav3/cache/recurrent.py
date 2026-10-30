@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from ..constants import PAGE_SIZE
+import threading
 import torch
 from ..util.memory import malloc_trim
 
@@ -26,12 +27,25 @@ class HostPool:
     then hand back depends on the allocator and the platform). Buffers are handed out by exact shape
     and dtype, returned on eviction, and never freed, so the pool's footprint is bounded by the peak
     checkpoint occupancy and the allocator sees no churn at all.
+
+    New buffers are carved out of SLAB_BYTES slabs of pinned host memory rather than allocated one by one:
+    dozens of separate MiB-scale pageable allocations per checkpoint each map and fault in their own pages, and
+    every blocking copy into pageable memory leaves the GPU idle while the host finishes it. Into pinned slabs
+    host_copy issues non-blocking copies, so a stash no longer stalls the prefill (Qwen3.8-27B, 8k-token prompt:
+    ~200 ms of GPU idle per prefill). A slab goes back to the allocator whole once every buffer carved from it
+    is gone; host-side readers of stashed tensors call wait_stashes() first.
     """
+
+    SLAB_BYTES = 64 * 1024**2
+    ALIGN = 4096
 
     def __init__(self):
         self.free = {}
         self.allocated = 0
         self.reused = 0
+        self.slab = None
+        self.slab_used = 0
+        self.lock = threading.Lock()  # disk-tier workers take buffers off the main thread
 
     def take(self, shape, dtype):
         key = (tuple(shape), dtype)
@@ -40,7 +54,17 @@ class HostPool:
             self.reused += 1
             return lst.pop()
         self.allocated += 1
-        return torch.empty(shape, dtype = dtype)
+        nbytes = torch.Size(shape).numel() * torch.empty((), dtype = dtype).element_size()
+        span = (nbytes + self.ALIGN - 1) // self.ALIGN * self.ALIGN
+        if not 0 < span <= self.SLAB_BYTES:
+            return torch.empty(shape, dtype = dtype)
+        with self.lock:
+            if self.slab is None or self.slab_used + span > self.SLAB_BYTES:
+                self.slab = torch.empty(self.SLAB_BYTES, dtype = torch.uint8, pin_memory = torch.cuda.is_available())
+                self.slab_used = 0
+            slab, offset = self.slab, self.slab_used
+            self.slab_used += span
+        return slab[offset : offset + nbytes].view(dtype).view(shape)
 
     def give(self, obj):
         """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
@@ -59,6 +83,12 @@ class HostPool:
         """Drop the idle buffers (idle-transition housekeeping: the ones pruning stranded checkpoints
         just returned would otherwise hold their RAM for the whole idle period)"""
         self.free.clear()
+        with self.lock:
+            self.slab = None
+        # torch caches freed pinned blocks; hand them back so the idle period does not hold the RAM
+        if torch.cuda.is_available() and hasattr(torch._C, "_host_emptyCache"):
+            wait_stashes()
+            torch._C._host_emptyCache()
 
 
 host_pool = HostPool()
@@ -68,11 +98,32 @@ def mp_host_pool_release(local_context: dict):
     host_pool.release()
 
 
+# Last copy event per device of the non-blocking host_copy calls (later copies on a stream complete after
+# earlier ones, so one event per device covers them all)
+_pending_copies = {}
+
+
 def host_copy(src: torch.Tensor) -> torch.Tensor:
-    """Copy a device tensor (any strides) into a pooled host buffer; the stash-side replacement for .cpu()"""
+    """Copy a device tensor (any strides) into a pooled host buffer; the stash-side replacement for .cpu().
+    Into a pinned buffer the copy is non-blocking: device-side users (unstash) are ordered behind it on the
+    stream, host-side readers must call wait_stashes() first"""
     dst = host_pool.take(src.shape, src.dtype)
-    dst.copy_(src)
+    if src.is_cuda and dst.is_pinned():
+        dst.copy_(src, non_blocking = True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(src.device))
+        _pending_copies[src.device] = event
+    else:
+        dst.copy_(src)
     return dst
+
+
+def wait_stashes():
+    """Block until every host_copy issued so far has landed in host memory"""
+    for device in list(_pending_copies):
+        event = _pending_copies.pop(device, None)
+        if event is not None:
+            event.synchronize()
 
 def note_freed(nbytes: int):
     global _freed_bytes
