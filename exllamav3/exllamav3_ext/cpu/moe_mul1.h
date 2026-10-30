@@ -25,12 +25,13 @@ struct MoeCpuMatrix
     int n;
     int bits;               // bits per weight, integer part
     int hb = 0;             // half-integer rate: bits + 0.5
-    // Packed trellis layout (integer rates on the tiers that band them; the loader repacks
+    // Packed trellis layout on tiers/rates that band it; the loader repacks
     // with the group exl3_moe_cpu_swizzle_group returns, so swz is re-derived from the rate,
-    // never trusted from the caller). Tile (kt, nt) stored at (nt/g) * tiles_k * g + kt * g +
+    // never trusted from the caller. Tile (kt, nt) stored at (nt/g) * tiles_k * g + kt * g +
     // nt % g, so each banded kernel's tile group reads as one sequential k-stream; on the
-    // AVX2 tier (g = 2) the tile dwords are additionally planar-repacked (dword w at
-    // 8 * (w % bits) + w / bits), which is part of the g = 2 contract, not a separate flag.
+    // AVX2 tier (g = 2) integer dwords are planar-repacked (dword w at
+    // 8 * (w % bits) + w / bits), or fractional chronological halfword j from native[j ^ 1]
+    // is stored at 8 * (j % Q) + j / Q, Q = 2 * bits + 1. Both are part of the g = 2 contract.
     int swz = 0;
 };
 
@@ -133,12 +134,13 @@ bool exl3_moe_cpu_has_avx512_vbmi();
 
 // Packed-layout rules for one trellis rate K (possibly half-integer) under the runtime ISA
 // tier. swizzle_group: 0 = native tile order, 8 = band-8 (AVX-512 banded kernels, K8 excepted),
-// 2 = band-2 + planar dwords (AVX2, integer rates only). planar_layout: 1 = the intra-tile
-// dword repack the AVX2 band-2 kernel requires (always paired with group 2).
+// 2 = band-2 + planar dwords (AVX2 integers) or chronological halfwords (opt-in AVX2
+// fractions). planar_layout: 1 = the intra-tile repack paired with group 2.
 //
 // Single source of truth: the child loader repacks each tensor with these values, the kernels
-// dispatch on them, and the GPU staging path un-does (HIP) or reads (CUDA) the same bytes.
-// Query these instead of duplicating the gate. Rollback knob: EXL3_MOE_CPU_SWIZZLE=0 makes
-// the loader keep native bytes everywhere and zeroes these for the GPU path.
+// dispatch on them, and the GPU streaming path restores the same bytes to native order.
+// Query these instead of duplicating the gate. EXL3_MOE_CPU_SWIZZLE=0 makes the loader
+// keep native bytes; EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=1 opts AVX2 fractions into packing.
+// Set layout policy before process startup; changing it requires fresh parent/worker processes.
 int exl3_moe_cpu_swizzle_group(double K);
 int exl3_moe_cpu_planar_layout(double K);

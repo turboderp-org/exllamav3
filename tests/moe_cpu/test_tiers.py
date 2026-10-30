@@ -233,8 +233,8 @@ def _arena_repack_and_replacement():
             ex = rand_experts(E, H, I, K, gen)
             if not gated:
                 ex["g"] = []
-            # Mixed-rate layers can combine packed gate/up and native down (K8 on AVX-512),
-            # or native gate/up and packed down (fractional gate/up on AVX2).
+            # Mixed-rate layers combine packed gate/up with native K8 down on AVX-512,
+            # and fractional halfword planes with integer dword planes on opted-in AVX2.
             ex["d"] = [(rand_trellis(I, H, 8, gen), su, sv) for _, su, sv in ex["d"]]
             home = {}
             for p, experts in ex.items():
@@ -278,4 +278,5 @@ def _arena_repack_and_replacement():
 
 
 def test_arena_repack_and_replacement_match_native():
-    run_per_tier(_arena_repack_and_replacement)
+    run_per_tier(_arena_repack_and_replacement,
+                 env = {"EXL3_MOE_CPU_SWIZZLE": "1", "EXL3_MOE_CPU_FRACTIONAL_SWIZZLE": "1"})

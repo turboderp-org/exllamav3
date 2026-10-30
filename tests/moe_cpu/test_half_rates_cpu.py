@@ -80,7 +80,7 @@ def test_cpu_kernel_matches_gpu_reference(device, K):
 def test_cpu_tiers_agree():
     """The integer tiers (AVX2, AVX-512 BW / VNNI / VBMI) are bit-identical, the scalar tier (fp32 activations)
     agrees to the int8 rounding. Each tier runs in its own process: the ISA cap is read once"""
-    outs = run_per_tier(cpu_outputs)
+    outs = run_per_tier(cpu_outputs, env = {"EXL3_MOE_CPU_SWIZZLE": "1", "EXL3_MOE_CPU_FRACTIONAL_SWIZZLE": "1"})
     tiers = [t for t in INT8_TIERS if t in outs]
     if not tiers:
         pytest.skip("no vector tier in this build")
@@ -90,6 +90,8 @@ def test_cpu_tiers_agree():
     first = {}
     for t in tiers:
         for k, v in outs[t].items():
+            if k.endswith("_1"):
+                assert torch.equal(v, outs[t][k[:-1] + "0"]), f"tier {t}: packed differs from native at {k}"
             if k in first:
                 assert torch.equal(v, outs[first[k]][k]), f"tier {t} differs from {first[k]} at {k}"
             else:

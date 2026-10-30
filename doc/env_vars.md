@@ -374,7 +374,9 @@ thread configuration, and the knobs below for tuning the split.
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
-`TUNING` singleton before constructing a model instead of setting env vars.
+`TUNING` singleton before constructing a model instead of setting env vars. Layout policy is an
+exception: set its environment flags before starting the parent and worker, and reload the model
+in fresh processes to change it.
 
 ### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
 
@@ -456,7 +458,7 @@ throughput on a Xeon Gold 6148. The `vbmi` tier
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `bw` also disables the swizzled weight layout (see
+started. The `scalar` tier disables packed weight layouts; `avx2` has its own layout rules (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_WIDE` (default: `1`)
@@ -484,10 +486,33 @@ bands integer rates in groups of 2 and additionally repacks each tile's 32-bit w
 permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
 collapses to a single `vpermd` instead of walking the tile's registers, which removes the
 rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
-tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
-tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+tier unless `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=1`. The `scalar` tier reads the native layout.
+The GPU-streaming prefill path restores native tile and word order after each DMA, into a
+second VRAM ring allocated only when a layer's
 experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
 keep the native layout.
+
+Native AVX2 fractional kernels (1.5, 2.5 and 3.5 bpw) specialize batches of one, two or three
+prepared activation rows, including high/low pairs for wide activations. These kernels remain
+active with fractional packing off and need no new weight storage or allocation.
+
+### `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE` (default: `0`)
+
+Only the literal value `1` enables this flag; all other values leave it disabled.
+
+Opt in to same-size group-2 packing with chronological 16-bit halfword planes for AVX2
+fractional experts (1.5, 2.5 and 3.5 bpw). Requires an active AVX2 tier;
+`EXL3_MOE_CPU_SWIZZLE=0` disables it even when this flag is `1`. Integer, scalar and AVX-512
+layout policy is unchanged. This lossless byte permutation does not change weight size,
+quantization or model quality, or retain an additional persistent expert copy.
+
+It can nevertheless increase VRAM use: the first packed layer on a device needs the existing
+native-order/inverse weight ring, `EXL3_MOE_CPU_WSLOTS * EXL3_MOE_CPU_WSLOT_MB` MiB
+(default **64 MiB per host/device**). A ring already allocated for packed integer experts is
+reused, not duplicated. Autosplit's measured load accounts for this allocation; otherwise it
+can first occur when packed experts stream to the GPU. This is why fractional packing is
+explicit and default-off. Set the flag before starting both parent and worker; changing this
+load-time policy requires fresh processes and a model reload.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

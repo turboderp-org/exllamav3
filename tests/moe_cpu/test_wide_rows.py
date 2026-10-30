@@ -28,7 +28,7 @@ pytestmark = pytest.mark.usefixtures("cpu_runtime")
 
 DEV = get_test_device()
 E, H, I = 4, 512, 256
-RATES = (2, 3.5, 4, 8)
+RATES = (1.5, 2, 2.5, 3.5, 4, 8)
 # Expert e gets e + 1 tokens: with every row wide that is 2 to 8 GEMV rows per chunk, the last ones in a
 # second pass over the weights
 SEL = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3]
@@ -173,10 +173,8 @@ def test_ordinary_rows_unchanged(K, plain):
             assert row_errors(K, ex, x, sel, w, out).max() < 0.04
 
 
-@pytest.mark.cpu_flags("avx2")   # (the scalar tier takes float activations)
-@pytest.mark.parametrize("K", (3.5, 4))
-def test_mixed_chunks(K):
-    """Wide and plain rows side by side in a chunk come out as they do on their own"""
+def _mixed_chunks(K):
+    """Wide/plain chunks match individual rows, for native and packed versions of the same weights."""
     gen = torch.Generator().manual_seed(77)
     ex = make_experts(K, gen)
     wide_x, plain_x = inputs(gen, True), inputs(gen, False)
@@ -185,27 +183,49 @@ def test_mixed_chunks(K):
     x = torch.where(pick[:, None], wide_x, plain_x).contiguous()
     sel = torch.tensor(SEL, dtype = torch.long).view(T, 1)
     w = (torch.rand((T, 1), generator = gen) * 0.5 + 0.5).half()
-    lists = []
-    for p in ("g", "u", "d"):
-        lists += [[v[0].contiguous() for v in ex[p]], [v[1].contiguous() for v in ex[p]], [v[2].contiguous() for v in ex[p]]]
-    h = ext.exl3_moe_cpu_make_layer(*lists, ex["gb"], ex["ub"], [], 0, 0.0, 0)
-    batch = torch.empty((T, H), dtype = torch.float32)
-    ext.exl3_moe_cpu_forward(h, x, sel, w, batch, 4)
-    single = torch.empty((T, H), dtype = torch.float32)
-    for t in range(T):
-        o = torch.empty((1, H), dtype = torch.float32)
-        ext.exl3_moe_cpu_forward(h, x[t : t + 1].contiguous(), sel[t : t + 1].contiguous(), w[t : t + 1].contiguous(), o, 4)
-        single[t] = o[0]
-    ext.exl3_moe_cpu_free_layer(h)
-    assert torch.allclose(batch, single, rtol = 1e-4, atol = 1e-6 * single.abs().max().item())
-    # (the rows without the shared component are far outside the range this layer's biases are for)
-    assert row_errors(K, ex, x, sel, w, batch)[pick].max() < 0.05
+    native_batch = None
+    for swizzled in swizzle_layouts():
+        packed = swizzle if swizzled else torch.Tensor.contiguous
+        lists = []
+        for p in ("g", "u", "d"):
+            lists += [[packed(v[0]) for v in ex[p]], [v[1].contiguous() for v in ex[p]], [v[2].contiguous() for v in ex[p]]]
+        h = ext.exl3_moe_cpu_make_layer(*lists, ex["gb"], ex["ub"], [], 0, 0.0, int(swizzled))
+        try:
+            batch = torch.empty((T, H), dtype = torch.float32)
+            ext.exl3_moe_cpu_forward(h, x, sel, w, batch, 4)
+            single = torch.empty((T, H), dtype = torch.float32)
+            for t in range(T):
+                o = torch.empty((1, H), dtype = torch.float32)
+                ext.exl3_moe_cpu_forward(h, x[t : t + 1].contiguous(), sel[t : t + 1].contiguous(), w[t : t + 1].contiguous(), o, 4)
+                single[t] = o[0]
+        finally:
+            ext.exl3_moe_cpu_free_layer(h)
+        assert torch.allclose(batch, single, rtol = 1e-4, atol = 1e-6 * single.abs().max().item())
+        # (the rows without the shared component are far outside the range this layer's biases are for)
+        assert row_errors(K, ex, x, sel, w, batch)[pick].max() < 0.05
+        if native_batch is None:
+            native_batch = batch
+        else:
+            assert torch.equal(batch, native_batch), f"K {K}: packed mixed rows differ from native"
+
+
+@pytest.mark.cpu_flags("avx2")
+@pytest.mark.parametrize("K", (1.5, 2.5, 3.5, 4))
+def test_mixed_chunks(K):
+    tiers = ["avx2"]
+    current = supported_tiers()[-1]
+    if K in (3.5, 4) and current not in tiers:
+        tiers.append(current)
+    # Establish the layout policy before the isolated interpreter imports Python/native code.
+    run_per_tier(_mixed_chunks, K, tiers = tiers,
+                 env = {"EXL3_MOE_CPU_SWIZZLE": "1", "EXL3_MOE_CPU_FRACTIONAL_SWIZZLE": "1"})
 
 
 @pytest.mark.cpu_flags("avx2")   # (the scalar tier takes float activations)
 def test_tiers_agree():
     """The integer tiers are bit-identical on wide rows too. Each tier needs its own process"""
-    results = run_per_tier(outputs, tiers = [t for t in supported_tiers() if t in INT8_TIERS])
+    results = run_per_tier(outputs, tiers = [t for t in supported_tiers() if t in INT8_TIERS],
+                           env = {"EXL3_MOE_CPU_SWIZZLE": "1", "EXL3_MOE_CPU_FRACTIONAL_SWIZZLE": "1"})
     tiers = list(results)
     base = results[tiers[0]]
     for t in tiers[1:]:

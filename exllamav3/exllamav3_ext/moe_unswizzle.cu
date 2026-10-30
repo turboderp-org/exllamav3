@@ -8,7 +8,9 @@
 // Expert weights offloaded to the CPU live in the arena in a packed trellis layout for the
 // banded CPU kernels (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt)
 // at (nt / g) * tiles_k * g + kt * g + nt % g instead of kt * tiles_n + nt, and on the AVX2
-// tier (g = 2) each tile's dwords planar-repacked (native dword w at 8 * (w % bits) + w / bits).
+// tier (g = 2) each integer tile's dwords planar-repacked (native dword w at
+// 8 * (w % bits) + w / bits). Fractional tiles instead have Q = 2*bits+1 halfword planes:
+// native halfword h is at 8 * ((h ^ 1) % Q) + (h ^ 1) / Q, without a byte swap.
 // When experts stream back to the GPU for prefill they are staged and DMA'd verbatim, and this
 // kernel restores the native order in VRAM, which is the only order the GEMM and reconstruct
 // kernels read. Per (expert, kt, native 8-tile run) the run is one contiguous block in the
@@ -18,6 +20,8 @@
 
 #define NUM_THREADS 128
 
+// Q = 0 keeps the runtime layout; Q = 3/5/7 specializes fractional planar group 2.
+template <int Q = 0>
 __global__ __launch_bounds__(NUM_THREADS)
 void moe_unswizzle_kernel
 (
@@ -27,11 +31,14 @@ void moe_unswizzle_kernel
     const size_t proj_off_b,
     const int tiles_k,
     const int tiles_n,
-    const int tile_b,
-    const int group,              // 0 (native) | 2 | 8
-    const int planar              // 1: also invert the planar dword order (group > 0, integer K)
+    const int runtime_tile_b,
+    const int runtime_group,      // 0 (native) | 2 | 8
+    const int runtime_planar      // 1: also invert planar dwords or fractional halfwords
 )
 {
+    const int tile_b = Q ? 16 * Q : runtime_tile_b;
+    const int group = Q ? 2 : runtime_group;
+    const int planar = Q ? 1 : runtime_planar;
     const int runs = tiles_n / 8;
     const int kt = blockIdx.x / runs;
     const int r = blockIdx.x % runs;            // native 8-tile run index
@@ -56,6 +63,22 @@ void moe_unswizzle_kernel
             const uint4* ss = reinterpret_cast<const uint4*>(src + sub_src);
             for (int i = threadIdx.x; i < (int) (sub_b / 16); i += NUM_THREADS)
                 sd[i] = ss[i];
+            continue;
+        }
+        if (tile_b % 32)
+        {
+            // Fractional planar inverse: chronological halfwords swap within native dwords
+            // before the Q-by-8 plane transpose. Every source index stays below 8*Q.
+            const int q = tile_b / 16;
+            const int wh = tile_b / 2;                  // halfwords per tile (8*q)
+            const uint16_t* ss = reinterpret_cast<const uint16_t*>(src + sub_src);
+            uint16_t* dd = reinterpret_cast<uint16_t*>(sd);
+            for (int i = threadIdx.x; i < (int) (sub_b / 2); i += NUM_THREADS)
+            {
+                const int h = i % wh;
+                const int j = h ^ 1;
+                dd[i] = ss[(i - h) + 8 * (j % q) + j / q];
+            }
             continue;
         }
         // Planar inverse: native dword w of a tile is stored at 8 * (w % bits) + w / bits
@@ -83,7 +106,7 @@ void moe_unswizzle_trellis
     int64_t tiles_n,
     double K,
     int64_t group,                // packed tile group of this projection (0/2/8)
-    int64_t planar                // 1: planar dword order to invert
+    int64_t planar                // 1: planar dword / fractional halfword order to invert
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(src.device());
@@ -98,7 +121,8 @@ void moe_unswizzle_trellis
                 "moe_unswizzle: negative size or offset");
     const BitsK bk = bits_from_K((float) K);
     const int tile_b = bk.bits * 32 + (bk.half ? 16 : 0);
-    TORCH_CHECK(!planar || !bk.half, "moe_unswizzle: planar is undefined for half-integer rates");
+    TORCH_CHECK(!planar || !bk.half || group == 2,
+                "moe_unswizzle: fractional planar layout requires group 2");
     TORCH_CHECK((expert_stride_b | proj_off_b) % 16 == 0, "moe_unswizzle: offsets must be 16-byte aligned");
 
     // No experts or no tiles: nothing to copy
@@ -109,7 +133,14 @@ void moe_unswizzle_trellis
     TORCH_CHECK(need <= (int64_t) src.numel() * src.element_size()
                 && need <= (int64_t) dst.numel() * dst.element_size(), "moe_unswizzle: batch exceeds the buffers");
     dim3 grid((unsigned) (tiles_k * (tiles_n / 8)), (unsigned) num_experts);
-    moe_unswizzle_kernel<<<grid, NUM_THREADS, 0, stream>>>(
+    auto kernel = moe_unswizzle_kernel<>;
+    if (planar && bk.half)
+    {
+        if      (bk.bits == 1) kernel = moe_unswizzle_kernel<3>;
+        else if (bk.bits == 2) kernel = moe_unswizzle_kernel<5>;
+        else if (bk.bits == 3) kernel = moe_unswizzle_kernel<7>;
+    }
+    kernel<<<grid, NUM_THREADS, 0, stream>>>(
         (const uint8_t*) src.data_ptr(), (uint8_t*) dst.data_ptr(),
         (size_t) expert_stride_b, (size_t) proj_off_b, (int) tiles_k, (int) tiles_n, tile_b,
         (int) group, (int) planar);

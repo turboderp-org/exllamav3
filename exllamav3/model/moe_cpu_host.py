@@ -125,7 +125,7 @@ class MoeCpuTuning:
         # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
         # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
         # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
-        # AVX-512 tiers, band-2 + planar dwords on AVX2, native on scalar).
+        # AVX-512 tiers, band-2 + planar dwords/halfwords on AVX2, native on scalar).
         # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout everywhere.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
         # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
@@ -391,15 +391,43 @@ def _win32_large_page_alloc(size: int, min_size: int):
     return buf
 
 
+def _fractional_native_subset(native, q, p, e):
+    """Native halfwords for planes[..., p::2, e::2], retaining the tile-prefix strides."""
+    # q is odd: the even plane/lane steps leave xor 1 entirely in the start index.
+    return native.as_strided(
+        native.shape[:-1] + ((q - p + 1) // 2, 4),
+        native.stride()[:-1] + (2, 2 * q),
+        native.storage_offset() + ((q * e + p) ^ 1))
+
+
 def _copy_repacked(dst, tensor, group, planar):
     """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
     CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
-    to (nt/group, kt, nt%group), and with planar each tile's dwords are transposed -- dword w
-    to 8*(w%bits) + w/bits, i.e. the trailing (8, bits) dword dims swap (integer rates only,
-    where group is nonzero). One strided copy_; group 0 is a plain copy."""
+    to (nt/group, kt, nt%group). Integer planar tiles transpose dword w to 8*(w%bits) + w//bits.
+    Fractional planar tiles use Q = 2*bits+1 halfword planes, with chronological halfword j
+    packed at 8*(j%Q) + j//Q from native[j ^ 1] (no byte swap within a halfword).
+    Copies write directly into `dst` on the caller's CPU/CUDA stream, without a full-tensor
+    temporary. Group 0 is a plain copy."""
     tk, tn, ps = tensor.shape
     if not group:
         dst.copy_(tensor)
+    elif planar and ps % 16 == 8:
+        assert group == 2, "fractional planar layout requires group 2"
+        q = ps // 8
+        native = tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3)
+        planes = dst.view(tn // group, tk, group, q, 8)
+        if q == 3 and dst.device.type == "cpu" and tensor.device.type == "cpu":
+            # Measurements favor six single-plane copies for 1.5-bit CPU-to-CPU.
+            # The even 2*q step keeps xor 1 in start, preserving the byte mapping
+            # in bounded four-halfword slices.
+            for p in range(q):
+                for e in range(2):
+                    start = (q * e + p) ^ 1
+                    planes[..., p, e::2].copy_(native[..., start::2 * q])
+        else:
+            for p in range(2):
+                for e in range(2):
+                    planes[..., p::2, e::2].copy_(_fractional_native_subset(native, q, p, e))
     elif planar:
         wd = ps // 2
         dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
@@ -411,10 +439,25 @@ def _copy_repacked(dst, tensor, group, planar):
 
 def _copy_unpacked(dst, packed, group, planar):
     """The inverse of _copy_repacked: a packed-layout [k/16, n/16, 16K] view back to native
-    tile order (and dword order) in `dst`"""
+    tile order (and integer dword / fractional halfword order) directly in `dst`.
+    Fractional native halfword h comes from packed[8*((h ^ 1)%Q) + (h ^ 1)//Q]."""
     tk, tn, ps = dst.shape
     if not group:
         dst.copy_(packed)
+    elif planar and ps % 16 == 8:
+        assert group == 2, "fractional planar layout requires group 2"
+        q = ps // 8
+        native = dst.view(tk, tn // group, group, ps)
+        planes = packed.view(tn // group, tk, group, q, 8).permute(1, 0, 2, 3, 4)
+        if q == 3 and dst.device.type == "cpu" and packed.device.type == "cpu":
+            for p in range(q):
+                for e in range(2):
+                    start = (q * e + p) ^ 1
+                    native[..., start::2 * q].copy_(planes[..., p, e::2])
+        else:
+            for p in range(2):
+                for e in range(2):
+                    _fractional_native_subset(native, q, p, e).copy_(planes[..., p::2, e::2])
     elif planar:
         wd = ps // 2
         dst.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).copy_(
@@ -689,7 +732,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         # Repack the trellis copies into the packed layout the kernel tier wants for each
         # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
-        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        # keeps native order: scalar tier, half rates on AVX2 unless explicitly enabled,
+        # K8 on the AVX-512 tiers)
         swz = TUNING.swizzle
 
         def rehome_trellis(t):
@@ -835,7 +879,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         def install(li, ei, keys):
             """Replace expert ei of layer li with the checkpoint tensors at `keys` (one key
-            per projection, gate omitted for gateless layers), in place in the arena."""
+            per projection, gate omitted for gateless layers), in place in the arena using
+            the same packed representation as the initial rehome."""
             views = layer_views[li]
             projs = views if len(keys) == 3 else views[1:]
             for key, plist in zip(keys, projs):
@@ -1734,8 +1779,9 @@ class MoeCpuHost:
     # the GPU slot tensors and its arena block by DMA on a side stream: no checkpoint read, no
     # worker message, no quiesce. The arena holds the bytes in the CPU tier's packed layout
     # (_stream_layout), the GPU slots in native order, so a transfer repacks through the staging
-    # buffers with the same strided copies the child loader uses. The caller orders the transfers
-    # against the compute streams (BlockSparseMLP_CPU._split_promote_step).
+    # buffers with the same bounded strided copies the child loader uses, including fractional
+    # halfword planes. The caller orders the transfers against the compute streams
+    # (BlockSparseMLP_CPU._split_promote_step).
 
     def promote_ready(self, layer_idx, cpu_local):
         """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
@@ -2119,7 +2165,7 @@ class MoeCpuHost:
                 copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
                 if restore:
-                    # Restore the native tile order on the copy stream, one launch per
+                    # Restore native tile and dword/halfword order on the copy stream, one launch per
                     # projection over the whole batch (group-0 projections in an otherwise
                     # packed layer take the plain-copy path in the same kernel)
                     for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
