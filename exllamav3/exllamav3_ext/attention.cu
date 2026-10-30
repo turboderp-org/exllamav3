@@ -497,7 +497,7 @@ __global__ void attn_chunked_paged_kernel
     half*  kv_smem     = (half*) smem_raw;
     float* reduce_smem = (float*) (kv_smem + D);
 
-    register half q_reg[G];
+    half q_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -507,7 +507,7 @@ __global__ void attn_chunked_paged_kernel
         q_reg[g] = q[q_off];
     }
 
-    register float m_reg[G], l_reg[G], o_reg[G];
+    float m_reg[G], l_reg[G], o_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -642,7 +642,7 @@ __global__ void attn_chunked_kernel
     // reduce_smem has WARPS*G_MAX entries:
     //   reduce_smem[g*WARPS + w] is warp w's partial for head g.
 
-    register half q_reg[G];
+    half q_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
@@ -652,7 +652,7 @@ __global__ void attn_chunked_kernel
         q_reg[g] = q[q_off];
     }
 
-    register float m_reg[G], l_reg[G], o_reg[G];
+    float m_reg[G], l_reg[G], o_reg[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
