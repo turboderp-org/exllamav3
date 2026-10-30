@@ -67,17 +67,25 @@ void moe_unswizzle_kernel
         }
         if (tile_b % 32)
         {
-            // Fractional planar inverse: chronological halfwords swap within native dwords
-            // before the Q-by-8 plane transpose. Every source index stays below 8*Q.
-            const int q = tile_b / 16;
-            const int wh = tile_b / 2;                  // halfwords per tile (8*q)
-            const uint16_t* ss = reinterpret_cast<const uint16_t*>(src + sub_src);
-            uint16_t* dd = reinterpret_cast<uint16_t*>(sd);
-            for (int i = threadIdx.x; i < (int) (sub_b / 2); i += NUM_THREADS)
+            // Fractional planar inverse on dwords: native dword w holds halfwords 2w (low) and 2w + 1 (high),
+            // and native halfword h sits at packed halfword 8 * ((h ^ 1) % Q) + (h ^ 1) / Q, so the low half
+            // comes from chronological halfword 2w + 1 and the high half from 2w. Each source halfword is read
+            // as the dword containing it and the two are merged with one byte permute: dword traffic only
+            const int q = Q ? Q : tile_b / 16;
+            const int wd = tile_b / 4;                  // dwords per tile (4 * q)
+            const uint32_t* ss = reinterpret_cast<const uint32_t*>(src + sub_src);
+            uint32_t* dd = reinterpret_cast<uint32_t*>(sd);
+            for (int i = threadIdx.x; i < (int) (sub_b / 4); i += NUM_THREADS)
             {
-                const int h = i % wh;
-                const int j = h ^ 1;
-                dd[i] = ss[(i - h) + 8 * (j % q) + j / q];
+                const int w = i % wd;
+                const int tile0 = i - w;
+                const int hl = 2 * w + 1, hh = 2 * w;
+                const int pl = 8 * (hl % q) + hl / q;   // packed halfword holding the low half
+                const int ph = 8 * (hh % q) + hh / q;   // ... and the high half
+                const uint32_t a = ss[tile0 + (pl >> 1)];
+                const uint32_t b = ss[tile0 + (ph >> 1)];
+                const int sel = ((pl & 1) ? 0x0032 : 0x0010) | ((ph & 1) ? 0x7600 : 0x5400);
+                dd[i] = __byte_perm(a, b, sel);
             }
             continue;
         }
