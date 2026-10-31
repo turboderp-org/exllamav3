@@ -12,6 +12,10 @@
 #include "stloader_cu.cuh"
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 
 // A run is one contiguous file read covering one or more jobs. Small gaps between jobs (tensors
 // in the same region that load elsewhere, e.g. to a different device) are read through and
@@ -92,6 +96,13 @@ static bool read_range(FILE* file, size_t file_offset, size_t bytesize, uint8_t*
                 return false;
             }
             got = (size_t) br;
+            // The bytes are now in the caller's buffer. Release their duplicate file-cache
+            // pages before the next device allocation when EXL3_DROP_PAGE_CACHE=1.
+            // This is opt-in so warm reloads keep their existing cache by default.
+            // Advise the shard: partial ranges can leave consumed pages resident.
+            const char* drop_cache = std::getenv("EXL3_DROP_PAGE_CACHE");
+            if (br > 0 && drop_cache && std::strcmp(drop_cache, "1") == 0)
+                (void) posix_fadvise(fileno(file), 0, 0, POSIX_FADV_DONTNEED);
         #else
             if (_fseeki64(file, static_cast<__int64>(file_offset + done), SEEK_SET))
             {
