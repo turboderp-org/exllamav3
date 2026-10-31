@@ -343,14 +343,14 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N", "FIXED_SPLITS")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n, FIXED_SPLITS = False,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
