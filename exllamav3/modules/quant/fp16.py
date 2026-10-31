@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import torch
 from torch import nn
 from ...ext import exllamav3_ext as ext
@@ -365,19 +366,41 @@ class LinearFP16Packed(LinearFP16):
         return sum(seg.nbytes() for seg in self.segments) \
             + (self.bias.numel() * self.bias.element_size() if self.bias is not None else 0)
 
-    def _dequant_into(self, out: torch.Tensor) -> torch.Tensor:
+    def _dequant_into(self, out: torch.Tensor, segments: list | None = None) -> torch.Tensor:
         """Write the fp16 weight into out, an (in_features, out_features) buffer on the segments' device
         whose pad rows/cols are already zero"""
-        dev = self.device
+        segments = self.segments if segments is None else segments
+        dev = segments[0].packed.device
         if dev.type == "cuda" and hasattr(ext, "dequant_blocks"):
-            for seg in self.segments:
+            for seg in segments:
                 ext.dequant_blocks(seg.packed.view(torch.uint8), seg.scale, out, seg.fmt, self.global_scale,
                                    seg.col0, seg.src_transposed, seg.br, seg.bc)
             return out
-        for seg in self.segments:
+        for seg in segments:
             w = seg.dequant_torch(self.global_scale).T       # (in, out) part
             out[:w.shape[0], seg.col0:seg.col0 + w.shape[1]].copy_(w)
         return out
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self.in_features, self.out_features))
+
+    def dequant_weight(self, device) -> torch.Tensor:
+        """A fresh fp16 (in_features, out_features) weight on `device`, dequantized there from transient copies of
+        the packed bytes wherever they live (swapped to the CPU or on another device). The quantizer's staging
+        path: a group of packed experts never materializes in fp16 on the load device, one weight at a time on
+        the device that consumes it, on that device's current stream"""
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        segs = []
+        for seg in self.segments:
+            s = copy.copy(seg)
+            s.packed = seg.packed.to(device)
+            s.scale = seg.scale.to(device) if seg.scale is not None else None
+            segs.append(s)
+        w = torch.zeros((self.in_features, self.out_features), dtype = torch.half, device = device)
+        return self._dequant_into(w, segs)
 
     def _zero_pads(self, w: torch.Tensor):
         if self.rows_real < self.in_features: w[self.rows_real:].zero_()
@@ -411,15 +434,8 @@ class LinearFP16Packed(LinearFP16):
 
     def get_weight_tensor(self) -> torch.Tensor:
         """A fresh fp16 (in_features, out_features) weight on the device the packed data lives (or lived, when
-        swapped: the packed bytes are moved back for the dequant and parked again)"""
-        swapped = self.swap_device
-        if swapped is not None:
-            for seg in self.segments: seg.to(swapped)
-        w = torch.zeros((self.in_features, self.out_features), dtype = torch.half, device = self.device)
-        self._dequant_into(w)
-        if swapped is not None:
-            for seg in self.segments: seg.to("cpu")
-        return w
+        swapped)"""
+        return self.dequant_weight(self.swap_device if self.swap_device is not None else self.device)
 
     def reconstruct_columns(self, cols: torch.Tensor, out: torch.Tensor):
         torch.index_select(self.get_weight_tensor(), 1, cols, out = out)
