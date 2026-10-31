@@ -70,6 +70,9 @@
 #include "dsv4_compress.cuh"
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
+#if defined(USE_ROCM)
+#include "rocm/attn/dsa_prefill_rdna.cuh"
+#endif
 #include "hc_mix.cuh"
 #include "dequant_blocks.cuh"
 #include "ple.cuh"
@@ -93,6 +96,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
     m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
     m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
+    m.attr("HAS_DSA_PREFILL_RDNA") = !cuda_only; // dsa_prefill_rdna
 
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
@@ -133,6 +137,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
+#if defined(USE_ROCM)
+    m.def("dsa_prefill_rdna", &dsa_prefill_rdna, "dsa_prefill_rdna");
+#endif
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
