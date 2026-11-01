@@ -2125,8 +2125,37 @@ def paged_attn_triton_prefill(
         return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
+        # The pick is cached per key, so the key has to describe everything that can change either
+        # the candidate list or the probed footprint. q_len does both, and was absent:
+        #
+        #  - the RDNA stock tile branches on it: `q.shape[1] >= 128` selects (128, 32, 8, 2) versus
+        #    (64, 32, 8, 1), and the ladder is then built from that stock, so a short chunk and a
+        #    long one probe different tiles entirely;
+        #  - Triton specialises a non-constexpr integer argument on `== 1` and `% 16`, compiling a
+        #    distinct kernel per bucket, so a pick measured for one bucket does not describe the
+        #    other.
+        #
+        # A chunked prefill reaches this kernel at several q_len under one module, so the pick made
+        # for the first chunk was reused for every chunk after it, including chunks whose probe
+        # would have walked a different ladder. On 3x gfx1100, TP=3, hd_pad 256 the 4096 token chunk
+        # and the 132 token remainder arrived with byte-identical keys; the tile admitted for the
+        # former was then launched for the latter and raised, after the prefill had started and with
+        # no chance to re-pick:
+        #
+        #     out of resource: shared memory, Required: 131072, Hardware limit: 65536
+        #
+        # These three predicates are the whole of q_len's influence on that decision, and they are
+        # as coarse as the choices they select between (one ladder branch, two specialisation
+        # buckets), so a chunked prefill probes a couple of times rather than once per chunk.
+        q_len_key = (q_len == 1, q_len % 16 == 0, q_len >= 128)
+        # programs and bound_kv are what the remaining inputs feed. bsz and n_q_heads reach the
+        # decision only as their product, num_pages_per_seq and kv_append_len only as their sum,
+        # and max_kv_len clamps that sum in prepare(), so all of them are folded in here.
+        kv_bound = num_pages_per_seq * page_size + kv_append_len
+        if max_kv_len is not None:
+            kv_bound = min(kv_bound, max_kv_len + kv_append_len)
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, stock)
+                    window_right >= 0, has_sinks, stock, q_len_key, bsz * n_q_heads, kv_bound)
         def probe(cfg):
             _, args, nw, ns, *_ = prepare(cfg)
             return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
