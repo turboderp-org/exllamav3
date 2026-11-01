@@ -3,7 +3,8 @@ Prefill across a layer split with the devices working on different chunks at onc
 in which the devices do their work and nothing else, so its output has to match the serial path's exactly: the same
 kernels run on the same inputs. That goes for the logits after the prompt, and for those after restoring from the
 checkpoints written behind chunks in flight, at the end of the reply and from inside the prompt, with and without a
-drafter sharing a device with the target.
+drafter sharing a device with the target, and for image jobs with the image across a chunk boundary, where Gemma4
+extends the chunk over the image and rewinds the state after the pass.
 
 Each model is split across two devices by weight size; a split the pipeline declines is skipped.
 """
@@ -14,6 +15,8 @@ import os
 import pytest
 import torch
 
+from exllamav3 import Model
+from PIL import Image
 from testlib.e2e import REFERENCE_TEXT, assert_greedy_equivalent, greedy, load_model
 from testlib.env import num_devices
 
@@ -37,20 +40,22 @@ def _split(model_dir: str, devices: list[torch.device]) -> str:
     return ",".join(split)
 
 
-def _conversation(lm, pipelined: bool) -> list:
+def _conversation(lm, pipelined: bool, ids: torch.Tensor = None, embeddings: list = None) -> list:
     gen = lm.generator(pipelined_prefill = pipelined, max_chunk_size = CHUNK)
     if pipelined and gen.pipeline is None:
         gen.close()
         pytest.skip("the pipeline declined this split")
-    ids = lm.tokenizer.encode(REFERENCE_TEXT * 40, add_bos = True)[:, : 5 * CHUNK + 100]
+    if ids is None:
+        ids = lm.tokenizer.encode(REFERENCE_TEXT * 40, add_bos = True)[:, : 5 * CHUNK + 100]
     assert ids.shape[-1] > 4 * CHUNK
-    turns = [greedy(gen, ids, REPLY_TOKENS, return_logits = True)]
+    job = dict(return_logits = True, embeddings = embeddings)
+    turns = [greedy(gen, ids, REPLY_TOKENS, **job)]
     # Restores the checkpoint at the end of the reply
     suffix = lm.tokenizer.encode("\n\nAnd then?\n", add_bos = False)
     followup = torch.cat((ids, torch.tensor([turns[0][0]]), suffix), dim = -1)
-    turns.append(greedy(gen, followup, NEW_TOKENS, return_logits = True))
+    turns.append(greedy(gen, followup, NEW_TOKENS, **job))
     # Restores one from inside the prompt, written behind the chunks then in flight
-    turns.append(greedy(gen, ids[:, : -CHUNK], NEW_TOKENS, return_logits = True))
+    turns.append(greedy(gen, ids[:, : -CHUNK], NEW_TOKENS, **job))
     gen.close()
     return turns
 
@@ -72,6 +77,25 @@ def test_pipelined_prefill_is_exact(model_id, model_dir, devices):
         assert_greedy_equivalent(serial[0][0], serial[0][1], pipelined[0][0], tag = model_id)
     else:
         _assert_exact(serial, pipelined)
+
+
+@pytest.mark.models("vision", exclude = ("deepseek_v4", "stub"))
+def test_pipelined_prefill_with_an_image_is_exact(model_id, model_dir, devices):
+    with load_model(model_dir, None, "-gs", _split(model_dir, devices[:2]), cache_tokens = 64 * PAGE) as lm:
+        vision = Model.from_config(lm.config, component = "vision")
+        vision.load(device = devices[0])
+        media = os.path.join(os.path.dirname(__file__), "..", "..", "examples", "media", "cat.png")
+        image = vision.get_image_embeddings(tokenizer = lm.tokenizer, image = Image.open(media).convert("RGB"))
+        vision.unload()
+        # Ending just before a chunk boundary, the image's tokens run across it
+        text = lm.tokenizer.encode(REFERENCE_TEXT * 40, add_bos = False)
+        head = lm.tokenizer.decode(text[:, : CHUNK - 40])[0]
+        tail = lm.tokenizer.decode(text[:, CHUNK - 40 : 5 * CHUNK])[0]
+        ids = lm.tokenizer.encode(f"{head}\n{image.text_alias}\n{tail}", add_bos = True, encode_special_tokens = True,
+                                  embeddings = [image])[:, : 5 * CHUNK + 100]
+        pipelined = _conversation(lm, True, ids, [image])
+        serial = _conversation(lm, False, ids, [image])
+    _assert_exact(serial, pipelined)
 
 
 @pytest.mark.model()

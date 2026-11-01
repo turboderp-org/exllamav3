@@ -1604,7 +1604,10 @@ class Job:
                 if to_output:
                     params["last_tokens_only"] = 1
                 then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None
-                if gen.pipeline is not None and not self.embeddings and len(self.sequences) == 1:
+                # DeepSeek-V4's image spans stay serial: its compressors stream across chunks cut to the span, and the
+                # serial path doesn't reproduce itself closely enough to show that overlapping them is harmless
+                exact_spans = bool(self.embeddings) and gen.model.caps.get("mm_exact_chunks")
+                if gen.pipeline is not None and len(self.sequences) == 1 and not exact_spans:
                     gen.pipeline.prefill(prefill_ids, params, self, to_output, then)
                 else:
                     if to_output:
