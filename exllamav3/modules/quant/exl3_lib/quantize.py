@@ -271,14 +271,9 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     # Get pinned buffers
     pin_tiles, pin_q_tiles, pin_q_idx = get_pinned(tiles.shape[0])
 
-    # Copy input tiles to pinned memory. Input is always on the first device in the split. The caller produced
-    # the tiles on its current stream and will consume the results there (the batched scale search runs on the
-    # default stream; the LDLQ loops already run on main_stream, where both waits are no-ops), so the fan-out
-    # stream is ordered after the caller's stream on entry and the caller's stream after the fan-in on exit
+    # Copy input tiles to pinned memory. Input is always on the first device in the split
     copy_input_event = torch.cuda.Event(blocking = False)
     main_stream = get_quant_stream(devices[0])
-    caller_stream = torch.cuda.current_stream(tiles.device)
-    main_stream.wait_stream(caller_stream)
     with torch.cuda.stream(main_stream):
         tiles = tiles.contiguous()
         pin_tiles.copy_(tiles, non_blocking = True)
@@ -389,7 +384,6 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         q_idx = torch.empty_like(tiles, dtype = torch.short, device = devices[0])
         q_tiles.copy_(pin_q_tiles, non_blocking = True)
         q_idx.copy_(pin_q_idx, non_blocking = True)
-    caller_stream.wait_stream(main_stream)
 
     return q_tiles, q_idx
 
@@ -1947,11 +1941,6 @@ def _get_stage_buf(device_index: int, slot: int, nbytes: int):
         return buf
 
 
-def _materialize(w, device) -> torch.Tensor:
-    """A weight as a tensor on `device`: packed conversion-time inners (LinearFP16Packed) dequantize there"""
-    return w.dequant_weight(device) if hasattr(w, "dequant_weight") else w
-
-
 class _WeightStager:
     """
     Stages CPU-swapped weights to the device through pinned buffers on a side stream, one
@@ -1966,12 +1955,8 @@ class _WeightStager:
         self.slot = 0
         self.pending = {}
 
-    def prefetch(self, t: int, w):
+    def prefetch(self, t: int, w: torch.Tensor):
         if t in self.pending:
-            return
-        if hasattr(w, "dequant_weight"):
-            # A packed (natively quantized) weight: dequantized on this device, on the consuming stream
-            self.pending[t] = (w.dequant_weight(self.device), None)
             return
         if w.is_cuda:
             self.pending[t] = (w if w.device == self.device else w.to(self.device), None)
@@ -2066,7 +2051,7 @@ def quantize_exl3_batch(
 
         for t in range(n_t):
             if finalized[t] is None:
-                results[t] = quantize_exl3(_materialize(weights[t], device).float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
+                results[t] = quantize_exl3(weights[t].float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
 
         if not batch_idx:
             return results
