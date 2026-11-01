@@ -42,3 +42,40 @@ void exl3_gemv
     bool mcg,
     bool mul1
 );
+
+// Dual-matrix entry (see docs/sm70_dual_gemv_design.md): fuses two
+// back-to-back GEMV calls into one launch. Same A on both slots.
+void exl3_gemv2
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& B2,
+    at::Tensor& C2,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    const c10::optional<at::Tensor>& suh2,
+    const c10::optional<at::Tensor>& A_had2,
+    const c10::optional<at::Tensor>& svh2,
+    bool mcg,
+    bool mul1
+);
+
+// Multi-matrix entry (pointer tables, sm80 mgemm contract): N
+// matrices in ONE launch. See docs/sm70_perf_report.md.
+void exl3_gemv_multi
+(
+    const at::Tensor& A_list,
+    const at::Tensor& B_list,
+    const at::Tensor& C_list,
+    const at::Tensor& suh_list,
+    const at::Tensor& A_had_list,
+    const at::Tensor& svh_list,
+    int64_t n_mat,
+    int64_t size_k,
+    int64_t size_n,
+    int64_t K,
+    bool mcg,
+    bool mul1
+);

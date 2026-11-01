@@ -110,6 +110,18 @@ int g_get_cc(int device)
     return DevCtx::instance().get_cc(device);
 }
 
+// Raw compute capability as major*10 + minor (70 = Volta, 75 = Turing, 80 = Ampere, ...).
+// The DevCtx enum (CC_OLD=1..CC_BLACKWELL=5) is for the C++ kernel-map switch and must not
+// be mixed with these thresholds. Turing (75) and Volta (70) both report major 7, so the
+// minor digit is required to separate them (the EXL3 SM75 paths run on Turing, not Volta).
+int g_get_cc_raw(int device)
+{
+    int device_i = device;
+    cudaDeviceProp prop;
+    cuda_check(cudaGetDeviceProperties(&prop, device_i));
+    return prop.major * 10 + prop.minor;
+}
+
 int g_get_num_sms(int device)
 {
     return DevCtx::instance().get_num_sms(device);
