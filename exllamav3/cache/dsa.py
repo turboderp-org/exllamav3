@@ -410,7 +410,7 @@ class DSV4LayerState:
                 out.append(host_copy(self.idx_buf_kv[slot]))
                 out.append(host_copy(self.idx_buf_gate[slot]))
                 out.append(host_copy(self.comp_ovl[slot]))
-                out.append(self.idx_ovl[slot].cpu())
+                out.append(host_copy(self.idx_ovl[slot]))
         return out
 
 

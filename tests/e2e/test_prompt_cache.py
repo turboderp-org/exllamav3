@@ -9,6 +9,7 @@ arithmetic differs and the continuation may part ways at a near-tie (testlib.e2e
 """
 
 import pytest
+import torch
 
 from testlib.e2e import REFERENCE_TEXT, assert_greedy_equivalent, greedy, load_model
 
@@ -41,6 +42,25 @@ def test_prefix_reuse(model_id, model_dir, device):
     reused = second["eos"]["cached_pages"]
     assert reused >= 3, f"second job reused {reused} pages of a {ids.shape[-1]}-token prompt"
     assert_greedy_equivalent(ref_tokens, ref_logits, tokens, tag = f"{reused} pages reused")
+
+
+def test_followup_resumes_reply(model_id, model_dir, device):
+    """A prompt extending a job's output resumes from the last page boundary of that output, with no regular
+    checkpoint anywhere near it, and continues as a fresh prefill would. The sequence runs past the state rings of
+    SWA models, where the last page boundary of a job lies just behind a ring shift"""
+    with load_model(model_dir, device, cache_tokens = 32 * PAGE) as lm:
+        gen = lm.generator(recurrent_checkpoint_interval = 64 * PAGE)
+        ids = _prompt(lm, 4 * PAGE + 100)
+        reply, _, _ = greedy(gen, ids, 4 * PAGE + 60)
+        suffix = lm.tokenizer.encode("\n\nAnd then?\n", add_bos = False)
+        followup = torch.cat((ids, torch.tensor([reply]), suffix), dim = -1)
+        tokens, _, second = greedy(gen, followup, NEW_TOKENS)
+        ref_tokens, ref_logits, _ = greedy(lm.generator(), followup, NEW_TOKENS, return_logits = True)
+
+    boundary = (ids.shape[-1] + len(reply) - 1) // PAGE * PAGE
+    cached = second["eos"]["cached_tokens"]
+    assert cached >= boundary, f"resumed at {cached} of {followup.shape[-1]} tokens, the reply's last page ends at {boundary}"
+    assert_greedy_equivalent(ref_tokens, ref_logits, tokens, tag = f"resumed at {cached}")
 
 
 def test_cpu_tier_restore(model_id, model_dir, device):

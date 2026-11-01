@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash
 from .filter import Filter
 import random
 import time
@@ -310,6 +310,7 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+        self.rolling_stash = None
 
         # Loop detector. A requeued job continues the detector of its first pass (whose input is the original
         # prompt, so it is primed only there)
@@ -1062,6 +1063,9 @@ class Job:
             replay_from = None
             if self.recurrent_state is not None:
                 target = self.sequences[0].kv_position - offset
+                # A rolling checkpoint past the target holds tokens that are about to go
+                if self.rolling_stash is not None and self.rolling_stash["position"] > target:
+                    self.drop_rolling_checkpoint()
                 # During draft verification the state runs ahead of the accepted K/V position, so rewind to the
                 # target position rather than by the checkpoint offset; every side of the pair must be able to
                 # roll back in place, else the pair is restored from a stash
@@ -1737,6 +1741,7 @@ class Job:
 
 
     def deallocate_pages(self):
+        self.drop_rolling_checkpoint()
         self.free_recurrent_state()
         for seq in self.sequences:
             if seq.allocated_pages is not None:
@@ -1844,11 +1849,95 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
+    def rolls_checkpoint(self) -> bool:
+        """
+        Whether this job keeps a rolling checkpoint. The last page boundary of a job's output isn't known until
+        the job ends, and a state that advances destructively can't go back to it then, so such a state is copied
+        at every page, over the previous copy. States that roll back in place don't need this (stash_by_rollback).
+        """
+        state = self.recurrent_state
+        return (
+            self.generator.rolling_checkpoint and state is not None and not state.stash_by_rollback
+            and state.checkpoint_size <= self.generator.recurrent_cache.max_size
+        )
+
+
+    def is_stash_boundary(self) -> bool:
+        """Whether draft acceptance has to stop at the current position, for the state to settle where it is stashed"""
+        return self.is_checkpoint_boundary() or \
+            (self.sequences[0].kv_position % PAGE_SIZE == 0 and self.rolls_checkpoint())
+
+
+    def update_rolling_checkpoint(self):
+        """
+        Move the rolling checkpoint up to the current page boundary. It stays outside the recurrent cache until the
+        job ends, so a long generation evicts nothing, and its buffers are recycled through the stash pool, so
+        no page boundary reaches the allocator. A regular checkpoint at this position supersedes it.
+        """
+        pos = self.sequences[0].kv_position
+        if pos == 0 or pos % PAGE_SIZE or not self.is_prefill_done() or not self.rolls_checkpoint():
+            return
+        if self.rolling_stash is not None and self.rolling_stash["position"] == pos:
+            return
+        self.drop_rolling_checkpoint()
+        if self.last_recurrent_checkpoint_pos != pos:
+            self.rolling_stash = self.recurrent_state.stash()
+
+
+    def drop_rolling_checkpoint(self):
+        if self.rolling_stash is not None:
+            self.generator.recurrent_cache.recycle(self.rolling_stash)
+            self.rolling_stash = None
+
+
+    def page_anchor(self, position: int) -> bytes | None:
+        """Hash a checkpoint at this page boundary is findable under, or None if the page has no content hash
+        yet (tokens held by a banned string match)"""
+        page = self.sequences[0].allocated_pages[position // PAGE_SIZE - 1]
+        return page.phash if page.kv_position == PAGE_SIZE and is_content_hash(page.phash) else None
+
+
+    def commit_recurrent_checkpoint(self):
+        """
+        Leave a checkpoint at the last page boundary of a job that is ending, so that a follow-up prompt extending
+        its output replays less than a page of it: the state itself if it is there or can roll back to it, else
+        the rolling checkpoint. The state may be anything from that point on; it is released right after this.
+        """
+        if not self.generator.rolling_checkpoint:
+            return
+        cache = self.generator.recurrent_cache
+        state = self.recurrent_state
+        boundary = self.sequences[0].kv_position // PAGE_SIZE * PAGE_SIZE
+
+        def past_last(position):
+            return position > (self.last_recurrent_checkpoint_pos or 0)
+
+        if state is not None and self.is_prefill_done() and past_last(boundary):
+            at_boundary = state.settled_at(boundary)
+            if at_boundary or (state.stash_by_rollback and state.can_stash_at(boundary)):
+                key = self.page_anchor(boundary)
+                if key is not None:
+                    if not at_boundary:
+                        state.rewind_to(boundary)
+                    cache.put(key, state)
+                    self.last_recurrent_checkpoint_pos = boundary
+
+        rolling, self.rolling_stash = self.rolling_stash, None
+        if rolling is not None:
+            key = self.page_anchor(rolling["position"]) if past_last(rolling["position"]) else None
+            if key is not None:
+                cache.adopt(key, rolling)
+            else:
+                cache.recycle(rolling)
+
+
     def find_recurrent_stash(self, target_pos: int):
         """
         Return the most recent page-aligned recurrent state stash at or before target_pos, refreshing its LRU
         position in the recurrent cache, or None if no eligible stash remains.
         """
+        if self.rolling_stash is not None and self.rolling_stash["position"] <= target_pos:
+            return self.rolling_stash
         seq = self.sequences[0]
         rc = self.generator.recurrent_cache
         for pi in range(target_pos // PAGE_SIZE - 1, -1, -1):

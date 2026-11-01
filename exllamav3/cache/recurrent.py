@@ -129,6 +129,18 @@ class PairedState:
         if self.target is not None:
             self.target.rewind(num_tokens)
 
+    @property
+    def stash_by_rollback(self) -> bool:
+        """Whether every side can reach a past page boundary in place when a job ends (SWA rings), so that no
+        rolling checkpoint has to be copied while the job runs"""
+        return all(getattr(s, "stash_by_rollback", False) for s in self.components)
+
+    def can_stash_at(self, position: int) -> bool:
+        return all(s.can_stash_at(position) for s in self.components)
+
+    def settled_at(self, position: int) -> bool:
+        return all(s.position == position and s.last_history == 0 for s in self.components)
+
     def can_rewind_to(self, position: int) -> bool:
         return all(0 <= s.position - position <= s.rollback_capacity() for s in self.components)
 
@@ -223,6 +235,24 @@ class RecurrentCache(OrderedDict):
             self._insert(key, None, persist = True, state = state)
 
 
+    def adopt(self, key, stashed: dict):
+        """Store a stash made outside the cache (a job's rolling checkpoint), taking ownership of it"""
+        if key in self:
+            self.move_to_end(key)
+            self.recycle(stashed)
+        elif stashed["checkpoint_size"] > self.max_size:
+            self.recycle(stashed)
+        else:
+            self._insert(key, stashed, persist = True)
+
+
+    def recycle(self, stashed: dict):
+        """Hand a stash that never entered the cache back to the pool, for the next stash to reuse. Nothing
+        reaches the allocator and no disk write can be pending, so this doesn't count towards a trim"""
+        host_pool.give(stashed)
+        self._release_tp(stashed, trim = False)
+
+
     def _insert(self, key, stashed, persist: bool, state = None):
         """Make room for a checkpoint, then stash `state` (or take `stashed` as is) under key"""
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
@@ -314,7 +344,7 @@ class RecurrentCache(OrderedDict):
         malloc_trim()
 
 
-    def _release_tp(self, stashed: dict):
+    def _release_tp(self, stashed: dict, trim: bool = True):
         """Drop the tensor-parallel ranks' copies of a stash: one handle per side of a pair (or at
         the top level of a bare state stash)"""
         for key in ("target", "draft", None):
@@ -323,7 +353,7 @@ class RecurrentCache(OrderedDict):
                 continue
             model = self.model if key is None else self.models[key]
             if model is not None and model.loaded_tp:
-                model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), s["tp_handle"]))
+                model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), s["tp_handle"], trim))
 
     def _release(self, stashed: dict):
         # A stash the disk tier is still writing keeps its buffers until the write is done
@@ -397,8 +427,9 @@ def _stashed_bytes(obj) -> int:
     return 0
 
 
-def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):
+def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int, trim: bool = True):
     recurrent_cache = local_context["recurrent_cache"]
     stashed = recurrent_cache.pop(cp_handle)
     host_pool.give(stashed)
-    note_freed(_stashed_bytes(stashed))
+    if trim:
+        note_freed(_stashed_bytes(stashed))

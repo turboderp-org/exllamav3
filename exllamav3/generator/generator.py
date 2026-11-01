@@ -63,6 +63,7 @@ class Generator:
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
+        rolling_checkpoint: bool = True,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
@@ -229,6 +230,12 @@ class Generator:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
             multiple of the page size. Checkpoints land on the first chunk boundary at least this far past the
             previous one, so the interval need not be a multiple of the chunk size. Default is 32768 tokens
+
+        :param rolling_checkpoint:
+            Leave a checkpoint at the last page boundary of every job's output, so that a follow-up prompt
+            extending it replays less than a page instead of up to a checkpoint interval. States that can't
+            roll back in place keep one copy per active job, updated at every page and outside
+            recurrent_cache_size until the job ends. Ignored if model doesn't use recurrent states
 
         :param kwargs:
         """
@@ -421,6 +428,7 @@ class Generator:
             "checkpoint interval must be a multiple of the page size (256)"
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
+        self.rolling_checkpoint = rolling_checkpoint and self.recurrent_cache is not None
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -667,6 +675,7 @@ class Generator:
         if job in self.pending_jobs:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
+            job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
@@ -1051,12 +1060,13 @@ class Generator:
             self._flush_pass = None
             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
         if self.recurrent_cache is not None:
-            self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
-            # is actually returned (the next stash reallocates once)
-            host_pool.release()
-            if self.model.loaded_tp:
-                self.model.tp_dispatch_all(mp_host_pool_release, ())
+            # is actually returned (the next stash reallocates once). Without pruning the pool holds
+            # about one checkpoint per job that just ended, which the next turn's stashes reuse
+            if self.recurrent_cache.prune_stranded():
+                host_pool.release()
+                if self.model.loaded_tp:
+                    self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -1069,6 +1079,7 @@ class Generator:
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
             job.maybe_stash_recurrent(self.recurrent_cache)
+            job.update_rolling_checkpoint()
 
 
     def update_visualizer(self):
@@ -2011,7 +2022,7 @@ class Generator:
                     # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                        cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                        cp_boundary = batch_states is not None and job.is_stash_boundary()
                         if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
@@ -2173,6 +2184,7 @@ class Generator:
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
 
