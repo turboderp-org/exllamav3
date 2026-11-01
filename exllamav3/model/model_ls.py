@@ -467,6 +467,42 @@ class Model_LSMixin(ABC):
             yield
 
 
+    @property
+    def last_kv_end(self) -> int:
+        """End of the modules a prefill runs, in fwd_modules"""
+        for i, (_, instance, idx) in enumerate(self.fwd_modules):
+            if (idx, instance) == self.last_kv_module_idx_instance:
+                return i + 1
+        return len(self.fwd_modules)
+
+
+    def run_section(self, x: torch.Tensor, params: dict, a: int, b: int, prefill: bool) -> torch.Tensor:
+        """Run fwd_modules[a:b] of a prefill, or of a forward"""
+        mods = self.fwd_modules
+        if prefill:
+            for module, instance, idx in mods[a : b]:
+                params["layer_instance"] = instance
+                params["prefill"] = (idx, instance) == self.last_kv_module_idx_instance
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+            return x
+
+        from ..modules.transformer import TransformerBlock
+        for i in range(a, b):
+            module, instance, idx = mods[i]
+            params["layer_instance"] = instance
+            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
+            x = module.prepare_for_device(x, params)
+            # A block may leave its final residual add to the next block's input norm (same device)
+            nxt = mods[i + 1][0] if i + 1 < len(mods) else None
+            params["resid_defer"] = (
+                type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
+            )
+            x = module.forward(x, params)
+        return x
+
+
     def prefill_ls(
         self,
         x: torch.Tensor,
@@ -474,14 +510,7 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            pf = (idx, instance) == self.last_kv_module_idx_instance
-            params["prefill"] = pf
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
-            if pf:
-                break
+        self.run_section(x, params, 0, self.last_kv_end, True)
         del params["prefill"]
         return None
 
@@ -493,19 +522,7 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        from ..modules.transformer import TransformerBlock
-        mods = self.fwd_modules
-        for i, (module, instance, idx) in enumerate(mods):
-            params["layer_instance"] = instance
-            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                x = x[..., -num:, :].contiguous()
-            x = module.prepare_for_device(x, params)
-            # A block may leave its final residual add to the next block's input norm (same device)
-            nxt = mods[i + 1][0] if i + 1 < len(mods) else None
-            params["resid_defer"] = (
-                type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
-            )
-            x = module.forward(x, params)
+        x = self.run_section(x, params, 0, len(self.fwd_modules), False)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)
         if pending is not None:

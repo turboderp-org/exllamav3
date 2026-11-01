@@ -1,6 +1,6 @@
 from __future__ import annotations
 import torch
-from .device_copy import to_device
+from .device_copy import host_to_device, to_device
 
 class SeqTensor:
 
@@ -155,12 +155,15 @@ def get_for_device(
             dv = to_device(v, device)
             scache[device] = dv
     else:
-        # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
-        # that consume it, so the host never stalls. Callers that reuse pinned staging buffers
-        # must not refill them until a sync point (the generator syncs every iteration when
-        # collecting sampled tokens)
-        nb = v.device.type == "cpu" and v.is_pinned()
-        dv = to_device(v, device, non_blocking = nb)
+        # Host sources upload asynchronously: the copy is stream-ordered ahead of the kernels that
+        # consume it, so the host never stalls, and a blocking copy here would wait out everything
+        # queued on the device, a chunk still on its way from the device before it included.
+        # Callers that reuse pinned staging buffers must not refill them until a sync point (the
+        # generator syncs every iteration when collecting sampled tokens)
+        if v.device.type == "cpu" and torch.device(device).type != "cpu":
+            dv = host_to_device(v, device)
+        else:
+            dv = to_device(v, device)
     cache[cache_key] = (v, dv)
     return dv
 

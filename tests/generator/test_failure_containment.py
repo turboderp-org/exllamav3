@@ -68,6 +68,7 @@ class StubJob:
 
 def make_generator(pending, active = (), max_batch_size = 16):
     generator = Generator.__new__(Generator)
+    generator.pipeline = None
     generator.pagetable = StubPagetable()
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
@@ -192,6 +193,7 @@ def test_async_deliver_error_as_raw_exception():
 
 def test_sync_generate_raises_on_error_result():
     generator = Generator.__new__(Generator)
+    generator.pipeline = None
 
     def fake_enqueue(job):
         job.serial_number = 0

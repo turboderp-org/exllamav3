@@ -260,15 +260,20 @@ class DSV4State:
         self.window_beg += self.wshift
         self.wshift = 0
 
-    def stash(self):
-        stashed = {
+    def stash_header(self):
+        return {
             "position": self.position,
             "window_beg": self.window_beg,
             "checkpoint_size": self.checkpoint_size,
         }
+
+    def stash_layers(self, layers: dict):
+        return {k: l.stash(self.slot, self.position) for k, l in layers.items()}
+
+    def stash(self):
+        stashed = self.stash_header()
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(

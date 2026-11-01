@@ -14,7 +14,7 @@ from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
-from functools import lru_cache
+from functools import lru_cache, partial
 from ..util import profile_opt
 
 
@@ -1485,6 +1485,8 @@ class Job:
                     best_match = min(best_match, prefill_ids.shape[-1] - 1)
 
                 if best_match_page and best_match > 1:
+                    # The page may be another job's, with its chunk still in flight
+                    self.pipeline_flush()
                     page = seq.allocated_pages[p0]
                     for c in [self.generator.cache] if not self.generator.draft_model else \
                             [self.generator.cache, self.generator.draft_cache]:
@@ -1591,54 +1593,26 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
-                if self.generator.draft_model:
-                    params.update(self.generator.draft_model.draft_verifier_params)
-                dm = self.generator.draft_model
-                if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
-                    # MTP needs the target's post-final-norm state for every prompt token.
-                    # Normal prefill stops at the last cache-writing layer, before final norm.
+                gen = self.generator
+                dm = gen.draft_model
+                if dm:
+                    params.update(dm.draft_verifier_params)
+                # MTP needs the target's post-final-norm state for every prompt token. Normal prefill stops at the
+                # last cache-writing layer, before final norm. (A drafter fed the last decoder layer's output takes
+                # the regular prefill, which runs through that layer)
+                to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
+                if to_output:
                     params["last_tokens_only"] = 1
-                    self.generator.model.forward(input_ids = prefill_ids, params = params)
+                then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None
+                if gen.pipeline is not None and not self.embeddings and len(self.sequences) == 1:
+                    gen.pipeline.prefill(prefill_ids, params, self, to_output, then)
                 else:
-                    # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
-                    # through that layer)
-                    self.generator.model.prefill(input_ids = prefill_ids, params = params)
-
-                if self.generator.dflash_draft:
-                    self.generator.draft_model.update_kv_from_target(
-                        target_hidden = params.get("export_states"),
-                        cache = self.generator.draft_cache,
-                        params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
-                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
-                                                and self.recurrent_state.draft is not None else None,
-                        }
-                    )
-                elif self.generator.draft_model:
-                    if self.generator.mtp_draft:
-                        target_hidden = params.get("export_states")[-1]
-                        carry_hidden = seq.mtp_carry_hidden
-                        if carry_hidden is None:
-                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
-                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
-                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
-                        self.mtp_last_hidden = seq.mtp_carry_hidden
+                    if to_output:
+                        gen.model.forward(input_ids = prefill_ids, params = params)
                     else:
-                        shifted_hidden = None
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                            "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
-                                                and self.recurrent_state.draft is not None else None,
-                        }
-                    )
+                        gen.model.prefill(input_ids = prefill_ids, params = params)
+                    if then is not None:
+                        then(params)
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
@@ -1699,6 +1673,49 @@ class Job:
             results.append(r)
 
 
+    def update_draft_from_prefill(self, seq, prefill_ids: torch.Tensor, prefill_start: int, params: dict):
+        """
+        Bring the draft model up to a prefill chunk of the target, from the finished chunk's params: the states it
+        exported go in as they are, or the draft model takes the chunk itself. Runs on the draft model's device when
+        the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
+        """
+        if self.generator.dflash_draft:
+            self.generator.draft_model.update_kv_from_target(
+                target_hidden = params.get("export_states"),
+                cache = self.generator.draft_cache,
+                params = {
+                    "block_table": params["block_table"],
+                    "cache_seqlens": params["cache_seqlens"],
+                    "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                        and self.recurrent_state.draft is not None else None,
+                }
+            )
+        elif self.generator.draft_model:
+            if self.generator.mtp_draft:
+                target_hidden = params.get("export_states")[-1]
+                carry_hidden = seq.mtp_carry_hidden
+                if carry_hidden is None:
+                    carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                self.mtp_last_hidden = seq.mtp_carry_hidden
+            else:
+                shifted_hidden = None
+            self.generator.draft_model.prefill(
+                input_ids = prefill_ids,
+                params = {
+                    "target_hidden": shifted_hidden,
+                    "attn_mode": "flash_attn",
+                    "block_table": params["block_table"],
+                    "cache": self.generator.draft_cache,
+                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                    "recurrent_states": [self.recurrent_state.draft] if self.recurrent_state is not None
+                                        and self.recurrent_state.draft is not None else None,
+                }
+            )
+
+
     def allocate_pages(self):
         """
         Claim cache pages for this job after it leaves the pending queue.
@@ -1707,6 +1724,8 @@ class Job:
         prompt-cache pages where possible and assigning fresh pages for uncached prompt or future generation. For
         recurrent models this also creates or restores the recurrent state corresponding to the cached prefix.
         """
+        # Evicting pages for this job and restoring its state read what chunks in flight may still be writing
+        self.pipeline_flush()
 
         # Pages matching any of the job's own prompt hashes must not be taken to serve this same allocation's
         # cache misses (e.g. when resuming a partially evicted sequence, the misses at the front must not
@@ -1740,7 +1759,14 @@ class Job:
             self.non_sequential_pages += non_sequential_pages
 
 
+    def pipeline_flush(self):
+        pipeline = self.generator.pipeline if self.generator is not None else None
+        if pipeline is not None:
+            pipeline.flush()
+
+
     def deallocate_pages(self):
+        self.pipeline_flush()
         self.drop_rolling_checkpoint()
         self.free_recurrent_state()
         for seq in self.sequences:
@@ -1843,7 +1869,7 @@ class Job:
 
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
-            cache.put(page.phash, self.recurrent_state)
+            cache.put(page.phash, self.recurrent_state, owner = self)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
@@ -1881,6 +1907,7 @@ class Job:
             return
         self.drop_rolling_checkpoint()
         if self.last_recurrent_checkpoint_pos != pos:
+            self.pipeline_flush()
             self.rolling_stash = self.recurrent_state.stash()
 
 
@@ -1905,6 +1932,7 @@ class Job:
         """
         if not self.generator.rolling_checkpoint:
             return
+        self.pipeline_flush()
         cache = self.generator.recurrent_cache
         state = self.recurrent_state
         boundary = self.sequences[0].kv_position // PAGE_SIZE * PAGE_SIZE

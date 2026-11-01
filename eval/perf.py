@@ -4,6 +4,7 @@ from exllamav3.util.progress import ProgressBar
 from exllamav3.util.misc import Timer, cuda_sync_active
 from exllamav3.util.file import disk_lru_cache
 from exllamav3 import model_init
+from exllamav3.model.prefill_pipeline import PrefillPipeline
 import torch
 import argparse
 
@@ -107,7 +108,15 @@ def measure_prefill(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
                     }
-                    model.prefill(workload_ids(start + ids_offset, end - start), params)
+                    ids = workload_ids(start + ids_offset, end - start)
+                    if model.pipeline is not None:
+                        model.pipeline.prefill(ids, params, "perf")
+                    else:
+                        model.prefill(ids, params)
+                if model.pipeline is not None:
+                    model.pipeline.flush()
+                    for _, error in model.pipeline.take_failures():
+                        raise error
                 cuda_sync_active()
                 if is_recurrent:
                     recurrent[0].free()
@@ -192,6 +201,11 @@ def main(args):
 
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
     print(f" -- Chunk size: {args.chunk_size}")
+    # A direct model.prefill runs serially: the generator is what normally sets up the pipeline
+    plan = None if args.no_pipeline else PrefillPipeline.plan(model, cache)
+    if plan is not None:
+        model.pipeline = PrefillPipeline(model, *plan)
+        print(f" -- Prefill pipeline: {' -> '.join(str(d) for d in model.pipeline.route)}")
     print()
 
     if not args.skip_prefill:
@@ -222,6 +236,7 @@ if __name__ == "__main__":
         default_chunk_size = 4096,
     )
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
+    parser.add_argument("-npp", "--no_pipeline", action = "store_true", help = "Prefill serially across a layer split")
     parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
     parser.add_argument("-dr", "--decode_reps", type = int, default = 1, help = "Repeat each 100-token decode measurement this many times from the same context and report the mean (and min-max), default: 1")
     parser.add_argument("-sg", "--skip_gen", action = "store_true", help = "Skip measuring generaition speed")

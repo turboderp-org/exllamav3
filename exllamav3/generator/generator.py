@@ -3,6 +3,7 @@ import logging
 import torch
 import os
 from ..model.model import Model
+from ..model.prefill_pipeline import PrefillPipeline
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
@@ -64,6 +65,7 @@ class Generator:
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
         rolling_checkpoint: bool = True,
+        pipelined_prefill: bool = True,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
@@ -236,6 +238,11 @@ class Generator:
             extending it replays less than a page instead of up to a checkpoint interval. States that can't
             roll back in place keep one copy per active job, updated at every page and outside
             recurrent_cache_size until the job ends. Ignored if model doesn't use recurrent states
+
+        :param pipelined_prefill:
+            With the model split across devices, let them work on different prefill chunks at once, each device
+            on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
+            offload, attention pinned to one device, a draft model on several devices or reading the target's cache
 
         :param kwargs:
         """
@@ -429,6 +436,21 @@ class Generator:
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
         self.rolling_checkpoint = rolling_checkpoint and self.recurrent_cache is not None
+
+        # One pipeline per model: a retired generator may not have been closed
+        previous = getattr(self.model, "pipeline", None)
+        if previous is not None:
+            previous.close()
+        self.pipeline = None
+        plan = PrefillPipeline.plan(self.model, cache, draft_model) if pipelined_prefill else None
+        if plan is not None:
+            on_idle = self.recurrent_cache.write_settled if self.recurrent_cache is not None else None
+            self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle)
+        self.model.pipeline = self.pipeline
+        if draft_model is not None:
+            draft_model.pipeline = self.pipeline
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.pipeline = self.pipeline
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -802,6 +824,12 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
+        # Generation runs in the foreground, on devices and draft state the prefill pipeline has finished with
+        if self.pipeline is not None:
+            if self.pipeline.busy and any(job.is_prefill_done() for job in self.active_jobs):
+                self.pipeline.flush()
+            self.reap_pipeline_failures(results)
+
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
         draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
         round_start = None
@@ -860,6 +888,13 @@ class Generator:
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
         the pinned staging and draft buffers, and the filter thread pool.
         """
+        if self.pipeline is not None:
+            self.pipeline.close()
+            self.model.pipeline = None
+            if self.draft_model is not None:
+                self.draft_model.pipeline = None
+            self.recurrent_cache and setattr(self.recurrent_cache, "pipeline", None)
+            self.pipeline = None
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
             # After abort() (generator error), nothing is written
@@ -1017,6 +1052,9 @@ class Generator:
         budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
         if budget <= 0:
             return
+        # A sequence's position runs ahead of the devices while prefill chunks are in flight
+        if self.pipeline is not None:
+            self.pipeline.flush()
         pages = []
         for job in self.active_jobs:
             for seq in job.sequences:
@@ -1059,6 +1097,8 @@ class Generator:
             # jobs since the last one have left in VRAM
             self._flush_pass = None
             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
+        if self.pipeline is not None:
+            self.pipeline.flush()
         if self.recurrent_cache is not None:
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
             # is actually returned (the next stash reallocates once). Without pruning the pool holds
@@ -2197,6 +2237,14 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def reap_pipeline_failures(self, results: list):
+        """Fail the jobs whose work in the prefill pipeline raised, which only comes out once it has moved on"""
+        for job, error in self.pipeline.take_failures():
+            if job is not None:
+                self.reap_failed_job(job, error, results)
+            self.pipeline.forget_owner(job)
 
 
     def reap_failed_job(self, job, error, results: list):

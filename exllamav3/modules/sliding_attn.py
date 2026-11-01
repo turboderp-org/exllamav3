@@ -111,16 +111,24 @@ class SWAState:
         )
 
 
-    def stash(self):
-        stashed = {
+    def stash_header(self):
+        return {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size,
             "window_beg": self.window_beg,
         }
+
+
+    def stash_layers(self, layers: dict):
+        cache_pos = self.position - self.window_beg
+        return {k: l.stash(self.slot, cache_pos) for k, l in layers.items()}
+
+
+    def stash(self):
+        stashed = self.stash_header()
         cache_pos = self.position - self.window_beg
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, cache_pos)
+            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, cache_pos))

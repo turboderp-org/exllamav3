@@ -70,6 +70,7 @@ def make_job(prompt_length, sequence_length, replay_start, *, image = True, imag
         model = ModelProbe(rope),
         max_chunk_size = PAGE_SIZE,
         recurrent_cache = object(),
+        pipeline = None,
         cache = None,
         draft_model = None,
         mtp_draft = mtp,

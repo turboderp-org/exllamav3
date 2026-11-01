@@ -31,6 +31,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.cache_weakrefs = {}
         self.recurrent_state_cls = None
         self.draft_verifier_params = {}
+        # Set by a Generator running prefill across the split (PrefillPipeline); a direct forward or
+        # prefill waits for what it has issued
+        self.pipeline = None
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -376,6 +379,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        if self.pipeline is not None:
+            self.pipeline.flush()
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -444,6 +449,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        if self.pipeline is not None:
+            self.pipeline.flush()
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -458,6 +465,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        if self.pipeline is not None:
+            self.pipeline.flush()
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
