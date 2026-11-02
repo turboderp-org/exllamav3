@@ -2057,22 +2057,12 @@ def paged_attn_triton_prefill(
         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
     sms = _decode_sm_count[dev]
 
-    def prepare(cfg, slice = None):
-        """Launch geometry for one tile config: grid, kv split count, partial buffers and the
-        kernel argument list (the probe compiles with exactly the launch's arguments). A staging
-        slice overrides the cache tensors, block table, kv offset, resume flag and split count,
-        and reuses the shared fp32 accumulator."""
-        block_m, block_n, num_warps, num_stages = cfg
-        s = slice or _StagingSlice(k_cache, v_cache, block_table, 0, 0, None, None, None)
-        kc_, vc_, bt_, kv_offset, resume, force_splits, part_o, part_ml = s
-        num_pages_ = bt_.shape[1]
-        q_blocks = triton.cdiv(q_len, block_m)
-        programs = q_blocks * bsz * n_q_heads
-
-        # Split the kv range when the grid would quantize badly against the SM count (uniform
-        # full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
-        # count minimizing ceil-waves per unit of work, with a small penalty per extra split
-        splits = num_splits if force_splits is None else force_splits
+    def kv_splits(block_m, num_pages_):
+        """Split the kv range when the grid would quantize badly against the SM count (uniform
+        full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
+        count minimizing ceil-waves per unit of work, with a small penalty per extra split"""
+        programs = triton.cdiv(q_len, block_m) * bsz * n_q_heads
+        splits = num_splits
         if splits is None:
             bound_kv = num_pages_ * page_size + kv_append_len
             if max_kv_len is not None:
@@ -2092,6 +2082,20 @@ def paged_attn_triton_prefill(
                 max_partial_bytes = 128 * 1024 * 1024
                 max_splits = max(1, max_partial_bytes // (programs * block_m * hd_pad * 4))
                 splits = min(splits, max_splits)
+        return splits
+
+    def prepare(cfg, slice = None):
+        """Launch geometry for one tile config: grid, kv split count, partial buffers and the
+        kernel argument list (the probe compiles with exactly the launch's arguments). A staging
+        slice overrides the cache tensors, block table, kv offset, resume flag and split count,
+        and reuses the shared fp32 accumulator."""
+        block_m, block_n, num_warps, num_stages = cfg
+        s = slice or _StagingSlice(k_cache, v_cache, block_table, 0, 0, None, None, None)
+        kc_, vc_, bt_, kv_offset, resume, force_splits, part_o, part_ml = s
+        num_pages_ = bt_.shape[1]
+        q_blocks = triton.cdiv(q_len, block_m)
+        programs = q_blocks * bsz * n_q_heads
+        splits = kv_splits(block_m, num_pages_) if force_splits is None else force_splits
 
         is_split = splits > 1 or part_o is not None
         if is_split:
@@ -2125,8 +2129,12 @@ def paged_attn_triton_prefill(
         return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
+        # IS_SPLIT compiles a different kernel with a larger footprint, and it follows from the tile, q_len and
+        # the kv range rather than from anything above: a pick made without it fails to launch on a chunk
+        # whose candidates split differently
+        split_tiles = tuple(kv_splits(m, num_pages_per_seq) > 1 for m in sorted({c[0] for c in candidates}))
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, stock)
+                    window_right >= 0, has_sinks, stock, split_tiles)
         def probe(cfg):
             _, args, nw, ns, *_ = prepare(cfg)
             return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
