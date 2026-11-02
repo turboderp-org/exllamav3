@@ -4,11 +4,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import copy
 import json
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 
-from exllamav3 import Generator, Job, model_init
+from exllamav3 import Config, Generator, Job, Tokenizer, model_init
 from exllamav3.util.progress import ProgressBar
+from eval.api_source import add_api_args, api_from_args, assistant_message, response_token_ids
 
 """
 Generate a self-sampled, in-domain test trace for qbench: run a set of multi-turn conversations
@@ -37,6 +40,17 @@ With --tool_frac > 0 (default 0.3) a portion of the conversations define tools (
 the chat template's `tools` support) and ask questions expected to elicit a reasoning trace 
 plus a tool invocation; scripted tool-role results feed follow-up turns when the model actually
 produced a tool call.
+
+Without hardware for a good quant, --api_model sources the responses from an OpenAI-compatible
+chat API instead, OpenRouter by default:
+
+    python eval/qbench_prompts.py -m <model_dir> --api_model deepseek/deepseek-v4.1-flash -o qbench_prompts.json
+
+-m then only provides the tokenizer and chat template: prompts are templated and tokenized
+locally, and each finished turn, tool calls included, is rendered back through the template to
+recover the token stream the model would have produced (eval/api_source.py). Responses are
+requested concurrently, one wave per turn, so the trace can overshoot --min_tokens by up to
+--api_concurrency responses.
 """
 
 # Seeds chosen to elicit long reasoning traces plus a substantial final answer, across domains.
@@ -526,64 +540,11 @@ def resolve_template_vars(tokenizer, template_vars):
     return template_vars
 
 
-@torch.inference_mode()
-def main(args):
-    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
-    generator = Generator(
-        model = model,
-        cache = cache,
-        tokenizer = tokenizer,
-        draft_model = draft_model,
-        draft_cache = draft_cache,
-        num_draft_tokens = args.num_draft_tokens,
-        sparse_draft_head = getattr(args, 'sparse_draft_head', 0),
-        ngram_match_min = args.ngram_match_min,
-        ngram_corpus = args.ngram_corpus,
-        dynamic_draft_tokens = args.dynamic_draft,
-        draft_confidence = args.draft_confidence,
-        max_chunk_size = args.chunk_size,
-    )
+def conv_template_kwargs(conv: dict, template_vars: dict) -> dict:
+    return template_vars if conv["tools"] is None else dict(template_vars, tools = conv["tools"])
 
-    TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
-    TEMPLATE_VARS.update(args.template_vars)
-    TEMPLATE_VARS = resolve_template_vars(tokenizer, TEMPLATE_VARS)
 
-    # Base conversations plus an optional tool-calling portion (~args.tool_frac of the total),
-    # interleaved evenly so a small token budget that stops early still samples both kinds
-    CONVS, TOOL_CONVS = conversations_for_domain(args.domain, args.lang)
-    base = [{"tools": None, "messages": [],
-             "turns": [("user", seed)] + [("user", fu) for fu in fus]}
-            for seed, fus in CONVS]
-    convs = []
-    if not TOOL_CONVS:
-        convs = base
-    elif args.domain == "tools" or args.tool_frac >= 1.0:
-        # Tools only
-        convs = [{"tools": tools, "messages": [],
-                  "turns": [("user", seed)] + list(fus)}
-                 for tools, seed, fus in TOOL_CONVS]
-    elif args.tool_frac > 0:
-        n_tools = min(len(TOOL_CONVS),
-                      max(1, round(args.tool_frac / (1 - args.tool_frac) * len(CONVS))))
-        tool_convs = [{"tools": tools, "messages": [],
-                       "turns": [("user", seed)] + list(fus)}
-                      for tools, seed, fus in TOOL_CONVS[:n_tools]]
-        acc = 0.0
-        ratio = len(tool_convs) / len(base)
-        for b in base:
-            convs.append(b)
-            acc += ratio
-            while acc >= 1.0 and tool_convs:
-                convs.append(tool_convs.pop(0))
-                acc -= 1.0
-        convs += tool_convs
-    else:
-        convs = base
-    if args.domain == "tools":
-        convs += agentic_conversations(tokenizer, TEMPLATE_VARS, args.max_context)
-    # Independent resamples of the whole set (each repeat continues its own conversations)
-    convs = [copy.deepcopy(c) for _ in range(args.repeats) for c in convs]
-
+def sample_local(generator, config, tokenizer, args, convs, template_vars):
     rows = []
     total_in = total_out = 0
     # Turn-major order: every conversation's first turn before any follow-ups, so a small token
@@ -610,9 +571,7 @@ def main(args):
                 messages.append({"role": "tool", "content": content})
             else:
                 messages.append({"role": "user", "content": content})
-            template_kwargs = dict(TEMPLATE_VARS)
-            if conv["tools"] is not None:
-                template_kwargs["tools"] = conv["tools"]
+            template_kwargs = conv_template_kwargs(conv, template_vars)
             try:
                 input_ids = tokenizer.hf_chat_template(
                     messages, add_generation_prompt = True, **template_kwargs)
@@ -669,6 +628,208 @@ def main(args):
             print(f"Input tokens:  {col_yellow}{total_in:6,}{col_default}")
             print(f"Output tokens: {col_yellow}{total_out:6,}{col_default}")
             print(f"\n{col_blue}---------------------------------------------------------------{col_default}\n")
+    return rows, total_in, total_out
+
+
+def wire_messages(messages: list) -> list:
+    """A conversation that starts from a transcript, as the API takes it: the templates want tool call arguments
+    as dicts, the API as JSON strings"""
+    wire = copy.deepcopy(messages)
+    for msg in wire:
+        for tc in msg.get("tool_calls") or []:
+            tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
+    return wire
+
+
+def open_tool_calls(messages: list) -> list:
+    """The calls of the last response that have no result yet"""
+    answered = 0
+    for msg in reversed(messages):
+        if msg["role"] != "tool":
+            return (msg.get("tool_calls") or [])[answered:]
+        answered += 1
+    return []
+
+
+def next_api_turn(conv: dict) -> bool:
+    """Adds what comes next in the script to the conversation, or returns False if that can't follow the last
+    response. In a local conversation a tool call is just markup in the context. An API refuses further messages
+    until each call of the last response has its result, by id, so a response that makes more calls than the script
+    has results for takes as many as there are and an error for the rest."""
+    messages, wire, turns, t = conv["messages"], conv["wire"], conv["turns"], conv["next_turn"]
+    calls = open_tool_calls(messages)
+    is_tool = turns[t][0] == "tool"
+    if is_tool and not calls:
+        return False
+    for call in calls:
+        content = json.dumps({"error": "no result available"})
+        if t < len(turns) and turns[t][0] == "tool":
+            content = turns[t][1]
+            t += 1
+        messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"], "content": content})
+        wire.append({"role": "tool", "tool_call_id": call["id"], "content": content})
+    if not is_tool:
+        messages.append({"role": "user", "content": turns[t][1]})
+        wire.append(messages[-1])
+        t += 1
+    conv["next_turn"] = t
+    return True
+
+
+def sample_api(api, args, tokenizer, convs, template_vars):
+    """Turn-major like the local path, a wave of concurrent requests at a time. Each conversation keeps two
+    histories: "messages" is what the template renders, tool calls structured and reasoning dropped the way the
+    local path drops it, and "wire" is what the API gets, with its tool call turns sent back as it returned them."""
+    rows = []
+    total_in = total_out = 0
+    for conv in convs:
+        conv["wire"] = wire_messages(conv["messages"])
+        conv["next_turn"] = 0
+    active = list(range(len(convs)))
+
+    def request(c_idx, seed):
+        # Requests already running still finish, but what's left of the wave isn't billed
+        if total_out >= args.min_tokens:
+            return None
+        return api.complete(convs[c_idx]["wire"], seed, convs[c_idx]["tools"])
+
+    with ProgressBar("Sampling", args.min_tokens) as pb:
+        while active and total_out < args.min_tokens:
+            pending = {}
+            for c_idx in active:
+                conv = convs[c_idx]
+                if conv["next_turn"] >= len(conv["turns"]) or not next_api_turn(conv):
+                    continue
+                template_kwargs = conv_template_kwargs(conv, template_vars)
+                try:
+                    input_ids = tokenizer.hf_chat_template(conv["messages"], add_generation_prompt = True, **template_kwargs)
+                except Exception as e:
+                    print(f" !! Templating failed for conversation {c_idx} turn {conv['next_turn'] - 1}: {e}")
+                    continue
+                pending[c_idx] = (input_ids, template_kwargs)
+            active = []
+            print(f" -- {col_blue}{len(pending)}{col_default} requests")
+
+            wave_rows = []
+            with ThreadPoolExecutor(max_workers = args.api_concurrency) as pool:
+                futures = {}
+                for c_idx in pending:
+                    seed = zlib.crc32(f"{c_idx}|{convs[c_idx]['next_turn']}".encode())
+                    futures[pool.submit(request, c_idx, seed)] = c_idx
+                for fut in as_completed(futures):
+                    c_idx = futures[fut]
+                    conv = convs[c_idx]
+                    t_idx = conv["next_turn"] - 1
+                    input_ids, template_kwargs = pending[c_idx]
+                    try:
+                        r = fut.result()
+                        if r is None:
+                            continue
+                        if not (r["content"] or r["reasoning"] or r["tool_calls"]):
+                            raise ValueError("empty response")
+                        assistant = assistant_message(r["content"], r["reasoning"], r["tool_calls"])
+                        ids = response_token_ids(tokenizer, conv["messages"], assistant, template_kwargs)
+                    except Exception as e:
+                        print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
+                        continue
+                    wave_rows.append({
+                        "conversation": c_idx,
+                        "turn": t_idx,
+                        "tools": conv["tools"] is not None,
+                        "input_ids": input_ids[0].tolist(),
+                        "response_ids": ids,
+                    })
+                    total_in += input_ids.shape[-1]
+                    total_out += len(ids)
+                    pb.update(min(total_out, args.min_tokens))
+                    print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}{len(ids):5}{col_default} tokens "
+                          f"({r['finish_reason']}, reasoning {len(r['reasoning'] or '')} chars)")
+                    conv["messages"].append({k: v for k, v in assistant.items() if k in ("role", "content", "tool_calls")})
+                    conv["wire"].append(r["message"] if r["tool_calls"] else {"role": "assistant", "content": r["content"]})
+                    active.append(c_idx)
+            # Completion order would make the trace depend on request timing
+            rows += sorted(wave_rows, key = lambda row: row["conversation"])
+            active.sort()
+
+    if total_out < args.min_tokens:
+        print(f" !! Collected only {total_out:,} of {args.min_tokens:,} response tokens; "
+              f"consider a higher --repeats or --max_new_tokens")
+    return rows, total_in, total_out
+
+
+@torch.inference_mode()
+def main(args):
+    api = None
+    if args.api_model:
+        # Responses from the API; the local model is only its tokenizer and chat template
+        config = Config.from_directory(args.model_dir)
+        tokenizer = Tokenizer.from_config(config)
+        generator = None
+        api = api_from_args(args)
+    else:
+        model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+        generator = Generator(
+            model = model,
+            cache = cache,
+            tokenizer = tokenizer,
+            draft_model = draft_model,
+            draft_cache = draft_cache,
+            num_draft_tokens = args.num_draft_tokens,
+            sparse_draft_head = getattr(args, 'sparse_draft_head', 0),
+            ngram_match_min = args.ngram_match_min,
+            ngram_corpus = args.ngram_corpus,
+            dynamic_draft_tokens = args.dynamic_draft,
+            draft_confidence = args.draft_confidence,
+            max_chunk_size = args.chunk_size,
+        )
+
+    TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
+    TEMPLATE_VARS.update(args.template_vars)
+    TEMPLATE_VARS = resolve_template_vars(tokenizer, TEMPLATE_VARS)
+    if api is not None:
+        api.request_reasoning(TEMPLATE_VARS)
+
+    # Base conversations plus an optional tool-calling portion (~args.tool_frac of the total),
+    # interleaved evenly so a small token budget that stops early still samples both kinds
+    CONVS, TOOL_CONVS = conversations_for_domain(args.domain, args.lang)
+    base = [{"tools": None, "messages": [],
+             "turns": [("user", seed)] + [("user", fu) for fu in fus]}
+            for seed, fus in CONVS]
+    convs = []
+    if not TOOL_CONVS:
+        convs = base
+    elif args.domain == "tools" or args.tool_frac >= 1.0:
+        # Tools only
+        convs = [{"tools": tools, "messages": [],
+                  "turns": [("user", seed)] + list(fus)}
+                 for tools, seed, fus in TOOL_CONVS]
+    elif args.tool_frac > 0:
+        n_tools = min(len(TOOL_CONVS),
+                      max(1, round(args.tool_frac / (1 - args.tool_frac) * len(CONVS))))
+        tool_convs = [{"tools": tools, "messages": [],
+                       "turns": [("user", seed)] + list(fus)}
+                      for tools, seed, fus in TOOL_CONVS[:n_tools]]
+        acc = 0.0
+        ratio = len(tool_convs) / len(base)
+        for b in base:
+            convs.append(b)
+            acc += ratio
+            while acc >= 1.0 and tool_convs:
+                convs.append(tool_convs.pop(0))
+                acc -= 1.0
+        convs += tool_convs
+    else:
+        convs = base
+    if args.domain == "tools":
+        convs += agentic_conversations(tokenizer, TEMPLATE_VARS, args.max_context)
+    # Independent resamples of the whole set (each repeat continues its own conversations)
+    convs = [copy.deepcopy(c) for _ in range(args.repeats) for c in convs]
+
+    if api is not None:
+        rows, total_in, total_out = sample_api(api, args, tokenizer, convs, TEMPLATE_VARS)
+        api.print_usage()
+    else:
+        rows, total_in, total_out = sample_local(generator, config, tokenizer, args, convs, TEMPLATE_VARS)
 
     out = {
         "model": args.model_dir,
@@ -679,6 +840,8 @@ def main(args):
         "meta": {"rows": len(rows), "input_tokens": total_in, "output_tokens": total_out},
         "rows": rows,
     }
+    if api is not None:
+        out["api_model"] = args.api_model
     with open(args.output, "w") as f:
         json.dump(out, f)
     print(f" -- {len(rows)} rows, {total_in:,} input + {total_out:,} output tokens -> {args.output}")
@@ -696,4 +859,5 @@ if __name__ == "__main__":
     parser.add_argument("--max_context", type = int, default = 12288, help = "--domain tools: longest templated context of an agentic cut point, default: 12288")
     parser.add_argument("--repeats", type = int, default = 1, help = "Sample the whole conversation set this many times (independent samples per repeat), default: 1")
     parser.add_argument("--lang", type = str, default = "en", choices = ["en", "zh"], help = "Language of the user turns: en (default) or zh (same conversations in Chinese; tool specs/results stay English)")
+    add_api_args(parser)
     main(parser.parse_args())

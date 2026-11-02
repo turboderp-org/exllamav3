@@ -54,8 +54,13 @@ def row_views(ids: torch.Tensor, lengths: list[int] | None) -> list[torch.Tensor
     return [ids[r:r + 1, :n] for r, n in enumerate(lengths)]
 
 
-def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
-    n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
+def apply_mult_noise(x: torch.Tensor, eps: float, gens: dict) -> torch.Tensor:
+    """Generators can't cross devices and activations do (an unquantized embedding runs on the CPU), so gens
+    holds one per device"""
+    if x.device not in gens:
+        gens[x.device] = torch.Generator(device = x.device)
+        gens[x.device].manual_seed(1)
+    n = torch.randn(x.shape, generator = gens[x.device], device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
 
@@ -84,8 +89,7 @@ class Exl3Backend:
         params_rows = [{} for _ in range(ids.shape[0])]
         rows = row_views(ids, lengths)
         states = [self.model.prepare_inputs(row, p) for row, p in zip(rows, params_rows)]
-        gen = torch.Generator(device = self.device)
-        gen.manual_seed(1)
+        gens = {}
 
         sum_bits = sum_numel = head_bits = head_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
@@ -126,7 +130,7 @@ class Exl3Backend:
                     if torch.is_tensor(x):
                         x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
-                        x = apply_mult_noise(x, noise_eps, gen)
+                        x = apply_mult_noise(x, noise_eps, gens)
                     if logits_layer:
                         callback(r, x)
                         states[r] = None
@@ -623,11 +627,7 @@ class TransformersBackend:
         gens = {}
         def hook(module, inputs, output):
             out = output[0] if isinstance(output, tuple) else output
-            if out.device not in gens:
-                g = torch.Generator(device = out.device)
-                g.manual_seed(1)
-                gens[out.device] = g
-            out = apply_mult_noise(out, noise_eps, gens[out.device])
+            out = apply_mult_noise(out, noise_eps, gens)
             if isinstance(output, tuple):
                 return (out,) + output[1:]
             return out

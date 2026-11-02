@@ -11,6 +11,9 @@ import json
 import threading
 import requests
 
+# What's kept of a response for sending it back: providers want a tool call turn returned as they gave it
+MESSAGE_FIELDS = ("role", "content", "tool_calls", "reasoning", "reasoning_content", "reasoning_details")
+
 
 def resolve_api_key(explicit: str | None, api_base: str) -> str | None:
     if explicit:
@@ -64,8 +67,23 @@ class ApiChat:
         self.lock = threading.Lock()
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0, "retries": 0}
 
-    def complete(self, messages: list, seed: int | None = None) -> dict:
-        """Returns {"content", "reasoning", "finish_reason"}; raises after the last retry"""
+    def request_reasoning(self, template_vars: dict):
+        """OpenRouter only returns reasoning when asked: follow the template's thinking setting unless the
+        request body already says"""
+        if "reasoning" in self.extra or "include_reasoning" in self.extra or "openrouter" not in self.url \
+                or not template_vars.get("enable_thinking", True):
+            return
+        effort = template_vars.get("reasoning_effort")
+        self.extra["reasoning"] = {"effort": effort} if effort in ("low", "medium", "high") else {"enabled": True}
+
+    def print_usage(self):
+        u = self.usage
+        print(f" -- API usage: {u['requests']} requests ({u['retries']} retries), {u['prompt_tokens']:,} prompt + "
+              f"{u['completion_tokens']:,} completion tokens billed")
+
+    def complete(self, messages: list, seed: int | None = None, tools: list | None = None) -> dict:
+        """Returns {"content", "reasoning", "tool_calls", "finish_reason", "message"}, the last being the response
+        as it can be sent back; raises after the last retry"""
         body = {
             "model": self.model,
             "messages": messages,
@@ -75,6 +93,8 @@ class ApiChat:
         }
         if seed is not None:
             body["seed"] = seed
+        if tools:
+            body["tools"] = tools
         body.update(self.extra)
         delay = 2.0
         for attempt in range(self.retries):
@@ -103,7 +123,9 @@ class ApiChat:
                 return {
                     "content": content,
                     "reasoning": reasoning,
+                    "tool_calls": msg.get("tool_calls"),
                     "finish_reason": choice.get("finish_reason") or choice.get("native_finish_reason"),
+                    "message": {k: msg[k] for k in MESSAGE_FIELDS if k in msg},
                 }
             except PermissionError:
                 raise
@@ -116,12 +138,48 @@ class ApiChat:
                 delay = min(delay * 2, 60.0)
 
 
-def assistant_message(content: str, reasoning: str | None) -> dict:
+def add_api_args(parser):
+    parser.add_argument("--api_model", type = str, default = None, help = "Source the responses from an OpenAI-compatible chat API instead of the local model (model name or OpenRouter slug); -m then provides the tokenizer and chat template")
+    parser.add_argument("--api_base", type = str, default = "https://openrouter.ai/api/v1", help = "Chat API base URL, default: OpenRouter")
+    parser.add_argument("--api_key", type = str, default = None, help = "API key, default: $OPENROUTER_API_KEY, $OPENAI_API_KEY or ~/.config/openrouter_key")
+    parser.add_argument("--api_concurrency", type = int, default = 8, help = "Concurrent API requests, default: 8")
+    parser.add_argument("--api_temperature", type = float, default = 0.8, help = "Sampling temperature for API requests, default: 0.8")
+    parser.add_argument("--api_extra", type = json.loads, default = {}, help = 'JSON merged into every request body, e.g. {"reasoning": {"effort": "high"}, "provider": {"order": ["DeepSeek"]}}')
+
+
+def api_from_args(args) -> ApiChat:
+    api_key = resolve_api_key(args.api_key, args.api_base)
+    if api_key is None:
+        print(" !! No API key (--api_key, $OPENROUTER_API_KEY, $OPENAI_API_KEY or ~/.config/openrouter_key)")
+    api = ApiChat(args.api_base, api_key, args.api_model, args.api_temperature, args.max_new_tokens, args.api_extra)
+    print(f" -- Responses from {args.api_model} at {args.api_base}, {args.api_concurrency} concurrent requests")
+    return api
+
+
+def parse_tool_calls(tool_calls: list) -> list:
+    """Tool calls as the chat templates take them, with the arguments as a dict. Raises ValueError on arguments
+    that aren't a JSON object, as in a response cut off inside a call"""
+    parsed = []
+    for tc in tool_calls:
+        func = tc["function"]
+        arguments = func.get("arguments") or {}
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        if not isinstance(arguments, dict):
+            raise ValueError(f"tool call arguments are not an object: {str(arguments)[:80]}")
+        parsed.append({"id": tc.get("id"), "type": "function",
+                       "function": {"name": func["name"], "arguments": arguments}})
+    return parsed
+
+
+def assistant_message(content: str, reasoning: str | None, tool_calls: list | None = None) -> dict:
     """The finished turn as the chat templates expect it: reasoning under both of the field names in use"""
     m = {"role": "assistant", "content": content}
     if reasoning:
         m["reasoning_content"] = reasoning
         m["thinking"] = reasoning
+    if tool_calls:
+        m["tool_calls"] = parse_tool_calls(tool_calls)
     return m
 
 

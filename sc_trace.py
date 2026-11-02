@@ -11,7 +11,7 @@ from safetensors.torch import save_file
 from exllamav3 import Generator, Job, model_init, Config, Tokenizer
 from exllamav3.util.progress import ProgressBar
 from eval.qbench_prompts import clean_response_for_context, DEFAULT_TEMPLATE_VARS
-from eval.api_source import ApiChat, resolve_api_key, assistant_message, response_token_ids
+from eval.api_source import add_api_args, api_from_args, assistant_message, response_token_ids
 
 """
 Generate a large self-sampled, in-domain trace, sized for use as quantization calibration data:
@@ -639,11 +639,7 @@ def main(args):
         config = Config.from_directory(args.model_dir)
         tokenizer = Tokenizer.from_config(config)
         generator = None
-        api_key = resolve_api_key(args.api_key, args.api_base)
-        if api_key is None:
-            print(" !! No API key (--api_key, $OPENROUTER_API_KEY, $OPENAI_API_KEY or ~/.config/openrouter_key)")
-        api = ApiChat(args.api_base, api_key, args.api_model, args.api_temperature, args.max_new_tokens, args.api_extra)
-        print(f" -- Responses from {args.api_model} at {args.api_base}, {args.api_concurrency} concurrent requests")
+        api = api_from_args(args)
     else:
         model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
         generator = Generator(
@@ -683,12 +679,8 @@ def main(args):
             print(" !! Chat template rejects all variable combinations; using template defaults")
             TEMPLATE_VARS = {}
 
-    # OpenRouter only returns reasoning when asked: follow the template's thinking setting unless
-    # the request body already says
-    if api is not None and "reasoning" not in api.extra and "include_reasoning" not in api.extra \
-            and TEMPLATE_VARS.get("enable_thinking", True) and "openrouter" in args.api_base:
-        effort = TEMPLATE_VARS.get("reasoning_effort")
-        api.extra["reasoning"] = {"effort": effort} if effort in ("low", "medium", "high") else {"enabled": True}
+    if api is not None:
+        api.request_reasoning(TEMPLATE_VARS)
 
     target_tokens = args.target_tokens or args.cal_rows * args.cal_cols
     rows = []
@@ -793,9 +785,7 @@ def main(args):
               f"{args.max_epochs} epoch(s); consider more epochs or a higher --max_new_tokens")
 
     if api is not None:
-        u = api.usage
-        print(f" -- API usage: {u['requests']} requests ({u['retries']} retries), {u['prompt_tokens']:,} prompt + "
-              f"{u['completion_tokens']:,} completion tokens billed")
+        api.print_usage()
 
     # qbench-compatible trace
     out = {
@@ -846,10 +836,5 @@ if __name__ == "__main__":
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
-    parser.add_argument("--api_model", type = str, default = None, help = "Source the responses from an OpenAI-compatible chat API instead of the local model (model name or OpenRouter slug); -m then provides the tokenizer and chat template")
-    parser.add_argument("--api_base", type = str, default = "https://openrouter.ai/api/v1", help = "Chat API base URL, default: OpenRouter")
-    parser.add_argument("--api_key", type = str, default = None, help = "API key, default: $OPENROUTER_API_KEY, $OPENAI_API_KEY or ~/.config/openrouter_key")
-    parser.add_argument("--api_concurrency", type = int, default = 8, help = "Concurrent API requests, default: 8")
-    parser.add_argument("--api_temperature", type = float, default = 0.8, help = "Sampling temperature for API requests, default: 0.8")
-    parser.add_argument("--api_extra", type = json.loads, default = {}, help = 'JSON merged into every request body, e.g. {"reasoning": {"effort": "high"}, "provider": {"order": ["DeepSeek"]}}')
+    add_api_args(parser)
     main(parser.parse_args())
