@@ -32,6 +32,8 @@ class _Sub:
     def __init__(self, stc):
         self.stc = stc
         self.loaded_deferred = None
+        self.device = None
+        self.caps = {}
     def can_defer_load(self):
         return True
     def load(self, device, **kwargs):

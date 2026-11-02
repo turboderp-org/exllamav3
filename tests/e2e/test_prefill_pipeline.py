@@ -4,7 +4,7 @@ in which the devices do their work and nothing else, so its output has to match 
 kernels run on the same inputs. That goes for the logits after the prompt, and for those after restoring from the
 checkpoints written behind chunks in flight, at the end of the reply and from inside the prompt, with and without a
 drafter sharing a device with the target, and for image jobs with the image across a chunk boundary, where Gemma4
-extends the chunk over the image and rewinds the state after the pass.
+extends the chunk over the image and rewinds the state after the pass, and DeepSeek-V4 cuts its chunks to the image.
 
 Each model is split across two devices by weight size; a split the pipeline declines is skipped.
 """
@@ -17,7 +17,7 @@ import torch
 
 from exllamav3 import Model
 from PIL import Image
-from testlib.e2e import REFERENCE_TEXT, assert_greedy_equivalent, greedy, load_model
+from testlib.e2e import REFERENCE_TEXT, greedy, load_model
 from testlib.env import num_devices
 
 pytestmark = [pytest.mark.multi_gpu(2), pytest.mark.slow]
@@ -26,9 +26,6 @@ PAGE = 256
 CHUNK = 4 * PAGE
 NEW_TOKENS = 16
 REPLY_TOKENS = PAGE + 60
-# The serial path doesn't reproduce itself on this one: its logits vary by a step of fp16 from run to run, enough to
-# part ways at a near-tie, and each run's follow-up is then built from a different reply
-NOT_REPRODUCIBLE = {"dsv4-vision-stub"}
 
 
 def _split(model_dir: str, devices: list[torch.device]) -> str:
@@ -38,6 +35,18 @@ def _split(model_dir: str, devices: list[torch.device]) -> str:
     split[devices[0].index] = f"{max(size * 0.55, 0.25):.2f}"
     split[devices[1].index] = "1000"
     return ",".join(split)
+
+
+def _distinct_hash_routing(lm):
+    """Give a stub's hash-routed layers distinct experts per token, as a real checkpoint's tid2eid has. Stubs generated
+    with repeats add one expert twice for a token, and the racing additions make the serial path vary from run to run"""
+    g = torch.Generator().manual_seed(0)
+    for m in lm.model:
+        table = getattr(getattr(m, "routing_cfg", None), "tid2eid", None)
+        if table is not None:
+            rows = torch.rand(table.shape[0], m.num_experts, generator = g).argsort(-1)
+            with torch.inference_mode():
+                table.copy_(rows[:, : table.shape[1]].to(table.device, table.dtype))
 
 
 def _conversation(lm, pipelined: bool, ids: torch.Tensor = None, embeddings: list = None) -> list:
@@ -71,17 +80,16 @@ def _assert_exact(serial: list, pipelined: list):
 @pytest.mark.models()
 def test_pipelined_prefill_is_exact(model_id, model_dir, devices):
     with load_model(model_dir, None, "-gs", _split(model_dir, devices[:2]), cache_tokens = 64 * PAGE) as lm:
+        _distinct_hash_routing(lm)
         pipelined = _conversation(lm, True)
         serial = _conversation(lm, False)
-    if model_id in NOT_REPRODUCIBLE:
-        assert_greedy_equivalent(serial[0][0], serial[0][1], pipelined[0][0], tag = model_id)
-    else:
-        _assert_exact(serial, pipelined)
+    _assert_exact(serial, pipelined)
 
 
-@pytest.mark.models("vision", exclude = ("deepseek_v4", "stub"))
+@pytest.mark.models("vision")
 def test_pipelined_prefill_with_an_image_is_exact(model_id, model_dir, devices):
     with load_model(model_dir, None, "-gs", _split(model_dir, devices[:2]), cache_tokens = 64 * PAGE) as lm:
+        _distinct_hash_routing(lm)
         vision = Model.from_config(lm.config, component = "vision")
         vision.load(device = devices[0])
         media = os.path.join(os.path.dirname(__file__), "..", "..", "examples", "media", "cat.png")
