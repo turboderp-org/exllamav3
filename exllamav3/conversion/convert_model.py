@@ -102,7 +102,7 @@ parser.add_argument("-hess", "--hessians", type = str, default = None, help = "D
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
 parser.add_argument("-mae", "--moe_affinity_eps", type = float, default = None, help = "Quantize each block-sparse expert against its own Hessian, with calibration tokens weighted by eps + the expert's routing weight relative to its mean (zero for tokens not routed to it, see conversion/moe_affinity.py). Typical eps: 0.01. Default (0): one shared gate/up Hessian per layer, unweighted")
 parser.add_argument("-mar", "--moe_affinity_rows", type = int, default = 262144, help = "With --moe_affinity_eps: sampled calibration tokens per layer for the per-expert gate/up Hessians, default 262144")
-parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
+parser.add_argument("-sh", "--scaled_hessian", action = argparse.BooleanOptionalAction, default = None, help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor). On by default, so -sh and --scaled_hessian are no-ops; --no-scaled_hessian shares one factorization per input instead")
 parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--no_swap", action = "store_true", help = "Keep weights, Hessians and factors on the device between uses instead of swapping them to system memory (unified-memory systems, where a swap is a second copy in the same pool). Default on integrated GPUs")
@@ -284,9 +284,10 @@ def prepare(args) -> (dict, dict, bool, str):
         if arg in args and vars(args)[arg] is not None:
             new = vars(args)[arg]
             if arg in in_args and in_args[arg] != new:
-                if not new:
+                if not new and not (new is False and parser.get_default(arg) is None):
                     # An unset store_true flag (or a zero default) can't be told from "unspecified":
-                    # the resumed job's saved value stands (e.g. --hq stays on when resuming without it)
+                    # the resumed job's saved value stands (e.g. --hq stays on when resuming without it).
+                    # A boolean with a None default is only False when asked for
                     return
                 if can_override:
                     print(
@@ -325,7 +326,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hessians", False, ""),
         ("hessians_reg", False, 0.025),
         ("hessians_one_sided", False, False),
-        ("scaled_hessian", False, False),
+        ("scaled_hessian", False, True),
         ("moe_affinity_eps", False, 0),  # 0 = off
         ("moe_affinity_rows", False, 262144),
         ("no_swap", True, False),

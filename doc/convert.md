@@ -55,6 +55,8 @@ does.
 
 - **-hreg / --hessians_reg *float***: Diagonal regularization of the output-side Hessian in two-sided LDLQ, relative to its mean diagonal. Larger values blend toward one-sided LDLQ. Default is 0.025.
 
+- **--no-scaled_hessian**: Share one Hessian factorization per input instead of factoring it per tensor with the tensor's input channel scales folded in. Per-tensor factorization is the default, so that LDLQ's error feedback weights each row by what its error costs at the output, and it takes more transient memory on MoE models. `-sh / --scaled_hessian` are accepted and do nothing.
+
 - **-cb / --codebook *str***: Trellis codebook: "mul1" (default), "mcg" or "3inst". The mul1 codebook is required by some optimized inference paths (int8 GEMV, CPU expert offload); there is no reason to pick another codebook except for testing.
 
 #### Checkpoints
