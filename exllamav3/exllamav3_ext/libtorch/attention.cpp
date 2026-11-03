@@ -10,6 +10,9 @@
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
 #include "../add.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_rdna3_fused.cuh"
+#endif
 #include "../activation.cuh"
 #include "../norm.cuh"
 #include "../dsa_topk.cuh"
@@ -838,7 +841,19 @@ void BC_Attention::run_gr
             mul_sigmoid_broadcast__gr(s.o4, g3, graph);
     }
     else if (gate_mode == 2 || gate_mode == 3)
+    {
+#if defined(USE_ROCM)
+        // RDNA3: the full output gate folds into o_proj's input transform
+        if (hs == hidden_size && !o_proj->bias)
+        {
+            at::Tensor y2f = y.view({R, hidden_size});
+            if (exl3_gemm_silu_gr(s.o2, s.g2, o_proj->trellis, y2f, o_proj->suh, o_proj->svh,
+                                  o_proj->mcg, o_proj->mul1, graph, true))
+                return;
+        }
+#endif
         mul_sigmoid__gr(s.o2, s.g2, graph);
+    }
 
     // Output projection. With a padded hidden dim the GEMM writes the padded static (N of the
     // quantized o_proj), bias included, and the exact-width columns are copied out to y
