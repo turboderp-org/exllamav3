@@ -316,6 +316,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("histogram", &histogram, "histogram");
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
+#if defined(USE_ROCM)
+    // RDNA-only fused tail kernel (rocm/quant/exl3_gate_fused_rdna.cu); the attribute lets
+    // tests skip on CUDA builds, where the kernel is not compiled at all
+    m.attr("HAS_RDNA_GATE_FUSED") = true;       // moe_gate_fused_rdna
+    m.def("moe_gate_fused_rdna", &moe_gate_fused_rdna, "moe_gate_fused_rdna",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg());
+#endif
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
