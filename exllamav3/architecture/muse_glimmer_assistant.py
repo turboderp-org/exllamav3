@@ -27,6 +27,8 @@ class MuseGlimmerAssistantConfig(DFlashConfig):
             model_classes = {"text": MuseGlimmerAssistantModel},
             **kwargs
         )
+        if self.is_causal is None:
+            self.is_causal = False
 
 
 class MuseGlimmerAssistantModel(DFlashModel):
