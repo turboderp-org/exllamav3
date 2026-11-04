@@ -3,6 +3,7 @@ from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import time
 from pathlib import Path
 import tempfile
 import webbrowser
@@ -533,6 +534,7 @@ def main(args):
         saved_samples = []
 
         completions = ["" for _ in range(num_completions)]
+        finished = []  # (time of the final result, final result) per completion
 
         # Stream response
         stop_reason = None
@@ -548,6 +550,8 @@ def main(args):
                     if bid is None: continue
                     chunk = r.get("text", "")
                     completions[bid] += chunk
+                    if r["eos"]:
+                        finished.append((time.perf_counter(), r))
                     if bid != 0: continue
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
@@ -616,6 +620,18 @@ def main(args):
             for i in range(num_completions):
                 print_info(f"Completion {i+1} / {num_completions}")
                 print("\n" + completions[i])
+
+            # Aggregate generation throughput: all new tokens over the span from the first completion's first
+            # generated token to the last completion's end (prefill excluded)
+            if len(finished) == num_completions:
+                total_tokens = sum(fr["new_tokens"] for _, fr in finished)
+                span = max(t for t, _ in finished) - min(t - fr["time_generate"] for t, fr in finished)
+                if span > 0:
+                    print(
+                        f"\nBatch: {col_info}{num_completions}{col_default} completions, "
+                        f"{col_info}{total_tokens:,}{col_default} tokens in {col_info}{span:.2f}{col_default} s, "
+                        f"{col_info}{total_tokens / span:.2f}{col_default} t/s aggregate"
+                    )
 
         # Add response to context
         response = s.all_text.strip()
