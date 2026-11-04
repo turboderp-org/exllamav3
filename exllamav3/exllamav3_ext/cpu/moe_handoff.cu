@@ -399,7 +399,15 @@ void exl3_moe_cpu_worker_run
             if (load_acquire_u32(stage_tail) == shead)
             {
                 if (++s_idle < 65536) { cpu_pause_(); continue; }
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (s_idle < 66036)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                else
+                {
+                    s_idle = 66036;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
                 continue;
             }
             s_idle = 0;
@@ -463,9 +471,17 @@ void exl3_moe_cpu_worker_run
         if (load_acquire_u32(jobs_tail) == head)
         {
             // Spin hard in-pass (jobs arrive within microseconds of the GPU reaching the layer),
-            // back off to naps when the queue has been dry for a while
+            // back off to two-tier naps (100us for first ~50ms, then 10ms between prompts)
             if (++idle < 65536) { cpu_pause_(); continue; }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (idle < 66036)
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            else
+            {
+                idle = 66036;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             continue;
         }
         idle = 0;

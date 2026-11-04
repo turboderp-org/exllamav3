@@ -52,7 +52,15 @@ static void slice_worker(int idx)
                 _mm_pause();
                 continue;
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (idle < 8692)
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            else
+            {
+                idle = 8692;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             continue;
         }
         idle = 0;
