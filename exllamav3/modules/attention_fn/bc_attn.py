@@ -158,7 +158,8 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        self.window_size = module.sliding_window
+        wr = getattr(module, "window_right", 0)
+        self.window_size = (module.sliding_window, wr) if wr and module.sliding_window >= 0 else module.sliding_window
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
