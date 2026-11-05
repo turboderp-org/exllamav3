@@ -20,7 +20,8 @@ from .bc_attn import (
 
 class BCSharedKVAttn:
 
-    def __init__(self, module, cache_k: torch.Tensor, cache_v: torch.Tensor):
+    def __init__(self, module, cache_k: torch.Tensor, cache_v: torch.Tensor, qc = None):
+        self.qc = qc   # (k_scales, v_scales, k_bits, v_bits) for a quantized source
         self.module = module
         self.device = torch.device(module.device)
         self.head_dim = module.head_dim
@@ -37,7 +38,11 @@ class BCSharedKVAttn:
         rope = module.rope
         w = max(self.hidden_padded, self.num_q_heads * self.head_dim)
         xh = g_tensor_cache.get(self.device, (2 * MAX_R * w,), torch.half, "bcs_xh")
-        h32 = g_tensor_cache.get(self.device, (1,), torch.half, "bcs_dummy")
+        if qc is not None:
+            from .triton_paged import _get_h32
+            h32 = _get_h32(self.device)
+        else:
+            h32 = g_tensor_cache.get(self.device, (1,), torch.half, "bcs_dummy")
         self.bc = ext.BC_SharedKVAttention(
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
@@ -60,6 +65,8 @@ class BCSharedKVAttn:
             cache_v = cache_v,
             xh = xh,
             h32 = h32,
+            k_scales = qc[0] if qc is not None else None,
+            v_scales = qc[1] if qc is not None else None,
         )
 
 
@@ -79,7 +86,7 @@ class BCSharedKVAttn:
         splits_cap = max(1, min(2 * _get_sm_count(dev) // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
         sig = {
-            "q": "*fp16:16", "k_cache": "*fp16:16", "v_cache": "*fp16:16",
+            "q": "*fp16:16", "k_cache": "*i32:16" if self.qc else "*fp16:16", "v_cache": "*i32:16" if self.qc else "*fp16:16",
             "block_table": "*i32:16", "cache_seqlens": "*i32", "out": "*fp16:16",
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16",
             "k_scales": "*fp16:16", "v_scales": "*fp16:16", "h32": "*fp16:16",
@@ -91,7 +98,7 @@ class BCSharedKVAttn:
             "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_ROWS", "BLOCK_N")}
         # kv_append_len 0: the query attends to the cached keys only, nothing of its own is appended
         consts = dict(
-            QCK = 0, QCV = 0,
+            QCK = self.qc[2] if self.qc else 0, QCV = self.qc[3] if self.qc else 0,
             q_len = q_len, kv_append_len = 0, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = True, WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
@@ -107,7 +114,7 @@ class BCSharedKVAttn:
             "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
-            QCV = 0, HAS_SINKS = False, q_len = q_len,
+            QCV = self.qc[3] if self.qc else 0, HAS_SINKS = False, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = hd,
             BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
@@ -151,7 +158,7 @@ class BCSharedKVAttn:
         return y
 
 
-def build_bc_shared_kv(module, cache_k: torch.Tensor, cache_v: torch.Tensor):
+def build_bc_shared_kv(module, cache_k: torch.Tensor, cache_v: torch.Tensor, qc = None):
     """A BCSharedKVAttn for the module over the given source pages, or None when unsupported (the module then
     takes its python path): quantized q/o projections with native kernels, RoPE present (q_norm is fused into
     the rope stage), fp16 source pages on the module's device"""
@@ -163,13 +170,14 @@ def build_bc_shared_kv(module, cache_k: torch.Tensor, cache_v: torch.Tensor):
         m.q_proj.quant_type == "exl3" and m.q_proj.inner.bc is not None and
         m.o_proj.quant_type == "exl3" and m.o_proj.inner.bc is not None and
         (m.q_norm is None or (type(m.q_norm).__name__ == "RMSNorm" and m.q_norm.weight is not None)) and
-        cache_k.dtype == torch.float16 and cache_v.dtype == torch.float16 and
+        ((qc is None and cache_k.dtype == torch.float16 and cache_v.dtype == torch.float16) or
+         (qc is not None and cache_k.dtype == torch.int32 and cache_v.dtype == torch.int32 and m.head_dim % 32 == 0)) and
         cache_k.device == dev and cache_v.device == dev and
         cache_k.is_contiguous() and cache_v.is_contiguous()
     )
     if not ok:
         _trace_build(m, None, "shared_kv")
         return None
-    bca = BCSharedKVAttn(m, cache_k, cache_v)
+    bca = BCSharedKVAttn(m, cache_k, cache_v, qc = qc)
     _trace_build(m, bca, "shared_kv")
     return bca

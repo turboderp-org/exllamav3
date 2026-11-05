@@ -34,7 +34,9 @@ BC_SharedKVAttention::BC_SharedKVAttention
     at::Tensor _cache_k,
     at::Tensor _cache_v,
     at::Tensor _xh,
-    at::Tensor _h32
+    at::Tensor _h32,
+    c10::optional<at::Tensor> _k_scales,
+    c10::optional<at::Tensor> _v_scales
 ) :
     num_q_heads(_num_q_heads),
     num_kv_heads(_num_kv_heads),
@@ -56,13 +58,24 @@ BC_SharedKVAttention::BC_SharedKVAttention
     cache_k(std::move(_cache_k)),
     cache_v(std::move(_cache_v)),
     xh(std::move(_xh)),
-    h32(std::move(_h32))
+    h32(std::move(_h32)),
+    k_scales(std::move(_k_scales)),
+    v_scales(std::move(_v_scales))
 {
     TORCH_CHECK(q_proj && o_proj, "BC_SharedKVAttention: q and o projections required");
     TORCH_CHECK(cache_k.is_contiguous() && cache_v.is_contiguous(), "BC_SharedKVAttention: source pages must be contiguous");
-    TORCH_CHECK(cache_k.dim() == 4 && cache_k.size(1) == page_size && cache_k.size(2) == num_kv_heads && cache_k.size(3) == head_dim,
-        "BC_SharedKVAttention: source pages must be (pages, page_size, kv_heads, head_dim)");
-    TORCH_CHECK(cache_v.sizes() == cache_k.sizes(), "BC_SharedKVAttention: K and V pages differ");
+    if (k_scales.has_value())
+    {
+        // Quantized source: packed int32 pages (pages, page_size, words) with per-32 fp16 scales
+        TORCH_CHECK(v_scales.has_value() && k_scales->is_contiguous() && v_scales->is_contiguous(), "BC_SharedKVAttention: bad quantized scales");
+        TORCH_CHECK(cache_k.dim() == 3 && cache_k.size(1) == page_size, "BC_SharedKVAttention: quantized source pages must be (pages, page_size, words)");
+    }
+    else
+    {
+        TORCH_CHECK(cache_k.dim() == 4 && cache_k.size(1) == page_size && cache_k.size(2) == num_kv_heads && cache_k.size(3) == head_dim,
+            "BC_SharedKVAttention: source pages must be (pages, page_size, kv_heads, head_dim)");
+        TORCH_CHECK(cache_v.sizes() == cache_k.sizes(), "BC_SharedKVAttention: K and V pages differ");
+    }
     slots.resize(MAX_BSZ * MAX_QLEN);
 }
 
@@ -186,8 +199,8 @@ void BC_SharedKVAttention::run_gr
             (void*) s.o.data_ptr(),
             (void*) s.partial_o.data_ptr(),
             (void*) s.partial_ml.data_ptr(),
-            (void*) s.q.data_ptr(),      // k_scales: dead arg, fp16 pages
-            (void*) s.q.data_ptr(),      // v_scales: dead arg
+            (void*) (k_scales.has_value() ? k_scales->data_ptr() : s.q.data_ptr()),   // k_scales (dead arg for fp16 pages)
+            (void*) (v_scales.has_value() ? v_scales->data_ptr() : s.q.data_ptr()),   // v_scales
             (void*) h32.data_ptr(),
             (void*) (intptr_t) split_len,
             (void*) (intptr_t) (int) block_table.size(1),

@@ -8,7 +8,8 @@ py::class_<BC_SharedKVAttention, std::shared_ptr<BC_SharedKVAttention>>(m, "BC_S
         float, float,
         at::Tensor,
         int, float, float, int, int,
-        at::Tensor, at::Tensor, at::Tensor, at::Tensor
+        at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>
     >(),
     py::arg("num_q_heads"),
     py::arg("num_kv_heads"),
@@ -30,7 +31,9 @@ py::class_<BC_SharedKVAttention, std::shared_ptr<BC_SharedKVAttention>>(m, "BC_S
     py::arg("cache_k"),
     py::arg("cache_v"),
     py::arg("xh"),
-    py::arg("h32")
+    py::arg("h32"),
+    py::arg("k_scales") = py::none(),
+    py::arg("v_scales") = py::none()
 )
 .def("needs_configure", &BC_SharedKVAttention::needs_configure)
 .def("configure_slot", &BC_SharedKVAttention::configure_slot,
