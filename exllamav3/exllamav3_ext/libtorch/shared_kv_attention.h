@@ -38,7 +38,9 @@ struct BC_SharedKVAttention
     at::Tensor cache_k;          // source layer's pages (pages, page_size, kv_heads, head_dim), fp16
     at::Tensor cache_v;
     at::Tensor xh;               // Hadamard staging for the projections
-    at::Tensor h32;              // dummy for the kernel's unused quantized-cache argument
+    at::Tensor h32;              // H32 rotation (quantized source) or a dummy (fp16 source)
+    c10::optional<at::Tensor> k_scales;   // quantized source cache scales (QCK/QCV > 0)
+    c10::optional<at::Tensor> v_scales;
 
     struct Slot
     {
@@ -77,7 +79,9 @@ struct BC_SharedKVAttention
         at::Tensor cache_k,
         at::Tensor cache_v,
         at::Tensor xh,
-        at::Tensor h32
+        at::Tensor h32,
+        c10::optional<at::Tensor> k_scales = c10::nullopt,
+        c10::optional<at::Tensor> v_scales = c10::nullopt
     );
 
     Slot& slot(int bsz, int q_len) { return slots[(bsz - 1) * MAX_QLEN + (q_len - 1)]; }
