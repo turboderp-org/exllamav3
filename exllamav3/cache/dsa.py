@@ -81,7 +81,7 @@ class CacheLayer_dsa(CacheLayer):
         D_r = attention.rope_head_dim
         self.D_c = D - D_r
         self.D_r = D_r
-        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.D_i = attention.index_head_dim if getattr(attention, "indexer_mode", None) == "full" else 0
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -198,6 +198,8 @@ class DSV4ExportedState:
     serial: int
     wshift: int = 0
     last_history: int = 0
+    # Marks the handle a TP worker holds, for modules that look their layer state up by cache id (PLE)
+    exported = True
 
 
 class DSV4State:
@@ -244,6 +246,10 @@ class DSV4State:
     def rewind(self, num_tokens: int):
         assert num_tokens <= self.rollback_capacity(), \
             f"DSV4State: rewind {num_tokens} exceeds capacity {self.rollback_capacity()}"
+        # The DSA layers derive everything from the position; other layer states sharing the
+        # state (V4.1's Engram id context) keep a history window the way the generic states do
+        for l in self.cache.get_all_recurrent_layers().values():
+            l.rewind(self.slot, self.last_history, num_tokens)
         self.position -= num_tokens
         self.last_history = 0
 
@@ -254,15 +260,20 @@ class DSV4State:
         self.window_beg += self.wshift
         self.wshift = 0
 
-    def stash(self):
-        stashed = {
+    def stash_header(self):
+        return {
             "position": self.position,
             "window_beg": self.window_beg,
             "checkpoint_size": self.checkpoint_size,
         }
+
+    def stash_layers(self, layers: dict):
+        return {k: l.stash(self.slot, self.position) for k, l in layers.items()}
+
+    def stash(self):
+        stashed = self.stash_header()
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(
@@ -331,7 +342,7 @@ class DSV4LayerState:
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
 
-        if self.layer_type in ("csa", "hca"):
+        if module.compressor is not None:
             m = module.compress_rate
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
@@ -404,7 +415,7 @@ class DSV4LayerState:
                 out.append(host_copy(self.idx_buf_kv[slot]))
                 out.append(host_copy(self.idx_buf_gate[slot]))
                 out.append(host_copy(self.comp_ovl[slot]))
-                out.append(self.idx_ovl[slot].cpu())
+                out.append(host_copy(self.idx_ovl[slot]))
         return out
 
 

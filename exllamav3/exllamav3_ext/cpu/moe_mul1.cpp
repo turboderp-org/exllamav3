@@ -331,6 +331,10 @@ struct PreparedIn
     int rows;
     uint8_t slot[MAX_M];
     uint8_t wide[MAX_M];
+    // m x k/2, the paired kernels' layout (avx2_swz2_pair, bw_pair_tiles): x[2j] as i16 in the
+    // low and x[2j+1] in the high 16 bits. Filled on the AVX2 and BW tiers when the caller
+    // provides it
+    int32_t* splat_pair = nullptr;
 };
 
 // EXL3_MOE_CPU_WIDE=0: plain int8 activations for every row (testing)
@@ -361,10 +365,19 @@ inline int32_t hsum_epi32_avx2(__m256i v)
     return sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
 }
 
-// Both activation layouts of one int8 row (see PreparedIn)
+// The activation layouts of one int8 row (see PreparedIn); splat_pair takes the 8 values as 4 pairs
 M1_TARGET_AVX2
-inline void store_x8_avx2(__m256i v, int32_t* splat, int32_t* splat_dup)
+inline void store_x8_avx2(__m256i v, int32_t* splat, int32_t* splat_dup, int32_t* splat_pair = nullptr)
 {
+    if (splat_pair)
+    {
+        // Per qword (x[2j], x[2j+1]): the odd dword's low 16 bits shifted down next to the even
+        // one's, then the even dwords compacted into the low 128 bits
+        const __m256i low16 = _mm256_and_si256(v, _mm256_set1_epi32(0xffff));
+        const __m256i pairs = _mm256_or_si256(low16, _mm256_srli_epi64(low16, 16));
+        const __m256i packed = _mm256_permutevar8x32_epi32(pairs, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(splat_pair), _mm256_castsi256_si128(packed));
+    }
     const __m256i b = _mm256_and_si256(v, _mm256_set1_epi32(0xff));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat), _mm256_mullo_epi32(b, _mm256_set1_epi32(0x01010101)));
     // x in both 16-bit slots: the low 16 bits of v are already the two's-complement i16
@@ -380,7 +393,7 @@ inline void store_x8_avx2(__m256i v, int32_t* splat, int32_t* splat_dup)
 // A row as two int8 rows, k apart in splat / splat_dup: the value in steps of amax / WIDE_LEVELS,
 // split into a high part in steps of 128 and the remainder
 M1_TARGET_AVX2
-void quantize_row_wide_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+void quantize_row_wide_avx2(const float* dst, int32_t* splat, int32_t* splat_dup, int32_t* splat_pair,
     int k, float amax, float* q_out, int32_t* s_out)
 {
     const float q = amax * (1.0f / WIDE_LEVELS);
@@ -397,8 +410,9 @@ void quantize_row_wide_avx2(const float* dst, int32_t* splat, int32_t* splat_dup
         const __m256i vl = _mm256_sub_epi32(v, _mm256_slli_epi32(vh, 7));
         vsum_h = _mm256_add_epi32(vsum_h, vh);
         vsum_l = _mm256_add_epi32(vsum_l, vl);
-        store_x8_avx2(vh, splat + i, splat_dup ? splat_dup + i : nullptr);
-        store_x8_avx2(vl, splat + k + i, splat_dup ? splat_dup + k + i : nullptr);
+        store_x8_avx2(vh, splat + i, splat_dup ? splat_dup + i : nullptr, splat_pair ? splat_pair + i / 2 : nullptr);
+        store_x8_avx2(vl, splat + k + i, splat_dup ? splat_dup + k + i : nullptr,
+                      splat_pair ? splat_pair + k / 2 + i / 2 : nullptr);
     }
     q_out[0] = q * 128.0f;
     q_out[1] = q;
@@ -408,7 +422,7 @@ void quantize_row_wide_avx2(const float* dst, int32_t* splat, int32_t* splat_dup
 
 // Returns the number of activations that came out zero
 M1_TARGET_AVX2
-int quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+int quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup, int32_t* splat_pair,
     int k, float amax, float& q_out, int32_t& s_out)
 {
     // Explicit scale / reciprocal order: the reassociation GCC emits under -Ofast, spelled
@@ -425,7 +439,7 @@ int quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
         v = _mm256_min_epi32(hi, _mm256_max_epi32(lo, v));
         vsum = _mm256_add_epi32(vsum, v);
         vzero = _mm256_sub_epi32(vzero, _mm256_cmpeq_epi32(v, _mm256_setzero_si256()));
-        store_x8_avx2(v, splat + i, splat_dup ? splat_dup + i : nullptr);
+        store_x8_avx2(v, splat + i, splat_dup ? splat_dup + i : nullptr, splat_pair ? splat_pair + i / 2 : nullptr);
     }
     s_out = hsum_epi32_avx2(vsum);
     q_out = q;
@@ -468,6 +482,8 @@ int quantize_row(const float* dst, int k, PreparedIn& p, int r, int slot)
     // dup is only read by the AVX2/BW maddubs kernels; skip the stores on the VNNI/VBMI tiers
     int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
         ? p.splat_dup + static_cast<size_t>(slot) * k : nullptr;
+    int32_t* splat_pair = (p.splat_pair && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
+        ? p.splat_pair + static_cast<size_t>(slot) * (k / 2) : nullptr;
     p.slot[r] = static_cast<uint8_t>(slot);
     p.wide[r] = 0;
     float q;
@@ -475,10 +491,10 @@ int quantize_row(const float* dst, int k, PreparedIn& p, int r, int slot)
     if (g_isa != Isa::Scalar)
     {
         const float amax = row_absmax_avx2(dst, k);
-        const int zeros = quantize_row_avx2(dst, splat, splat_dup, k, amax, q, s);
+        const int zeros = quantize_row_avx2(dst, splat, splat_dup, splat_pair, k, amax, q, s);
         if (g_wide_rows && amax > 0.0f && zeros * WIDE_ZERO_DIV > k)
         {
-            quantize_row_wide_avx2(dst, splat, splat_dup, k, amax, p.q + slot, p.sum_x8 + slot);
+            quantize_row_wide_avx2(dst, splat, splat_dup, splat_pair, k, amax, p.q + slot, p.sum_x8 + slot);
             p.wide[r] = 1;
             return slot + 2;
         }
@@ -1016,6 +1032,266 @@ void bw_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn
     }
 }
 
+// Paired-row variant of the BW kernel, the AVX-512 counterpart of avx2_swz2_pair on the same
+// layouts: tile rows 2p and 2p+1 share one register, row 2p's 16-bit state in the low and row
+// 2p+1's in the high half of each column's dword, hashed with 16-bit multiplies into per-row
+// bytesums (i16), and one vpmaddwd per token row against splat_pair's (x[2p], x[2p+1]) covers
+// both k-rows. The dword extraction drops its 16-bit mask (the blend keeps only the half each
+// state lands in) and prunes the first word wherever it cannot reach that half. Same integer
+// sums, so the outputs match bw_tiles bitwise. Only this tier: with vpdpbusd the per-row
+// accumulate already costs one instruction per k-row and token, and the 16-bit hash costs more
+// than the pairing saves at up to four rows
+
+// Per-column shift counts of the state at row_shift - delta: mode 0 = s, 1 = 32 - s, 2 = s - 16,
+// 3 = 16 - s, 4 = 48 - s (2 and 3 clamped at zero)
+template <int bits, bool hb, int row, int delta, int mode>
+constexpr std::array<int32_t, 16> make_pair_shifts()
+{
+    std::array<int32_t, 16> v{};
+    for (int col = 0; col < 16; ++col)
+    {
+        const int s = row_shift<bits, hb, row>(col) - delta;
+        const int c = mode == 0 ? s : mode == 1 ? 32 - s : mode == 2 ? s - 16 : mode == 3 ? 16 - s : 48 - s;
+        v[col] = c < 0 ? 0 : c;
+    }
+    return v;
+}
+
+template <int bits, bool hb, int row, int delta>
+constexpr std::pair<int, int> pair_shift_range()
+{
+    const auto s = make_pair_shifts<bits, hb, row, delta, 0>();
+    int lo = 32, hi = 0;
+    for (int c = 0; c < 16; ++c) { lo = s[c] < lo ? s[c] : lo; hi = s[c] > hi ? s[c] : hi; }
+    return { lo, hi };
+}
+
+constexpr bool all_equal(const std::array<int32_t, 16>& v)
+{
+    for (int c = 1; c < 16; ++c) if (v[c] != v[0]) return false;
+    return true;
+}
+
+// v >> count (left = false) or v << count per column, immediate when the count is uniform
+template <int bits, bool hb, int row, int delta, int mode, bool left>
+M1_TARGET_BW
+M1_ALWAYS_INLINE __m512i pair_shift(__m512i v)
+{
+    alignas(64) static constexpr auto cnt = make_pair_shifts<bits, hb, row, delta, mode>();
+    if constexpr (all_equal(cnt))
+    {
+        if constexpr (cnt[0] == 0) return v;
+        else if constexpr (cnt[0] >= 32) return _mm512_setzero_si512();
+        else if constexpr (left) return _mm512_slli_epi32(v, cnt[0]);
+        else return _mm512_srli_epi32(v, cnt[0]);
+    }
+    else
+    {
+        const __m512i c = _mm512_load_si512(cnt.data());
+        return left ? _mm512_sllv_epi32(v, c) : _mm512_srlv_epi32(v, c);
+    }
+}
+
+// One of dword_gather's two word vectors
+template <int bits, bool hb, int row, bool second_word>
+M1_TARGET_BW
+M1_ALWAYS_INLINE __m512i dword_gather_word(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
+{
+    alignas(64) static constexpr auto id = make_row_indices<bits, hb, row, second_word>();
+    const __m512i i = _mm512_load_si512(id.data());
+    __m512i w = _mm512_permutex2var_epi32(p0, i, p1);
+    if constexpr (tile_words32(bits, hb) > 32)
+    {
+        constexpr __mmask16 hm = make_row_himask<bits, hb, row, second_word>();
+        if constexpr (hm != 0) w = _mm512_mask_blend_epi32(hm, w, _mm512_permutex2var_epi32(p2, i, p3));
+    }
+    else
+    {
+        (void) p2; (void) p3;
+    }
+    return w;
+}
+
+// The state of `row` at shift row_shift - delta from row's word gather, in bits 0..15 (high =
+// false) or 16..31 (high = true) of each column's dword, the other half garbage. The first word
+// only reaches the kept half where a column's shift exceeds 16
+template <int bits, bool hb, int row, int delta, bool high>
+M1_TARGET_BW
+M1_ALWAYS_INLINE __m512i dword_half_state(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
+{
+    constexpr auto range = pair_shift_range<bits, hb, row, delta>();
+    const __m512i b = dword_gather_word<bits, hb, row, true>(p0, p1, p2, p3);
+    __m512i v;
+    if constexpr (!high)
+        v = pair_shift<bits, hb, row, delta, 0, false>(b);
+    else if constexpr (range.first >= 16)
+        v = pair_shift<bits, hb, row, delta, 2, false>(b);
+    else if constexpr (range.second <= 16)
+        v = pair_shift<bits, hb, row, delta, 3, true>(b);
+    else
+        v = pair_shift<bits, hb, row, delta, 3, true>(pair_shift<bits, hb, row, delta, 2, false>(b));
+    if constexpr (range.second > 16)
+    {
+        const __m512i a = dword_gather_word<bits, hb, row, false>(p0, p1, p2, p3);
+        v = _mm512_or_si512(v, pair_shift<bits, hb, row, delta, high ? 4 : 1, true>(a));
+    }
+    return v;
+}
+
+struct BwPairConsts
+{
+    __m512i c1, c2, one8;
+};
+
+// Row pair P's bytesums, one per i16 lane (low: row 2P, high: row 2P+1). One word gather serves
+// both rows where the odd row fits the even row's shift headroom (word_pair_ok). The 32-bit
+// product's low half is lo16(s * c1), its high half hi16(s * c1) + lo16(s * c2)
+template <int bits, bool hb, int P>
+M1_TARGET_BW
+M1_ALWAYS_INLINE __m512i bw_pair_sums(__m512i p0, __m512i p1, __m512i p2, __m512i p3, const BwPairConsts& C)
+{
+    constexpr int R = 2 * P;
+    constexpr bool shared = word_pair_ok<bits, hb, R>();
+    const __m512i lo = dword_half_state<bits, hb, R, 0, false>(p0, p1, p2, p3);
+    const __m512i hi = dword_half_state<bits, hb, shared ? R : R + 1, shared ? pair_delta(bits, hb) : 0, true>(
+        p0, p1, p2, p3);
+    const __m512i st = _mm512_mask_blend_epi16(0xAAAAAAAAu, lo, hi);
+    const __m512i hl = _mm512_mullo_epi16(st, C.c1);
+    const __m512i hh = _mm512_add_epi16(_mm512_mulhi_epu16(st, C.c1), _mm512_mullo_epi16(st, C.c2));
+    return _mm512_add_epi16(_mm512_maddubs_epi16(hl, C.one8), _mm512_maddubs_epi16(hh, C.one8));
+}
+
+// px: this tile's 8 pairs of the first token row, rows kh apart
+template <int bits, bool hb, int rows, int band, int P>
+M1_TARGET_BW
+M1_ALWAYS_INLINE void bw_pair_rows
+(
+    __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* px, int kh,
+    __m512i (&acc)[band][MAX_M], const BwPairConsts& C
+)
+{
+    if constexpr (P < 8)
+    {
+        const __m512i s = bw_pair_sums<bits, hb, P>(p0, p1, p2, p3, C);
+        for (int i = 0; i < rows; ++i)
+            acc[b][i] = _mm512_add_epi32(acc[b][i], _mm512_madd_epi16(s,
+                _mm512_set1_epi32(px[static_cast<size_t>(i) * kh + P])));
+        bw_pair_rows<bits, hb, rows, band, P + 1>(p0, p1, p2, p3, b, px, kh, acc, C);
+    }
+}
+
+template <int bits, bool hb, int rows, int band>
+M1_TARGET_BW
+void bw_pair_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+{
+    const int tiles_k = mat.k / 16;
+    const int tiles_n = mat.n / 16;
+    const int kh = mat.k / 2;
+    constexpr int packed_size = tile_u16(bits, hb);
+    constexpr int words32 = tile_words32(bits, hb);
+    constexpr auto ld_mask = [](int n) -> __mmask16
+    {
+        return n >= 16 ? 0xffffu : (n <= 0 ? 0x0000u : static_cast<__mmask16>((1u << n) - 1u));
+    };
+    constexpr __mmask16 mask0 = ld_mask(words32 - 0);
+    constexpr __mmask16 mask1 = ld_mask(words32 - 16);
+    constexpr __mmask16 mask2 = ld_mask(words32 - 32);
+    constexpr __mmask16 mask3 = ld_mask(words32 - 48);
+    const BwPairConsts C {
+        _mm512_set1_epi16(static_cast<short>(MUL1_MULT & 0xffff)),
+        _mm512_set1_epi16(static_cast<short>(MUL1_MULT >> 16)),
+        _mm512_set1_epi8(1)
+    };
+
+    __m512i acc[band][MAX_M];
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+            acc[b][i] = _mm512_setzero_si512();
+
+    // Layout and prefetch as in bw_band
+    const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+    const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    {
+        const int32_t* px = in.splat_pair + tile_k * 8;
+        for (int b = 0; b < band; ++b)
+        {
+            const uint16_t* packed = mat.swz
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                                 + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
+                : packed_row + b * packed_size;
+            if (mat.swz && band == 8)
+            {
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
+            const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
+            const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
+            const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
+            const __m512i p2 = mask2 ? _mm512_maskz_loadu_epi32(mask2, pw + 32) : _mm512_setzero_si512();
+            const __m512i p3 = mask3 ? _mm512_maskz_loadu_epi32(mask3, pw + 48) : _mm512_setzero_si512();
+            bw_pair_rows<bits, hb, rows, band, 0>(p0, p1, p2, p3, b, px, kh, acc, C);
+        }
+    }
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
+            _mm512_storeu_ps(tout + static_cast<size_t>(i) * mat.n + (n0 + b) * 16, out);
+        }
+}
+
+// Rows the paired kernel takes: from three rows at every rate (the per-token accumulate then
+// dominates), and every row count at K1/K2, where most row pairs share one word gather
+constexpr bool bw_pair_wins(int bits, bool hb, int rows) { return rows >= 3 || (!hb && bits <= 2); }
+
+template <int bits, bool hb, int rows>
+M1_TARGET_BW
+void bw_pair_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    // Same band widths as bw_tiles
+    const int max_band = mat.swz ? (rows == 1 ? 8 : rows <= 3 ? 4 : 2)
+                                 : (rows == 1 ? 8 : (12 / rows < 8 ? 12 / rows : 8));
+    int n0 = tn0;
+    while (n0 < tn1)
+    {
+        const int band = std::min(tn1 - n0, max_band);
+        switch (band)
+        {
+            case 1: bw_pair_band<bits, hb, rows, 1>(mat, in, tout, n0); break;
+            case 2: bw_pair_band<bits, hb, rows, 2>(mat, in, tout, n0); break;
+            case 3: bw_pair_band<bits, hb, rows, 3>(mat, in, tout, n0); break;
+            case 4: bw_pair_band<bits, hb, rows, 4>(mat, in, tout, n0); break;
+            case 5: bw_pair_band<bits, hb, rows, 5>(mat, in, tout, n0); break;
+            case 6: bw_pair_band<bits, hb, rows, 6>(mat, in, tout, n0); break;
+            case 7: bw_pair_band<bits, hb, rows, 7>(mat, in, tout, n0); break;
+            default: bw_pair_band<bits, hb, rows, 8>(mat, in, tout, n0); break;
+        }
+        n0 += band;
+    }
+}
+
+// Per-row bw_tiles, or bw_pair_tiles where it wins (the caller checked splat_pair)
+template <int bits, bool hb, int rows>
+void bw_tiles_any(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    if constexpr (bw_pair_wins(bits, hb, rows))
+    {
+        if (in.splat_pair) { bw_pair_tiles<bits, hb, rows>(mat, in, tout, tn0, tn1); return; }
+    }
+    bw_tiles<bits, hb, rows>(mat, in, tout, tn0, tn1);
+}
+
 // -------------------------------------------------------------------------------------------
 //   AVX-512 VBMI banded kernel
 //
@@ -1511,10 +1787,17 @@ M1_ALWAYS_INLINE void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)],
         const __m256i sh_hi = _mm256_setr_epi32(sh[8], sh[9], sh[10], sh[11], sh[12], sh[13], sh[14], sh[15]);
         const __m256i shc_lo = _mm256_setr_epi32(shc[0], shc[1], shc[2], shc[3], shc[4], shc[5], shc[6], shc[7]);
         const __m256i shc_hi = _mm256_setr_epi32(shc[8], shc[9], shc[10], shc[11], shc[12], shc[13], shc[14], shc[15]);
-        codes_lo = _mm256_and_si256(_mm256_or_si256(
-            _mm256_srlv_epi32(b_lo, sh_lo), _mm256_sllv_epi32(a_lo, shc_lo)), mask16);
-        codes_hi = _mm256_and_si256(_mm256_or_si256(
-            _mm256_srlv_epi32(b_hi, sh_hi), _mm256_sllv_epi32(a_hi, shc_hi)), mask16);
+        // When all shifts are <= 16, mask16 discards the left-shifted term (shift 32 is zero).
+        if constexpr (*std::max_element(sh.begin(), sh.begin() + 8) <= 16)
+            codes_lo = _mm256_and_si256(_mm256_srlv_epi32(b_lo, sh_lo), mask16);
+        else
+            codes_lo = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srlv_epi32(b_lo, sh_lo), _mm256_sllv_epi32(a_lo, shc_lo)), mask16);
+        if constexpr (*std::max_element(sh.begin() + 8, sh.end()) <= 16)
+            codes_hi = _mm256_and_si256(_mm256_srlv_epi32(b_hi, sh_hi), mask16);
+        else
+            codes_hi = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srlv_epi32(b_hi, sh_hi), _mm256_sllv_epi32(a_hi, shc_hi)), mask16);
         return;
     }
     constexpr int s0 = row_shift<bits, hb, row>(0);
@@ -1557,10 +1840,10 @@ M1_ALWAYS_INLINE void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const i
 // registers staying live across the even row's accumulate spills -- AVX2 has 16 architectural
 // ymm registers). At every other K the same restructure measured neutral-to-negative
 // (K3 -5% 1T / -14% 24T-cold on the 7960X); do not widen the gate without re-measuring.
-template <int bits, bool hb, int row = 0>
+template <int bits, bool hb, int row = 0, int Rows = MAX_M>
 M1_TARGET_AVX2
 M1_ALWAYS_INLINE void avx2_rows_accum(
-    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8 && !hb)
@@ -1579,30 +1862,31 @@ M1_ALWAYS_INLINE void avx2_rows_accum(
                 _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
             __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+            avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
             // Odd row: same gathered words, shifted by an extra `bits` (>= 32 shifts are
             // well-defined zero, so the slli term drops out cleanly when s - bits == 0)
             codes_lo = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
             codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
-            avx2_rows_accum<bits, hb, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
+            avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
+            avx2_rows_accum<bits, hb, row + 2, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
         }
     }
     else if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes<bits, hb, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum<bits, hb, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum<bits, hb, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
-template <int bits, bool hb>
+template <int bits, bool hb, int Rows = MAX_M>
 M1_TARGET_AVX2
 void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
+    const int rows = Rows == MAX_M ? m : Rows;
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
     constexpr int packed_size = tile_u16(bits, hb);
@@ -1624,8 +1908,8 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
-        __m256i acc[MAX_M][2];
-        for (int i = 0; i < m; ++i)
+        __m256i acc[Rows][2];
+        for (int i = 0; i < rows; ++i)
         {
             acc[i][0] = _mm256_setzero_si256();
             acc[i][1] = _mm256_setzero_si256();
@@ -1654,10 +1938,10 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
             else
                 preg[nreg - 1] = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i*>(packed + (nreg - 1) * 16));
-            avx2_rows_accum<bits, hb>(preg, splat_k, mat.k, m, acc, mult, ones32);
+            avx2_rows_accum<bits, hb, 0, Rows>(preg, splat_k, mat.k, rows, acc, mult, ones32);
         }
 
-        for (int i = 0; i < m; ++i)
+        for (int i = 0; i < rows; ++i)
         {
             const float scale = mul1_k_inv() * in.q[i];
             const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
@@ -1671,6 +1955,97 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 // -------------------------------------------------------------------------------------------
 //   AVX2 swizzle: band-2 kernel over the group-2 + planar layout
 // -------------------------------------------------------------------------------------------
+
+// Integer planes contain eight dwords; fractional planes contain eight chronological
+// halfwords, widened once on load. Neither representation changes the tile byte count.
+constexpr int avx2_planar_regs(int bits, bool hb) { return hb ? rate_k2(bits, true) : bits; }
+
+template <int bits, bool hb>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_load_planar(const uint16_t* packed,
+    __m256i (&preg)[avx2_planar_regs(bits, hb)])
+{
+    static_assert(!hb || (bits >= 1 && bits <= 3), "fractional planar rate");
+    static_assert(tile_u16(bits, hb) == avx2_planar_regs(bits, hb) * (hb ? 8 : 16),
+                  "planar loads exactly cover the tile");
+    for (int i = 0; i < avx2_planar_regs(bits, hb); ++i)
+    {
+        if constexpr (hb)
+            preg[i] = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(packed + i * 8)));
+        else
+            preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + i * 16));
+    }
+}
+
+template <int bits, int row, bool second_word, int half>
+constexpr std::array<int32_t, 8> make_halfword_indices()
+{
+    constexpr auto inv = make_tc_perm_inv();
+    std::array<int32_t, 8> idx{};
+    for (int c = 0; c < 8; ++c)
+    {
+        const int end = state_end(bits, true, inv[row * 16 + half * 8 + c]);
+        idx[c] = ((end - (second_word ? 1 : 16)) / 16) % tile_u16(bits, true);
+    }
+    return idx;
+}
+
+template <int bits, int row, int half>
+constexpr bool halfword_planar_ok()
+{
+    constexpr int q = rate_k2(bits, true);
+    constexpr int count = tile_u16(bits, true);
+    constexpr auto inv = make_tc_perm_inv();
+    constexpr auto a = make_halfword_indices<bits, row, false, half>();
+    constexpr auto b = make_halfword_indices<bits, row, true, half>();
+    constexpr int shift = row_shift<bits, true, row>(half * 8) % 16;
+    for (int c = 0; c < 8; ++c)
+    {
+        const int end = state_end(bits, true, inv[row * 16 + half * 8 + c]);
+        if (a[c] < 0 || a[c] >= count || b[c] < 0 || b[c] >= count) return false;
+        if (a[c] % q != a[0] % q || b[c] % q != b[0] % q) return false;
+        if (a[c] / q != (a[0] / q + c) % 8 || b[c] / q != (b[0] / q + c) % 8) return false;
+        if ((16 - end % 16) % 16 != shift ||
+            row_shift<bits, true, row>(half * 8 + c) % 16 != shift) return false;
+        if (a[c] != (b[c] + count - (shift != 0)) % count) return false;
+    }
+    return true;
+}
+
+// The loader stores packed[8*(j%Q)+j/Q] = native[j xor 1]. The xor corrects
+// little-endian dword halfword order; the bytes within each halfword are unchanged.
+template <int bits, int row, bool second_word, int half>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_gather_halfword_planar(const __m256i (&preg)[2 * bits + 1])
+{
+    static_assert(bits >= 1 && bits <= 3 && row >= 0 && row < 16 && half >= 0 && half < 2,
+                  "fractional half-row bounds");
+    static_assert(halfword_planar_ok<bits, row, half>(), "fractional plane, lane or shift mismatch");
+    constexpr int q = rate_k2(bits, true);
+    constexpr auto idx = make_halfword_indices<bits, row, second_word, half>();
+    if constexpr (idx[0] / q == 0) return preg[idx[0] % q];
+    const __m256i lane = _mm256_setr_epi32(idx[0] / q, idx[1] / q, idx[2] / q, idx[3] / q,
+                                         idx[4] / q, idx[5] / q, idx[6] / q, idx[7] / q);
+    return _mm256_permutevar8x32_epi32(preg[idx[0] % q], lane);
+}
+
+// Only the selected 16-bit half is meaningful, as in avx2_half_state_planar.
+template <int bits, int row, int half, bool high>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_half_state_halfword(const __m256i (&preg)[2 * bits + 1])
+{
+    constexpr int shift = row_shift<bits, true, row>(half * 8) % 16;
+    const __m256i b = avx2_gather_halfword_planar<bits, row, true, half>(preg);
+    __m256i state = b;
+    if constexpr (shift != 0)
+    {
+        const __m256i a = avx2_gather_halfword_planar<bits, row, false, half>(preg);
+        state = _mm256_or_si256(_mm256_slli_epi32(a, 16 - shift), _mm256_srli_epi32(b, shift));
+    }
+    if constexpr (high) return _mm256_slli_epi32(state, 16);
+    else return state;
+}
 
 // Register holding a half-row's source dwords under the planar order: the half-row's dword
 // residue class mod bits. All 8 columns must agree (the orbit property); a disagreement is
@@ -1732,18 +2107,27 @@ M1_ALWAYS_INLINE void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
-template <int bits, int row = 0, int Rows = MAX_M>
+template <int bits, int row = 0, int Rows = MAX_M, bool hb = false>
 M1_TARGET_AVX2
 M1_ALWAYS_INLINE void avx2_rows_accum_planar(
-    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
+    const __m256i (&preg)[avx2_planar_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
-        avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
+        if constexpr (hb)
+        {
+            const __m256i lo = avx2_half_state_halfword<bits, row, 0, false>(preg);
+            const __m256i hi = avx2_half_state_halfword<bits, row, 1, false>(preg);
+            const __m256i mask16 = _mm256_set1_epi32(0xffff);
+            codes_lo = _mm256_and_si256(lo, mask16);
+            codes_hi = _mm256_and_si256(hi, mask16);
+        }
+        else
+            avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
         avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum_planar<bits, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_rows_accum_planar<bits, row + 1, Rows, hb>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
@@ -1765,21 +2149,21 @@ M1_ALWAYS_INLINE void avx2_rows_accum_planar(
 // one vpermd (or nothing) instead of avx2_tiles' O(bits) register walk with blends. That
 // removes the rate-proportional ALU wall of the walk (every rate lands at the accumulate
 // ceiling) and frees the registers the walk needed -- without planar the band-2 body spills
-// at the odd and high rates, which would lock those rates out of the swizzle. Half-integer
-// rates are never packed on this tier: their per-column word step is not integral, so the residue classes do not
-// partition the tile, and avx2_swz2 has no hb instances. K1's dword permutation is the
-// identity, so "planar" is a no-op repack there and the gathers degenerate to the walking
-// gather of a single-register tile anyway.
+// at the odd and high rates, which would lock those rates out of the swizzle. Fractional
+// rates instead use Q = 2*bits+1 chronological halfword planes (see avx2_load_planar),
+// enabled separately and sharing only the band traversal and accumulation. K1's dword
+// permutation is the identity, so "planar" is a no-op repack there and the gathers
+// degenerate to the walking gather of a single-register tile anyway.
 //
 // tn0/tn1 are always even: assign_gemvs splits in 8-tile groups (2-tile aligned) and
 // tiles_n is a multiple of 8. There is no per-tile edge handling.
-template <int bits, int Rows = MAX_M>
+template <int bits, int Rows = MAX_M, bool hb = false>
 M1_TARGET_AVX2
 void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     const int rows = Rows == MAX_M ? m : Rows;
     const int tiles_k = mat.k / 16;
-    constexpr int packed_size = 16 * bits;
+    constexpr int packed_size = tile_u16(bits, hb);
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
     const __m256i ones32 = _mm256_set1_epi32(0x01010101);
     const int32_t* splat_dup = in.splat_dup;
@@ -1799,13 +2183,11 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
         {
             const int32_t* dup = splat_dup + tile_k * 16;
-            __m256i preg[bits];
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
-            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accA, mult, ones32);
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
-            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accB, mult, ones32);
+            __m256i preg[avx2_planar_regs(bits, hb)];
+            avx2_load_planar<bits, hb>(pA, preg);
+            avx2_rows_accum_planar<bits, 0, Rows, hb>(preg, dup, mat.k, rows, accA, mult, ones32);
+            avx2_load_planar<bits, hb>(pB, preg);
+            avx2_rows_accum_planar<bits, 0, Rows, hb>(preg, dup, mat.k, rows, accB, mult, ones32);
         }
         for (int i = 0; i < rows; ++i)
         {
@@ -1819,6 +2201,154 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
         }
     }
+}
+
+// Paired-row variant of avx2_swz2 on the same band-2 + planar layout, the AVX2 tier's kernel
+// whenever the caller prepared the paired activations (PreparedIn::splat_pair). Tile rows 2p and
+// 2p+1 share one register, each 8-lane half-row's 16-bit state in the low (row 2p) or high
+// (2p+1) half of each dword, and are hashed with 16-bit multiplies: the low half of s * MUL1 is
+// lo16(s * c1), the high half hi16(s * c1) + lo16(s * c2), with c1/c2 the multiplier's halves.
+// Two vpmaddubsw against ones give the per-row bytesums (<= 1020) as i16, and one vpmaddwd per
+// token row against (x[2p], x[2p+1]) folds both k-rows into a single i32: half the per-token
+// work of avx2_accum_row, which bounds the multi-token rows. Same integer sums, so the outputs
+// match avx2_swz2 bitwise.
+//
+// The funnel (b >> s) | (a << (32 - s)) of the state extraction is pruned per half-row: the
+// consumer keeps only one 16-bit half, so the first word's contribution is dead whenever it
+// lands outside that half (s <= 16), which removes its gather and shift for most half-rows
+template <int s>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_funnel_lo(__m256i a, __m256i b)   // state in bits 0..15
+{
+    if constexpr (s <= 16) { (void) a; return s ? _mm256_srli_epi32(b, s) : b; }
+    else return _mm256_or_si256(_mm256_srli_epi32(b, s), _mm256_slli_epi32(a, 32 - s));
+}
+
+template <int s>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_funnel_hi(__m256i a, __m256i b)   // state in bits 16..31
+{
+    if constexpr (s < 16) { (void) a; return _mm256_slli_epi32(b, 16 - s); }
+    else if constexpr (s == 16) { (void) a; return b; }
+    else return _mm256_or_si256(_mm256_srli_epi32(b, s - 16), _mm256_slli_epi32(a, 48 - s));
+}
+
+template <int bits, int row, int half, bool high, bool hb = false>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_half_state_planar(const __m256i (&preg)[avx2_planar_regs(bits, hb)])
+{
+    if constexpr (hb)
+        return avx2_half_state_halfword<bits, row, half, high>(preg);
+    else
+    {
+        constexpr int sft = row_shift<bits, false, row>(half * 8);
+        const __m256i b = avx2_gather_half_planar<bits, row, true, half>(preg);
+        __m256i a = b;
+        if constexpr (sft > 16) a = avx2_gather_half_planar<bits, row, false, half>(preg);
+        if constexpr (high) return avx2_funnel_hi<sft>(a, b);
+        else return avx2_funnel_lo<sft>(a, b);
+    }
+}
+
+struct Avx2PairConsts
+{
+    __m256i c1, c2, one8;
+};
+
+// Bytesum of the mul1 hash of 16 16-bit states, one per i16 lane
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_bytesum16(__m256i st, const Avx2PairConsts& C)
+{
+    const __m256i lo = _mm256_mullo_epi16(st, C.c1);
+    const __m256i hi = _mm256_add_epi16(_mm256_mulhi_epu16(st, C.c1), _mm256_mullo_epi16(st, C.c2));
+    return _mm256_add_epi16(_mm256_maddubs_epi16(lo, C.one8), _mm256_maddubs_epi16(hi, C.one8));
+}
+
+// splat_pair: this tile's 8 pairs of the first token row, rows kh apart
+template <int bits, int Rows, bool hb = false, int p = 0>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_pair_rows_accum(const __m256i (&preg)[avx2_planar_regs(bits, hb)],
+    const int32_t* splat_pair, int kh, __m256i (&acc)[Rows][2], const Avx2PairConsts& C)
+{
+    if constexpr (p < 8)
+    {
+        // Clang's _mm256_blend_epi16 is a macro: the template argument commas would split its
+        // arguments, so the halves are named first
+        const __m256i lo_even = avx2_half_state_planar<bits, 2 * p, 0, false, hb>(preg);
+        const __m256i lo_odd = avx2_half_state_planar<bits, 2 * p + 1, 0, true, hb>(preg);
+        const __m256i hi_even = avx2_half_state_planar<bits, 2 * p, 1, false, hb>(preg);
+        const __m256i hi_odd = avx2_half_state_planar<bits, 2 * p + 1, 1, true, hb>(preg);
+        const __m256i st_lo = _mm256_blend_epi16(lo_even, lo_odd, 0xAA);
+        const __m256i st_hi = _mm256_blend_epi16(hi_even, hi_odd, 0xAA);
+        const __m256i s_lo = avx2_bytesum16(st_lo, C);
+        const __m256i s_hi = avx2_bytesum16(st_hi, C);
+        #pragma GCC unroll 4
+        for (int i = 0; i < Rows; ++i)
+        {
+            const __m256i xs = _mm256_set1_epi32(splat_pair[static_cast<size_t>(i) * kh + p]);
+            acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(s_lo, xs));
+            acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(s_hi, xs));
+        }
+        avx2_pair_rows_accum<bits, Rows, hb, p + 1>(preg, splat_pair, kh, acc, C);
+    }
+}
+
+template <int bits, int Rows, bool hb = false>
+M1_TARGET_AVX2
+void avx2_swz2_pair(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    const int tiles_k = mat.k / 16;
+    const int kh = mat.k / 2;
+    constexpr int packed_size = tile_u16(bits, hb);
+    const Avx2PairConsts C {
+        _mm256_set1_epi16(static_cast<short>(MUL1_MULT & 0xffff)),
+        _mm256_set1_epi16(static_cast<short>(MUL1_MULT >> 16)),
+        _mm256_set1_epi8(1)
+    };
+    const size_t step = static_cast<size_t>(2) * packed_size;
+
+    for (int pair = tn0; pair < tn1; pair += 2)
+    {
+        __m256i accA[Rows][2], accB[Rows][2];
+        for (int i = 0; i < Rows; ++i)
+        {
+            accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
+            accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
+        }
+        const uint16_t* pA = mat.trellis
+            + static_cast<size_t>(pair >> 1) * tiles_k * 2 * packed_size;
+        const uint16_t* pB = pA + packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
+        {
+            const int32_t* px = in.splat_pair + tile_k * 8;
+            __m256i preg[avx2_planar_regs(bits, hb)];
+            avx2_load_planar<bits, hb>(pA, preg);
+            avx2_pair_rows_accum<bits, Rows, hb>(preg, px, kh, accA, C);
+            avx2_load_planar<bits, hb>(pB, preg);
+            avx2_pair_rows_accum<bits, Rows, hb>(preg, px, kh, accB, C);
+        }
+        for (int i = 0; i < Rows; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* outA = tout + static_cast<size_t>(i) * mat.n + pair * 16;
+            float* outB = outA + 16;
+            _mm256_storeu_ps(outA, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outA + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][1]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
+// Without splat_pair, use the unpaired kernel for the same packed fractional layout.
+template <int bits, int Rows>
+void avx2_swz2_half_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    if (in.splat_pair)
+        avx2_swz2_pair<bits, Rows, true>(mat, in, tout, tn0, tn1);
+    else
+        avx2_swz2<bits, Rows, true>(mat, in, tout, Rows, tn0, tn1);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1930,6 +2460,14 @@ Isa detect_isa()
 }
 
 const Isa g_isa = []{ return detect_isa(); }();
+
+// Layout policy is immutable after extension load, like the ISA cap. Fractional packing
+// is opt-in: its first streamed use can require the existing GPU inverse ring.
+const bool g_fractional_swizzle = []{
+    const char* e = std::getenv("EXL3_MOE_CPU_FRACTIONAL_SWIZZLE");
+    const char* swz = std::getenv("EXL3_MOE_CPU_SWIZZLE");
+    return e && std::strcmp(e, "1") == 0 && !(swz && std::strcmp(swz, "0") == 0);
+}();
 
 // ks (split-K slice, see KSlice): VBMI tier only and never K8, which that tier routes to the VNNI
 // kernels; decode_phase checks split_k_ok first
@@ -2062,64 +2600,99 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             {
                 switch (mat.bits * 4 + m - 1)
                 {
-                    case 1 * 4 + 0: bw_tiles<1, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 1: bw_tiles<1, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 2: bw_tiles<1, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 1 * 4 + 3: bw_tiles<1, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 0: bw_tiles<2, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 1: bw_tiles<2, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 2: bw_tiles<2, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 2 * 4 + 3: bw_tiles<2, true, 4>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 0: bw_tiles<3, true, 1>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 1: bw_tiles<3, true, 2>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 2: bw_tiles<3, true, 3>(mat, in, tout, tn0, tn1); return;
-                    case 3 * 4 + 3: bw_tiles<3, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 1 * 4 + 0: bw_tiles_any<1, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 1 * 4 + 1: bw_tiles_any<1, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 1 * 4 + 2: bw_tiles_any<1, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 1 * 4 + 3: bw_tiles_any<1, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 2 * 4 + 0: bw_tiles_any<2, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 2 * 4 + 1: bw_tiles_any<2, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 2 * 4 + 2: bw_tiles_any<2, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 2 * 4 + 3: bw_tiles_any<2, true, 4>(mat, in, tout, tn0, tn1); return;
+                    case 3 * 4 + 0: bw_tiles_any<3, true, 1>(mat, in, tout, tn0, tn1); return;
+                    case 3 * 4 + 1: bw_tiles_any<3, true, 2>(mat, in, tout, tn0, tn1); return;
+                    case 3 * 4 + 2: bw_tiles_any<3, true, 3>(mat, in, tout, tn0, tn1); return;
+                    case 3 * 4 + 3: bw_tiles_any<3, true, 4>(mat, in, tout, tn0, tn1); return;
                 }
                 return;
             }
             switch (mat.bits * 4 + m - 1)
             {
-                case 1 * 4 + 0: bw_tiles<1, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: bw_tiles<1, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: bw_tiles<1, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: bw_tiles<1, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: bw_tiles<2, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: bw_tiles<2, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: bw_tiles<2, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: bw_tiles<2, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: bw_tiles<3, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: bw_tiles<3, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: bw_tiles<3, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: bw_tiles<3, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: bw_tiles<4, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: bw_tiles<4, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: bw_tiles<4, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: bw_tiles<4, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: bw_tiles<5, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: bw_tiles<5, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: bw_tiles<5, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: bw_tiles<5, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: bw_tiles<6, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: bw_tiles<6, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: bw_tiles<6, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: bw_tiles<6, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: bw_tiles<7, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: bw_tiles<7, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: bw_tiles<7, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: bw_tiles<7, false, 4>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 0: bw_tiles<8, false, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: bw_tiles<8, false, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: bw_tiles<8, false, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: bw_tiles<8, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 0: bw_tiles_any<1, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 1: bw_tiles_any<1, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 2: bw_tiles_any<1, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 3: bw_tiles_any<1, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 0: bw_tiles_any<2, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 1: bw_tiles_any<2, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 2: bw_tiles_any<2, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 3: bw_tiles_any<2, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 0: bw_tiles_any<3, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 1: bw_tiles_any<3, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 2: bw_tiles_any<3, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 3: bw_tiles_any<3, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 0: bw_tiles_any<4, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 1: bw_tiles_any<4, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 2: bw_tiles_any<4, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 3: bw_tiles_any<4, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 0: bw_tiles_any<5, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 1: bw_tiles_any<5, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 2: bw_tiles_any<5, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 3: bw_tiles_any<5, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 0: bw_tiles_any<6, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 1: bw_tiles_any<6, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 2: bw_tiles_any<6, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 3: bw_tiles_any<6, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 0: bw_tiles_any<7, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 1: bw_tiles_any<7, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 2: bw_tiles_any<7, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 3: bw_tiles_any<7, false, 4>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 0: bw_tiles_any<8, false, 1>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 1: bw_tiles_any<8, false, 2>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 2: bw_tiles_any<8, false, 3>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 3: bw_tiles_any<8, false, 4>(mat, in, tout, tn0, tn1); return;
             }
             return;
         }
         case Isa::Avx2:
         {
-            // Swizzled matrices on this tier are always group-2 + planar dwords (the rule
-            // couples the two, the loader repacks accordingly and make_matrix re-derives the
-            // flag from the same rule, so bytes and kernel cannot drift). Half rates are
-            // never swizzled here and take the hb branch below.
+            // The shared selectors couple group-2 with planar packing. Fractional planes
+            // contain halfwords, not dwords: dispatch them before any integer swz branch.
+            if (mat.hb && mat.swz)
+            {
+                #define AVX2_HB_SWZ2_ROWS(B) \
+                    switch (m) { \
+                        case 1: avx2_swz2_half_tiles<B, 1>(mat, in, tout, tn0, tn1); return; \
+                        case 2: avx2_swz2_half_tiles<B, 2>(mat, in, tout, tn0, tn1); return; \
+                        case 3: avx2_swz2_half_tiles<B, 3>(mat, in, tout, tn0, tn1); return; \
+                        default: avx2_swz2_half_tiles<B, 4>(mat, in, tout, tn0, tn1); return; }
+                switch (mat.bits)
+                {
+                    case 1: AVX2_HB_SWZ2_ROWS(1)
+                    case 2: AVX2_HB_SWZ2_ROWS(2)
+                    default: AVX2_HB_SWZ2_ROWS(3)
+                }
+                #undef AVX2_HB_SWZ2_ROWS
+            }
+            if (mat.swz && in.splat_pair)
+            {
+                #define AVX2_SWZ2P_ROWS(B) \
+                    switch (m) { \
+                        case 1: avx2_swz2_pair<B, 1>(mat, in, tout, tn0, tn1); return; \
+                        case 2: avx2_swz2_pair<B, 2>(mat, in, tout, tn0, tn1); return; \
+                        case 3: avx2_swz2_pair<B, 3>(mat, in, tout, tn0, tn1); return; \
+                        default: avx2_swz2_pair<B, 4>(mat, in, tout, tn0, tn1); return; }
+                switch (mat.bits)
+                {
+                    case 1: AVX2_SWZ2P_ROWS(1)
+                    case 2: AVX2_SWZ2P_ROWS(2)
+                    case 3: AVX2_SWZ2P_ROWS(3)
+                    case 4: AVX2_SWZ2P_ROWS(4)
+                    case 5: AVX2_SWZ2P_ROWS(5)
+                    case 6: AVX2_SWZ2P_ROWS(6)
+                    case 7: AVX2_SWZ2P_ROWS(7)
+                    default: AVX2_SWZ2P_ROWS(8)
+                }
+                #undef AVX2_SWZ2P_ROWS
+            }
             if (mat.swz)
             {
                 // Compile-time row count for two and three rows (two tokens, or one token split
@@ -2155,12 +2728,21 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             }
             if (mat.hb)
             {
+                // Specialize up to three prepared rows (including wide tokens' high/low pairs);
+                // four-row passes keep the runtime bound.
+                #define AVX2_HB_ROWS(B) \
+                    switch (m) { \
+                        case 1: avx2_tiles<B, true, 1>(mat, in, tout, m, tn0, tn1); return; \
+                        case 2: avx2_tiles<B, true, 2>(mat, in, tout, m, tn0, tn1); return; \
+                        case 3: avx2_tiles<B, true, 3>(mat, in, tout, m, tn0, tn1); return; \
+                        default: avx2_tiles<B, true>(mat, in, tout, m, tn0, tn1); return; }
                 switch (mat.bits)
                 {
-                    case 1: avx2_tiles<1, true>(mat, in, tout, m, tn0, tn1); return;
-                    case 2: avx2_tiles<2, true>(mat, in, tout, m, tn0, tn1); return;
-                    case 3: avx2_tiles<3, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 1: AVX2_HB_ROWS(1)
+                    case 2: AVX2_HB_ROWS(2)
+                    case 3: AVX2_HB_ROWS(3)
                 }
+                #undef AVX2_HB_ROWS
                 return;
             }
             switch (mat.bits)
@@ -2710,6 +3292,7 @@ inline void run_rows(const MoeCpuMatrix& mat, const PreparedIn& p, float* tout, 
     rest.tin += static_cast<size_t>(MAX_M) * mat.k;
     rest.splat32 += static_cast<size_t>(MAX_M) * mat.k;
     if (rest.splat_dup) rest.splat_dup += static_cast<size_t>(MAX_M) * mat.k;
+    if (rest.splat_pair) rest.splat_pair += static_cast<size_t>(MAX_M) * (mat.k / 2);
     for (int i = 0; i < MAX_M; ++i)
     {
         rest.q[i] = p.q[MAX_M + i];
@@ -2766,20 +3349,23 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
 struct DecodeScratch
 {
     std::vector<float> tin_g, tin_u;
-    std::vector<int32_t> splat_g, splat_u, splat_d, dup_g, dup_u, dup_d;
+    std::vector<int32_t> splat_g, splat_u, splat_d, dup_g, dup_u, dup_d, pair_g, pair_u, pair_d;
     PreparedIn pg{}, pu{}, pd{};
 
-    // One token row, which may take two GEMV rows (wide)
+    // A chunk's token rows, each of which may take two GEMV rows (wide)
     static DecodeScratch& get(int H, int I)
     {
         static thread_local DecodeScratch s;
         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-        grow(s.tin_g, H); grow(s.tin_u, H);
-        grow(s.splat_g, 2 * H); grow(s.splat_u, 2 * H); grow(s.splat_d, 2 * I);
-        grow(s.dup_g, 2 * H); grow(s.dup_u, 2 * H); grow(s.dup_d, 2 * I);
+        const size_t sh = static_cast<size_t>(MAX_SLOTS) * H, si = static_cast<size_t>(MAX_SLOTS) * I;
+        grow(s.tin_g, sh); grow(s.tin_u, sh);
+        grow(s.splat_g, sh); grow(s.splat_u, sh); grow(s.splat_d, si);
+        grow(s.dup_g, sh); grow(s.dup_u, sh); grow(s.dup_d, si);
+        grow(s.pair_g, sh / 2); grow(s.pair_u, sh / 2); grow(s.pair_d, si / 2);
         s.pg.tin = s.tin_g.data(); s.pg.splat32 = s.splat_g.data(); s.pg.splat_dup = s.dup_g.data();
         s.pu.tin = s.tin_u.data(); s.pu.splat32 = s.splat_u.data(); s.pu.splat_dup = s.dup_u.data();
         s.pd.splat32 = s.splat_d.data(); s.pd.splat_dup = s.dup_d.data();
+        s.pg.splat_pair = s.pair_g.data(); s.pu.splat_pair = s.pair_u.data(); s.pd.splat_pair = s.pair_d.data();
         return s;
     }
 };
@@ -2802,13 +3388,17 @@ void decode_gu_block(ForwardCtx& c, int j, int block)
     const int I = L.interm_size;
     const int e = c.chunks[j].expert;
     const bool gated = !L.gates.empty();
-    float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
-    float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
-    if (gated) transform_out_block(L.gates[e], g, block);
-    transform_out_block(L.ups[e], u, block);
-    apply_activation(L, g + block, u + block, 128);
-    const float* a = gated ? g : u;
-    prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + block, 128);
+    for (int r = 0; r < c.chunks[j].m; ++r)
+    {
+        const size_t ro = static_cast<size_t>(r) * I;
+        float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I + ro;
+        float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I + ro;
+        if (gated) transform_out_block(L.gates[e], g, block);
+        transform_out_block(L.ups[e], u, block);
+        apply_activation(L, g + block, u + block, 128);
+        const float* a = gated ? g : u;
+        prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + ro + block, 128);
+    }
 }
 
 // Down block complete for every chunk: output transform and routing-weighted accumulate, chunks
@@ -2825,14 +3415,13 @@ void decode_out_block(ForwardCtx& c, int block, bool fold)
         const MoeCpuMatrix& mat = L.downs[ch.expert];
         float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
         if (fold) fold_rows(d, c.prep_d[j], ch.m, H, block, block + 128);
-        // Normally m == 1 here; retain repeated selections of the same expert
-        // too, which the raw API groups into a multi-row chunk.
         for (int r = 0; r < ch.m; ++r)
         {
             float* v = d + static_cast<size_t>(r) * H;
+            float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
             transform_out_block(mat, v, block);
             for (int col = 0; col < 128; ++col)
-                c.out[block + col] += ch.weight[r] * v[block + col];
+                dst[block + col] += ch.weight[r] * v[block + col];
         }
     }
 }
@@ -2959,7 +3548,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
     }
 }
 
-// Single-token decode in two dispatches, gate/up and down (see exl3_moe_cpu_forward_raw).
+// A job in two dispatches, gate/up and down (see exl3_moe_cpu_forward_raw).
 // Splitting the five-phase schedule into separate preparation phases handed every prepared
 // input from the worker that wrote it to all the workers that read it, and most of those
 // phases' time went to moving cache lines between cores rather than to arithmetic. Here
@@ -3040,7 +3629,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
             PreparedIn& p = up ? s.pu : s.pg;
             if (prep_j[up] != j)
             {
-                prepare_rows(mat, c.x, nullptr, H, ch.token, 1, p);
+                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
                 prep_j[up] = j;
             }
             float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j) * MAX_SLOTS * I;
@@ -3055,7 +3644,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 if (c.grp_done_gu[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
                 finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, p, tout, I, b * 8);
             }
-            fold_rows(tout, p, 1, I, b * 128, b * 128 + 128);
+            fold_rows(tout, p, ch.m, I, b * 128, b * 128 + 128);
             if (c.blk_done[j * nb + b].fetch_add(1, std::memory_order_acq_rel) == gu - 1)
                 decode_gu_block(c, j, b * 128);
         });
@@ -3075,7 +3664,10 @@ void decode_phase(void* vctx, int worker, int num_workers)
             if (prep_j != j)
             {
                 s.pd.tin = c.prep_d[j].tin;
-                s.pd.rows = quantize_row(s.pd.tin, I, s.pd, 0, 0);
+                int slot = 0;
+                for (int r = 0; r < ch.m; ++r)
+                    slot = quantize_row(s.pd.tin + static_cast<size_t>(r) * I, I, s.pd, r, slot);
+                s.pd.rows = slot;
                 prep_j = j;
             }
             float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
@@ -3090,7 +3682,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 if (c.grp_done_d[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
                 finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, s.pd, tout, H, b * 8);
             }
-            fold_rows(tout, s.pd, 1, H, b * 128, b * 128 + 128);
+            fold_rows(tout, s.pd, ch.m, H, b * 128, b * 128 + 128);
             if (c.out_done[b].fetch_add(1, std::memory_order_acq_rel) == nc - 1)
                 decode_out_block(c, b * 128, false);
         });
@@ -3117,7 +3709,7 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
 }
 
 // Staged bytes are copied verbatim, packed or not: the GPU restores the native tile order (and
-// dword order) after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM
+// in-tile dword/halfword order) after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM
 // bandwidth instead of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
 // whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
@@ -3185,14 +3777,18 @@ bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 
 // Packed-layout rules (see moe_mul1.h). Band-8 feeds the AVX-512 band kernels (bw/vnni/vbmi
 // share the structure); K8 is exempt (it routes to the dword kernel, which gains nothing);
-// half rates ride the hb template instances there. Band-2 + planar feeds the AVX2 avx2_swz2
-// kernel, which measures above native at every integer rate (numbers in its header comment);
-// half rates stay native on this tier.
+// half rates ride the hb template instances there. Band-2 + planar feeds the AVX2 kernels
+// (avx2_swz2_pair, avx2_swz2), which measure above native at every integer rate (see the
+// avx2_swz2 header comment); half rates use chronological halfword planes only when opted in.
 int exl3_moe_cpu_swizzle_group(double K)
 {
     const int bits = static_cast<int>(K);
     if (g_isa >= Isa::Bw) return bits != 8 ? 8 : 0;
-    if (g_isa == Isa::Avx2) return K == bits && bits >= 1 && bits <= 8 ? 2 : 0;
+    if (g_isa == Isa::Avx2)
+    {
+        if (K == bits && bits >= 1 && bits <= 8) return 2;
+        if (g_fractional_swizzle && K == bits + 0.5 && bits >= 1 && bits <= 3) return 2;
+    }
     return 0;
 }
 
@@ -3459,10 +4055,9 @@ void exl3_moe_cpu_forward_raw(
     static double phase_bytes[6] = {};
     static long prof_jobs = 0;
 
-    // Single-token decode runs as two dispatches (decode_phase). The five-phase schedule
-    // remains for the scalar tier and for repeated selections of one expert (multi-row chunks)
-    bool decode = rows == 1 && g_isa != Isa::Scalar;
-    for (const Chunk& ch : ctx.chunks) decode = decode && ch.m == 1;
+    // The SIMD tiers run every job as two dispatches (decode_phase), from single tokens through
+    // speculative verification to prefill tails; the five-phase schedule remains for the scalar tier
+    const bool decode = g_isa != Isa::Scalar;
     if (decode)
     {
         const size_t num_blk = static_cast<size_t>(nc) * (I / 128);
@@ -3479,23 +4074,27 @@ void exl3_moe_cpu_forward_raw(
         ctx.out_done = ctx.blk_done + num_blk;
         ctx.grp_done_gu = ctx.out_done + H / 128;
         ctx.grp_done_d = ctx.grp_done_gu + num_grp_gu;
-        // Up to four split-K slices per group
-        grow(ar.partials, std::max(num_grp_gu, num_grp_d) * 4 * 256);
-        ctx.partials = ar.partials.data();
 
         // Participants as Pool::run counts them
         const int nw = (n_run > 0 && n_run < g_pool.num_workers) ? n_run : g_pool.num_workers;
+        // Split-K partials hold the two GEMV rows of one token (KSlice)
         bool ok_gu = true, ok_d = true;
         for (const Chunk& ch : ctx.chunks)
         {
-            ok_gu = ok_gu && split_k_ok(layer->ups[ch.expert])
+            ok_gu = ok_gu && ch.m == 1 && split_k_ok(layer->ups[ch.expert])
                           && (layer->gates.empty() || split_k_ok(layer->gates[ch.expert]));
-            ok_d = ok_d && split_k_ok(layer->downs[ch.expert]);
+            ok_d = ok_d && ch.m == 1 && split_k_ok(layer->downs[ch.expert]);
         }
         ctx.parts[0] = decode_parts(static_cast<int>(num_grp_gu), nw, ok_gu);
         ctx.parts[1] = decode_parts(static_cast<int>(num_grp_d), nw, ok_d);
         ctx.units[0] = static_cast<int>(num_grp_gu) * ctx.parts[0];
         ctx.units[1] = static_cast<int>(num_grp_d) * ctx.parts[1];
+        // Split-K slices' raw accumulators, indexed by unit
+        if (ctx.parts[0] > 1 || ctx.parts[1] > 1)
+        {
+            grow(ar.partials, static_cast<size_t>(std::max(ctx.units[0], ctx.units[1])) * 256);
+            ctx.partials = ar.partials.data();
+        }
         if (ar.num_cursors < static_cast<size_t>(2 * nw))
         {
             ar.cursors.reset(new PaddedCounter[2 * nw]);

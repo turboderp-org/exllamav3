@@ -4,7 +4,11 @@
 //
 // Layout: q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (row and head strides given, last dim contiguous), o [Tq, Hq, 256]
 // contiguous. Causal is bottom-right aligned (query i sees keys j <= i + Tkv - Tq), as for a prefill chunk
-// appended to a cache. GQA: head h reads kv head h / (Hq / Hkv).
+// appended to a cache; the frame offset is an argument (offs, Tkv - Tq for that call), so a sliced prefill can
+// pass the offset of the staged slice it is attending over. GQA: head h reads kv head h / (Hq / Hkv).
+// A sliced call (po != nullptr) writes the unnormalized (oacc, m, l) of its slice into slot
+// m_tile * n_bh + bh0 + hq of po / pml instead of the normalized fp16 output, resuming that slot when
+// resume != 0, for the sliced-prefill combine to merge.
 //
 // Block = 64 query rows of one head, 4 warps x 16 rows, two blocks per SM. Q dims 0..127 live in mma A fragments
 // (32 regs) and dims 128..255 in shared memory (read with ldmatrix per tile), O in fp32 accumulators (128 regs);
@@ -75,8 +79,9 @@ fa75_kernel
     const half* __restrict__ k, int64_t k_row, int64_t k_head,
     const half* __restrict__ v, int64_t v_row, int64_t v_head,
     half* __restrict__ o,
+    float* __restrict__ po, float* __restrict__ pml, int n_bh, int bh0, int resume,
     int Tq, int Tkv, int Hq, int Hkv,
-    float scale_log2, int causal
+    float scale_log2, int causal, int offs
 )
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
@@ -98,7 +103,7 @@ fa75_kernel
     const int hq = blockIdx.y;
     const int hk = hq / (Hq / Hkv);
     const int m0 = m_tile * BM;
-    const int offs = Tkv - Tq;                            // causal: key j visible to row i iff j <= i + offs
+    const int slot = m_tile * n_bh + bh0 + hq;         // this block's slice of the combine's partials
 
     const half* q_ = q + hq * q_head;
     const half* k_ = k + hk * k_head;
@@ -140,6 +145,25 @@ fa75_kernel
         for (int i = 0; i < 4; ++i) oacc[dn][i] = 0.0f;
     float mrow[2] = { -1e30f, -1e30f };
     float lrow[2] = { 0.0f, 0.0f };
+
+    if (resume != 0)
+    {
+        // Pick the running state of this slot up where the previous slice left it, in the layout the
+        // store below writes (row = 16 * warp + gq + hh * 8, columns 2 * cq and 2 * cq + 1 of chunk dn)
+        const float* pr = po + ((int64_t)(slot * BM + 16 * warp + gq) * HD + 2 * cq);
+        const float* pl = pml + (slot * BM + 16 * warp + gq) * 2;
+        #pragma unroll
+        for (int dn = 0; dn < HD / 8; ++dn)
+        {
+            oacc[dn][0] = pr[8 * dn];
+            oacc[dn][1] = pr[8 * dn + 1];
+            oacc[dn][2] = pr[8 * dn + 8 * HD];
+            oacc[dn][3] = pr[8 * dn + 8 * HD + 1];
+        }
+        // The buffer holds the row total (summed over the 4 lanes sharing the row); lrow stays per-lane
+        mrow[0] = pl[0]; lrow[0] = pl[1] * 0.25f;
+        mrow[1] = pl[16]; lrow[1] = pl[17] * 0.25f;
+    }
 
     const int row0 = m0 + 16 * warp + gq;                 // this thread's rows: row0, row0 + 8
     int kv_end = causal ? min(Tkv, m0 + BM - 1 + offs + 1) : Tkv;
@@ -297,21 +321,37 @@ fa75_kernel
         __syncthreads();                                   // K(kt+1) visible, V(kt) no longer read
     }
 
-    // Normalize and store
+    // Normalize and store; a sliced call hands the unnormalized state to the combine instead
     #pragma unroll
     for (int hh = 0; hh < 2; ++hh)
     {
         float l = lrow[hh];
         l += __shfl_xor_sync(0xffffffff, l, 1);
         l += __shfl_xor_sync(0xffffffff, l, 2);
-        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
         const int row = row0 + hh * 8;
         if (row < Tq)
         {
-            half* o_ = o + ((int64_t) row * Hq + hq) * HD;
-            #pragma unroll
-            for (int dn = 0; dn < HD / 8; ++dn)
-                *reinterpret_cast<uint32_t*>(o_ + 8 * dn + 2 * cq) = pack_h2(oacc[dn][2 * hh] * inv, oacc[dn][2 * hh + 1] * inv);
+            if (po == nullptr)
+            {
+                const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+                half* o_ = o + ((int64_t) row * Hq + hq) * HD;
+                #pragma unroll
+                for (int dn = 0; dn < HD / 8; ++dn)
+                    *reinterpret_cast<uint32_t*>(o_ + 8 * dn + 2 * cq) = pack_h2(oacc[dn][2 * hh] * inv, oacc[dn][2 * hh + 1] * inv);
+            }
+            else
+            {
+                float* po_ = po + ((int64_t)(slot * BM + 16 * warp + gq + hh * 8) * HD + 2 * cq);
+                #pragma unroll
+                for (int dn = 0; dn < HD / 8; ++dn)
+                {
+                    po_[8 * dn] = oacc[dn][2 * hh];
+                    po_[8 * dn + 1] = oacc[dn][2 * hh + 1];
+                }
+                float* pl_ = pml + (slot * BM + 16 * warp + gq + hh * 8) * 2;
+                pl_[0] = mrow[hh];
+                pl_[1] = l;                    // row total: the combine reads one l per row
+            }
         }
     }
 #endif
@@ -334,7 +374,45 @@ void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
         (const half*) q.data_ptr(), q.stride(0), q.stride(1),
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),
         (const half*) v.data_ptr(), v.stride(0), v.stride(1),
-        (half*) o.data_ptr(), Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0);
+        (half*) o.data_ptr(), nullptr, nullptr, 0, 0, 0,
+        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, Tkv - Tq);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// One slice of the bounded staged prefill window. q [Tq, Hq, HD] fp16, k/v [Tkv, Hkv, HD] fp16 are
+// the scratch slice of one sequence; the first key is absolute (frame_len - offs) in a frame of
+// frame_len keys ending at this q chunk. Writes the unnormalized (oacc, m, l) into the combine's
+// slot (m_tile * n_bh + bh), resuming that slot when resume != 0.
+void fa75_fwd_slice(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor partial_o, at::Tensor partial_ml,
+                    int64_t n_bh, int64_t bh0, double scale, int64_t offs, bool resume)
+{
+    const at::cuda::OptionalCUDAGuard guard(q.device());
+    TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf, "fp16");
+    TORCH_CHECK(partial_o.dtype() == at::kFloat && partial_ml.dtype() == at::kFloat, "fp32 partials");
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "3-d tensors");
+    TORCH_CHECK(q.size(2) == HD && k.size(2) == HD && v.size(2) == HD,
+                "fa75_fwd_slice: head_dim 256 only");
+    TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1, "contiguous head dim");
+    TORCH_CHECK(q.stride(1) % 8 == 0 && q.stride(0) % 8 == 0 && k.stride(0) % 8 == 0 && k.stride(1) % 8 == 0 &&
+                v.stride(0) % 8 == 0 && v.stride(1) % 8 == 0, "16-byte aligned strides");
+    int Tq = q.size(0), Hq = q.size(1), Tkv = k.size(0), Hkv = k.size(1);
+    TORCH_CHECK(Hq % Hkv == 0 && v.size(0) == Tkv && v.size(1) == Hkv, "shapes");
+    TORCH_CHECK(bh0 >= 0 && bh0 + Hq <= n_bh, "head/batch base within n_bh");
+    dim3 grid((Tq + BM - 1) / BM, Hq);
+    // Slot (m_tile, bh0 + q head): n_bh slots per query block (m_tile), BM * HD floats per slot.
+    // The launched grid.x query blocks therefore need grid.x * n_bh slots, not n_bh alone
+    int64_t n_slots = (int64_t) grid.x * n_bh;
+    TORCH_CHECK(partial_o.is_contiguous() && partial_o.numel() >= n_slots * BM * HD,
+                "partial_o must hold grid.x * n_bh * BM * 256 floats");
+    TORCH_CHECK(partial_ml.is_contiguous() && partial_ml.numel() >= n_slots * BM * 2,
+                "partial_ml must hold grid.x * n_bh * BM * 2 floats");
+    fa75_kernel<<<grid, NTHREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        (const half*) q.data_ptr(), q.stride(0), q.stride(1),
+        (const half*) k.data_ptr(), k.stride(0), k.stride(1),
+        (const half*) v.data_ptr(), v.stride(0), v.stride(1),
+        nullptr, (float*) partial_o.data_ptr(), (float*) partial_ml.data_ptr(),
+        (int) n_bh, (int) bh0, resume ? 1 : 0,
+        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), 1, (int) offs);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -344,6 +422,12 @@ void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
 #include <c10/util/Optional.h>
 
 void fa75_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+{
+    TORCH_CHECK(false, "Turing (sm_75) kernel not available on ROCm");
+}
+
+void fa75_fwd_slice(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor partial_o, at::Tensor partial_ml,
+                    int64_t n_bh, int64_t bh0, double scale, int64_t offs, bool resume)
 {
     TORCH_CHECK(false, "Turing (sm_75) kernel not available on ROCm");
 }

@@ -15,6 +15,10 @@ class InferParams:
     Runtime inference parameters. Configure before loading model/modules
     """
 
+    # Conversion only: keep block-scaled fp4/fp8 checkpoint linears packed as stored and dequantize to fp16 per
+    # use (LinearFP16Packed), so a layer of hundreds of fp4 experts costs a quarter of its fp16 footprint
+    packed_fp16_source: bool = False
+
     # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
     no_reconstruct: bool = False
 

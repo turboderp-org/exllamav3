@@ -206,10 +206,6 @@ def main(args):
             state_b = module_b.prepare_for_device(state_b, params_b[b])
             state_b = module_b.forward(state_b, params_b[b]).clone()
 
-            # Optionally override model A state for first layers
-            if idx < args.keep_b:
-                state_a = state_b.clone()
-
             # Drop logits on last iteration
             if not logits_layer:
                 states_a[b] = state_a
@@ -285,6 +281,11 @@ def main(args):
                     for cf_a in range(0, logits_b2.shape[0], 256):
                         cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
                         conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
+
+            # keep_b: the error above is this module's own, both models fed the same (B) input;
+            # from here on A continues from B's state
+            if idx < args.keep_b and not logits_layer:
+                states_a[b] = state_b.clone()
 
         # Print error
         if not logits_layer:
@@ -473,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows, default: 100", default = 100)
     parser.add_argument("-l", "--length", type = int, help = "Tokens per row, default: 2048", default = 2048)
-    parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
+    parser.add_argument("-kb", "--keep_b", type = int, help = "Propagate B's state through the first N modules: each of them still reports its own A vs B error on the same input, isolating per-module error from accumulated drift", default = 0)
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
     parser.add_argument("-or", "--override", type = str, help = "Model A tensor override spec (YAML)", default = None)

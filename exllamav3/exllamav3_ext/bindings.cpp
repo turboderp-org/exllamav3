@@ -14,6 +14,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "sparse_head.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
@@ -36,6 +37,7 @@
 #include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
+#include "generator/staging.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/sampling_extra.cuh"
 #include "generator/gumbel.cuh"
@@ -57,6 +59,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
@@ -68,6 +71,7 @@
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
+#include "dequant_blocks.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -113,6 +117,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
+    m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup",
         py::arg("hidden"), py::arg("gate"), py::arg("scores"), py::arg("bias"),
@@ -135,13 +140,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ple_forward_streams_fused", &ple_forward_streams_fused, "ple_forward_streams_fused");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_fused", &hc_mix_fused, "hc_mix_fused");
+    m.def("dequant_blocks", &dequant_blocks, "dequant_blocks");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
@@ -231,6 +239,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+    m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
@@ -302,6 +311,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("generator_stage_decode", &generator_stage_decode, "generator_stage_decode");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
 
     m.def("quant_cache_cont", &quant_cache_cont, "quant_cache_cont");
@@ -326,6 +336,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"

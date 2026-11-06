@@ -212,6 +212,7 @@ python examples/chat.py -h
 | **Ling 3.x**                                      | `BailingMoeV3ForCausalLM`                                                     |            |                       |
 | **Laguna 2.1**                                    | `LagunaForCausalLM`                                                           |            |                       |
 | **LFM 2.5**, **LFM2.5-VL**                        | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM`<br>`Lfm2VlForConditionalGeneration` |     ✓     |                       |
+| **LFM 3**, **LFM3-VL**                            | `Lfm3ForCausalLM`<br>`Lfm3VlForConditionalGeneration`                          |     ✓     |                       |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.             | `LlamaForCausalLM`                                                            |            |                       |
 | **MiMo-RL**                                       | `MiMoForCausalLM`                                                             |            |                       |
 | **MiMo-V2.6-Flash**                               | `MiMoV2ForCausalLM`                                                           |     ✓     | no audio              |
@@ -219,7 +220,7 @@ python examples/chat.py -h
 | **Mistral**, **Ministral 3**, **Mistral-4** etc.  | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration`                    |     ✓     |                       |
 | **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
 | **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
-| **Nemotron 3.5 Bolt**                             | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
+| **Nemotron 3.5 Bolt**, **Nemotron 3.5 Super VL**  | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
 | **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
 | **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |
 | **Phi3**, **Phi4**                                | `Phi3ForCausalLM`                                                             |            |                       |

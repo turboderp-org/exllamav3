@@ -155,7 +155,10 @@ BC_Attention::BC_Attention
         qkv_n_stride = meta.select(0, 3).contiguous().to(dev);
         qkv_had_src = meta.select(0, 4).contiguous().to(dev);
         int width = meta[2][0].item<int>();
-        qkv_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kHalf).device(dev));
+        // Sliced mode writes every slice through qkv_c_ptrs, so the carrier is never touched and
+        // needs no backing beyond one element: a zero-stride expansion to the shape mgemm checks
+        qkv_carrier = at::empty({1, 1, 1}, at::TensorOptions().dtype(at::kHalf).device(dev))
+                      .expand({slices, MAX_BSZ * MAX_QLEN, width});
     }
 }
 

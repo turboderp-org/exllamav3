@@ -21,6 +21,19 @@ void ple_gate_gr
     Graph* graph
 );
 
+void ple_forward_streams_fused
+(
+    const at::Tensor& streams,
+    const at::Tensor& emb,
+    const at::Tensor& kv_w,
+    const at::Tensor& norm_key_w,
+    const at::Tensor& norm_query_w,
+    double rms_eps,
+    double norm_bias,
+    double gate_scale,
+    at::Tensor delta
+);
+
 void ple_forward_streams
 (
     const at::Tensor& streams,

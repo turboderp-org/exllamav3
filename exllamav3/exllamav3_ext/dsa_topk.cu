@@ -295,10 +295,12 @@ compaction resolves ties in ascending global index order, identical to the legac
 static at::Tensor& dsa_topk_ws(int device)
 {
     static std::mutex mtx;
-    static std::map<int, at::Tensor> ws;
+    // Leaked: a static map would free its tensors from a static destructor at exit, after the CUDA
+    // allocator has gone (a cudaMallocAsync free at teardown terminates the process)
+    static auto* ws = new std::map<int, at::Tensor>();
     std::lock_guard<std::mutex> lock(mtx);
-    auto it = ws.find(device);
-    if (it == ws.end())
+    auto it = ws->find(device);
+    if (it == ws->end())
     {
         // Candidate indices + counts (int32) followed by candidate scores (half, same count
         // as indices; int-sized allocation keeps one flat buffer)
@@ -307,7 +309,7 @@ static at::Tensor& dsa_topk_ws(int device)
             {(int64_t) TOPK_SPLIT_MAX_R * TOPK_SPLIT_G * TOPK_SPLIT_MAX_KPAD * 3 / 2 + TOPK_SPLIT_MAX_R * TOPK_SPLIT_G},
             at::TensorOptions().dtype(at::kInt).device(at::Device(at::kCUDA, device))
         );
-        it = ws.emplace(device, std::move(t)).first;
+        it = ws->emplace(device, std::move(t)).first;
     }
     return it->second;
 }

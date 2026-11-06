@@ -39,6 +39,7 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.pending_jobs = []
     g.active_jobs = list(jobs)
     g.recurrent_cache = None
+    g.pipeline = None
     g.draft_model = None
     g.dflash_draft = False
     g.mtp_draft = False

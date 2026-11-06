@@ -96,7 +96,7 @@ struct BC_Attention
     bool qkv_mcg;
     bool qkv_mul1;
     at::Tensor qkv_size_n, qkv_n_stride, qkv_had_src;   // device int32, per slice
-    at::Tensor qkv_carrier;   // (slices, MAX_R, width) dtype/width carrier for the mgemm C argument
+    at::Tensor qkv_carrier;   // (slices, MAX_R, width) zero-stride dtype/width carrier for the mgemm C argument
     int qkv_num_src = 0;
 
     // Head norms, fused into the RoPE kernel

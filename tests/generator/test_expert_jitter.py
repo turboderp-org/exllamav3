@@ -22,6 +22,8 @@ def generator():
     gen.expert_jitter_layout = {"layer0": 0, "layer1": 3}
     gen.expert_jitter_size = 7
     gen.pagetable = SimpleNamespace(max_pages = 16, all_pages = [])
+    gen.max_total_tokens = 16 * 256
+    gen.pipeline = None
     gen.max_draft_tokens = 0
     gen.max_chunk_size = 256
     gen.max_batch_size = 8
@@ -30,7 +32,7 @@ def generator():
     gen.ngram_match_min = gen.hybrid_draft_tokens = 0
     gen.ngram_corpus = gen.recurrent_cache = gen.draft_model = None
     gen.cache = gen.draft_cache = None
-    gen.model = MagicMock(caps = {})
+    gen.model = MagicMock(caps = {}, pipeline = None)
     return gen
 
 
@@ -110,13 +112,20 @@ def test_layer_and_token_broadcast(monkeypatch, batch, tokens):
 
 
 @pytest.mark.parametrize("mtp", [False, True])
-def test_prefill_target_only(mtp):
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_prefill_target_only(mtp, pipeline):
     gen = generator()
     gen.mtp_draft = mtp
-    gen.draft_model = MagicMock(draft_verifier_params = {})
+    gen.draft_model = MagicMock(draft_verifier_params = {}, caps = {})
     def target_forward(input_ids, params):
         params["export_states"] = [torch.zeros(1, input_ids.shape[1], 4)]
     gen.model.forward.side_effect = target_forward
+    if pipeline:
+        def prefill(input_ids, params, owner, to_output, then):
+            target = gen.model.forward if to_output else gen.model.prefill
+            target(input_ids = input_ids, params = params)
+            then(params)
+        gen.pipeline = SimpleNamespace(prefill = MagicMock(side_effect = prefill))
     a = job(gen)
     seq = a.sequences[0]
     seq.allocated_pages = [SimpleNamespace(kv_position = 0, sequence = torch.zeros(1, 256).long())]
@@ -144,7 +153,7 @@ def test_decode_compact_batch(speculative):
     gen = generator()
     gen.num_draft_tokens = 0
     gen.target_recurrent = False
-    gen.draft_model = MagicMock(draft_verifier_params = {})
+    gen.draft_model = MagicMock(draft_verifier_params = {}, caps = {})
     ready, skipped, disabled, last = job(gen, seed = 124), job(gen, seed = 125), job(gen, j = 1), job(gen)
     gen.active_jobs = [ready, skipped, disabled, last]
     for a in (ready, disabled, last):
@@ -157,6 +166,12 @@ def test_decode_compact_batch(speculative):
                                               sequence = torch.zeros(1, 256).long())]
     gen._staging = lambda name, rows, width = None, dtype = torch.int32: torch.zeros(
         (rows,) if width is None else (rows, width), dtype = dtype)
+    def stage_arena(rows, width, with_positions):
+        host = torch.zeros(rows * width + rows * (2 if with_positions else 1), dtype = torch.int32)
+        return host, gen._arena_views(host, rows, width, with_positions), {}
+    gen._stage_arena = stage_arena
+    gen._upload_arena = lambda *args: None
+    # The native staging call is GPU-independent; use it to assemble the real decode inputs.
     # Stop at the model boundary: exercise real input assembly without sampling or GPU execution.
     gen.model.forward.side_effect = RuntimeError("model boundary")
     with pytest.raises(RuntimeError, match = "model boundary"):

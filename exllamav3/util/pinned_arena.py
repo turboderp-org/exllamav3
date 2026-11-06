@@ -4,6 +4,7 @@ import os
 import weakref
 import torch
 from .memory import check_host_memory
+from .misc import cuda_sync_active
 
 # cudaHostRegister / hipHostRegister flags. Portable: usable from every device's context. Mapped: addressable
 # from kernels through its device pointer (zero-copy aliases)
@@ -13,7 +14,9 @@ _HOST_REGISTER_MAPPED = 0x02
 
 def _unregister(ptr: int):
     from ..ext import exllamav3_ext as ext
-    torch.cuda.synchronize()
+    # Wait for transfers on every device that can have any queued, without creating a context on cuda:0
+    # the way a bare torch.cuda.synchronize() would
+    cuda_sync_active()
     ext.cuda_host_unregister(ptr)
 
 

@@ -9,12 +9,15 @@ ext.gdn_lowrank_gemv_f(x, w_t, y): the same without bias for fp32 x and any k (K
     k = head dim, n = num_v_heads * head dim).
 
 Both reduce in a fixed order (strided per-lane fp32 FMA chains, then a warp butterfly), so results are
-bit-reproducible. Every element of y is written, nothing beyond it.
+bit-reproducible. Every element of y is written, nothing beyond it. gdn_ba_gemv takes a single-pass kernel for up to
+16 rows when k % 8 == 0 and x, w_t are 16-byte aligned (8-element chunks per thread, the 8 warps of a block splitting
+k, then a warp butterfly and the sum of the 8 warp partials), the strided kernel otherwise.
 
 Tolerance: fp16 x fp16 products are exact in fp32 and fp32 x fp16 products are rounded once per FMA, so the error
 is that of fp32 summation: each lane accumulates ceil(k / 64) (fp16 pairs) or ceil(k / 32) (fp32 x) terms and
 the warp reduction adds 5 levels, giving |err| <= (terms per lane + 5 + 2) * 2^-24 * sum_i |x_i w_i| (+ bias),
-the usual first-order bound on recursive summation.
+the usual first-order bound on recursive summation. The single-pass kernel's chains hold 8 * ceil(k / 2048)
+products plus the 8 warp partials; ba_terms takes the deeper of the two.
 """
 
 import math
@@ -53,6 +56,10 @@ def gemv_reference(x, w_t, bias, terms_per_lane):
     return ref, bound
 
 
+def ba_terms(k):
+    return max(math.ceil(k / 64), 8 * math.ceil(k / 2048) + 8)
+
+
 def assert_within(y, ref, bound):
     y2 = y.reshape(ref.shape).double()
     err = (y2 - ref).abs()
@@ -71,6 +78,15 @@ BA_CASES = [
     ((2, 5), 2050, 13),
     ((1, 1), 2, 1),
     ((33,), 384, 96),
+    # single-pass kernel (<= 16 rows, k % 8 == 0): a 9-token speculative verify step at Qwen3.8-27B's size, the
+    # 16-row limit, k / 8 not a multiple of the block width, a k smaller than one chunk per thread, and 17 rows,
+    # the first row count that takes the strided kernel again
+    ((9,), 5120, 96),
+    ((1, 16), 4096, 64),
+    ((1, 7), 2048, 48),
+    ((3,), 1032, 40),
+    ((2,), 8, 5),
+    ((17,), 2048, 96),
 ]
 
 
@@ -87,7 +103,7 @@ def test_gdn_ba_gemv(device, lead, k, n, with_bias):
 
     ext.gdn_ba_gemv(x, w_t, bias, y)
 
-    ref, bound = gemv_reference(x, w_t, bias, math.ceil(k / 64))
+    ref, bound = gemv_reference(x, w_t, bias, ba_terms(k))
     assert_within(y, ref, bound)
     assert_guards(buf)
     assert torch.equal(x, x_in) and torch.equal(w_t, w_in), "inputs modified"
@@ -95,6 +111,26 @@ def test_gdn_ba_gemv(device, lead, k, n, with_bias):
     y2 = torch.empty_like(y)
     ext.gdn_ba_gemv(x, w_t, bias, y2)
     assert torch.equal(y, y2), "not bit-reproducible"
+
+
+@pytest.mark.parametrize("rows", [1, 9, 16])
+@torch.inference_mode()
+def test_gdn_ba_gemv_unaligned(device, rows):
+    # x 4-byte but not 16-byte aligned: the strided kernel runs instead of the single-pass one, same results
+    torch.manual_seed(2)
+    k, n = 2048, 96
+    x = torch.randn(rows * k + 2, dtype = torch.half, device = device)[2:].view(rows, k)
+    w_t = (torch.randn(n, k, device = device) / k ** 0.5).half()
+    assert x.data_ptr() % 16 != 0
+    buf, y = guarded_out((rows, n), device)
+    ext.gdn_ba_gemv(x, w_t, None, y)
+    ref, bound = gemv_reference(x, w_t, None, ba_terms(k))
+    assert_within(y, ref, bound)
+    assert_guards(buf)
+
+    y_aligned = torch.empty_like(y)
+    ext.gdn_ba_gemv(x.clone(), w_t, None, y_aligned)
+    assert_within(y_aligned, ref, bound)
 
 
 @torch.inference_mode()

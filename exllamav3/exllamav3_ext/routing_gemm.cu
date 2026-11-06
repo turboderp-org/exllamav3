@@ -268,9 +268,11 @@ static int rg_slices(int R, int E, int KC)
     return S;
 }
 
-// Per-device static workspaces for decode-class row counts
+// Per-device static workspaces for decode-class row counts. Leaked: a static array would free its tensors from
+// a static destructor at exit, after the CUDA allocator has gone (a cudaMallocAsync free at teardown terminates
+// the process)
 struct RGWorkspace { at::Tensor ahi, alo, sa, part; int K = 0, E = 0; };
-static RGWorkspace g_rg_ws[32];
+static RGWorkspace* const g_rg_ws = new RGWorkspace[32];
 
 bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, const at::Tensor& scores)
 {

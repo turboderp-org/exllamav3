@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import multiprocessing
 from multiprocessing import shared_memory
 import numpy as np
@@ -124,7 +125,7 @@ class MoeCpuTuning:
         # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
         # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
         # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
-        # AVX-512 tiers, band-2 + planar dwords on AVX2, native on scalar).
+        # AVX-512 tiers, band-2 + planar dwords/halfwords on AVX2, native on scalar).
         # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout everywhere.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
         # Experts read per deferred-load pass when the worker loads a layer. Each pass is read
@@ -390,15 +391,43 @@ def _win32_large_page_alloc(size: int, min_size: int):
     return buf
 
 
+def _fractional_native_subset(native, q, p, e):
+    """Native halfwords for planes[..., p::2, e::2], retaining the tile-prefix strides."""
+    # q is odd: the even plane/lane steps leave xor 1 entirely in the start index.
+    return native.as_strided(
+        native.shape[:-1] + ((q - p + 1) // 2, 4),
+        native.stride()[:-1] + (2, 2 * q),
+        native.storage_offset() + ((q * e + p) ^ 1))
+
+
 def _copy_repacked(dst, tensor, group, planar):
     """Copy a [k/16, n/16, 16K] trellis tensor into a same-shape view, applying the packed
     CPU layout (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout): tile (kt, nt) moves
-    to (nt/group, kt, nt%group), and with planar each tile's dwords are transposed -- dword w
-    to 8*(w%bits) + w/bits, i.e. the trailing (8, bits) dword dims swap (integer rates only,
-    where group is nonzero). One strided copy_; group 0 is a plain copy."""
+    to (nt/group, kt, nt%group). Integer planar tiles transpose dword w to 8*(w%bits) + w//bits.
+    Fractional planar tiles use Q = 2*bits+1 halfword planes, with chronological halfword j
+    packed at 8*(j%Q) + j//Q from native[j ^ 1] (no byte swap within a halfword).
+    Copies write directly into `dst` on the caller's CPU/CUDA stream, without a full-tensor
+    temporary. Group 0 is a plain copy."""
     tk, tn, ps = tensor.shape
     if not group:
         dst.copy_(tensor)
+    elif planar and ps % 16 == 8:
+        assert group == 2, "fractional planar layout requires group 2"
+        q = ps // 8
+        native = tensor.view(tk, tn // group, group, ps).permute(1, 0, 2, 3)
+        planes = dst.view(tn // group, tk, group, q, 8)
+        if q == 3 and dst.device.type == "cpu" and tensor.device.type == "cpu":
+            # Measurements favor six single-plane copies for 1.5-bit CPU-to-CPU.
+            # The even 2*q step keeps xor 1 in start, preserving the byte mapping
+            # in bounded four-halfword slices.
+            for p in range(q):
+                for e in range(2):
+                    start = (q * e + p) ^ 1
+                    planes[..., p, e::2].copy_(native[..., start::2 * q])
+        else:
+            for p in range(2):
+                for e in range(2):
+                    planes[..., p::2, e::2].copy_(_fractional_native_subset(native, q, p, e))
     elif planar:
         wd = ps // 2
         dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
@@ -410,10 +439,25 @@ def _copy_repacked(dst, tensor, group, planar):
 
 def _copy_unpacked(dst, packed, group, planar):
     """The inverse of _copy_repacked: a packed-layout [k/16, n/16, 16K] view back to native
-    tile order (and dword order) in `dst`"""
+    tile order (and integer dword / fractional halfword order) directly in `dst`.
+    Fractional native halfword h comes from packed[8*((h ^ 1)%Q) + (h ^ 1)//Q]."""
     tk, tn, ps = dst.shape
     if not group:
         dst.copy_(packed)
+    elif planar and ps % 16 == 8:
+        assert group == 2, "fractional planar layout requires group 2"
+        q = ps // 8
+        native = dst.view(tk, tn // group, group, ps)
+        planes = packed.view(tn // group, tk, group, q, 8).permute(1, 0, 2, 3, 4)
+        if q == 3 and dst.device.type == "cpu" and packed.device.type == "cpu":
+            for p in range(q):
+                for e in range(2):
+                    start = (q * e + p) ^ 1
+                    native[..., start::2 * q].copy_(planes[..., p, e::2])
+        else:
+            for p in range(2):
+                for e in range(2):
+                    _fractional_native_subset(native, q, p, e).copy_(planes[..., p::2, e::2])
     elif planar:
         wd = ps // 2
         dst.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).copy_(
@@ -666,8 +710,12 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             pass
 
     shm = None
+    t_entry = time.time()
     try:
         stc = SafetensorsCollection(model_dir)
+        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(f" -- worker: entered main at {t_entry:.3f}, checkpoint index ready at {time.time():.3f} "
+                  f"({time.time() - t_entry:.2f} s)", flush = True)
         cpu = torch.device("cpu")
         # Pinned mode: memfd-backed chunks, published to the parent as they are created
         arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None)
@@ -684,7 +732,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         # Repack the trellis copies into the packed layout the kernel tier wants for each
         # matrix's bitrate (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; group 0
-        # keeps native order: scalar tier, half rates on AVX2, K8 on the AVX-512 tiers)
+        # keeps native order: scalar tier, half rates on AVX2 unless explicitly enabled,
+        # K8 on the AVX-512 tiers)
         swz = TUNING.swizzle
 
         def rehome_trellis(t):
@@ -737,13 +786,48 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         # install, so the workers never observe a torn write
         layer_views = []
 
+        # The pipe is drained by its own thread into a queue: the parent registers layers as
+        # fast as it loads its own, and a send that had to wait for a child busy rehoming the
+        # previous layer would couple the two loads through the socket buffer
+        import queue
+        import threading
+        inbox = queue.Queue()
+        def receive():
+            while True:
+                try:
+                    m = conn.recv()
+                except EOFError:
+                    m = ("quit",)
+                inbox.put(m)
+                if m[0] == "quit":
+                    return
+        threading.Thread(target = receive, daemon = True).start()
+        # Rehoming one batch overlaps the deferred fetch of the next (the loader releases the
+        # GIL while its engine runs); a single worker thread keeps the arena writes in order
+        from concurrent.futures import ThreadPoolExecutor
+        rehome_pool = ThreadPoolExecutor(max_workers = 1)
+        debug = bool(os.environ.get("EXL3_MOE_ARENA_DEBUG"))
+        if debug:
+            print(f" -- worker: affinity {len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else '?'} cpus, "
+                  f"torch threads {torch.get_num_threads()}, loader stage threads {stage_threads}", flush = True)
         while True:
-            msg = conn.recv()
+            t_wait = time.perf_counter()
+            msg = inbox.get()
+            t_wait = time.perf_counter() - t_wait
             if msg[0] == "layer":
+                t_layer = time.perf_counter()
                 spec = msg[1]
                 num_experts = len(spec["up_keys"])
                 batch = TUNING.load_batch_experts or num_experts
                 g, u, d, blocks, auxlocs = [], [], [], [], []
+                pending = None
+                def collect(fut):
+                    bg_, bu_, bd_, bb, ba = fut.result()
+                    g.extend(bg_)
+                    u.extend(bu_)
+                    d.extend(bd_)
+                    blocks.extend(bb)
+                    auxlocs.extend(ba)
                 for e0 in range(0, num_experts, batch):
                     sl = slice(e0, e0 + batch)
                     stc.begin_deferred_load()
@@ -752,13 +836,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     bd = fetch(spec["down_keys"][sl])
                     stc.end_deferred_load()
                     # Copy into the hugepage-backed arena now that the deferred reads have
-                    # actually populated these tensors; the loader tensors die with this batch
-                    bg, bu, bd, bb, ba = rehome_experts(bg, bu, bd)
-                    g += bg
-                    u += bu
-                    d += bd
-                    blocks += bb
-                    auxlocs += ba
+                    # actually populated these tensors; the loader tensors die with this batch.
+                    # The copy runs on the rehome thread while the next batch is fetched
+                    if pending is not None:
+                        collect(pending)
+                    pending = rehome_pool.submit(rehome_experts, bg, bu, bd)
+                if pending is not None:
+                    collect(pending)
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -768,12 +852,17 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     1 if swz else 0,
                 )
                 layer_views.append((g, u, d))
-                # Reclaim this layer's now-discarded loader tensors immediately (rehome_experts
-                # copied everything into the arena)
-                try:
-                    ctypes.CDLL(None).malloc_trim(0)
-                except Exception:
-                    pass
+                if debug:
+                    print(f" -- worker: layer {len(layer_views) - 1}: waited {t_wait * 1000:.0f} ms for the spec, "
+                          f"loaded in {(time.perf_counter() - t_layer) * 1000:.0f} ms, done at {time.time():.3f}", flush = True)
+                # Reclaim the discarded loader tensors (rehome_experts copied everything into the
+                # arena); every few layers rather than every layer, the trim itself takes a
+                # noticeable slice of a layer's load
+                if len(layer_views) % 4 == 3:
+                    try:
+                        ctypes.CDLL(None).malloc_trim(0)
+                    except Exception:
+                        pass
                 # The ack carries the expert block locations (only meaningful to a parent that
                 # maps the arena)
                 conn.send(("ok", blocks if pinned else None, auxlocs if pinned else None))
@@ -790,7 +879,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         def install(li, ei, keys):
             """Replace expert ei of layer li with the checkpoint tensors at `keys` (one key
-            per projection, gate omitted for gateless layers), in place in the arena."""
+            per projection, gate omitted for gateless layers), in place in the arena using
+            the same packed representation as the initial rehome."""
             views = layer_views[li]
             projs = views if len(keys) == 3 else views[1:]
             for key, plist in zip(keys, projs):
@@ -831,10 +921,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         threading.Thread(target = arena.promote_hugepages, daemon = True).start()
 
         while True:
-            try:
-                msg = conn.recv()
-            except EOFError:
-                break
+            msg = inbox.get()
             if msg[0] == "install":
                 try:
                     install(msg[1], msg[2], msg[3])
@@ -883,6 +970,21 @@ def _pinning_exhausted(e: Exception) -> bool:
 
 class MoeCpuHost:
 
+    @classmethod
+    def for_config(cls, config):
+        """The worker host of this config's component (infer_params.moe_cpu_component), created
+        on first use and shared by every offloaded layer of the component"""
+        comp = getattr(config.infer_params, "moe_cpu_component", "text")
+        hosts = getattr(config, "moe_cpu_hosts", None)
+        if hosts is None:
+            hosts = {}
+            config.moe_cpu_hosts = hosts
+        host = hosts.get(comp)
+        if host is None:
+            host = cls(config)
+            hosts[comp] = host
+        return host
+
     def __init__(self, config):
         self.config = config
         self.model_dir = config.directory
@@ -930,6 +1032,9 @@ class MoeCpuHost:
         # memory (WDDM and WSL2 budget the pinnable memory at about half of RAM) ends the pinning,
         # and experts in it and every later chunk stream through the staged path instead
         self.arena_registered = None
+        # The chunk the worker may still be writing: (index, size, name, mapping), page-locked
+        # once the next chunk appears or loading is done (see _attach_chunk)
+        self._arena_pending = None
         self.layer_blocks = []
         self.layer_auxloc = []
         # Promote-on-miss transfers (see BlockSparseMLP_CPU._split_promote_step): per device a
@@ -950,6 +1055,23 @@ class MoeCpuHost:
         )
         self.proc.start()
         child_conn.close()
+        # Parent -> child messages go through a queue and a sender thread: a layer spec is tens
+        # of KB, and a direct send would block the loading thread until the child's receiver
+        # takes it, which it only gets to do between its own loader calls
+        import queue
+        import threading
+        self._send_queue = queue.Queue()
+        def sender():
+            while True:
+                msg = self._send_queue.get()
+                if msg is None:
+                    return
+                try:
+                    self.conn.send(msg)
+                except Exception:
+                    return
+        self._sender = threading.Thread(target = sender, daemon = True)
+        self._sender.start()
         # Cleanupper fires at the end of the __main__ scope, before interpreter teardown breaks
         # the shm views and pipe machinery that shutdown() needs; PDEATHSIG in the child covers
         # the paths where no Python hook runs at all
@@ -998,12 +1120,16 @@ class MoeCpuHost:
 
     def _attach_chunk(self, index, size, name):
         """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
-        ("chunk", ...) message; Windows: section `name`) and page-lock it for DMA. Registration
-        is done here, per chunk as it appears during loading, so its cost overlaps the rest of
-        the load instead of stacking up at startup. Any failure closes the mapping before the
-        error leaves this frame."""
+        ("chunk", ...) message; Windows: section `name`) and page-lock the chunk before it. The
+        worker fills its chunks strictly in order, so a chunk is complete once its successor is
+        published; the last one is page-locked when loading is done (ensure_started). A chunk is
+        never page-locked while the worker writes it: on Windows the driver's per-page probe
+        rewrites each page's first byte, and a concurrent write there is lost. Registration still
+        overlaps the rest of the load. Any failure closes the mapping before the error leaves
+        this frame."""
         import mmap
         import socket
+        self._pin_pending_chunk()
         assert index == len(self.arena_maps), "arena chunk published out of order"
         if name is not None:
             # Opening by name fails loudly if the worker already dropped the section
@@ -1024,6 +1150,14 @@ class MoeCpuHost:
             self.arena_maps.append(None)
             self.arena_views.append(None)
             return
+        self._arena_pending = (index, size, name, m)
+
+    def _pin_pending_chunk(self):
+        """Page-lock the chunk published last (see _attach_chunk), once the worker has finished it"""
+        if self._arena_pending is None:
+            return
+        index, size, name, m = self._arena_pending
+        self._arena_pending = None
         view = None
         try:
             # count = size // 2: a section opened by name reports its page-rounded size, and
@@ -1094,30 +1228,28 @@ class MoeCpuHost:
         self.by_key[key] = idx
         if aux is not None:
             self.aux[idx] = aux
-        self.conn.send(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
+        self._send_queue.put(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
         return idx
 
     def commit_module(self, module_key):
         """
-        Called by the loader after a top-level module has committed on the GPU side: block until
-        the child has loaded every layer registered under that module, keeping load progress
-        honest and the child at most one layer behind.
+        Called by the loader after a top-level module has committed on the GPU side: take whatever
+        the child has sent so far (acks, pinned-arena chunks, errors) without waiting for it. The
+        child loads behind the parent at its own pace and the parent only waits for it in
+        ensure_started, before the first forward; an error in the child still surfaces within a
+        module of happening
         """
-        if self.proc is None:
+        if self.proc is None or self.conn is None:
             return
-        idxs = [i for k, i in self.by_key.items()
-                if k == module_key or k.startswith(module_key + ".")]
-        if not idxs:
-            return
-        need = max(idxs) + 1
-        while self.acked < need:
-            self._pump(1.0)
+        while self.conn.poll(0):
+            self._pump(0)
 
     def ensure_started(self):
         if self.started or not self.specs:
             return
         while self.acked < len(self.specs):
             self._pump(1.0)
+        self._pin_pending_chunk()
 
         max_hi = max(s["hi"] for s in self.specs)
         max_ho = max(s["ho"] for s in self.specs)
@@ -1210,7 +1342,7 @@ class MoeCpuHost:
         # Per-device CUDA state for the streamed-prefill path (copy stream, VRAM ring, events)
         self.sstate = {}
 
-        self.conn.send(("start", self.shm.name, self.layout))
+        self._send_queue.put(("start", self.shm.name, self.layout))
 
         import time
         t0 = time.time()
@@ -1647,8 +1779,9 @@ class MoeCpuHost:
     # the GPU slot tensors and its arena block by DMA on a side stream: no checkpoint read, no
     # worker message, no quiesce. The arena holds the bytes in the CPU tier's packed layout
     # (_stream_layout), the GPU slots in native order, so a transfer repacks through the staging
-    # buffers with the same strided copies the child loader uses. The caller orders the transfers
-    # against the compute streams (BlockSparseMLP_CPU._split_promote_step).
+    # buffers with the same bounded strided copies the child loader uses, including fractional
+    # halfword planes. The caller orders the transfers against the compute streams
+    # (BlockSparseMLP_CPU._split_promote_step).
 
     def promote_ready(self, layer_idx, cpu_local):
         """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
@@ -1785,7 +1918,7 @@ class MoeCpuHost:
         checkpoint tensors at `keys` (per-projection prefixes, gate first when gated). The
         caller must have quiesced (full stream sync => job ring drained, worker idle) before
         calling; blocks until the child acks the in-place arena copy."""
-        self.conn.send(("install", layer_idx, local_idx, keys))
+        self._send_queue.put(("install", layer_idx, local_idx, keys))
         msg = self.conn.recv()
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
@@ -2032,7 +2165,7 @@ class MoeCpuHost:
                 copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
                 if restore:
-                    # Restore the native tile order on the copy stream, one launch per
+                    # Restore native tile and dword/halfword order on the copy stream, one launch per
                     # projection over the whole batch (group-0 projections in an otherwise
                     # packed layer take the plain-copy path in the same kernel)
                     for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
@@ -2207,9 +2340,11 @@ class MoeCpuHost:
                     # The child's main thread serves the pipe at runtime (expert installs);
                     # the flag stops its compute thread, the message unblocks the recv loop
                     if self.conn is not None:
-                        self.conn.send(("quit",))
+                        self._send_queue.put(("quit",))
                 elif self.conn is not None:
-                    self.conn.send(("quit",))
+                    self._send_queue.put(("quit",))
+                self._send_queue.put(None)
+                self._sender.join(timeout = 5)
                 self.proc.join(timeout = 5)
                 if self.proc.is_alive():
                     self.proc.terminate()
@@ -2267,6 +2402,9 @@ class MoeCpuHost:
         self.layer_auxloc = []
         self._promo = {}
         maps, self.arena_maps = self.arena_maps, []
+        if self._arena_pending is not None:
+            maps.append(self._arena_pending[3])
+            self._arena_pending = None
         if maps:
             import gc
             gc.collect()

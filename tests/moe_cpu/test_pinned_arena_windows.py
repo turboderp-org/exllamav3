@@ -193,6 +193,7 @@ def test_parent_registers_named_section_for_dma_and_releases_it_on_shutdown(monk
 
     host = _host(m)
     host._attach_chunk(index, size, name)
+    host._pin_pending_chunk()
     assert len(host.arena_maps) == len(host.arena_views) == 1
     assert host.arena_views[0].numel() == size // 2
     assert int(host.arena_views[0][0]) == 1234
@@ -219,8 +220,9 @@ def test_short_section_is_closed_even_while_the_traceback_is_held(monkeypatch):
     arena._new_chunk(1)
     _, index, size, name = pipe.messages[0]
     host = _host(m)
+    host._attach_chunk(index, size * 2, name)        # advertised twice the real section
     with pytest.raises(RuntimeError, match = f"chunk {index}") as excinfo:
-        host._attach_chunk(index, size * 2, name)    # advertised twice the real section
+        host._pin_pending_chunk()
     assert host.arena_maps == [] and host.arena_views == []
     arena.cur.close()
     with pytest.raises(FileNotFoundError):            # excinfo (and its frames) still alive here
@@ -238,13 +240,39 @@ def test_registration_failure_closes_the_section_while_the_traceback_is_held(mon
         raise RuntimeError("cudaHostRegister injected failure")
     monkeypatch.setattr(m, "cuda_host_register", refuse)
     host = _host(m)
+    host._attach_chunk(index, size, name)
     with pytest.raises(RuntimeError, match = "injected failure.*EXL3_MOE_PINNED_ARENA") as excinfo:
-        host._attach_chunk(index, size, name)
+        host._pin_pending_chunk()
     assert host.arena_maps == [] and host.arena_views == []
     arena.cur.close()
     with pytest.raises(FileNotFoundError):
         shared_memory.SharedMemory(name = name)
     del excinfo
+
+
+@pytest.mark.platform("windows")
+def test_chunk_is_page_locked_only_after_the_worker_has_moved_past_it(monkeypatch):
+    # Page-locking a section the worker is still writing loses writes: the driver's per-page probe
+    # rewrites each page's first byte, so a concurrent write to it can revert to the old value
+    pinned = []
+    monkeypatch.setattr(m, "cuda_host_register", lambda ptr, n, flags = 0: pinned.append(ptr))
+    pipe = _CapturePipe()
+    arena = _small_arena(monkeypatch, m, pipe)
+    host = _host(m)
+    arena._new_chunk(1)
+    host._attach_chunk(*pipe.messages[0][1:])
+    assert pinned == [] and host.arena_views == []       # the worker is still filling chunk 0
+    first = arena.cur
+    arena._new_chunk(1)                                  # the worker writes chunks in order
+    host._attach_chunk(*pipe.messages[1][1:])
+    assert pinned == [host.arena_views[0].data_ptr()] and len(host.arena_views) == 1
+    host._pin_pending_chunk()                            # loading done: the last chunk is complete
+    assert pinned == [v.data_ptr() for v in host.arena_views] and len(pinned) == 2
+    host.arena_views = []
+    for mp_ in host.arena_maps:
+        mp_.close()
+    first.close()
+    arena.cur.close()
 
 
 class _FakeKernel32:

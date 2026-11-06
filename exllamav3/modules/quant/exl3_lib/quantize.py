@@ -6,9 +6,15 @@ from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
 from ....util.hadamard import get_hadamard_dt
+from .hessian_packed import unpack
 from ....util import cuda_sync_active
 from ....util.tensor import save_tensor_image
 from functools import lru_cache
+
+# Conversion on unified-memory systems (convert.py --no_swap, the default on integrated GPUs): a host copy of a
+# device tensor is a second copy in the same memory pool, so the parking of Hessians, factors and weights on
+# the CPU between uses is skipped and the copies that doubled as clones become plain clones
+NO_SWAP = False
 import threading
 
 # Constant
@@ -265,9 +271,14 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     # Get pinned buffers
     pin_tiles, pin_q_tiles, pin_q_idx = get_pinned(tiles.shape[0])
 
-    # Copy input tiles to pinned memory. Input is always on the first device in the split
+    # Copy input tiles to pinned memory. Input is always on the first device in the split. The caller produced
+    # the tiles on its current stream and will consume the results there (the batched scale search runs on the
+    # default stream; the LDLQ loops already run on main_stream, where both waits are no-ops), so the fan-out
+    # stream is ordered after the caller's stream on entry and the caller's stream after the fan-in on exit
     copy_input_event = torch.cuda.Event(blocking = False)
     main_stream = get_quant_stream(devices[0])
+    caller_stream = torch.cuda.current_stream(tiles.device)
+    main_stream.wait_stream(caller_stream)
     with torch.cuda.stream(main_stream):
         tiles = tiles.contiguous()
         pin_tiles.copy_(tiles, non_blocking = True)
@@ -378,6 +389,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         q_idx = torch.empty_like(tiles, dtype = torch.short, device = devices[0])
         q_tiles.copy_(pin_q_tiles, non_blocking = True)
         q_idx.copy_(pin_q_idx, non_blocking = True)
+    caller_stream.wait_stream(main_stream)
 
     return q_tiles, q_idx
 
@@ -428,28 +440,56 @@ _HAD_MAX_GEMM_ROWS = 1 << 19
 
 def preapply_had_l(x: torch.Tensor, had_dim):
     k, n = x.shape
-    x_dtype = x.dtype
-    x = x.to(torch.float)
-    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
-    x = (had @ x.view(-1, had_dim, n)).view(k, n)
-    x = x.to(x_dtype)
-    return x
+    out = torch.empty_like(x)
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(had_dim, 2048)
+    rows = (rows // had_dim) * had_dim
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        out[i:i + actual_rows] = (
+            had @ x[i:i + actual_rows].float().reshape(-1, had_dim, n)
+        ).view(-1, n)
+    return out
 
 
 def preapply_had_r(x: torch.Tensor, had_dim):
     k, n = x.shape
-    x_dtype = x.dtype
-    x = x.to(torch.float)
-    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    out = torch.empty_like(x)
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
     rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
-    if rows >= k:
-        x = (x.view(k, -1, had_dim) @ had).view(k, n)
-    else:
-        x = torch.cat([
-            (x[i:i + rows].reshape(-1, had_dim) @ had).view(-1, n)
-            for i in range(0, k, rows)
-        ], dim = 0)
-    x = x.to(x_dtype)
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        out[i:i + actual_rows] = (
+            x[i:i + actual_rows].float().reshape(-1, had_dim) @ had
+        ).view(-1, n)
+    return out
+
+def preapply_had_l_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(had_dim, 2048)
+    rows = (rows // had_dim) * had_dim
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        x[i:i + actual_rows] = (
+            had @ x[i:i + actual_rows].float().reshape(-1, had_dim, n)
+        ).view(-1, n)
+    return x
+
+
+def preapply_had_r_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
+
+    for i in range(0, k, rows):
+        actual_rows = min(rows, k - i)
+        x[i:i + actual_rows] = (
+            x[i:i + actual_rows].float().reshape(-1, had_dim) @ had
+        ).view(-1, n)
     return x
 
 
@@ -518,8 +558,9 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
         try:
             L = torch.linalg.cholesky(H)
             # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
-            # free up that VRAM as the tensor is referenced by the parent frame
-            H_cpu = H.cpu()
+            # free up that VRAM as the tensor is referenced by the parent frame. Without swapping the kept copy is a
+            # device clone: same storage handoff, so the factor's layout (and every later step) is unchanged
+            H_cpu = H.clone() if NO_SWAP else H.cpu()
             H.copy_(L)  # VRAM copy, tiny overhead
             L = H
             H = H_cpu
@@ -1030,10 +1071,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
             return True, None, None, su, None
 
-        # Unswap H
+        # Unswap H, and reconstruct the square matrix from the capture's block-packed upper triangle
         if "H_swap_device" in H_data:
             H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
             del H_data["H_swap_device"]
+        if H_data.get("packed"):
+            H_data["H"] = unpack(H_data["H"], H_data["n"])
+            H_data["packed"] = False
 
         H = H_data["H"]
         if H_data["finalized"]:
@@ -1101,8 +1145,9 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         H_data["L"] = L
 
         # H is no longer needed except to compute proxy error so move to CPU
-        H = H.cpu()
-        H_data["H"] = H.cpu()
+        if not NO_SWAP:
+            H = H.cpu()
+        H_data["H"] = H
 
         H_data["finalized"] = True
         H_data["diag"] = diag
@@ -1597,16 +1642,15 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
     k, n = weight_q.shape
     Q = weight_q
-    su = su.float().to(dev).view(k, 1)
-    sv = sv.float().to(dev).view(1, n)
+    su = su.float().to(dev).view(k, 1).clone()
+    sv = sv.float().to(dev).view(1, n).clone()
     # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
-    HW = torch.empty((k, n), dtype = torch.float, device = dev)
     den = 0.0
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         wc = cols(weight, a, b)
-        HW[:, a:b] = H @ wc
-        den += (wc * HW[:, a:b]).sum().item()
+        HW_chunk = H @ wc
+        den += (wc * HW_chunk).sum().item()
     den_err = den
     if H_err is not H:
         den_err = 0.0
@@ -1624,23 +1668,37 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     e_before = err(Q)
     for _ in range(rounds):
         # output-side scales
-        num = torch.zeros(n, device = dev); dn = torch.zeros(n, device = dev)
+        num = torch.zeros(n, device=dev)
+        dn = torch.zeros(n, device=dev)
+        
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            HW_chunk = H @ wc # Recompute on the fly
+            
             HQ = H @ Q[:, a:b]
-            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            num[a:b] = (Q[:, a:b] * HW_chunk).sum(0)
             dn[a:b] = (Q[:, a:b] * HQ).sum(0)
-        c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
-        Q = Q * c.view(1, n)
-        sv = sv * c.view(1, n)
+            
+        c = torch.where(dn > 1e-30, num / dn.clamp(min=1e-30), torch.ones_like(num))
+        Q *= c.view(1, n)
+        sv *= c.view(1, n)
+        
         # input-side scales
-        A = (Q @ Q.T) * H
-        b_ = (Q * HW).sum(1)
+        A = (Q @ Q.T) * H # Keep this out-of-place to prevent fp16/fp32 dtype casting bugs
         A.diagonal().add_(1e-6 * A.diagonal().mean())
+
+        b_ = torch.zeros(k, device=dev)
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            wc = cols(weight, a, b)
+            HW_chunk = H @ wc
+            b_ += (Q[:, a:b] * HW_chunk).sum(1)
+        
         r = torch.linalg.solve(A, b_)
         r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
-        Q = Q * r.view(k, 1)
-        su = su * r.view(k, 1)
+        Q *= r.view(k, 1)
+        su *= r.view(k, 1)
     e_after = err(Q)
     return Q, su, sv, e_before, e_after
 
@@ -1720,15 +1778,15 @@ def quantize_exl3(
         sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
 
         # Move stored L to CPU (if not already), move working L to device
-        if H_data["L"] is not None:
+        if H_data["L"] is not None and not NO_SWAP:
             H_data["L"] = H_data["L"].cpu()
         if L is not None:
             L = L.to(device)
 
         if verbose:
-            weight_copy = weight.cpu()
+            weight_copy = weight.clone() if NO_SWAP else weight.cpu()
         # The post-LDLQ scale refit compares against the original weight (regularize works in place)
-        weight_orig = weight.clone() if weight.numel() <= 5e8 else weight.cpu()
+        weight_orig = weight.clone() if weight.numel() <= 5e8 or NO_SWAP else weight.cpu()
         weight_r = weight
         del weight
 
@@ -1761,7 +1819,7 @@ def quantize_exl3(
 
         # Select device for work buffers (CPU is slower for small tensors but saves a lot of VRAM on big ones)
         # TODO: Use pynvml or mem_get_info to predict whether CPU buffer is needed
-        if weight_r.numel() > 5e8:
+        if weight_r.numel() > 5e8 and not NO_SWAP:
             weight_r = weight_r.cpu()
 
         # The input scales regularize folded into the weight belong in the Hessian too (see scaled_ldl)
@@ -1820,14 +1878,15 @@ def quantize_exl3(
         # free_mem()
 
         weight_q = weight_q.to(device)
-        weight_q = preapply_had_l(weight_q, had_k)
+        weight_q = preapply_had_l_(weight_q, had_k)
         weight_q *= su
-        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q = preapply_had_r_(weight_q, had_n)
         weight_q *= sv
 
         # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
         if not q_fallback and H is not None and not quant_args.get("no_refit"):
-            H_orig = unrotate_H(H, H_data["su"])
+            # On the quantization device whichever device H is parked on, so the result doesn't depend on swapping
+            H_orig = unrotate_H(H.to(device), H_data["su"])
             weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv,
                                                                    damping = damping_share(quant_args))
             del H_orig
@@ -1888,6 +1947,11 @@ def _get_stage_buf(device_index: int, slot: int, nbytes: int):
         return buf
 
 
+def _materialize(w, device) -> torch.Tensor:
+    """A weight as a tensor on `device`: packed conversion-time inners (LinearFP16Packed) dequantize there"""
+    return w.dequant_weight(device) if hasattr(w, "dequant_weight") else w
+
+
 class _WeightStager:
     """
     Stages CPU-swapped weights to the device through pinned buffers on a side stream, one
@@ -1902,8 +1966,12 @@ class _WeightStager:
         self.slot = 0
         self.pending = {}
 
-    def prefetch(self, t: int, w: torch.Tensor):
+    def prefetch(self, t: int, w):
         if t in self.pending:
+            return
+        if hasattr(w, "dequant_weight"):
+            # A packed (natively quantized) weight: dequantized on this device, on the consuming stream
+            self.pending[t] = (w.dequant_weight(self.device), None)
             return
         if w.is_cuda:
             self.pending[t] = (w if w.device == self.device else w.to(self.device), None)
@@ -1985,6 +2053,10 @@ def quantize_exl3_batch(
             qa = quant_args_list[t]
             if "seed" in qa:
                 torch.manual_seed(qa["seed"])
+            # Unswap and factor on the device doing the quantization rather than on the capture
+            # device, which would otherwise factor every tensor of the layer for all threads
+            if "H_swap_device" in H_datas[t]:
+                H_datas[t]["H_swap_device"] = device
             q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
             if q_fallback:
                 finalized.append(None)
@@ -1994,7 +2066,7 @@ def quantize_exl3_batch(
 
         for t in range(n_t):
             if finalized[t] is None:
-                results[t] = quantize_exl3(weights[t].float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
+                results[t] = quantize_exl3(_materialize(weights[t], device).float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
 
         if not batch_idx:
             return results
@@ -2020,7 +2092,7 @@ def quantize_exl3_batch(
                 H_diag = H_diag.to(device)
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
             # Original kept for the post-LDLQ scale refit (regularize works in place)
-            origs[t] = weight.clone() if weight.numel() <= 5e7 else weight.cpu()
+            origs[t] = weight.clone() if weight.numel() <= 5e7 or NO_SWAP else weight.cpu()
             apply_out_scales, weight_r, _, su, sv = regularize(
                 weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
             regs[t] = [weight_r, su, sv, apply_out_scales]
@@ -2091,6 +2163,14 @@ def quantize_exl3_batch(
 
         pb.update(tiles_k)
 
+        # Like quantize_exl3, park the stored factor on the CPU once the recursion has run: a layer
+        # of distinct per-expert factors would otherwise accumulate on the device until the layer
+        # is done. Tensors sharing the Hessian keep the per-device copy cached above
+        for t in batch_idx:
+            hd = H_datas[t]
+            if hd.get("L") is not None and hd["L"].is_cuda and not NO_SWAP:
+                hd["L"] = hd["L"].cpu()
+
         # Per-tensor metrics and packing
         Hd = None
         for bi, t in enumerate(batch_idx):
@@ -2118,9 +2198,9 @@ def quantize_exl3_batch(
             # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
             if not qa.get("no_refit"):
                 wq = weight_qs[bi].to(device)
-                wq = preapply_had_l(wq, had_k)
+                wq = preapply_had_l_(wq, had_k)
                 wq *= su
-                wq = preapply_had_r(wq, had_n)
+                wq = preapply_had_r_(wq, had_n)
                 wq *= sv
                 H_orig = unrotate_H(Hd, H_datas[t]["su"])
                 _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,

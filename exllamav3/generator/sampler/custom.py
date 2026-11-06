@@ -1151,13 +1151,19 @@ class CustomSampler(Sampler):
         # path.
         simplified = []
         for step in steps:
-            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
-            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
-            if not isinstance(step, SS_NoOp):
-                simplified.append(step)
+            if isinstance(step, SS_NoOp):
+                # A step is only replaced by SS_NoOp when it is a mathematical identity
+                # (temperature 1.0, top_k < 1, top_p 1.0, min_p 0, rep_p 1.0, empty mask...),
+                # so it can neither need the past ids nor a torch seed. Reading the flags off
+                # the *original* step would otherwise keep reqs_past_ids True for the default
+                # TabbyAPI sampler stack, costing a full-context H2D upload per token.
+                continue
+            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
+            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
+            simplified.append(step)
 
         head = []
         fused_tail = None

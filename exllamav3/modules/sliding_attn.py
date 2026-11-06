@@ -51,6 +51,9 @@ class SWAState:
     # always possible
     guaranteed_rollback = PAGE_SIZE
 
+    # The checkpoint for the last page boundary of a job comes from rolling the ring back when the job ends
+    stash_by_rollback = True
+
     def __init__(
         self,
         cache: Cache,
@@ -97,18 +100,38 @@ class SWAState:
         return self.position - self.window_beg
 
 
-    def stash(self):
-        stashed = {
+    def can_stash_at(self, position: int) -> bool:
+        """Whether rolling back to position leaves every layer's attention window for it in the ring"""
+        if not 0 <= self.position - position <= self.rollback_capacity():
+            return False
+        cache_pos = position - self.window_beg
+        return all(
+            cache_pos >= min(l.module.sliding_window, position)
+            for l in self.cache.get_all_recurrent_layers().values()
+        )
+
+
+    def stash_header(self):
+        return {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size,
             "window_beg": self.window_beg,
         }
+
+
+    def stash_layers(self, layers: dict):
+        cache_pos = self.position - self.window_beg
+        return {k: l.stash(self.slot, cache_pos) for k, l in layers.items()}
+
+
+    def stash(self):
+        stashed = self.stash_header()
+        cache_pos = self.position - self.window_beg
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
         else:
             cp_handle = new_checkpoint_handle()
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, cache_pos))
             stashed["tp_handle"] = cp_handle
         return stashed
 
@@ -116,12 +139,13 @@ class SWAState:
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
+        cache_pos = self.position - self.window_beg
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k], self.position)
+                l.unstash(self.slot, stashed[k], cache_pos)
         else:
             cp_handle = stashed["tp_handle"]
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position))
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, cache_pos))
 
 
     def post_advance(self):
@@ -225,8 +249,10 @@ class SWALayerState:
         pass
 
 
-    def stash(self, slot, position):
-        b = min(self.module.kv_state_size, position)
+    def stash(self, slot, cache_pos):
+        # The window ends at the state's ring row, which sits short of the ring's end after a rollback across a
+        # shift
+        b = cache_pos
         a = max(0, b - self.module.sliding_window)
         return (
             host_copy(self.k_state[slot, a:b]),
@@ -244,8 +270,8 @@ class SWALayerState:
         return [spec, dict(spec)]
 
 
-    def unstash(self, slot, stashed, position):
-        b = min(self.module.kv_state_size, position)
+    def unstash(self, slot, stashed, cache_pos):
+        b = cache_pos
         a = max(0, b - self.module.sliding_window)
         k, v = stashed
         self.k_state[slot].zero_()

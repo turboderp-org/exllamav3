@@ -122,6 +122,50 @@ void ple_gate
 //   conv_stream = [conv_state | normed^T]; out = silu(depthwise dilated conv1d)
 //   delta  = gated + out^T
 
+// DeepSeek-V4.1 Engram form of ple_forward_streams: one projection of the n-gram rows gives the keys and the
+// value together, there is no conv, and the norms carry their own constant bias. delta receives the gated
+// value broadcast over the streams directly
+void ple_forward_streams_fused
+(
+    const at::Tensor& streams,       // (bsz, seq, H, D) fp32 contiguous
+    const at::Tensor& emb,           // (bsz, seq, ple_dim) half
+    const at::Tensor& kv_w,          // (ple_dim, H * D + D) half (the fp16 Linear's matmul layout)
+    const at::Tensor& norm_key_w,    // (H * D) half/bf16 raw weight
+    const at::Tensor& norm_query_w,
+    double rms_eps,
+    double norm_bias,
+    double gate_scale,
+    at::Tensor delta                 // (bsz, seq, H, D) fp32 out
+)
+{
+    py::gil_scoped_release release;
+    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    int64_t bsz = streams.size(0);
+    int64_t seq = streams.size(1);
+    int64_t H = streams.size(2);
+    int64_t D = streams.size(3);
+    int64_t R = bsz * seq;
+    int64_t hc = H * D;
+    float eps = (float) rms_eps;
+    float bias = (float) norm_bias;
+    TORCH_CHECK(streams.is_contiguous() && emb.is_contiguous() && delta.is_contiguous(), "ple_forward_streams_fused: contiguous tensors");
+    TORCH_CHECK(kv_w.dim() == 2 && kv_w.size(1) == hc + D, "ple_forward_streams_fused: kv_w must be (ple_dim, H * D + D)");
+    TORCH_CHECK(D > 0, "ple_forward_streams_fused: norm over an empty stream dimension");
+    if (!R || !H) return;
+    auto opts_f = streams.options();
+    at::Tensor emb2 = emb.view({R, emb.size(2)});
+    at::Tensor key = at::matmul(emb2, kv_w.narrow(1, 0, hc));                 // (R, hc) half
+    at::Tensor key_n = at::empty({R * H, D}, opts_f);
+    rms_norm(key.view({R * H, D}), norm_key_w, key_n, eps, bias, 1.0f, false, false, (int) H);
+    at::Tensor query_n = at::empty({R * H, D}, opts_f);
+    at::Tensor s2 = streams.view({R * H, D});
+    rms_norm(s2, norm_query_w, query_n, eps, bias, 1.0f, false, false, (int) H);
+    at::Tensor gate = at::bmm(query_n.view({R * H, 1, D}), key_n.view({R * H, D, 1}))
+        .view({bsz, seq, H});
+    at::Tensor value = at::matmul(emb2, kv_w.narrow(1, hc, D)).view({bsz, seq, D}).contiguous();
+    ple_gate(gate.contiguous(), value, delta, (float) gate_scale);
+}
+
 void ple_forward_streams
 (
     const at::Tensor& streams,       // (bsz, seq, H, D) fp32 contiguous

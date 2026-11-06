@@ -67,6 +67,9 @@ class Module(ABC):
     def load(self, device: torch.Device, **kwargs):
         self.device = device
         for module in self.modules:
+            # Placed ahead of the parent, on the split's attention device (Model.load attn_device)
+            if module.device is not None and module.caps.get("attn_device"):
+                continue
             module.load(device, **kwargs)
 
     def pin_linears(self):

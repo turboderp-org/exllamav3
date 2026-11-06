@@ -138,8 +138,10 @@ def make_dsv4_checkpoint(out_dir, seed: int = 7, **overrides) -> str:
             t[f"{L}.hc_{tag}_scale"] = (1.0 + 0.1 * torch.randn(3)).float()
         w(f"{L}.ffn.gate.weight", c["n_routed_experts"], H, scale = 0.05)
         if i < c["num_hash_layers"]:
-            t[f"{L}.ffn.gate.tid2eid"] = torch.randint(
-                0, c["n_routed_experts"], (c["vocab_size"], c["num_experts_per_tok"]), dtype = torch.long)
+            # Distinct experts per token, as in the real table: a repeat would add one expert twice, and the
+            # racing additions to one row would make the output vary from run to run
+            t[f"{L}.ffn.gate.tid2eid"] = torch.rand(c["vocab_size"], c["n_routed_experts"]).argsort(-1)[
+                :, : c["num_experts_per_tok"]].long().clone()
         else:
             t[f"{L}.ffn.gate.bias"] = (0.05 * torch.randn(c["n_routed_experts"])).float()
         for e in range(c["n_routed_experts"]):

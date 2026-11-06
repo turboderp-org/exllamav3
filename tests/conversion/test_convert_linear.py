@@ -87,6 +87,7 @@ def test_convert_linear(device, checkpoint, name, K, codebook):
         "seed": 1,
         "apply_out_scales": None,
         "devices": [device],
+        "scaled_hessian": True,
     }
     if codebook != "3inst":
         quant_args[codebook] = True

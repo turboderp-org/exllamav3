@@ -47,6 +47,9 @@ DRAFT_CASES = {
     # longer than the drafter's window in one chunk, so the ring writer drops the chunk's own leading pages
     "dflash2-rings": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-chunk_size", "4096"], REFERENCE_TEXT * 16),
     "dflash2-swa-full": ("dflash2-target", lambda dirs: ["-dm", dirs["dflash2-27b"], "-swa_full"], REFERENCE_TEXT),
+    # Gemma4 assistant: reads the target's window rings, or its paged sliding layers with -swa_full
+    "gemma4-assistant": ("gemma4-assistant-target", lambda dirs: ["-dm", dirs["gemma4-assistant"]], REFERENCE_TEXT),
+    "gemma4-assistant-swa-full": ("gemma4-assistant-target", lambda dirs: ["-dm", dirs["gemma4-assistant"], "-swa_full"], REFERENCE_TEXT),
 }
 LONG_PROMPT_CASES = {"dflash2-rings"}
 EXTRA_MODELS = {"ar-recurrent": ["recurrent"]}
@@ -84,3 +87,40 @@ def test_drafting_is_lossless(case, model_registry, device):
     if hybrid:
         assert hybrid_rounds > 0, f"{case}: no hybrid draft round fired"
     assert_greedy_equivalent(ref_tokens, ref_logits, tokens, NEAR_TIE, tag = case)
+
+
+@pytest.mark.parametrize("case", ["mtp", "dflash", "dflash2-swa-full", "gemma4-assistant"])
+@torch.inference_mode()
+def test_sparse_head_drafting_is_lossless(case, model_registry, device):
+    """
+    Drafting through the dynamic sparse LM head (Generator(sparse_draft_head = ...)) is as lossless as the full
+    head for every drafter that borrows the target's head (MTP argmax, DFlash argmax, DFlash2 top-k into the
+    selector walk): verification never touches the subset. The head must actually have been in use (target
+    tokens were looked up against the subset), and the probe rounds must have fired. The evidence threshold is
+    lowered so a short test prompt qualifies as enough history
+    """
+    role, draft_args, _ = DRAFT_CASES[case]
+    entry = model_registry.get(role)
+    if not entry.available:
+        pytest.skip(f"test model '{role}' not available")
+    dirs = {mid: model_registry.get(mid).path for mid in ([entry.draft] if entry.draft else [])}
+    for mid in dirs:
+        if not model_registry.get(mid).available:
+            pytest.skip(f"draft model '{mid}' not available")
+    with load_model(entry.path, device, *draft_args(dirs)) as lm:
+        ids = lm.tokenizer.encode(REFERENCE_TEXT, add_bos = True)[:, :PROMPT_TOKENS]
+        plain = lm.generator(draft_model = None, draft_cache = None)
+        ref_tokens, ref_logits, _ = greedy(plain, ids, NEW_TOKENS, return_logits = True)
+        del plain
+        gen = lm.generator(sparse_draft_head = 4096)
+        sh = gen.sparse_head
+        assert sh is not None and sh.t_full is not None and sh.t_sparse is not None
+        sh.min_evidence = 1.0
+        sh.probe_interval = 4
+        tokens, _, events = greedy(gen, ids, NEW_TOKENS)
+        st = sh.stats()
+    final = events.get("eos")
+    assert final is not None and final.get("accepted_draft_tokens", 0) > 0, "no drafted tokens were accepted"
+    assert st["lookups"] > 0 and st["rounds"] > 0 and st["probes"] > 0, st
+    assert st["active"] > 0 and torch.equal(sh.member[sh.cols[:st["active"]]], torch.arange(st["active"], device = sh.device))
+    assert_greedy_equivalent(ref_tokens, ref_logits, tokens, NEAR_TIE, tag = f"{case}-sparse-head")

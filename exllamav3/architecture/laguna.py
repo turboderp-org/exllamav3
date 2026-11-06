@@ -135,6 +135,7 @@ class LagunaModel(Model):
                 key_g = "g_proj",
                 gate_softplus = True,
                 qmap = "block.attn",
+                select_hq_bits = 2,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",

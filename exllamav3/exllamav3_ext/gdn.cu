@@ -1920,6 +1920,102 @@ void gdn_ba_gemv_kernel
     }
 }
 
+// Up to BA_GEMV_ROWS_MAX token rows (decode and speculative verify) from a single pass over the weights: one
+// block of BA_GEMV_WARPS warps per output column, the warps splitting k, 16-byte loads, each weight chunk
+// multiplied into every row's accumulator. The kernel above re-reads the whole of w_t once per row, which for
+// a 9-token verify step at k = 5120, n = 96 is nine passes over 1 MB. Same arguments as the kernel above, so
+// the x pointer stays patchable in captured graphs. Fixed reduction order, bit-reproducible
+#define BA_GEMV_ROWS_MAX 16
+
+__device__ __forceinline__ float ba_dot8(uint4 a, uint4 b, float acc)
+{
+    const half2* a2 = reinterpret_cast<const half2*>(&a);
+    const half2* b2 = reinterpret_cast<const half2*>(&b);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+#if defined(USE_ROCM)
+        acc = exl3_fdot2(a2[i], b2[i], acc);
+#else
+        float2 af = __half22float2(a2[i]);
+        float2 bf = __half22float2(b2[i]);
+        acc = fmaf(af.y, bf.y, fmaf(af.x, bf.x, acc));
+#endif
+    }
+    return acc;
+}
+
+template <int rows>
+__global__ __launch_bounds__(BA_GEMV_WARPS * 32)
+void gdn_ba_gemv_rows_kernel
+(
+    const half* __restrict__ x,                 // [rows, k]
+    const half* __restrict__ w_t,               // [n, k]
+    const half* __restrict__ bias,              // [n] or null
+    float* __restrict__ y,                      // [rows, n]
+    const int k,
+    const int n
+)
+{
+    __shared__ float partial[BA_GEMV_WARPS][rows];
+    const int col = blockIdx.x;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int k8 = k / 8;
+    const uint4* w8 = (const uint4*) (w_t + (size_t) col * k);
+    const uint4* x8 = (const uint4*) x;
+
+    float acc[rows];
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) acc[r] = 0.0f;
+
+    for (int j = threadIdx.x; j < k8; j += BA_GEMV_WARPS * 32)
+    {
+        const uint4 w = w8[j];
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) acc[r] = ba_dot8(x8[(size_t) r * k8 + j], w, acc[r]);
+    }
+
+    #pragma unroll
+    for (int r = 0; r < rows; ++r)
+    {
+        float v = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (lane == 0) partial[warp][r] = v;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < rows)
+    {
+        const int r = threadIdx.x;
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < BA_GEMV_WARPS; ++i) v += partial[i][r];
+        if (bias) v += __half2float(bias[col]);
+        y[(size_t) r * n + col] = v;
+    }
+}
+
+template <int r>
+static bool ba_gemv_rows_try(const half* x, const half* w_t, const half* bias, float* y, int rows, int k, int n,
+                             cudaStream_t stream, Graph* graph)
+{
+    if constexpr (r > BA_GEMV_ROWS_MAX)
+        return false;
+    else
+    {
+        if (rows != r) return ba_gemv_rows_try<r + 1>(x, w_t, bias, y, rows, k, n, stream, graph);
+        gdn_ba_gemv_rows_kernel<r><<<n, BA_GEMV_WARPS * 32, 0, stream>>>(x, w_t, bias, y, k, n);
+        if (graph)
+        {
+            graph->record_param((void*) &gdn_ba_gemv_rows_kernel<r>, GP_gdn_ba_x, 0);
+            graph->record_param((void*) &gdn_ba_gemv_rows_kernel<r>, GP_end, 0);
+        }
+        return true;
+    }
+}
+
 void gdn_ba_gemv_gr
 (
     const at::Tensor& x,            // [rows, k] half
@@ -1952,6 +2048,17 @@ void gdn_ba_gemv_gr
     if (rows == 0 || n == 0) return;
 
     const half* bias_ptr = (const half*) OPTPTR(bias);
+
+    // Decode-sized row counts with 16-byte aligned rows take the single-pass kernel
+    const bool vec16 = k % 8 == 0 && (((uintptr_t) x.data_ptr() | (uintptr_t) w_t.data_ptr()) & 15) == 0;
+    if (vec16 && rows <= BA_GEMV_ROWS_MAX &&
+        ba_gemv_rows_try<1>((const half*) x.data_ptr(), (const half*) w_t.data_ptr(), bias_ptr, (float*) y.data_ptr(),
+                            rows, k, n, stream, graph))
+    {
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+
     dim3 blocks(CEIL_DIVIDE(n, BA_GEMV_WARPS), rows);
 
     gdn_ba_gemv_kernel<<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>

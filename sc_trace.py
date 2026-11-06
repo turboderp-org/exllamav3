@@ -8,9 +8,10 @@ import zlib
 import torch
 from safetensors.torch import save_file
 
-from exllamav3 import Generator, Job, model_init
+from exllamav3 import Generator, Job, model_init, Config, Tokenizer
 from exllamav3.util.progress import ProgressBar
 from eval.qbench_prompts import clean_response_for_context, DEFAULT_TEMPLATE_VARS
+from eval.api_source import add_api_args, api_from_args, assistant_message, response_token_ids
 
 """
 Generate a large self-sampled, in-domain trace, sized for use as quantization calibration data:
@@ -25,6 +26,15 @@ languages.
 The trace should be produced from the unquantized model or a high-bitrate quant (e.g. 6 bpw,
 minimally distorted), then reused for measurement (measure.py), recipe optimization and
 conversion of all lower-bitrate quants of the same model.
+
+Without hardware for the unquantized model, --api_model sources the responses (reasoning and
+content) from an OpenAI-compatible chat API instead, OpenRouter by default:
+
+    python sc_trace.py -m <model_dir> --api_model deepseek/deepseek-v4.1-flash -o trace.json
+
+-m then only provides the tokenizer and chat template: prompts are templated and tokenized
+locally, and each finished turn is rendered back through the template to recover the token
+stream the model would have produced (eval/api_source.py).
 
 If the seed set alone doesn't reach the token target, additional epochs re-run the same
 conversations with different per-job sampling seeds.
@@ -591,21 +601,60 @@ col_green = "[32;1m"
 
 
 @torch.inference_mode()
+def run_api_wave(api, args, tokenizer, convs, pending, template_vars, t_idx, progress):
+    """One wave of API requests, concurrently; fills pending[c]["chunks"] with the reconstructed response
+    ids and pending[c]["assistant"] with the finished message. Returns the wave's token count"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    wave_tokens = 0
+    finish_map = {"stop": "stop_token", "length": "max_new_tokens"}
+    with ThreadPoolExecutor(max_workers = args.api_concurrency) as pool:
+        futures = {pool.submit(api.complete, convs[c]["messages"], pending[c]["seed"]): c for c in pending}
+        for fut in as_completed(futures):
+            c_idx = futures[fut]
+            p = pending[c_idx]
+            try:
+                r = fut.result()
+            except Exception as e:
+                print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
+                continue
+            assistant = assistant_message(r["content"], r["reasoning"])
+            ids = response_token_ids(tokenizer, convs[c_idx]["messages"], assistant, template_vars)
+            if not ids:
+                print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}empty{col_default} response")
+                continue
+            p["chunks"] = [torch.tensor([ids], dtype = torch.long)]
+            p["assistant"] = assistant
+            p["eos_reason"] = finish_map.get(r["finish_reason"], r["finish_reason"])
+            wave_tokens += len(ids) + p["input_ids"].shape[-1]
+            print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}{len(ids):5}{col_default} tokens "
+                  f"({p['eos_reason']}, reasoning {len(r['reasoning'] or '')} chars)")
+            progress(wave_tokens)
+    return wave_tokens
+
+
 def main(args):
-    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
-    generator = Generator(
-        model = model,
-        cache = cache,
-        tokenizer = tokenizer,
-        draft_model = draft_model,
-        draft_cache = draft_cache,
-        num_draft_tokens = args.num_draft_tokens,
-        ngram_match_min = args.ngram_match_min,
-        ngram_corpus = args.ngram_corpus,
-        dynamic_draft_tokens = args.dynamic_draft,
-        draft_confidence = args.draft_confidence,
-        max_chunk_size = 2048,
-    )
+    api = None
+    if args.api_model:
+        # Responses from the API; the local model is only its tokenizer and chat template
+        config = Config.from_directory(args.model_dir)
+        tokenizer = Tokenizer.from_config(config)
+        generator = None
+        api = api_from_args(args)
+    else:
+        model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+        generator = Generator(
+            model = model,
+            cache = cache,
+            tokenizer = tokenizer,
+            draft_model = draft_model,
+            draft_cache = draft_cache,
+            num_draft_tokens = args.num_draft_tokens,
+            ngram_match_min = args.ngram_match_min,
+            ngram_corpus = args.ngram_corpus,
+            dynamic_draft_tokens = args.dynamic_draft,
+            draft_confidence = args.draft_confidence,
+            max_chunk_size = 2048,
+        )
 
     TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
     TEMPLATE_VARS.update(args.template_vars)
@@ -629,6 +678,9 @@ def main(args):
         else:
             print(" !! Chat template rejects all variable combinations; using template defaults")
             TEMPLATE_VARS = {}
+
+    if api is not None:
+        api.request_reasoning(TEMPLATE_VARS)
 
     target_tokens = args.target_tokens or args.cal_rows * args.cal_cols
     rows = []
@@ -658,20 +710,25 @@ def main(args):
                     conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
                     input_ids = tokenizer.hf_chat_template(
                         conv["messages"], add_generation_prompt = True, **TEMPLATE_VARS)
-                    job = Job(
-                        input_ids = input_ids,
-                        max_new_tokens = args.max_new_tokens,
-                        stop_conditions = config.eos_token_id_list,
-                        decode_special_tokens = True,
-                        identifier = c_idx,
-                        seed = zlib.crc32(f"{args.seed}|{epoch}|{c_idx}|{t_idx}".encode()),
-                    )
-                    generator.enqueue(job)
-                    pending[c_idx] = {"input_ids": input_ids, "chunks": [], "eos_reason": None}
+                    seed = zlib.crc32(f"{args.seed}|{epoch}|{c_idx}|{t_idx}".encode())
+                    pending[c_idx] = {"input_ids": input_ids, "chunks": [], "eos_reason": None, "seed": seed}
+                    if api is None:
+                        job = Job(
+                            input_ids = input_ids,
+                            max_new_tokens = args.max_new_tokens,
+                            stop_conditions = config.eos_token_id_list,
+                            decode_special_tokens = True,
+                            identifier = c_idx,
+                            seed = seed,
+                        )
+                        generator.enqueue(job)
 
                 print(f" -- Epoch {epoch}, turn {t_idx}: {col_blue}{len(pending)}{col_default} jobs")
                 wave_tokens = 0
-                while generator.num_remaining_jobs():
+                if api is not None:
+                    wave_tokens = run_api_wave(api, args, tokenizer, convs, pending, TEMPLATE_VARS, t_idx,
+                                               lambda n: pb.update(min(total_packed() + n, target_tokens)))
+                while api is None and generator.num_remaining_jobs():
                     for result in generator.iterate():
                         if result["stage"] != "streaming":
                             continue
@@ -697,6 +754,16 @@ def main(args):
                         conv["messages"].pop()
                         conv["alive"] = False
                         continue
+                    if "assistant" in p:
+                        # API turn: the finished message goes into the context as it came, content only
+                        rows.append({
+                            "conversation": c_idx, "turn": t_idx, "epoch": epoch, "eos_reason": p["eos_reason"],
+                            "input_ids": p["input_ids"][0].tolist(), "response_ids": response_ids.tolist(),
+                        })
+                        total_in += p["input_ids"].shape[-1]
+                        total_out += response_ids.numel()
+                        conv["messages"].append({"role": "assistant", "content": p["assistant"]["content"]})
+                        continue
                     rows.append({
                         "conversation": c_idx,
                         "turn": t_idx,
@@ -717,6 +784,9 @@ def main(args):
         print(f" !! Collected only {total_packed():,} of {target_tokens:,} target tokens after "
               f"{args.max_epochs} epoch(s); consider more epochs or a higher --max_new_tokens")
 
+    if api is not None:
+        api.print_usage()
+
     # qbench-compatible trace
     out = {
         "model": args.model_dir,
@@ -725,6 +795,8 @@ def main(args):
         "meta": {"rows": len(rows), "input_tokens": total_in, "output_tokens": total_out},
         "rows": rows,
     }
+    if api is not None:
+        out["api_model"] = args.api_model
     with open(args.output, "w") as f:
         json.dump(out, f)
     print(f" -- {len(rows)} trace rows, {total_in:,} context + {total_out:,} response tokens "
@@ -764,4 +836,5 @@ if __name__ == "__main__":
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
+    add_api_args(parser)
     main(parser.parse_args())

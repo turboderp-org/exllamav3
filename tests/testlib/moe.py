@@ -70,11 +70,17 @@ def contiguous_layout(counts: list[int], device) -> tuple[torch.Tensor, torch.Te
 def repack_trellis(t: torch.Tensor, group: int = 8, planar: bool = False) -> torch.Tensor:
     """Packed copy of a (k/16, n/16, 16K) trellis, mirroring the CPU arena loader
     (_copy_repacked in moe_cpu_host.py): tile (kt, nt) moves to (nt/group, kt, nt%group), and
-    with planar each tile's dwords are transposed (dword w to 8*(w%bits) + w/bits, integer
-    rates only). group 0 is the native layout: a plain copy. Stays on the input's device."""
+    with planar each integer tile's dwords are transposed (dword w to 8*(w%bits) + w/bits).
+    Fractional tiles transpose chronological halfwords: packed[8*(j%Q) + j//Q] = native[j^1],
+    Q = 2*K. group 0 is the native layout: a plain copy. Stays on the input's device."""
     tk, tn, ps = t.shape
     if not group:
         return t.clone()
+    if planar and ps % 16:
+        # Independent index reference for the loader's strided copies; xor 1 corrects the
+        # halfword order inside native dwords without swapping either halfword's bytes.
+        order = torch.arange(ps, device = t.device).view(8, ps // 8).t().reshape(-1) ^ 1
+        return t.index_select(-1, order).view(tk, tn // group, group, ps).permute(1, 0, 2, 3).contiguous().view_as(t)
     if planar:
         wd = ps // 2
         out = torch.empty(tk * tn * wd, dtype = torch.int32, device = t.device)

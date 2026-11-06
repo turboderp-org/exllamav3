@@ -8,6 +8,7 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
+from ..util.device_copy import to_device
 import os
 import math
 
@@ -87,9 +88,13 @@ class HyperConnection(Module):
         sinkhorn_iters: int,
         hc_eps: float,
         rms_norm_eps: float,
+        carry_pre: bool = False,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
+        # V4.1: a site collapses its streams with the PREVIOUS site's pre weights (the first site
+        # takes stream 0) and publishes its own through params["hc_pre"] for the next one
+        self.carry_pre = carry_pre
         self.hidden_size = hidden_size
         self.sinkhorn_iters = sinkhorn_iters
         self.hc_eps = hc_eps
@@ -160,7 +165,7 @@ class HyperConnection(Module):
             hc_flush(params)
             pend = None
         if _hc_fold and hc == 4 and b * s <= _HC_FOLD_MAX_R and streams.dtype == torch.float and D % 4 == 0 \
-                and streams.is_contiguous():
+                and streams.is_contiguous() and not self.carry_pre:
             fold_norm = norm is not None and self._fold_norm_ok(norm, D)
             if pend is not None or fold_norm:
                 params.pop("hc_pending", None)
@@ -195,6 +200,9 @@ class HyperConnection(Module):
         if pend is not None:
             hc_flush(params)
         post, comb, y = self._mix_unfused(streams, params)
+        if self.carry_pre and "quant_preserve" in params:
+            # Conversion: the next module's passes start from what this one published
+            params["quant_preserve"]["hc_pre"] = params["hc_pre"]
         return post, comb, y, False
 
     def _mix_unfused(self, streams: torch.Tensor, params: dict):
@@ -214,7 +222,9 @@ class HyperConnection(Module):
             partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
             post = ws(R * H, torch.float, "hc_post").view(R, H)
             comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
-            collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
+            # The collapse stays fp32 on the carry path: the residual streams can carry values past the
+            # fp16 range at a few positions (massive activations), and the block normalizes from here
+            collapsed = ws(R * D, torch.float if self.carry_pre else torch.half, "hc_coll").view(R, D)
             # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
             # dominant traffic and the kernel dots it in fp32 either way
             if R <= 32:
@@ -223,6 +233,20 @@ class HyperConnection(Module):
                 fn = self.fn_h
             else:
                 fn = self.fn
+            if self.carry_pre:
+                # The kernel collapses with the previous site's pre weights (stream 0 at the first site)
+                # and hands this site's own on. Conversion keeps what it publishes per row, so it gets a
+                # fresh tensor rather than the per-site static
+                prev = params.get("hc_pre")
+                pre_in = to_device(prev, dev).reshape(R, H).contiguous() if prev is not None else None
+                if "capture" in params or "quant_preserve" in params:
+                    pre_out = torch.empty((R, H), dtype = torch.float, device = dev)
+                else:
+                    pre_out = g_tensor_cache.get_scratch(dev, R * H, torch.float, f"hc_pre:{self.key}", R).view(R, H)
+                ext.hc_mix_carry(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                                 self.sinkhorn_iters, partials, post, comb, collapsed, pre_in, pre_out)
+                params["hc_pre"] = pre_out.view(b, s, H)
+                return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
             ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                        self.sinkhorn_iters, partials, post, comb, collapsed)
             return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
@@ -240,8 +264,16 @@ class HyperConnection(Module):
         for _ in range(self.sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim = -1, keepdim = True) + self.hc_eps)
             comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
+        collapsed = self._carry(streams, pre, params) if self.carry_pre else (pre.unsqueeze(-1) * streams).sum(dim = 2)
         return post, comb, collapsed
+
+    def _carry(self, streams: torch.Tensor, pre: torch.Tensor, params: dict):
+        """Collapse with the previous site's pre weights (stream 0 at the first site) and publish
+        this site's for the next"""
+        prev, params["hc_pre"] = params.get("hc_pre"), pre
+        if prev is None:
+            return streams[:, :, 0]
+        return torch.matmul(to_device(prev, streams.device).unsqueeze(-2), streams).squeeze(-2)
 
     def apply_(
         self,
@@ -258,18 +290,23 @@ class HyperConnection(Module):
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
         hc_flush(params)
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
-            # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
-            # partials kernel. Not while states are exported or under TP, where other readers see the streams
-            if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
-                params["hc_pending"] = (x, y, post, comb)
-                return x
+            if converting:
+                # The stored input state stays as it is: the fused update runs on a copy (one stream-sized
+                # allocation, against the three full-width fp32 temporaries of the torch expression below)
+                x = x.clone()
+            else:
+                # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
+                # partials kernel. Not while states are exported or under TP, where other readers see the streams
+                if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
+                    params["hc_pending"] = (x, y, post, comb)
+                    return x
             ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
             return x
-        return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
+        return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x) ###
 
     def tp_export(self, plan, producer):
         # Streams are replicated across TP workers (like the residual), so plain replication
@@ -282,6 +319,7 @@ class HyperConnection(Module):
                 "sinkhorn_iters": self.sinkhorn_iters,
                 "hc_eps": self.hc_eps,
                 "rms_norm_eps": self.rms_eps,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -700,12 +738,14 @@ class HyperHead(Module):
     mean = True (GLM5.3): parameterless unweighted mean over the streams, no tensors."""
 
     def __init__(self, config: Config, key: str, hc_mult: int, rms_norm_eps: float, hc_eps: float,
-                 mean: bool = False):
+                 mean: bool = False, carry_pre: bool = False):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
         self.rms_eps = rms_norm_eps
         self.hc_eps = hc_eps
-        self.mean = mean
+        # carry_pre (V4.1): collapse with the last site's pre weights, no tensors of its own (as mean)
+        self.mean = mean or carry_pre
+        self.carry_pre = carry_pre
         self.norm = RMSNorm(config, f"{key}.norm", rms_norm_eps, unweighted = True,
                             out_dtype = torch.float)
         self.register_submodule(self.norm)
@@ -772,6 +812,7 @@ class HyperHead(Module):
                 "hc_eps": self.hc_eps,
                 # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
                 "mean": self.mean,
+                "carry_pre": self.carry_pre,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -797,6 +838,8 @@ class HyperHead(Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         hc_flush(params)
+        if self.carry_pre:
+            return torch.matmul(to_device(params["hc_pre"], x.device).unsqueeze(-2), x).squeeze(-2)
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape

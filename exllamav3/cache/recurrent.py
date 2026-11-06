@@ -2,6 +2,7 @@ from collections import OrderedDict
 from ..constants import PAGE_SIZE
 import torch
 from ..util.memory import malloc_trim
+import threading
 
 
 def is_content_hash(h: bytes) -> bool:
@@ -32,21 +33,25 @@ class HostPool:
         self.free = {}
         self.allocated = 0
         self.reused = 0
+        # The workers of a pipelined prefill take buffers for their devices' layers
+        self.lock = threading.Lock()
 
     def take(self, shape, dtype):
         key = (tuple(shape), dtype)
-        lst = self.free.get(key)
-        if lst:
-            self.reused += 1
-            return lst.pop()
-        self.allocated += 1
+        with self.lock:
+            lst = self.free.get(key)
+            if lst:
+                self.reused += 1
+                return lst.pop()
+            self.allocated += 1
         return torch.empty(shape, dtype = dtype)
 
     def give(self, obj):
         """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
         if isinstance(obj, torch.Tensor):
             if obj.device.type == "cpu":
-                self.free.setdefault((tuple(obj.shape), obj.dtype), []).append(obj)
+                with self.lock:
+                    self.free.setdefault((tuple(obj.shape), obj.dtype), []).append(obj)
         elif isinstance(obj, (list, tuple)):
             for o in obj:
                 self.give(o)
@@ -58,7 +63,8 @@ class HostPool:
     def release(self):
         """Drop the idle buffers (idle-transition housekeeping: the ones pruning stranded checkpoints
         just returned would otherwise hold their RAM for the whole idle period)"""
-        self.free.clear()
+        with self.lock:
+            self.free.clear()
 
 
 host_pool = HostPool()
@@ -129,6 +135,18 @@ class PairedState:
         if self.target is not None:
             self.target.rewind(num_tokens)
 
+    @property
+    def stash_by_rollback(self) -> bool:
+        """Whether every side can reach a past page boundary in place when a job ends (SWA rings), so that no
+        rolling checkpoint has to be copied while the job runs"""
+        return all(getattr(s, "stash_by_rollback", False) for s in self.components)
+
+    def can_stash_at(self, position: int) -> bool:
+        return all(s.can_stash_at(position) for s in self.components)
+
+    def settled_at(self, position: int) -> bool:
+        return all(s.position == position and s.last_history == 0 for s in self.components)
+
     def can_rewind_to(self, position: int) -> bool:
         return all(0 <= s.position - position <= s.rollback_capacity() for s in self.components)
 
@@ -174,6 +192,10 @@ class RecurrentCache(OrderedDict):
         self.pagetable = None
         # Optional disk tier (DiskPageCache): checkpoints are written through on put() and read back on a miss
         self.disk_tier = None
+        # Optional PrefillPipeline: a checkpoint stashed behind chunks still in flight is filled in by it, and
+        # goes to the disk tier once that's done
+        self.pipeline = None
+        self.unwritten = []
         self.metrics = {
             "stash_evictions": 0,           # checkpoints dropped by LRU pressure
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
@@ -194,6 +216,8 @@ class RecurrentCache(OrderedDict):
         """
         if key in self:
             self.move_to_end(key)
+            self._settle(self[key])
+        if key in self:
             return self[key]
         if self.disk_tier is not None:
             stashed = self.disk_tier.read_state(key)
@@ -213,17 +237,60 @@ class RecurrentCache(OrderedDict):
                 self.disk_tier.rekey_state(old_key, new_key, stashed)
 
 
-    def put(self, key, state):
+    def put(self, key, state, owner = None):
         """
-        Add state to cache
+        Add state to cache. Behind prefill chunks in flight the stash is filled in as they finish, so the caller isn't
+        held up; owner is the job that a failure doing that belongs to.
         """
         if key in self:
             self.move_to_end(key)
         else:
-            self._insert(key, None, persist = True, state = state)
+            self._insert(key, None, persist = True, state = state, owner = owner)
 
 
-    def _insert(self, key, stashed, persist: bool, state = None):
+    def adopt(self, key, stashed: dict):
+        """Store a stash made outside the cache (a job's rolling checkpoint), taking ownership of it"""
+        if key in self:
+            self.move_to_end(key)
+            self.recycle(stashed)
+        elif stashed["checkpoint_size"] > self.max_size:
+            self.recycle(stashed)
+        else:
+            self._insert(key, stashed, persist = True)
+
+
+    def recycle(self, stashed: dict):
+        """Hand a stash that never entered the cache back to the pool, for the next stash to reuse. Nothing
+        reaches the allocator and no disk write can be pending, so this doesn't count towards a trim"""
+        host_pool.give(stashed)
+        self._release_tp(stashed, trim = False)
+
+
+    def _settle(self, stashed: dict):
+        """Wait for a stash that is still being filled in"""
+        if self.pipeline is not None and id(stashed) in self.pipeline.pending_stashes:
+            self.pipeline.flush()
+
+
+    def write_settled(self):
+        """
+        Once the prefill pipeline has drained: hand the checkpoints filled in behind it to the disk tier, and take
+        back any that didn't complete (the job failed along the way), which must never be restored
+        """
+        unwritten, self.unwritten = self.unwritten, []
+        for key, stashed in unwritten:
+            held = self.get(key) is stashed
+            if id(stashed) in self.pipeline.failed_stashes:
+                self.pipeline.failed_stashes.discard(id(stashed))
+                if held:
+                    del self[key]
+                    self.update_total_size()
+                    host_pool.give(stashed)
+            elif held and self.disk_tier is not None and is_content_hash(key):
+                self.disk_tier.note_state(key, stashed)
+
+
+    def _insert(self, key, stashed, persist: bool, state = None, owner = None):
         """Make room for a checkpoint, then stash `state` (or take `stashed` as is) under key"""
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
         # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
@@ -259,11 +326,16 @@ class RecurrentCache(OrderedDict):
             self.metrics["stash_evictions"] += 1
             self._release(popped)
 
-        if state is not None:
+        deferred = state is not None and self.pipeline is not None and self.pipeline.busy
+        if deferred:
+            stashed = self.pipeline.stash(state, owner)
+        elif state is not None:
             stashed = state.stash()
         self[key] = stashed
         self.update_total_size()
-        if persist and self.disk_tier is not None and is_content_hash(key):
+        if deferred:
+            self.unwritten.append((key, stashed))
+        elif persist and self.disk_tier is not None and is_content_hash(key):
             self.disk_tier.note_state(key, stashed)
 
 
@@ -314,7 +386,7 @@ class RecurrentCache(OrderedDict):
         malloc_trim()
 
 
-    def _release_tp(self, stashed: dict):
+    def _release_tp(self, stashed: dict, trim: bool = True):
         """Drop the tensor-parallel ranks' copies of a stash: one handle per side of a pair (or at
         the top level of a bare state stash)"""
         for key in ("target", "draft", None):
@@ -323,9 +395,10 @@ class RecurrentCache(OrderedDict):
                 continue
             model = self.model if key is None else self.models[key]
             if model is not None and model.loaded_tp:
-                model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), s["tp_handle"]))
+                model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), s["tp_handle"], trim))
 
     def _release(self, stashed: dict):
+        self._settle(stashed)
         # A stash the disk tier is still writing keeps its buffers until the write is done
         if self.disk_tier is not None:
             self.disk_tier.release_after_write(stashed, self._release_now)
@@ -397,8 +470,9 @@ def _stashed_bytes(obj) -> int:
     return 0
 
 
-def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):
+def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int, trim: bool = True):
     recurrent_cache = local_context["recurrent_cache"]
     stashed = recurrent_cache.pop(cp_handle)
     host_pool.give(stashed)
-    note_freed(_stashed_bytes(stashed))
+    if trim:
+        note_freed(_stashed_bytes(stashed))

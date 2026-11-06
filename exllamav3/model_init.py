@@ -60,6 +60,7 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-ad", "--attn_device", type = int, default = None, help = "Split load: device for the attention layers of models that share K/V pools across layers (DeepSeek-V4.1), default: first device of the split")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -133,6 +134,7 @@ def add_args(
         parser.add_argument("-hdt", "--hybrid_draft_tokens", type = int, help = "Hybrid drafting: when a job's current suffix matches at least this many tokens of its earlier context, draft that many tokens of the continuation (on top of any other drafting mode)", default = 0)
         parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
+        parser.add_argument("-sdh", "--sparse_draft_head", type = int, default = 0, help = "Draft through a dynamic sparse LM head of this many vocabulary columns (MTP/DFlash drafting; 0 = full head)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
 
@@ -373,8 +375,10 @@ def init(
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
 
-    # Load draft model
-    if draft_model_dir:
+    # Load draft model (one that reads the target's cache in place loads with the target below)
+    if draft_model_dir and draft_model.caps.get("load_with_target"):
+        printp(not quiet, f" -- Loading {draft_model_dir} with the target model")
+    elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
             use_per_device = split,
@@ -390,6 +394,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        attn_device = args.attn_device,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
@@ -399,6 +404,7 @@ def init(
         max_batch_size = args.autosplit_max_batch_size,
         autosplit_no_forward = args.autosplit_no_forward,
         max_chunk_size = args.chunk_size,
+        draft_model = draft_model,
         **kwargs
     )
 

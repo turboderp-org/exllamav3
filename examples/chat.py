@@ -3,6 +3,7 @@ from functools import partial
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import time
 from pathlib import Path
 import tempfile
 import webbrowser
@@ -93,6 +94,7 @@ def main(args):
         hybrid_draft_tokens = args.hybrid_draft_tokens,
         ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
+        sparse_draft_head = args.sparse_draft_head,
         draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         disk_cache_dir = args.disk_cache_dir,
@@ -525,7 +527,7 @@ def main(args):
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
-            stop_on_loop = (args.loop_window, args.loop_min_reps),
+            stop_on_loop = True,
             identifier = n,
         ) for n in range(num_completions)]
         generator.enqueue(jobs)
@@ -534,6 +536,7 @@ def main(args):
         saved_samples = []
 
         completions = ["" for _ in range(num_completions)]
+        finished = []  # (time of the final result, final result) per completion
 
         # Stream response
         stop_reason = None
@@ -549,6 +552,8 @@ def main(args):
                     if bid is None: continue
                     chunk = r.get("text", "")
                     completions[bid] += chunk
+                    if r["eos"]:
+                        finished.append((time.perf_counter(), r))
                     if bid != 0: continue
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
@@ -618,6 +623,18 @@ def main(args):
                 print_info(f"Completion {i+1} / {num_completions}")
                 print("\n" + completions[i])
 
+            # Aggregate generation throughput: all new tokens over the span from the first completion's first
+            # generated token to the last completion's end (prefill excluded)
+            if len(finished) == num_completions:
+                total_tokens = sum(fr["new_tokens"] for _, fr in finished)
+                span = max(t for t, _ in finished) - min(t - fr["time_generate"] for t, fr in finished)
+                if span > 0:
+                    print(
+                        f"\nBatch: {col_info}{num_completions}{col_default} completions, "
+                        f"{col_info}{total_tokens:,}{col_default} tokens in {col_info}{span:.2f}{col_default} s, "
+                        f"{col_info}{total_tokens / span:.2f}{col_default} t/s aggregate"
+                    )
+
         # Add response to context
         response = s.all_text.strip()
 
@@ -667,8 +684,6 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
-    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
-    parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     parser.add_argument("-ej", "--expert_jitter", type = expert_jitter_strength, default = 1.0,
