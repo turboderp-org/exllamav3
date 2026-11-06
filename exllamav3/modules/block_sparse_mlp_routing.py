@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
-from ..util.tensor import g_tensor_cache
+from ..util.tensor import g_tensor_cache, get_for_device
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 ROUTING_CACHE_ROWS = 128
@@ -89,6 +89,84 @@ def _gate_t(cfg):
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)
         ext.det_quant_weight(cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
     return cfg.gate_tensor_t
+
+
+def _jitter_logits(bsz, cfg, y, offsets):
+    """Reuse the normal projection, then broadcast each request's layer offsets across its tokens."""
+    if bsz == 1:
+        logits, selected, weights = cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    else:
+        logits, selected, weights = _routing_buffers(cfg, bsz, y.device)
+    _gate_t(cfg)
+    ext.routing_project(y, cfg.gate_tensor, logits, cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
+    logits.view(offsets.shape[0], -1, cfg.num_experts).add_(offsets.unsqueeze(1))
+    return logits, selected, weights
+
+
+def routing_jitter(bsz, cfg, y, params, key, router_type):
+    """Opt-in logit offsets; selection, activation and normalization use the existing kernels."""
+    start = params["expert_jitter_layout"][key]
+    offsets = get_for_device(params, "expert_jitter_offsets", y.device)[:, start:start + cfg.num_experts]
+    if bsz == 1 and router_type in ("dots", "sqrtsp") and not params.get("activate_all_experts") and \
+            (router_type == "dots" or _vl_rows(cfg, params, bsz, y.device) is None):
+        # Keep the fused projection + selection path; other shapes/backends add offsets after projection.
+        _gate_t(cfg)
+        ext.routing_ds3_nogroup(
+            y, cfg.gate_tensor, cfg.router_logits_bsz1, _esb_h(cfg), cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1, cfg.routed_scaling_factor, cfg.gate_tensor_t,
+            ROUTING_ACT_SIGMOID if router_type == "dots" else ROUTING_ACT_SQRTSP,
+            cfg.gate_i8, cfg.gate_sb, offsets)
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    if router_type == "ds3":
+        return _routing_ds3_torch(bsz, cfg, y, params, offsets)
+    logits, selected, weights = _jitter_logits(bsz, cfg, y, offsets)
+    if params.get("activate_all_experts"):
+        if router_type == "std_bias" and cfg.router_bias is not None:
+            logits.add_(cfg.router_bias)
+        selected = torch.arange(cfg.num_experts, device = y.device).expand(bsz, -1)
+        if router_type in ("std", "std_bias"):
+            weights = logits.float().softmax(dim = -1)
+            if cfg.per_expert_scale is not None:
+                weights *= cfg.per_expert_scale
+        else:
+            weights = logits.float().sigmoid() if router_type == "dots" else F.softplus(logits.float()).sqrt()
+            if router_type == "dots" and cfg.e_score_correction_bias is not None:
+                weights += cfg.e_score_correction_bias.float()
+            weights *= cfg.routed_scaling_factor / (weights.sum(dim = -1, keepdim = True) + 1e-20)
+        return selected, weights.half()
+    if router_type in ("std", "std_bias"):
+        ext.routing_std_logits(logits, selected, weights, cfg.per_expert_scale, True,
+                               cfg.router_bias if router_type == "std_bias" else None)
+        return selected, weights
+
+    act = ROUTING_ACT_SIGMOID if router_type == "dots" else ROUTING_ACT_SQRTSP
+    vl = _vl_rows(cfg, params, bsz, y.device) if router_type.startswith("sqrtsp") else None
+    hash_sel = None
+    if router_type == "sqrtsp_hash":
+        ids = get_for_device(params, "input_ids", cfg.tid2eid.device).reshape(-1)
+        assert ids.shape[0] == bsz, "hash routing: hidden and input id row counts differ"
+        if vl is not None:
+            ids = torch.where(to_device(vl, ids.device), torch.zeros_like(ids), ids)
+        hash_sel = to_device(cfg.tid2eid[ids], y.device).long()
+    if hash_sel is None:
+        ext.routing_ds3_nogroup_logits(logits, _esb_h(cfg), selected, weights,
+                                       cfg.routed_scaling_factor, True, act)
+    else:
+        selected = hash_sel
+        ext.routing_sel_norm_logits(logits, selected, weights, cfg.routed_scaling_factor, act)
+    if vl is not None:
+        # The bucketed output buffers are shared: preserve text results before the image-bias pass.
+        text_sel, text_weights = selected.clone(), weights.clone()
+        if bsz == 1:
+            selected = cfg.selected_experts_bsz1
+        else:
+            _, selected, _ = _routing_buffers(cfg, bsz, y.device)
+        ext.routing_ds3_nogroup_logits(logits, _esb_vl_h(cfg), selected, weights,
+                                       cfg.routed_scaling_factor, True, act)
+        selected = torch.where(vl.unsqueeze(-1), selected, text_sel)
+        weights = torch.where(vl.unsqueeze(-1), weights, text_weights)
+    return selected, weights
+
 
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
@@ -205,11 +283,13 @@ def routing_ds3(bsz, cfg, y, params):
     return selected_experts, routing_weights
 
 
-def _routing_ds3_torch(bsz, cfg, y, params):
+def _routing_ds3_torch(bsz, cfg, y, params, offsets = None):
     """Torch composition of the group-limited DS3 router (the all-experts calibration pass,
     and the reference the kernel is tested against)"""
     activate_all_experts = params.get("activate_all_experts")
     router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    if offsets is not None:
+        router_logits.view(offsets.shape[0], -1, cfg.num_experts).add_(offsets.unsqueeze(1))
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)

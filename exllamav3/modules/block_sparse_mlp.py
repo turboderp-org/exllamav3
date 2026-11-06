@@ -22,6 +22,7 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
+    routing_jitter,
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
@@ -1077,7 +1078,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             z = y
 
         if self.routing_gate is not None:
-            selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
+            selected_experts, routing_weights = self.route(bsz, z, params)
             if params.get("activate_all_experts") and "capture_qmaps" in params:
                 selected_experts, routing_weights = \
                     self.capture_pass_experts(selected_experts, routing_weights, params["capture_qmaps"])
@@ -1109,8 +1110,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routing_gate is not None and params.get("activate_all_experts"):
             need_sens = "capture_sens" in params and self.gated
             if need_sens or aff is not None:
-                sel, w = self.routing_fn(
-                    bsz, self.routing_cfg, z, {k: v for k, v in params.items() if k != "activate_all_experts"})
+                sel, w = self.route(
+                    bsz, z, {k: v for k, v in params.items() if k != "activate_all_experts"})
                 routed_w = torch.zeros((bsz, self.num_experts), dtype = torch.float, device = y.device)
                 routed_w.scatter_(1, sel, w.float())
                 if need_sens:
@@ -1753,6 +1754,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return False
         return g.in_features % 128 == 0 and g.out_features % 128 == 0 and d.out_features % 128 == 0 \
             and self.hidden_size <= d.out_features
+
+
+    def route(self, bsz, y, params):
+        if params.get("expert_jitter_offsets") is not None:
+            return routing_jitter(bsz, self.routing_cfg, y, params, self.key, self.router_type)
+        return self.routing_fn(bsz, self.routing_cfg, y, params)
+
 
     def tp_prefill_bound(self, tokens: int, s: int, channels: int, tensor_split: bool) -> int:
         """Prefill transients on a TP rank holding s of channels, the same bound the layer-split
