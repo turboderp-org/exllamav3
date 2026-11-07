@@ -229,6 +229,46 @@ def test_index_is_rebuilt_from_files(device, tmp_path):
     tier2.close()
 
 
+def test_pages_and_checkpoints_of_another_process_are_adopted_without_a_reopen(device, tmp_path):
+    # Two tiers open on one directory, as two processes sharing a root. What the first writes after the second
+    # opened is found by the hashes of a coming allocation: the pages, their chain metadata and the checkpoint
+    # they anchor; a hash not asked for stays unknown, and the adopted pages restore like any other
+    tier_a, disk_a, tensor_a = build(8, device, tmp_path)
+    tier_b, disk_b, tensor_b = build(8, device, tmp_path)
+    for tag in range(1, 4):
+        fill(tensor_a, tag, float(tag))
+        tier_a.store(page(tag, tag, prev = phash(tag - 1) if tag > 1 else None), serial = tag)
+    stashed = {"position": 96, "checkpoint_size": 4096, "layer.a": torch.full((8,), 2.0)}
+    disk_a.write_state(phash(3), stashed)
+    disk_a.flush()
+    assert not disk_b.has_page(phash(1)) and not disk_b.has_state(phash(3))
+
+    disk_b.prefetch([phash(1), phash(2)], serial = 1)
+    assert disk_b.has_page(phash(1)) and disk_b.has_page(phash(2)) and not disk_b.has_page(phash(3))
+    assert disk_b.page_prev_hash(phash(2)) == phash(1) and disk_b.chain_prev(phash(2)) == phash(1)
+    assert disk_b.metrics["pages_adopted"] == 2 and disk_b.metrics["states_adopted"] == 0
+    assert disk_b.total_size == disk_a.pages[phash(1)]["size"] + disk_a.pages[phash(2)]["size"]
+    for tag in (1, 2):
+        if phash(tag) not in tier_b:
+            assert tier_b.promote(phash(tag), serial = 20) is not None
+        e = tier_b.fetch(phash(tag), 0, serial = 20)
+        assert e is not None and e["pending"].is_set()
+        torch.cuda.synchronize()
+        assert torch.all(tensor_b[0] == float(tag))
+
+    disk_b.prefetch([phash(3)], serial = 2)
+    assert disk_b.has_page(phash(3)) and disk_b.has_state(phash(3))
+    assert disk_b.metrics["states_adopted"] == 1
+    back = disk_b.read_state(phash(3))
+    assert back["position"] == 96 and torch.equal(back["layer.a"], stashed["layer.a"])
+    host_pool.give(back)
+    # Asking again finds nothing new
+    assert disk_b.adopt([phash(1), phash(2), phash(3)]) == 0
+    for disk, tier in ((disk_a, tier_a), (disk_b, tier_b)):
+        disk.close()
+        tier.close()
+
+
 def test_root_budget_evicts_least_recently_used_sibling_directories(device, tmp_path):
     # Three configurations share one root. The budget is the root's; the newest open removes the oldest
     # sibling whole and keeps the one used more recently
