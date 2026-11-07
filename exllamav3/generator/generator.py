@@ -61,6 +61,11 @@ class Generator:
         disk_cache_flush_on_idle: bool = True,
         disk_cache_checkpoint_interval: int = 4096,
         disk_cache_write_interval: float = 2.0,
+        aging_lfu: bool = False,
+        aging_half_life_hours: float = 72.0,
+        aging_hit_cap_pages: int = 64,
+        aging_weight_cap: float = 64.0,
+        aging_persist_dir: str | None = None,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -220,6 +225,26 @@ class Generator:
             each sequence are not queued: speculative decoding can still rewind them, and the MTP draft cache
             writes the last slot of a page one step later. 0 disables. Default 2.0
 
+        :param aging_lfu:
+            Enable aging-LFU prompt-cache weights. A hit covering P pages adds min(P, aging_hit_cap_pages) / P
+            to each reused page, capped at aging_weight_cap. Effective weight decays with a half-life of
+            aging_half_life_hours, and eviction orders leaves by that weight, tree-aware. Default False
+
+        :param aging_half_life_hours:
+            Half-life of per-page prompt-cache weight, in hours. Default 72: stable system/tool prompts stay hot
+            while one-off documents decay out. Must be positive
+
+        :param aging_hit_cap_pages:
+            Per-hit credit cap, in pages. A 245K one-off document covers ~960 pages, so it earns 64/960 per page
+            instead of 1 and cannot dominate the cache after one read. Default 64
+
+        :param aging_weight_cap:
+            Per-page cumulative weight cap. Default 64
+
+        :param aging_persist_dir:
+            Directory for the SQLite weight/prefix sidecar, so weights and configured warm prefixes survive a
+            restart. None (default) keeps weights in memory only
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -254,7 +279,15 @@ class Generator:
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
         # Paging
-        self.pagetable = PageTable(self, cache)
+        self.pagetable = PageTable(
+            self,
+            cache,
+            aging_lfu = aging_lfu,
+            aging_half_life_hours = aging_half_life_hours,
+            aging_hit_cap_pages = aging_hit_cap_pages,
+            aging_weight_cap = aging_weight_cap,
+            aging_persist_dir = aging_persist_dir,
+        )
         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
         cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
         self.cache_owner_serial = cache.owner_serial
@@ -622,6 +655,10 @@ class Generator:
             "hit_rate": alloc_cached / alloc_prompt if alloc_prompt else None,
             "tier_hit_rate": alloc_tier / alloc_prompt if alloc_prompt else None,
             "disk_hit_rate": alloc_disk / alloc_prompt if alloc_prompt else None,
+            "aging_lfu": pt.aging_lfu,
+            "aging_half_life_hours": pt.aging_half_life_seconds / 3600.0,
+            "aging_hits": pt.metrics["aging_hits"],
+            "aging_credit_pages": pt.metrics["aging_credit_pages"],
             "active_jobs": len(self.active_jobs),
             "pending_jobs": len(self.pending_jobs),
         }
@@ -910,6 +947,7 @@ class Generator:
             self.cpu_page_cache.close()
             self.cpu_page_cache = None
             self.pagetable.cpu_tier = None
+        self.pagetable.close()
         self.sample_pinned = None
         self.staging_buffers = {}
         self.stage_arenas = {}

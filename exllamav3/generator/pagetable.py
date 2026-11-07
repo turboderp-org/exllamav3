@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 import heapq
+import numpy as np
 import torch
 import hashlib
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ import time
 from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
+from .aging_lfu import PrefixWeightStore
 
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
@@ -76,6 +78,13 @@ class CachePage:
     children: list[CachePage]
     longest_chain: int
 
+    # Aging-LFU state: cumulative credit and the wall-clock time of the last hit. Effective weight is computed
+    # lazily at eviction time (see PageTable._effective_weight), so the hot path only adds credit.
+    weight: float = 0.0
+    last_hit: float = 0.0
+    weight_revert: float = 0.0
+    last_hit_revert: float = 0.0
+
     # False when a multimodal placeholder id precedes the end of this page's chain: such a chain's hashes are
     # only meaningful within this process (see Sequence.allocate_pages), so the disk tier does not keep the page
     persistable: bool = True
@@ -115,6 +124,8 @@ class CachePage:
         self.prev_hash_revert = self.prev_hash
         self.access_serial_revert = self.access_serial
         self.kv_position_revert = self.kv_position
+        self.weight_revert = self.weight
+        self.last_hit_revert = self.last_hit
         self.can_revert = True
 
     # Reuse unreferenced page
@@ -124,6 +135,8 @@ class CachePage:
         self.prev_hash = self.prev_hash_revert
         self.access_serial = self.access_serial_revert
         self.kv_position = self.kv_position_revert
+        self.weight = self.weight_revert
+        self.last_hit = self.last_hit_revert
         self.can_revert = False
 
     # Increase reference count
@@ -148,6 +161,7 @@ class CachePage:
         self.prev_hash = None
         self.can_revert = False
         self.kv_position = 0
+        self.pagetable._attach_weight(self)
 
     # Add reference to (currently) unique page
     def add_ref_unique(self, serial):
@@ -161,6 +175,8 @@ class CachePage:
         self.access_serial = serial
         self.prev_hash = None
         self.kv_position = 0
+        self.weight = 0.0
+        self.last_hit = 0.0
 
     # Decrease reference count
     def sub_ref(self):
@@ -172,6 +188,8 @@ class CachePage:
             if self.phash in self.pagetable.referenced_pages or self.phash in self.pagetable.unreferenced_pages:
                 self.phash = _randomhash()
                 self.prev_hash = None
+                self.weight = 0.0
+                self.last_hit = 0.0
             assert self.phash not in self.pagetable.unreferenced_pages
             self.pagetable.unreferenced_pages[self.phash] = self
 
@@ -183,6 +201,8 @@ class CachePage:
         self.prev_hash = None
         self.kv_position = 0
         self.can_revert = False
+        self.weight = 0.0
+        self.last_hit = 0.0
         self.sequence[:, :] = 0
         assert self.phash not in self.pagetable.unreferenced_pages
         self.pagetable.unreferenced_pages[self.phash] = self
@@ -198,6 +218,7 @@ class CachePage:
         self.can_revert = False
         assert self.phash not in self.pagetable.referenced_pages
         self.pagetable.referenced_pages[self.phash] = self
+        self.pagetable._attach_weight(self)
 
     # Clear allocated page to repeat prefill
     def make_unique(self):
@@ -208,6 +229,8 @@ class CachePage:
         self.pagetable.referenced_pages[self.phash] = self
         self.prev_hash = None
         self.kv_position = 0
+        self.weight = 0.0
+        self.last_hit = 0.0
 
 
 class Sequence:
@@ -324,7 +347,12 @@ class PageTable:
     def __init__(
         self,
         generator: Generator,
-        cache: Cache
+        cache: Cache,
+        aging_lfu: bool = False,
+        aging_half_life_hours: float = 72.0,
+        aging_hit_cap_pages: int = 64,
+        aging_weight_cap: float = 64.0,
+        aging_persist_dir: str | None = None,
     ):
         """
         Manage the physical cache pages backing prompt and generation state.
@@ -335,9 +363,28 @@ class PageTable:
         practice for this purpose; checking full token contents on every lookup would cost more than the vanishing
         collision risk justifies. When a page becomes unreferenced after inference it remains indexed by its hash,
         so later jobs can revive it for prompt-cache reuse until eviction or defragmentation overwrites it.
-        Eviction consumes empty and orphaned pages first, then prunes cached sequences tail-first, least recently
-        used sequence first (see build_eviction_order).
+        Eviction consumes empty and orphaned pages first, then prunes cached sequences tail-first. With aging_lfu,
+        leaves are ordered by effective weight instead of raw recency, so repeatedly hit prefixes survive while
+        one-off long documents decay and are pruned from their tails first (see build_eviction_order).
+
+        :param aging_lfu:
+            Enable aging-LFU prompt-cache weights. A hit covering P pages adds min(P, hit_cap_pages) / P to each
+            reused page, capped at weight_cap. Effective weight decays with a half-life of aging_half_life_hours.
+        :param aging_half_life_hours:
+            Half-life of the per-page weight, in hours. 72 hours keeps stable system/tool prompts hot while
+            letting one-off documents fall out.
+        :param aging_hit_cap_pages:
+            Per-hit credit cap, in pages. A 245K one-off document covers ~960 pages, so it earns 64/960 per page
+            instead of 1 and cannot dominate the cache after one read.
+        :param aging_weight_cap:
+            Per-page cumulative weight cap.
+        :param aging_persist_dir:
+            Directory for the SQLite weight/prefix sidecar. None keeps weights in memory only.
         """
+        assert aging_half_life_hours > 0, "aging_half_life_hours must be positive"
+        assert aging_hit_cap_pages >= 1, "aging_hit_cap_pages must be at least 1"
+        assert aging_weight_cap > 0, "aging_weight_cap must be positive"
+
         self.generator = generator
         self.cache = cache
         self.max_pages = cache.max_num_tokens // PAGE_SIZE
@@ -349,9 +396,22 @@ class PageTable:
         self.reset_page_table()
         self.last_defrag_serial = self.max_pages
 
-        # "tree" = prune cached sequences tail-first, oldest first; "lru" = legacy oldest-page-first policy,
+        # "tree" = prune cached sequences tail-first; "lru" = legacy oldest-page-first policy,
         # kept for comparison/debug
         self.eviction_policy = "tree"
+
+        # Aging-LFU state. Weights are keyed by page hash, not page index, so defragmentation can move pages
+        # without losing them.
+        self.aging_lfu = bool(aging_lfu)
+        self.aging_half_life_seconds = float(aging_half_life_hours) * 3600.0
+        self.aging_hit_cap_pages = int(aging_hit_cap_pages)
+        self.aging_weight_cap = float(aging_weight_cap)
+        self._weight_store = (
+            PrefixWeightStore(aging_persist_dir)
+            if self.aging_lfu and aging_persist_dir
+            else None
+        )
+        self._weights = self._weight_store.load_weights() if self._weight_store is not None else {}
 
         # Optional second-tier page cache in system memory (CPUPageCache), set by the Generator. Complete pages
         # are pushed there on eviction and restored from there on allocation
@@ -368,6 +428,8 @@ class PageTable:
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
             "alloc_disk_pages": 0,        # of those, read from the disk tier (by the prefetch or the allocation)
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+            "aging_hits": 0,              # allocation events that credited reused pages
+            "aging_credit_pages": 0,      # pages credited by those hits
         }
 
 
@@ -397,11 +459,109 @@ class PageTable:
                 new_page_index = 0,
                 children = [],
                 longest_chain = 1,
+                weight = 0.0,
+                last_hit = 0.0,
+                weight_revert = 0.0,
+                last_hit_revert = 0.0,
             )
             self.all_pages.append(cp)
             self.unreferenced_pages[h] = cp
         self.access_serial = self.max_pages
         self.last_defrag_serial = self.access_serial
+
+
+    def _attach_weight(self, page: CachePage):
+        """
+        Attach the stored aging-LFU state to a page that has just taken a content hash, so a page recreated
+        after a restart inherits the weight its hash earned in an earlier process.
+        """
+        if not self.aging_lfu:
+            page.weight = 0.0
+            page.last_hit = 0.0
+            return
+        weight, last_hit = self._weights.get(page.phash, (0.0, 0.0))
+        page.weight = weight
+        page.last_hit = last_hit
+
+
+    def _effective_weight(self, page: CachePage) -> float:
+        """
+        Weight at eviction time, decayed lazily from the page's last hit. Not recomputed on every access.
+        """
+        if not self.aging_lfu or page.weight <= 0.0:
+            return 0.0
+        age = max(0.0, time.time() - page.last_hit)
+        return page.weight * (0.5 ** (age / self.aging_half_life_seconds))
+
+
+    def effective_weight_hash(self, phash: bytes) -> float:
+        """
+        Effective weight for a hash held only in the CPU or disk tier, where no CachePage object exists.
+        """
+        if not self.aging_lfu:
+            return 0.0
+        weight, last_hit = self._weights.get(phash, (0.0, 0.0))
+        if weight <= 0.0:
+            return 0.0
+        age = max(0.0, time.time() - last_hit)
+        return weight * (0.5 ** (age / self.aging_half_life_seconds))
+
+
+    def _credit_hit(self, pages: list[CachePage]):
+        """
+        Credit a prompt-cache hit by the prefill work it saved. P pages reused earn min(P, hit_cap_pages) total
+        credit, spread evenly over those pages, so a long one-off document earns a small per-page increment while
+        a repeated system/tool prefix earns a full increment on every page it covers. Per-page weight is capped.
+        """
+        if not self.aging_lfu or not pages:
+            return
+        p = len(pages)
+        credit = min(p, self.aging_hit_cap_pages)
+        per_page = credit / p
+        now = time.time()
+        items = []
+        for page in pages:
+            page.weight = min(page.weight + per_page, self.aging_weight_cap)
+            page.last_hit = now
+            self._weights[page.phash] = (page.weight, page.last_hit)
+            items.append((page.phash, page.weight, page.last_hit))
+        self.metrics["aging_hits"] += 1
+        self.metrics["aging_credit_pages"] += p
+        if self._weight_store is not None:
+            self._weight_store.put_weights(items)
+
+
+    def remember_prefix(self, label: str, token_ids: torch.Tensor):
+        """
+        Persist a configured warm prefix's exact token IDs, so a later process can re-prefill it and attach the
+        weights its pages earned.
+        """
+        if self._weight_store is None:
+            return
+        ids = token_ids.detach().cpu().to(torch.long).reshape(-1).numpy()
+        self._weight_store.put_prefix(label, ids.tobytes())
+
+
+    def stored_prefixes(self) -> list[tuple[str, torch.Tensor]]:
+        """
+        Load persisted warm prefixes as (label, input_ids) pairs, shape (1, n).
+        """
+        if self._weight_store is None:
+            return []
+        out = []
+        for label, blob in self._weight_store.load_prefixes():
+            ids = torch.from_numpy(np.frombuffer(blob, dtype = np.int64).copy()).unsqueeze(0)
+            out.append((label, ids))
+        return out
+
+
+    def close(self):
+        """
+        Close the weight sidecar. Safe to call more than once.
+        """
+        if self._weight_store is not None:
+            self._weight_store.close()
+            self._weight_store = None
 
 
     def dump_page_list(self, short: bool = True):
@@ -418,12 +578,13 @@ class PageTable:
              valuable intact data in the cache.
           3. Rooted trees, i.e. complete cached sequences.
 
-        Trees are consumed one at a time, least recently used root first; since any reuse of a cached prefix
-        refreshes the root's access serial, root age reflects the recency of the whole tree. Within a tree, pages
-        are pruned leaf-first, oldest leaf first, so a cached sequence is eaten from its tail and the longest
-        possible prefix survives. When one job reclaims pages from a paused long sequence, the paused job loses
-        only as many trailing pages as were actually taken; under the old oldest-page-first policy the root was
-        typically taken first, making the entire chain unrecoverable and forcing a full prefill on resume.
+        Within each class, candidate leaves are ordered by effective aging-LFU weight (or raw recency when
+        aging_lfu is off), lowest first. Pages are pruned leaf-first, so a cached sequence is eaten from its tail
+        and the longest possible prefix survives; an internal page is only emitted after every child has been
+        emitted, so evicting it cannot break a still-cached descendant chain. A referenced or protected leaf
+        blocks its ancestors, because taking an ancestor would orphan a chain still in use. When one job reclaims
+        pages from a paused long sequence, the paused job loses only as many trailing pages as were actually
+        taken.
 
         Pages whose hash appears in protected_hashes are pages the current allocation is itself about to claim,
         and are excluded so that serving early cache misses cannot cannibalize later hits of the same sequence.
@@ -477,24 +638,22 @@ class PageTable:
                 parent.children.append(p)
                 parent_of[id(p)] = parent
 
-        roots.sort(key = lambda p: p.access_serial)
-        orphan_roots.sort(key = lambda p: p.access_serial)
-
-        def prune(root):
-            # Emit the tree's evictable pages in the order given by repeatedly removing the oldest current leaf.
-            # A page that cannot be evicted (referenced or protected) blocks its ancestors, since evicting an
-            # ancestor would orphan a chain that is still in use.
+        def prune(roots):
+            # Gather every leaf of the class into one heap, ordered by effective weight. A page that cannot be
+            # evicted (referenced or protected) blocks its ancestors: it is skipped without decrementing the
+            # parent's remaining-child count, so the parent is never emitted while that chain is still in use.
             remaining = {}
             heap = []
-            stack = [root]
-            while stack:
-                p = stack.pop()
-                remaining[id(p)] = len(p.children)
-                if not p.children:
-                    heapq.heappush(heap, (p.access_serial, p.page_index, p))
-                stack.extend(p.children)
+            for root in roots:
+                stack = [root]
+                while stack:
+                    p = stack.pop()
+                    remaining[id(p)] = len(p.children)
+                    if not p.children:
+                        heapq.heappush(heap, (self._effective_weight(p), p.access_serial, p.page_index, p))
+                    stack.extend(p.children)
             while heap:
-                _, _, p = heapq.heappop(heap)
+                _, _, _, p = heapq.heappop(heap)
                 if id(p) not in emitted:
                     if p.ref_count > 0 or p.phash in protected_hashes:
                         continue
@@ -504,17 +663,16 @@ class PageTable:
                 if parent is not None:
                     remaining[id(parent)] -= 1
                     if remaining[id(parent)] == 0:
-                        heapq.heappush(heap, (parent.access_serial, parent.page_index, parent))
+                        heapq.heappush(heap, (self._effective_weight(parent), parent.access_serial,
+                                              parent.page_index, parent))
 
         # Classes 2 and 3
-        for root in orphan_roots:
-            prune(root)
-        for root in roots:
-            prune(root)
+        prune(orphan_roots)
+        prune(roots)
 
         # Last resort
         leftovers = [p for p in self.unreferenced_pages.values() if id(p) not in emitted]
-        leftovers.sort(key = lambda p: (p.phash in protected_hashes, p.access_serial))
+        leftovers.sort(key = lambda p: (p.phash in protected_hashes, self._effective_weight(p), p.access_serial))
         order += leftovers
 
         return deque(order)
@@ -573,6 +731,7 @@ class PageTable:
         """
         allocated_pages = []
         available_pages = None
+        hit_indices = []
 
         def next_evictable():
             # Deferred so allocations served entirely by hash matches never build the eviction order. Pages
@@ -596,6 +755,7 @@ class PageTable:
             if rp:
                 rp.add_ref(self.access_serial)
                 allocated_pages.append(rp)
+                hit_indices.append(lp)
 
             # If possible, reuse an unreferenced page with matching hash
             else:
@@ -603,6 +763,7 @@ class PageTable:
                 if up:
                     up.add_ref(self.access_serial)
                     allocated_pages.append(up)
+                    hit_indices.append(lp)
 
                 # No matching page, allocate the best eviction candidate. If the missing page is stored in the
                 # CPU tier, restore it into the new page; the eviction above may itself push to the tier, and in
@@ -629,6 +790,7 @@ class PageTable:
                             # the prefetch or this allocation brought it in; from then on it is a tier entry
                             if entry.pop("from_disk", False):
                                 self.metrics["alloc_disk_pages"] += 1
+                            hit_indices.append(lp)
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -655,6 +817,7 @@ class PageTable:
                 break
 
         # If recurrent cache used, roll back to longest prefix, clear subsequent pages
+        credit_limit = len(page_hashes)
         if recurrent_pages is not None:
             max_recur = 0
             for rp in recurrent_pages:
@@ -664,6 +827,12 @@ class PageTable:
             #     allocated_pages[cpi].make_unique()
             self.metrics["alloc_kv_only_pages"] += cached_pages - max_recur
             cached_pages = max_recur
+            # Pages past the last usable recurrent checkpoint are rewritten by replay prefill, so they saved
+            # no prefill work and earn no aging-LFU credit
+            credit_limit = max_recur
+
+        if self.aging_lfu and hit_indices:
+            self._credit_hit([allocated_pages[i] for i in hit_indices if i < credit_limit])
 
         self.metrics["alloc_pages"] += len(allocated_pages)
         self.metrics["alloc_prompt_pages"] += len(page_hashes)
