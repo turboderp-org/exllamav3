@@ -353,6 +353,10 @@ class PageTable:
         aging_hit_cap_pages: int = 64,
         aging_weight_cap: float = 64.0,
         aging_persist_dir: str | None = None,
+        aging_capture_prefixes: bool = True,
+        aging_prefix_min_tokens: int = 2048,
+        aging_prefix_max_tokens: int = 65536,
+        aging_prefix_max_entries: int = 8,
     ):
         """
         Manage the physical cache pages backing prompt and generation state.
@@ -380,10 +384,22 @@ class PageTable:
             Per-page cumulative weight cap.
         :param aging_persist_dir:
             Directory for the SQLite weight/prefix sidecar. None keeps weights in memory only.
+        :param aging_capture_prefixes:
+            Persist the token IDs of a chain when a hit covers it, so a later process can re-prefill it and
+            restore its K/V pages (not just their weights) before the first request. Needs aging_persist_dir.
+        :param aging_prefix_min_tokens:
+            Shortest chain worth capturing. Recurrent-checkpoint models gain nothing from a prefix shorter than
+            their checkpoint interval, so tiny prologues are skipped.
+        :param aging_prefix_max_tokens:
+            Longest chain to capture, truncated down to a whole number of pages.
+        :param aging_prefix_max_entries:
+            Number of captured prefixes to keep; the least recently written are dropped.
         """
         assert aging_half_life_hours > 0, "aging_half_life_hours must be positive"
         assert aging_hit_cap_pages >= 1, "aging_hit_cap_pages must be at least 1"
         assert aging_weight_cap > 0, "aging_weight_cap must be positive"
+        assert aging_prefix_min_tokens >= 0, "aging_prefix_min_tokens must not be negative"
+        assert aging_prefix_max_tokens >= 0, "aging_prefix_max_tokens must not be negative"
 
         self.generator = generator
         self.cache = cache
@@ -413,6 +429,18 @@ class PageTable:
         )
         self._weights = self._weight_store.load_weights() if self._weight_store is not None else {}
 
+        # Captured/configured warm prefixes, keyed by label and held as raw int64 token bytes so a hit can be
+        # deduplicated against them without rebuilding a tensor
+        self.aging_capture_prefixes = bool(aging_capture_prefixes) and self._weight_store is not None
+        self.aging_prefix_min_tokens = int(aging_prefix_min_tokens)
+        self.aging_prefix_max_tokens = int(aging_prefix_max_tokens)
+        self.aging_prefix_max_entries = int(aging_prefix_max_entries)
+        self._prefix_blobs = (
+            {label: blob for label, blob in self._weight_store.load_prefixes()}
+            if self._weight_store is not None
+            else {}
+        )
+
         # Optional second-tier page cache in system memory (CPUPageCache), set by the Generator. Complete pages
         # are pushed there on eviction and restored from there on allocation
         self.cpu_tier = None
@@ -430,6 +458,7 @@ class PageTable:
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
             "aging_hits": 0,              # allocation events that credited reused pages
             "aging_credit_pages": 0,      # pages credited by those hits
+            "aging_prefix_captures": 0,   # hit chains persisted as replayable warm prefixes
         }
 
 
@@ -529,6 +558,98 @@ class PageTable:
         self.metrics["aging_credit_pages"] += p
         if self._weight_store is not None:
             self._weight_store.put_weights(items)
+            self._capture_prefix(pages)
+
+
+    def _chain_to_root(self, page: CachePage) -> list[CachePage] | None:
+        """
+        Walk prev_hash from page back to its root, root first. None if the chain is broken (a predecessor was
+        evicted), because such a chain's hashes cannot be reproduced by replaying its tokens from position 0.
+        """
+        chain = []
+        seen = set()
+        p = page
+        while True:
+            if p.phash in seen:
+                return None
+            seen.add(p.phash)
+            chain.append(p)
+            if p.prev_hash is None:
+                break
+            p = self.referenced_pages.get(p.prev_hash) or self.unreferenced_pages.get(p.prev_hash)
+            if p is None:
+                return None
+        chain.reverse()
+        return chain
+
+
+    def _capture_prefix(self, pages: list[CachePage]):
+        """
+        Persist the token IDs of the chain a hit just reused, so the next process can prefill it at load and
+        recreate those K/V pages instead of only their weights. The chain is captured from its root down to the
+        last complete page of the hit: replaying exactly that token sequence reproduces the same hash chain, so
+        the old weights attach to the pages it recreates.
+
+        Labeled by the terminal page hash, which makes the write idempotent, and deduplicated against the stored
+        prefixes: a chain covered by a longer one is dropped, and a chain that extends a stored one replaces it.
+        """
+        if not self.aging_capture_prefixes or not pages:
+            return
+
+        # Where the reusable part of this hit ends
+        last = None
+        for p in reversed(pages):
+            if p.kv_position == PAGE_SIZE and p.persistable:
+                last = p
+                break
+        if last is None:
+            return
+        if "auto-" + last.phash.hex() in self._prefix_blobs:
+            return
+
+        chain = self._chain_to_root(last)
+        if chain is None:
+            return
+        complete = []
+        for p in chain:
+            if p.kv_position != PAGE_SIZE or not p.persistable:
+                break
+            complete.append(p)
+        if not complete:
+            return
+
+        total = len(complete) * PAGE_SIZE
+        if total < self.aging_prefix_min_tokens:
+            return
+        if total > self.aging_prefix_max_tokens:
+            # Truncate to whole pages so the replayed chain still ends on a complete page
+            keep = (self.aging_prefix_max_tokens // PAGE_SIZE) * PAGE_SIZE
+            if keep < self.aging_prefix_min_tokens:
+                return
+            complete = complete[:keep // PAGE_SIZE]
+            last = complete[-1]
+            label = "auto-" + last.phash.hex()
+            if label in self._prefix_blobs:
+                return
+
+        blob = torch.cat([p.sequence[0, :PAGE_SIZE] for p in complete]).numpy().tobytes()
+
+        # A stored prefix that already covers this chain makes it redundant; one this chain extends is superseded
+        for old_label, old in list(self._prefix_blobs.items()):
+            if old.startswith(blob):
+                return
+            if blob.startswith(old):
+                self._weight_store.remove_prefix(old_label)
+                del self._prefix_blobs[old_label]
+
+        label = "auto-" + last.phash.hex()
+        self._prefix_blobs[label] = blob
+        self._weight_store.put_prefix(label, blob)
+        self.metrics["aging_prefix_captures"] += 1
+
+        if len(self._prefix_blobs) > self.aging_prefix_max_entries:
+            self._weight_store.prune_prefixes(self.aging_prefix_max_entries)
+            self._prefix_blobs = {label: blob for label, blob in self._weight_store.load_prefixes()}
 
 
     def remember_prefix(self, label: str, token_ids: torch.Tensor):
@@ -539,17 +660,23 @@ class PageTable:
         if self._weight_store is None:
             return
         ids = token_ids.detach().cpu().to(torch.long).reshape(-1).numpy()
-        self._weight_store.put_prefix(label, ids.tobytes())
+        blob = ids.tobytes()
+        self._prefix_blobs[label] = blob
+        self._weight_store.put_prefix(label, blob)
 
 
     def stored_prefixes(self) -> list[tuple[str, torch.Tensor]]:
         """
-        Load persisted warm prefixes as (label, input_ids) pairs, shape (1, n).
+        Load persisted warm prefixes as (label, input_ids) pairs, shape (1, n), dropping any that a longer
+        stored prefix already covers.
         """
         if self._weight_store is None:
             return []
+        blobs = [blob for _, blob in self._weight_store.load_prefixes()]
         out = []
-        for label, blob in self._weight_store.load_prefixes():
+        for label, blob in self._prefix_blobs.items():
+            if any(other != blob and other.startswith(blob) for other in blobs):
+                continue
             ids = torch.from_numpy(np.frombuffer(blob, dtype = np.int64).copy()).unsqueeze(0)
             out.append((label, ids))
         return out

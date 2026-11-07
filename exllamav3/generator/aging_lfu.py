@@ -12,8 +12,9 @@ class PrefixWeightStore:
 
     The page table keys prompt-cache pages by a chained content hash, so a weight can outlive the process that
     credited it: this store keeps (phash, weight, last_hit) in SQLite and reloads it when the model is loaded
-    again. Prefix token IDs are kept separately for configured warm prefixes, so a restart can re-prefill the
-    same token sequence and attach the old weights to the pages it recreates.
+    again. Prefix token IDs are kept separately, so a restart can re-prefill the same token sequence and attach
+    the old weights to the pages it recreates. They come from two sources: prefixes named in the server config,
+    and hot chains the page table captured on a cache hit (see PageTable._capture_prefix).
 
     Writes are batched per allocation, not per token. The connection is opened once and closed by
     PageTable.close(); WAL mode keeps the hot path from serializing on the journal.
@@ -70,6 +71,26 @@ class PrefixWeightStore:
                 "SELECT label, token_ids FROM prefixes ORDER BY updated DESC"
             ).fetchall()
         return [(label, bytes(ids)) for label, ids in rows]
+
+    def remove_prefix(self, label: str):
+        with self._lock:
+            self._conn.execute("DELETE FROM prefixes WHERE label = ?", (label,))
+            self._conn.commit()
+
+    def prune_prefixes(self, max_entries: int):
+        """
+        Keep the max_entries most recently written prefixes, dropping the rest. Bounds the number of chains a
+        restart has to replay, and hence how long the warm-up prefill can take.
+        """
+        if max_entries < 0:
+            return
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM prefixes WHERE label NOT IN "
+                "(SELECT label FROM prefixes ORDER BY updated DESC LIMIT ?)",
+                (max_entries,),
+            )
+            self._conn.commit()
 
     def close(self):
         with self._lock:

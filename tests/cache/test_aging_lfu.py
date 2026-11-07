@@ -112,6 +112,112 @@ def test_weights_survive_a_restart(tmp_path):
     second.close()
 
 
+def filled_chain(pt, tokens, base = 0x40):
+    """Cache a chain holding the given tokens, which must cover whole pages, and return (pages, hashes)."""
+    assert len(tokens) % PAGE_SIZE == 0
+    hashes = [bytes([base, i]) for i in range(len(tokens) // PAGE_SIZE)]
+    pages, _, _, _ = pt.allocate_pages(hashes, 0, None)
+    for i, p in enumerate(pages):
+        p.sequence[0, :] = torch.tensor(tokens[i * PAGE_SIZE: (i + 1) * PAGE_SIZE], dtype = torch.long)
+        p.kv_position = PAGE_SIZE
+    for p, prev in zip(pages[1:], hashes[:-1]):
+        p.prev_hash = prev
+    pt.deallocate_pages(pages)
+    return pages, hashes
+
+
+def hit_chain(pt, hashes):
+    pages, _, _, _ = pt.allocate_pages(hashes, 0, None)
+    pt.deallocate_pages(pages)
+
+
+def test_capture_persists_hit_chain_tokens_and_replays(tmp_path):
+    # A hit whose chain earns weight also stores the chain's token IDs, so a fresh process can re-prefill it
+    tokens = list(range(1000, 1000 + 3 * PAGE_SIZE))
+    kwargs = dict(aging_lfu = True, aging_persist_dir = str(tmp_path), aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    first = PageTable(None, fake_cache(), **kwargs)
+    _, hashes = filled_chain(first, tokens)
+    hit_chain(first, hashes)
+
+    (label, ids), = first.stored_prefixes()
+    assert label.startswith("auto-")
+    assert ids.reshape(-1).tolist() == tokens
+    assert first.metrics["aging_prefix_captures"] == 1
+    first.close()
+
+    second = PageTable(None, fake_cache(), **kwargs)
+    (label, ids), = second.stored_prefixes()
+    assert label.startswith("auto-")
+    assert ids.reshape(-1).tolist() == tokens
+    # Replaying the stored tokens recreates the same hash chain, and those pages inherit the weight it earned
+    pages, _ = filled_chain(second, tokens)
+    assert all(p.weight > 0.0 for p in pages)
+    second.close()
+
+
+def test_capture_skips_short_chains(tmp_path):
+    tokens = list(range(1000, 1000 + PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    hit_chain(pt, hashes)
+    assert pt.stored_prefixes() == []
+    pt.close()
+
+
+def test_capture_truncates_to_max_tokens(tmp_path):
+    tokens = list(range(1000, 1000 + 4 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE, aging_prefix_max_tokens = 3 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    hit_chain(pt, hashes)
+    (_, ids), = pt.stored_prefixes()
+    assert ids.reshape(-1).tolist() == tokens[:3 * PAGE_SIZE]
+    pt.close()
+
+
+def test_capture_supersedes_a_shorter_chain(tmp_path):
+    tokens = list(range(1000, 1000 + 4 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, short = filled_chain(pt, tokens[:2 * PAGE_SIZE])
+    hit_chain(pt, short)
+    assert len(pt.stored_prefixes()) == 1
+
+    # Cache the longer chain (its first pages are the short one), then hit all of it
+    _, long = filled_chain(pt, tokens)
+    hit_chain(pt, long)
+
+    (_, ids), = pt.stored_prefixes()
+    assert ids.reshape(-1).tolist() == tokens, "the longer chain should replace the shorter one"
+    pt.close()
+
+
+def test_capture_drops_the_least_recent_prefix(tmp_path):
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE, aging_prefix_max_entries = 2)
+    for base in (0x50, 0x51, 0x52):
+        tokens = [base] * (2 * PAGE_SIZE)
+        _, hashes = filled_chain(pt, tokens, base = base)
+        hit_chain(pt, hashes)
+        time.sleep(0.01)
+    assert len(pt.stored_prefixes()) == 2
+    pt.close()
+
+
+def test_capture_skips_a_broken_chain(tmp_path):
+    # Replaying a suffix alone would rebuild a different hash chain, so a hit whose ancestry is gone is not stored
+    tokens = list(range(1000, 1000 + 3 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    pt.unreferenced_pages[hashes[0]].clear()
+
+    hit_chain(pt, hashes[1:])
+    assert pt.stored_prefixes() == []
+    pt.close()
+
+
 def test_eviction_takes_cold_tails_before_hot_ones():
     # Two cached sequences, the older one hot (its pages were repeatedly reused) and the newer one cold.
     # Raw recency would eat the older tree first; aging-LFU has to prune the cold tail instead

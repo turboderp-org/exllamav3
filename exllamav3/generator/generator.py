@@ -66,6 +66,10 @@ class Generator:
         aging_hit_cap_pages: int = 64,
         aging_weight_cap: float = 64.0,
         aging_persist_dir: str | None = None,
+        aging_capture_prefixes: bool = True,
+        aging_prefix_min_tokens: int = 2048,
+        aging_prefix_max_tokens: int = 65536,
+        aging_prefix_max_entries: int = 8,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -245,6 +249,19 @@ class Generator:
             Directory for the SQLite weight/prefix sidecar, so weights and configured warm prefixes survive a
             restart. None (default) keeps weights in memory only
 
+        :param aging_capture_prefixes:
+            With aging_persist_dir set, also persist the token IDs of chains that earn weight, so a restart can
+            re-prefill them and rebuild their K/V pages instead of only their weights. Default True
+
+        :param aging_prefix_min_tokens:
+            Shortest chain worth capturing. Default 2048
+
+        :param aging_prefix_max_tokens:
+            Longest chain to capture, truncated to whole pages. Default 65536
+
+        :param aging_prefix_max_entries:
+            Number of captured prefixes to keep. Default 8
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -287,6 +304,10 @@ class Generator:
             aging_hit_cap_pages = aging_hit_cap_pages,
             aging_weight_cap = aging_weight_cap,
             aging_persist_dir = aging_persist_dir,
+            aging_capture_prefixes = aging_capture_prefixes,
+            aging_prefix_min_tokens = aging_prefix_min_tokens,
+            aging_prefix_max_tokens = aging_prefix_max_tokens,
+            aging_prefix_max_entries = aging_prefix_max_entries,
         )
         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
         cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
@@ -659,6 +680,8 @@ class Generator:
             "aging_half_life_hours": pt.aging_half_life_seconds / 3600.0,
             "aging_hits": pt.metrics["aging_hits"],
             "aging_credit_pages": pt.metrics["aging_credit_pages"],
+            "aging_prefix_captures": pt.metrics["aging_prefix_captures"],
+            "aging_stored_prefixes": len(pt._prefix_blobs),
             "active_jobs": len(self.active_jobs),
             "pending_jobs": len(self.pending_jobs),
         }
