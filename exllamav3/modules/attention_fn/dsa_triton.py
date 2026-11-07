@@ -840,6 +840,22 @@ _dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
 _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
 
+# EXL3_DSA_PF=1: on gfx1151, gathered-mode prefill calls at the V4 Flash shape go to the HIP kernel in
+# rocm/attn/dsa_prefill_rdna.cu instead of the Triton MQA kernel. Not bitwise identical to it (accumulation
+# order). Rows under _dsa_pf_min_r (decode, MTP and draft verify) always stay on Triton
+_dsa_pf = os.environ.get("EXL3_DSA_PF", "0") == "1"
+_dsa_pf_min_r = 256
+_dsa_pf_devices = {}
+
+
+def _dsa_pf_ok(device) -> bool:
+    key = str(device)
+    if key not in _dsa_pf_devices:
+        from ...ext import exllamav3_ext as ext
+        _dsa_pf_devices[key] = getattr(ext, "HAS_DSA_PREFILL_RDNA", False) and \
+            torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] == "gfx1151"
+    return _dsa_pf_devices[key]
+
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
     """Gather the pages holding entries [0, pool_len) of a packed pool and dequantize them into
@@ -960,6 +976,7 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
+    qc_in = qc is not None  # before staging: the HIP prefill kernel is only judged on fp16 pools
     if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
             and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
             and 0 < pool_len <= _dsa_qc_stage_max_entries):
@@ -1131,6 +1148,21 @@ def dsa_attn(
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
         )
+    # gfx1151: the HIP prefill kernel for gathered prefill at the V4 Flash shape (opt-in, see _dsa_pf)
+    if (DSA_MQA and _dsa_pf and R >= _dsa_pf_min_r and not dense_pool and has_window and has_sinks and derotate
+            and not qc_in and not q_split and not out_latent and not nc_block and not nc_chunk and multirow is None
+            and H == 64 and D_c == 448 and D_r == 64 and hpg > 0 and q.dtype == torch.half and q.is_contiguous()
+            and ring.is_contiguous() and kv_chunk.is_contiguous() and pc_arg.dtype == torch.half
+            and block_table.dtype == torch.int32 and block_table.is_contiguous()
+            and indices.dtype == torch.int32 and indices.is_contiguous() and k_len <= K_pad
+            and sinks_t.dtype == torch.float32 and _dsa_pf_ok(q.device)):
+        from ...ext import exllamav3_ext as ext
+        with torch.cuda.device(q.device):
+            ext.dsa_prefill_rdna(
+                q, ring, kv_chunk, pc_arg, pool_r.reshape(-1, D_r), block_table, indices, sinks_t, derot_t, out,
+                k_len, win_len, q_pos0, win_floor, ring_beg, page_size, float(scale),
+            )
+        return out
     # ROCm: the MQA prefill kernel (dsa_mqa.py) where the shape allows it, at its own tiling
     if DSA_MQA:
         c = m_consts((block_h, block_n, num_stages))
