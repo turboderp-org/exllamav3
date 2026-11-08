@@ -1076,8 +1076,8 @@ class SlidingAttention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         # Graph-captured C++ path for the whole decode step
-        # The graph kernels have no right-window mask: a non-causal block qualifies when its right
-        # window covers the whole block (the only keys past a row are the block's own)
+        # The graph kernels take the module's (left, right) window: a non-causal block qualifies when
+        # its right window covers the whole block (the only keys past a row are the block's own)
         if (
             _bc_attn_enable and non_causal_spans is None and (causal or self.window_right >= seqlen - 1) and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
