@@ -116,6 +116,12 @@ class Gemma4AssistantInputLayer(Module):
         assert target_hidden.shape[:-1] == x.shape, \
             f"Gemma4 assistant token/state shape mismatch: {tuple(x.shape)} vs {tuple(target_hidden.shape)}"
         state = get_for_device(params, "target_hidden", self.device).half()
+        if params.get("draft_step", 0) == 0:
+            # the round's first state must be the target's POST-final-norm hidden state (HF hidden_states[-1])
+            t = self.attached_model()
+            tn = t.modules[t.logit_layer_idx - 1]
+            assert type(tn).__name__ == "RMSNorm", type(tn).__name__
+            state = to_device(tn.forward(to_device(state, tn.device), params, out_dtype = torch.half), self.device)
         emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
         emb = to_device(emb, self.device)
         y = torch.cat((emb, state), dim = -1)
