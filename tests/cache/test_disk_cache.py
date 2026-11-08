@@ -689,8 +689,13 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
         prev = phash(tag)
     disk_a.flush()
     page_bytes = disk_a.image_size + 512
-    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes
+    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes. Processes
+    # on one root must agree on the budget: A's declaration is set to the root B will use, as if A had been
+    # started with it (a reopen would change A's directory size through the WAL checkpoint)
     root = DiskPageCache._dir_size(disk_a.dir) + page_bytes // 2
+    disk_a._retract_budget()
+    disk_a.root_size = disk_a.max_size = root
+    disk_a._declare_budget()
     tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
     assert os.path.isdir(disk_a.dir) and 0 <= disk_b.max_size < page_bytes
     # Over B's share but within the reclaim chunk: written, with the reclaim queued behind it
@@ -711,7 +716,7 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     disk_b.close(); tier_b.close()
     disk_a.close(); tier_a.close()
     # Reopened, A's index agrees with its files
-    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "aaaa")
     assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
     disk_a2.close(); tier_a2.close()
 
@@ -812,3 +817,26 @@ def test_idle_flush_ends_when_vram_holds_more_pages_than_the_disk_budget(device,
     # The pages the pass kept are the most recently used ones
     assert all(disk.has_page(phash(t)) or phash(t) in tier for t in (10, 11, 12))
     disk.close(); tier.close()
+
+
+def test_processes_sharing_a_root_must_agree_on_the_budget(device, tmp_path):
+    # Each directory records the budget of the process using it. A second tier on the root with a different budget
+    # is refused while the first is open (same directory or a sibling), accepted with the same budget; a closed
+    # tier retracts its declaration, and a declaration of a process that no longer runs does not count
+    import json
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_b")
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_b")
+    disk_b.close(); tier_b.close()
+    assert not os.path.exists(os.path.join(tmp_path, "model_b", "budget.json"))
+    disk_a.close(); tier_a.close()
+    tier_c, disk_c, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_c")
+    disk_c.close(); tier_c.close()
+    # A declaration left by a process that died (a pid nothing runs under, fresh file) is ignored
+    with open(os.path.join(tmp_path, "model_a", "budget.json"), "w") as f:
+        json.dump({"root_size": 1 << 20, "pid": 2 ** 22 - 1, "time": time.time()}, f)
+    tier_d, disk_d, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_d")
+    disk_d.close(); tier_d.close()

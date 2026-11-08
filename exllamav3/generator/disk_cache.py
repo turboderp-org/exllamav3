@@ -206,7 +206,12 @@ class DiskPageCache:
     mirror when a read misses. All SQLite writes of this directory happen on the writer thread (the sibling
     indexes are also read once at open); the main thread works from an in-memory mirror of the index, which
     it brings up to date for the hashes of each coming allocation with one read of the index (adopt), so the
-    pages and checkpoints another process writes to the directory are found without a reopen.
+    pages and checkpoints another process writes to the directory are found without a reopen. A directory's
+    share of the root is recomputed from what the siblings hold whenever one of them took a page of this
+    directory (a read miss) and at every touch interval, so a directory that fills up later does get its
+    share from one that filled the root first. The processes using a root must agree on its budget, since each
+    evicts the others' entries against its own: every directory records the budget of the process using it
+    (budget.json), and a live declaration of a different budget refuses the open.
     """
 
     def __init__(
@@ -302,6 +307,8 @@ class DiskPageCache:
             self.fingerprint, parts = cache_fingerprint(caches, canonical, self.image_size)
         else:
             self.fingerprint, parts = fingerprint, {"override": fingerprint}
+        # Temporary files carry the process id, so two processes never write the same temporary file
+        self._tmp_suffix = f".{os.getpid()}.tmp"
         self.dir = os.path.join(root_dir, self.fingerprint[:16])
         self.pages_dir = os.path.join(self.dir, "pages")
         self.states_dir = os.path.join(self.dir, "states")
@@ -314,6 +321,7 @@ class DiskPageCache:
         if not os.path.exists(manifest):
             with open(manifest, "w") as f:
                 json.dump({"fingerprint": self.fingerprint, "inputs": parts}, f, indent = 2, default = str)
+        self._declare_budget()
 
         # Mirrors of the index: phash -> {"prev_hash", "size", "last_access"} and phash -> {"size",
         # "last_access", "position"}. Updated by the main thread, persisted by the writer
@@ -343,6 +351,7 @@ class DiskPageCache:
         self._order_pops = 0
         self._order_rebuild = 64
         self._reclaim_pending = False
+        self._refresh_pending = False
         # Access stamp of the least recently used entry the sibling directories hold (None: they hold nothing),
         # as of the last scan. _make_room takes from them rather than evicting a more recently used entry here
         self._sibling_oldest = None
@@ -377,8 +386,6 @@ class DiskPageCache:
         self._space_checked = 0.0
         self._space_ok = True
 
-        # Temporary files carry the process id, so two processes never write the same temporary file
-        self._tmp_suffix = f".{os.getpid()}.tmp"
         self._last_touch = 0.0
         # Activity summary for the log: metric values at the last report, and the times of the last report and
         # the last activity
@@ -427,16 +434,43 @@ class DiskPageCache:
         files without a row are adopted from their headers (a crash between rename and insert)"""
         conn = self._connect()
         try:
-            for phash, prev_hash, size, last_access in conn.execute("SELECT phash, prev_hash, size, last_access FROM pages"):
-                if os.path.exists(self._page_path(phash)):
-                    self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
-                else:
-                    conn.execute("DELETE FROM pages WHERE phash = ?", (phash,))
-            for phash, size, last_access, position in conn.execute("SELECT phash, size, last_access, position FROM states"):
-                if os.path.exists(self._state_path(phash)):
-                    self.states[phash] = {"size": size, "last_access": last_access, "position": position}
-                else:
-                    conn.execute("DELETE FROM states WHERE phash = ?", (phash,))
+            for attempt in range(5):
+                try:
+                    self._reconcile(conn)
+                    break
+                except sqlite3.OperationalError as e:
+                    # Another process writes to this directory: a write that follows a read on one connection
+                    # fails at once when the index changed in between (WAL snapshot), not after the busy
+                    # timeout. Start over from a fresh read
+                    if "locked" not in str(e).lower() or attempt == 4:
+                        raise
+                    conn.rollback()
+                    self.pages.clear()
+                    self.states.clear()
+                    time.sleep(0.1 * (attempt + 1))
+        finally:
+            conn.close()
+        self.total_size = sum(m["size"] for m in self.pages.values()) + sum(m["size"] for m in self.states.values())
+        self.access_serial = max([m["last_access"] for m in self.pages.values()] +
+                                 [m["last_access"] for m in self.states.values()] + [0])
+
+
+    def _reconcile(self, conn):
+        # The reads complete before the first write, so the writes begin their own transaction and wait on the
+        # busy handler like any other writer instead of failing on a stale read snapshot
+        page_rows = conn.execute("SELECT phash, prev_hash, size, last_access FROM pages").fetchall()
+        state_rows = conn.execute("SELECT phash, size, last_access, position FROM states").fetchall()
+        for phash, prev_hash, size, last_access in page_rows:
+            if os.path.exists(self._page_path(phash)):
+                self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
+            else:
+                conn.execute("DELETE FROM pages WHERE phash = ?", (phash,))
+        for phash, size, last_access, position in state_rows:
+            if os.path.exists(self._state_path(phash)):
+                self.states[phash] = {"size": size, "last_access": last_access, "position": position}
+            else:
+                conn.execute("DELETE FROM states WHERE phash = ?", (phash,))
+        if True:
             for dirpath, _, filenames in os.walk(self.pages_dir):
                 for name in filenames:
                     path = os.path.join(dirpath, name)
@@ -477,11 +511,6 @@ class DiskPageCache:
                 conn.execute("INSERT OR REPLACE INTO states VALUES (?, ?, ?, ?)",
                              (phash, self.states[phash]["size"], 0, self.states[phash]["position"]))
             conn.commit()
-        finally:
-            conn.close()
-        self.total_size = sum(m["size"] for m in self.pages.values()) + sum(m["size"] for m in self.states.values())
-        self.access_serial = max([m["last_access"] for m in self.pages.values()] +
-                                 [m["last_access"] for m in self.states.values()] + [0])
 
 
     @staticmethod
@@ -683,11 +712,120 @@ class DiskPageCache:
             self._sibling_oldest = oldest
 
 
+    def _refresh_share(self):
+        """
+        Writer thread. Recompute this directory's share of the root from what the siblings hold now. The share
+        is otherwise only recomputed when this directory reclaims from them, so a process that owns the whole
+        root would never yield any of it: a sibling that fills up takes this directory's least recently used
+        pages (its reads then miss), but this directory would refill the space at once with its stale share.
+        Triggered by such a read miss and at every touch interval; when the share shrank below what the
+        directory holds, its own least recently used entries go
+        """
+        sibs, others = self._load_siblings()
+        try:
+            heap = self._sibling_heap(sibs)
+            oldest = heap[0][0] if heap else None
+        finally:
+            self._close_siblings(sibs)
+        with self._lock:
+            self.max_size = max(0, self.root_size - others)
+            self._sibling_oldest = oldest
+            if self.total_size > self.max_size:
+                self._make_room(0)
+
+
+    def _schedule_refresh(self):
+        with self._lock:
+            if self._refresh_pending or self._closed:
+                return
+            self._refresh_pending = True
+            self._enqueue(("refresh",))
+
+
+    def _read_missed(self):
+        """A page this directory's mirror holds has no file: a sibling directory took it (or another process
+        using this directory evicted it). Count it, and have the share re-read"""
+        self.metrics["page_read_failures"] += 1
+        self._schedule_refresh()
+
+
     @staticmethod
     def _remove_file(path: str):
         try:
             os.remove(path)
         except OSError:
+            pass
+
+
+    def _declare_budget(self):
+        """
+        The root budget is one number for every process using the root, since each process evicts the others'
+        entries against its own idea of it: a process with a smaller budget would keep stripping the pages of
+        one with a larger budget. Each directory records the budget of the process using it (budget.json); a
+        declaration counts while its directory is in use, by the same rule the stray handling applies (the
+        index touched within _STRAY_AGE), so the declarations of processes that exited or crashed expire.
+        A live declaration of a different budget, in this directory or a sibling, is an error.
+        """
+        mine = {"root_size": self.root_size, "pid": os.getpid(), "time": time.time()}
+        for path in [self.dir] + self._sibling_dirs():
+            bf = os.path.join(path, "budget.json")
+            if not os.path.isfile(bf):
+                continue
+            try:
+                with open(bf) as f:
+                    declared = json.load(f)
+                if not self._declaration_live(path, declared):
+                    continue
+            except (OSError, ValueError):
+                continue
+            other = int(declared.get("root_size", -1))
+            if other != self.root_size:
+                raise ValueError(
+                    f"Disk cache root {self.root_dir} is in use by another process (pid {declared.get('pid')}, "
+                    f"{os.path.basename(path)}) with a budget of {other} bytes; this process asked for "
+                    f"{self.root_size} bytes. Processes sharing a disk cache root must use the same disk cache size"
+                )
+        try:
+            tmp = os.path.join(self.dir, f"budget.json{self._tmp_suffix}")
+            with open(tmp, "w") as f:
+                json.dump(mine, f)
+            os.replace(tmp, os.path.join(self.dir, "budget.json"))
+        except OSError:
+            pass
+
+
+    @staticmethod
+    def _declaration_live(path: str, declared: dict) -> bool:
+        """A budget declaration counts while the process that made it runs (same host). Where that cannot be
+        checked, while its directory was in use recently, by the stray rule"""
+        pid = declared.get("pid")
+        if isinstance(pid, int) and hasattr(os, "kill") and os.name != "nt":
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                pass
+        index = os.path.join(path, "index.sqlite")
+        try:
+            used = os.path.getmtime(index) if os.path.exists(index) else float(declared.get("time", 0))
+        except OSError:
+            return False
+        return used >= time.time() - _STRAY_AGE
+
+
+    def _retract_budget(self):
+        """Remove this process's declaration at close, so a later process (or a reopen) with another budget
+        is not refused on its account"""
+        bf = os.path.join(self.dir, "budget.json")
+        try:
+            with open(bf) as f:
+                if json.load(f).get("pid") == os.getpid():
+                    os.remove(bf)
+        except (OSError, ValueError):
             pass
 
 
@@ -765,7 +903,9 @@ class DiskPageCache:
         if not missing_pages and not missing_states:
             return 0
         if self._query_conn is None:
-            self._query_conn = sqlite3.connect(os.path.join(self.dir, "index.sqlite"), timeout = 60,
+            # WAL readers do not wait on writers; the short timeout covers the rare exclusive moments (an index
+            # being rebuilt or switched to WAL by another process), after which the next enqueue simply retries
+            self._query_conn = sqlite3.connect(os.path.join(self.dir, "index.sqlite"), timeout = 1.0,
                                                check_same_thread = False)
         adopted = 0
         try:
@@ -1456,6 +1596,12 @@ class DiskPageCache:
                         finally:
                             with self._lock:
                                 self._reclaim_pending = False
+                    elif kind == "refresh":
+                        try:
+                            self._refresh_share()
+                        finally:
+                            with self._lock:
+                                self._refresh_pending = False
                     elif kind == "flush":
                         conn.commit()
                         self._touch_dir()
@@ -1477,8 +1623,10 @@ class DiskPageCache:
                     except sqlite3.Error as e:
                         self._write_failed("index commit", None, e)
                     if time.time() - self._last_touch > _TOUCH_INTERVAL:
-                        # Shows other processes that this directory is in use (see _reclaim_root)
+                        # Shows other processes that this directory is in use (see _reclaim_root), and takes
+                        # note of what they hold by now
                         self._touch_dir()
+                        self._schedule_refresh()
         finally:
             conn.close()
 
@@ -1680,7 +1828,7 @@ class DiskPageCache:
                 with self._lock:
                     self._promotions -= 1
                 if failed:
-                    self.metrics["page_read_failures"] += 1
+                    self._read_missed()
                     with self._lock:
                         if phash in self.pages:
                             self._drop("page", phash)
@@ -1751,7 +1899,7 @@ class DiskPageCache:
             meta["image_offset"] = meta["data_offset"] + meta["tokens_len"]
             return meta, tokens
         except (OSError, ValueError):
-            self.metrics["page_read_failures"] += 1
+            self._read_missed()
             with self._lock:
                 if phash in self.pages:
                     self._drop("page", phash)
@@ -1777,7 +1925,7 @@ class DiskPageCache:
                     raise ValueError("checksum mismatch")
             except (OSError, ValueError) as e:
                 logger.warning(f"Disk cache tier: page {phash.hex()[:12]} unreadable ({e}), dropped")
-                self.metrics["page_read_failures"] += 1
+                self._read_missed()
                 with self._lock:
                     if phash in self.pages:
                         self._drop("page", phash)
@@ -1952,6 +2100,7 @@ class DiskPageCache:
             else:
                 self.metrics["state_candidates_dropped"] += 1
         self._closed = True
+        self._retract_budget()
         if self._query_conn is not None:
             self._query_conn.close()
             self._query_conn = None
