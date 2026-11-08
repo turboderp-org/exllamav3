@@ -172,45 +172,20 @@ class SharedKVAttention(Module):
         assert self.source_kind is not None, f"{self.key}: not attached to a target layer"
         assert params.get("attn_mode", "flash_attn") == "flash_attn", "SharedKVAttention runs in decode mode only"
         bsz, seqlen, _ = x.shape
-        # Source pages and their addressing, shared by the native and the python path
+        # Source pages and their addressing, shared by the native and the python path. A quantized source layer
+        # is read in place (QCK/QCV in the native kernels, online dequant in the triton decode) when its format
+        # allows it, instead of get_kv() materializing full-size fp16 K/V every draft step
+        qc = None
         if self.source_kind == "paged":
-            # a quantized source layer is read in place (native path with QCK/QCV, else the online-dequant
-            # triton decode), instead of get_kv() materializing full-size fp16 K/V every draft step
-            _layer = params["cache"].layers[self.source_layer_idx, params.get("layer_instance") or 0]
-            if getattr(_layer, "qk", None) is not None and getattr(_layer, "compand_a", 0.0) == 0.0 and self.head_dim % 32 == 0:
-                qk, sk, qv, sv, k_bits, v_bits = _layer.get_qkv()
-                block_table = get_for_device(params, "block_table", self.device)
-                cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
-                if (
-                    _bc_attn_enable and x.dtype == torch.float16 and x.is_contiguous() and
-                    bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
-                ):
-                    o = self._bc_step(x, qk, qv, block_table, cache_seqlens, params, qc = (sk, sv, k_bits, v_bits))
-                    if o is not None:
-                        return to2(o, out_dtype, self.out_dtype)
-                q = self.q_proj.forward(x, params, out_dtype = torch.half)
-                q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
-                if self.q_norm is not None:
-                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                if self.rope is not None:
-                    q, _ = self.rope.apply(q, None, params.get("position", 0),
-                                           get_for_device(params, "positions", self.device, None),
-                                           get_for_device(params, "position_ids", self.device, None), True)
-                o = paged_attn_triton_decode(
-                    q, None, None, qk, qv, block_table, cache_seqlens,
-                    causal = True, softmax_scale = self.sm_scale,
-                    window_size = (self.sliding_window, 0) if self.sliding_window > 0 else None,
-                    softcap = self.logit_softcapping,
-                    qc = (sk, sv, k_bits, v_bits), n_kv_heads_override = self.num_kv_heads,
-                )
-                o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
-                o = self.o_proj.forward(o, params)
-                return to2(o, out_dtype, self.out_dtype)
             cache = params["cache"]
             block_table = get_for_device(params, "block_table", self.device)
             cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
             layer = cache.layers[self.source_layer_idx, params.get("layer_instance") or 0]
-            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, -1)
+            if getattr(layer, "qk", None) is not None and getattr(layer, "compand_a", 0.0) == 0.0 and self.head_dim % 32 == 0:
+                k_cache, sk, v_cache, sv, k_bits, v_bits = layer.get_qkv()
+                qc = (sk, sv, k_bits, v_bits)
+            else:
+                k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, -1)
             max_kv_len = None
         else:
             rsg = params.get("source_recurrent_states")
@@ -220,7 +195,7 @@ class SharedKVAttention(Module):
             _bc_attn_enable and x.dtype == torch.float16 and x.is_contiguous() and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
-            o = self._bc_step(x, k_cache, v_cache, block_table, cache_seqlens, params)
+            o = self._bc_step(x, k_cache, v_cache, block_table, cache_seqlens, params, qc = qc)
             if o is not None:
                 return to2(o, out_dtype, self.out_dtype)
         q = self.q_proj.forward(x, params, out_dtype = torch.half)
@@ -242,6 +217,8 @@ class SharedKVAttention(Module):
             window_size = (self.sliding_window, 0) if self.sliding_window > 0 else None,
             softcap = self.logit_softcapping,
             max_kv_len = max_kv_len,
+            qc = qc,
+            n_kv_heads_override = self.num_kv_heads if qc is not None else None,
         )
         o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         o = self.o_proj.forward(o, params)
