@@ -203,8 +203,10 @@ class DiskPageCache:
     them first, whether or not another process is using that directory. So a new model takes over the space
     of the models used before it as it fills its cache. Access times are wall-clock milliseconds in every
     index, so recency compares across directories, and a process whose files were taken drops them from its
-    mirror when a read misses. All SQLite traffic of this directory happens on the writer thread (the sibling
-    indexes are also read once at open); the main thread works from an in-memory mirror of the index.
+    mirror when a read misses. All SQLite writes of this directory happen on the writer thread (the sibling
+    indexes are also read once at open); the main thread works from an in-memory mirror of the index, which
+    it brings up to date for the hashes of each coming allocation with one read of the index (adopt), so the
+    pages and checkpoints another process writes to the directory are found without a reopen.
     """
 
     def __init__(
@@ -354,7 +356,10 @@ class DiskPageCache:
             "page_writes": 0, "page_write_bytes": 0, "page_reads": 0, "page_read_bytes": 0,
             "page_read_failures": 0, "state_writes": 0, "state_reads": 0, "evictions": 0, "skipped_mm": 0,
             "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
+            "pages_adopted": 0, "states_adopted": 0,
         }
+        # Read-only connection of the main thread for adopt(), opened on first use
+        self._query_conn = None
 
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
@@ -743,6 +748,61 @@ class DiskPageCache:
 
     def page_prev_hash(self, phash: bytes):
         return self.pages[phash]["prev_hash"]
+
+
+    def adopt(self, hashes: list) -> int:
+        """
+        Enter into the mirror the pages and checkpoints among `hashes` that another process using this
+        directory wrote after the mirror was loaded. The index is what the processes share and the mirror a
+        snapshot of it taken at open, so without this a page computed by a sibling process is invisible here
+        until a reopen. Called from prefetch with the hashes of a coming allocation: one read of the index
+        per enqueue covers exactly what the allocation will ask about, bounded by the prompt's length. A row
+        whose write the other process has not committed yet is found by the next job that asks for it. The
+        read never waits on a writer (WAL). Returns the number of entries adopted
+        """
+        missing_pages = [h for h in hashes if h not in self.pages]
+        missing_states = [h for h in hashes if h not in self.states and h not in self.pending_states]
+        if not missing_pages and not missing_states:
+            return 0
+        if self._query_conn is None:
+            self._query_conn = sqlite3.connect(os.path.join(self.dir, "index.sqlite"), timeout = 60,
+                                               check_same_thread = False)
+        adopted = 0
+        try:
+            for table, missing in (("pages", missing_pages), ("states", missing_states)):
+                for i in range(0, len(missing), 500):
+                    chunk = missing[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    if table == "pages":
+                        rows = self._query_conn.execute(
+                            f"SELECT phash, prev_hash, size, last_access FROM pages WHERE phash IN ({marks})", chunk
+                        ).fetchall()
+                    else:
+                        rows = self._query_conn.execute(
+                            f"SELECT phash, size, last_access, position FROM states WHERE phash IN ({marks})", chunk
+                        ).fetchall()
+                    with self._lock:
+                        for row in rows:
+                            if table == "pages":
+                                phash, prev_hash, size, last_access = row
+                                if phash in self.pages:
+                                    continue
+                                self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
+                                self.metrics["pages_adopted"] += 1
+                            else:
+                                phash, size, last_access, position = row
+                                if phash in self.states or phash in self.pending_states:
+                                    continue
+                                self.states[phash] = {"size": size, "last_access": last_access, "position": position}
+                                self.metrics["states_adopted"] += 1
+                            self.total_size += size
+                            adopted += 1
+        except sqlite3.Error as e:
+            # Another process may be rebuilding the index; the mirror is still valid, the next query retries
+            logger.warning(f"Disk cache tier: index read failed ({e})")
+            self._query_conn.close()
+            self._query_conn = None
+        return adopted
 
 
     def __len__(self):
@@ -1855,7 +1915,9 @@ class DiskPageCache:
 
     def prefetch(self, hashes: list, serial: int):
         """Promote the pages of a coming allocation from disk into the CPU tier ahead of time, in prefix order,
-        up to the in-flight bound; the allocation promotes synchronously whatever this did not reach"""
+        up to the in-flight bound; the allocation promotes synchronously whatever this did not reach. Pages
+        another process wrote to the directory are adopted first, so they are promoted like any other"""
+        self.adopt(hashes)
         pt = self.pagetable
         for h in hashes:
             if self._promotions >= self.max_promotions:
@@ -1890,6 +1952,9 @@ class DiskPageCache:
             else:
                 self.metrics["state_candidates_dropped"] += 1
         self._closed = True
+        if self._query_conn is not None:
+            self._query_conn.close()
+            self._query_conn = None
         self._readers.shutdown(wait = True)
         ev = threading.Event()
         self._enqueue(("stop", ev))     # held behind any rank transfer still in flight
