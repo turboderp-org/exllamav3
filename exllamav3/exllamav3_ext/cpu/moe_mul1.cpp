@@ -2991,7 +2991,15 @@ struct Pool
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (idle < 66036)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                else
+                {
+                    idle = 66036;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
