@@ -34,7 +34,7 @@ TEMP_ROWS_GRAPH = 32
 BATCH_RECON = MOE_BATCH_RECON
 # Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
 # instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
-# launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
+# launch over its expert range (mcg and mul1 codebooks). EXL3_MOE_MTILE=0 keeps the single 16-row
 # launch
 MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
@@ -736,11 +736,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
-            # N = 128 kernel instances) exist for the mul1 codebook; with them the fused tier's
+            # N = 128 kernel instances) exist for the mcg and mul1 codebooks; with them the fused tier's
             # row capacity rises to FUSED_ROWS_WIDE. Dims that are multiples of 256 keep the
             # N = 256 instance for the <= 16-row launch only (it is the faster 16-row tiling)
             if self.support_fused:
-                self.mtile_ok = MTILE and bool(self.multi_up.mul1)
+                self.mtile_ok = MTILE and bool(self.multi_up.mul1 or self.multi_up.mcg)
                 self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
