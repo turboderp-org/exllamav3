@@ -175,13 +175,34 @@ class PairedState:
 
 
 class RecurrentCache(OrderedDict):
+    """
+    Host-memory store for recurrent checkpoints.
+
+    A checkpoint is keyed by the chained content hash of the KV prefix it resumes from. When the state sits on
+    a page boundary (the historical case) that key is the hash of the last complete page, which is also what
+    Sequence.prepare computes for a later request. A checkpoint at the exact end of a prompt or request is
+    usually *inside* its last page; it is keyed by the content hash of that partial page chained onto the last
+    complete page, and indexed under the complete page's hash so a later request can enumerate the partial
+    positions that share its prefix (`partial_keys`). The partial page's K/V is stored in the page tiers under
+    the same partial key, so the existing chain walk (`PageTable.is_resumable`) covers it unchanged.
+
+    Eviction is LRU by default, with stranded checkpoints (whose KV chain has been broken) always dropped
+    first. With eviction_policy="gds" the cache instead applies GreedyDual-Size over the prefill seconds a
+    checkpoint saves per byte it occupies (FlashStates' cost-aware hybrid state management), with the classic
+    inflation term so recently inserted states are not immediately churned.
+    """
+
     def __init__(
         self,
         model,
         max_size: int = 4 * 1024**3,
         draft_model = None,
+        eviction_policy: str = "lru",
+        prefill_cost_d: float = 1.0,
+        prefill_cost_e: float = 0.0,
     ):
         super().__init__()
+        assert eviction_policy in ("lru", "gds"), f"Unknown recurrent cache eviction policy: {eviction_policy}"
         self.max_size = max_size
         self.current_size = 0
         self.model = model
@@ -196,11 +217,24 @@ class RecurrentCache(OrderedDict):
         # goes to the disk tier once that's done
         self.pipeline = None
         self.unwritten = []
+
+        # Arbitrary-position (partial-page) checkpoints: anchor page hash -> [checkpoint key]. Only partial
+        # checkpoints are indexed; boundary checkpoints are found directly from a sequence's page hashes.
+        self._partial = {}
+
+        # GreedyDual-Size state: priority per key and the inflation term
+        self.eviction_policy = eviction_policy
+        self.prefill_cost_d = float(prefill_cost_d)
+        self.prefill_cost_e = float(prefill_cost_e)
+        self._gds_keys = {}
+        self._gds_inflation = 0.0
+
         self.metrics = {
-            "stash_evictions": 0,           # checkpoints dropped by LRU pressure
+            "stash_evictions": 0,           # checkpoints dropped by eviction pressure
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
             "stash_evictions_live_kv": 0,   # of those, checkpoints whose anchor KV page was still cached
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
+            "stash_partial": 0,             # arbitrary-position checkpoints stored
         }
 
 
@@ -218,7 +252,10 @@ class RecurrentCache(OrderedDict):
             self.move_to_end(key)
             self._settle(self[key])
         if key in self:
-            return self[key]
+            stashed = self[key]
+            if self.eviction_policy == "gds":
+                self._gds_keys[key] = self._gds_priority(stashed) + self._gds_inflation
+            return stashed
         if self.disk_tier is not None:
             stashed = self.disk_tier.read_state(key)
             if stashed is not None:
@@ -227,14 +264,62 @@ class RecurrentCache(OrderedDict):
         return default
 
 
+    def position(self, key) -> int | None:
+        """Absolute token position a checkpoint resumes from, from RAM or the disk index, or None"""
+        stashed = OrderedDict.get(self, key)
+        if stashed is not None:
+            return stashed.get("position")
+        if self.disk_tier is not None:
+            meta = self.disk_tier.states.get(key)
+            if meta is not None:
+                return meta.get("position")
+        return None
+
+
+    def partial_keys(self, anchor_hash: bytes | None) -> list:
+        """Keys of the arbitrary-position checkpoints anchored on a complete page hash (None = first page)"""
+        return list(self._partial.get(anchor_hash, ()))
+
+
+    def put_partial(self, key, state, anchor_hash: bytes | None, offset: int):
+        """
+        Add a checkpoint that ends `offset` tokens into the page following `anchor_hash` (0 < offset <
+        PAGE_SIZE). The caller has already stored that partial page in the page tiers under `key`.
+        """
+        assert 0 < offset < PAGE_SIZE, "A partial checkpoint must sit inside a page"
+        if key in self:
+            self.move_to_end(key)
+            self._index_partial(key, anchor_hash)
+            if self.eviction_policy == "gds":
+                self._gds_keys[key] = self._gds_priority(self[key]) + self._gds_inflation
+            return
+        self._insert(
+            key,
+            None,
+            persist = True,
+            state = state,
+            meta = {
+                "anchor_hash": anchor_hash.hex() if anchor_hash is not None else None,
+                "offset": offset,
+            },
+        )
+        if key in self:
+            self.metrics["stash_partial"] += 1
+
+
     def rekey(self, old_key, new_key):
         """Move a checkpoint to the final hash of its anchor page (deferred pages are hashed once their
-        tokens are final)"""
-        if old_key in self and new_key not in self:
-            stashed = self.pop(old_key)
-            self[new_key] = stashed
-            if self.disk_tier is not None:
-                self.disk_tier.rekey_state(old_key, new_key, stashed)
+        tokens are final). Partial checkpoints are keyed by their own content and never re-key."""
+        if old_key not in self or new_key in self:
+            return
+        stashed = self[old_key]
+        if stashed.get("offset"):
+            return
+        self._pop_key(old_key)
+        self._gds_keys[new_key] = self._gds_priority(stashed) + self._gds_inflation
+        self[new_key] = stashed
+        if self.disk_tier is not None:
+            self.disk_tier.rekey_state(old_key, new_key, stashed)
 
 
     def put(self, key, state, owner = None):
@@ -244,6 +329,8 @@ class RecurrentCache(OrderedDict):
         """
         if key in self:
             self.move_to_end(key)
+            if self.eviction_policy == "gds":
+                self._gds_keys[key] = self._gds_priority(self[key]) + self._gds_inflation
         else:
             self._insert(key, None, persist = True, state = state, owner = owner)
 
@@ -290,7 +377,83 @@ class RecurrentCache(OrderedDict):
                 self.disk_tier.note_state(key, stashed)
 
 
-    def _insert(self, key, stashed, persist: bool, state = None, owner = None):
+    def _gds_priority(self, stashed: dict) -> float:
+        """Prefill seconds a checkpoint saves per byte it occupies (GreedyDual-Size value / cost)"""
+        size = max(1, int(stashed.get("checkpoint_size", 0)))
+        value = self.prefill_cost_d * max(0, int(stashed.get("position", 0))) + self.prefill_cost_e
+        return (value if value > 0.0 else 1e-9) / size
+
+
+    def _index_partial(self, key, anchor_hash):
+        lst = self._partial.setdefault(anchor_hash, [])
+        if key not in lst:
+            lst.append(key)
+
+
+    def _index_partial_from_stash(self, key, stashed: dict):
+        offset = stashed.get("offset", 0)
+        if not offset:
+            return
+        anchor = stashed.get("anchor_hash")
+        if isinstance(anchor, str):
+            anchor = bytes.fromhex(anchor)
+        self._index_partial(key, anchor)
+
+
+    def _unindex_partial(self, key, stashed: dict):
+        if not stashed.get("offset", 0):
+            return
+        # A state the disk tier still holds stays findable: get_stashed() reads it back into RAM on demand.
+        # Its position comes from the disk index, and find_resume() rejects it if the page chain is gone
+        if self.disk_tier is not None and key in self.disk_tier.states:
+            return
+        anchor = stashed.get("anchor_hash")
+        if isinstance(anchor, str):
+            anchor = bytes.fromhex(anchor)
+        lst = self._partial.get(anchor)
+        if lst is not None and key in lst:
+            lst.remove(key)
+            if not lst:
+                self._partial.pop(anchor, None)
+
+
+    def _pop_key(self, key):
+        stashed = self.pop(key)
+        self._gds_keys.pop(key, None)
+        self._unindex_partial(key, stashed)
+        return stashed
+
+
+    def _victim(self):
+        """Key and stash to drop: stranded first, then the GDS minimum or the least recently used entry"""
+        pt = self.pagetable
+
+        # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by an
+        # allocation, so drop stranded checkpoints before restorable ones. This is a pure win: if the
+        # conversation returns, the replay prefill recreates the same checkpoint at no extra cost, since the
+        # missing pages force a replay past this position either way.
+        if pt is not None:
+            for k in self:
+                if not pt.is_resumable(k):
+                    self.metrics["stash_evictions_stranded"] += 1
+                    return k, self._pop_key(k)
+
+        if self.eviction_policy == "gds" and self._gds_keys:
+            k = min(self._gds_keys, key = self._gds_keys.get)
+            if k in self:
+                self._gds_inflation = max(self._gds_inflation, self._gds_keys[k])
+                return k, self._pop_key(k)
+            self._gds_keys.pop(k, None)
+
+        k = next(iter(self))
+        if pt is not None:
+            page = pt.referenced_pages.get(k) or pt.unreferenced_pages.get(k)
+            if page is not None and page.kv_position == PAGE_SIZE:
+                self.metrics["stash_evictions_live_kv"] += 1
+        return k, self._pop_key(k)
+
+
+    def _insert(self, key, stashed, persist: bool, state = None, owner = None, meta: dict | None = None):
         """Make room for a checkpoint, then stash `state` (or take `stashed` as is) under key"""
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
         # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
@@ -301,28 +464,7 @@ class RecurrentCache(OrderedDict):
             return
         while self.update_total_size() + state_size > self.max_size:
             assert self.current_size >= 0, "Not enough space in cache for single state"
-            pt = self.pagetable
-
-            # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by
-            # an allocation, so drop stranded checkpoints (oldest first) before restorable ones. This is a
-            # pure win: if the conversation returns, the replay prefill recreates the same checkpoint at no
-            # extra cost, since the missing pages force a replay past this position either way.
-            popped_key = None
-            if pt is not None:
-                for k in self:
-                    if not pt.is_resumable(k):
-                        popped_key = k
-                        break
-            if popped_key is not None:
-                popped = self.pop(popped_key)
-                self.metrics["stash_evictions_stranded"] += 1
-            else:
-                popped_key, popped = self.popitem(last = False)
-                if pt is not None:
-                    page = pt.referenced_pages.get(popped_key) or pt.unreferenced_pages.get(popped_key)
-                    if page is not None and page.kv_position == PAGE_SIZE:
-                        self.metrics["stash_evictions_live_kv"] += 1
-
+            _, popped = self._victim()
             self.metrics["stash_evictions"] += 1
             self._release(popped)
 
@@ -331,12 +473,37 @@ class RecurrentCache(OrderedDict):
             stashed = self.pipeline.stash(state, owner)
         elif state is not None:
             stashed = state.stash()
+        if state is not None and meta:
+            stashed.update(meta)
+        self._index_partial_from_stash(key, stashed)
+        if self.eviction_policy == "gds":
+            self._gds_keys[key] = self._gds_priority(stashed) + self._gds_inflation
         self[key] = stashed
         self.update_total_size()
         if deferred:
             self.unwritten.append((key, stashed))
         elif persist and self.disk_tier is not None and is_content_hash(key):
             self.disk_tier.note_state(key, stashed)
+
+
+    def rebuild_partial_index(self):
+        """
+        Rebuild the anchor index of arbitrary-position checkpoints from RAM and the disk tier. Called once
+        the disk tier is attached: partial checkpoints written in an earlier process have no in-RAM index
+        entry, and their positions (not page-aligned) identify them in the disk index without reading files.
+        """
+        self._partial.clear()
+        for k, stashed in self.items():
+            self._index_partial_from_stash(k, stashed)
+        disk = self.disk_tier
+        if disk is None:
+            return
+        for k, meta in list(disk.states.items()):
+            if k in self or meta.get("position", 0) % PAGE_SIZE == 0:
+                continue
+            if not disk.has_page(k):
+                continue
+            self._index_partial(k, disk.page_prev_hash(k))
 
 
     def prune_stranded(self) -> int:
@@ -350,7 +517,7 @@ class RecurrentCache(OrderedDict):
             return 0
         stranded = [k for k in self if not self.pagetable.is_resumable(k)]
         for k in stranded:
-            popped = self.pop(k)
+            popped = self._pop_key(k)
             self.metrics["stash_pruned"] += 1
             self._release(popped)
         if stranded:
@@ -368,7 +535,8 @@ class RecurrentCache(OrderedDict):
         seen = set()
         freed = 0
         while len(self):
-            _, popped = self.popitem(last = False)
+            k = next(iter(self))
+            popped = self._pop_key(k)
             # Several keys may share one stash
             if id(popped) in seen:
                 continue
@@ -376,6 +544,9 @@ class RecurrentCache(OrderedDict):
             host_pool.give(popped)
             freed += popped["checkpoint_size"]
             self._release_tp(popped)
+        self._partial.clear()
+        self._gds_keys.clear()
+        self._gds_inflation = 0.0
         self.current_size = 0
         self.pagetable = None
         if freed:
