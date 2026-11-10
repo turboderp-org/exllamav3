@@ -222,3 +222,42 @@ def test_empty_mgemm_rejections(device):
                        bits, -1, False, True, -1, -1, 0, 2)
     assert (c == 5.0).all() and (c3 == 5.0).all()
     _device_still_works(device)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@torch.inference_mode()
+def test_range_filter_slot_limit(device, num_tokens):
+    """Expert-range filtering stages the filtered selection in fixed device arrays of 128 slots. A full selection
+    matches the per-expert GEMMs, a larger one is rejected instead of written past the arrays"""
+    torch.manual_seed(num_tokens)
+    k, n, bits, E, first = 256, 256, 4, 4, 4
+    mats = [_weights(k, n, bits, device) for _ in range(E)]
+    tB, tsuh, tsvh = (_ptrs([m[i] for m in mats], device) for i in range(3))
+    for slots, ok in [(128, True), (144, False)]:
+        per_token = slots // num_tokens
+        x = (torch.randn(num_tokens, k, device = device) * 0.5).half()
+        xs = x.repeat_interleave(per_token, dim = 0).view(slots, 1, k)
+        idx = torch.randint(0, 2 * E, (1, slots), device = device)
+        w = torch.rand((1, slots), device = device).half()
+        c = torch.zeros((slots, 1, n), dtype = torch.float, device = device)
+        a_had = torch.empty((slots, 1, k), dtype = torch.half, device = device)
+        args = (xs, tB, c, tsuh, a_had, tsvh, idx, w, bits, -1, False, True, first, first + E, 0, num_tokens)
+        if not ok:
+            with pytest.raises(RuntimeError, match = "expert-range filtering supports at most 128 slots"):
+                ext.exl3_mgemm(*args)
+            continue
+        ext.exl3_mgemm(*args)
+        prods = []
+        for B, suh, svh in mats:
+            p = torch.empty((num_tokens, n), dtype = torch.float, device = device)
+            ext.exl3_gemm(x, B, p, suh, torch.empty_like(x), svh, 0, False, True, 0)
+            prods.append(p)
+        ref = torch.zeros((num_tokens, n), device = device)
+        for j in range(slots):
+            e = idx[0, j].item() - first
+            if 0 <= e < E:
+                t = j // per_token
+                ref[t] += w[0, j].float() * prods[e][t]
+        # Up to 128 weighted products of mixed sign, each with its own fp16 accumulation noise
+        _close(c[:num_tokens, 0], ref, tol = 2e-2)
+    _device_still_works(device)
