@@ -2071,13 +2071,15 @@ class Generator:
 
                     # EOS. Stop sampling this job immediately once a stop condition, filter condition or max
                     # token limit produces an EOS event. Draft positions from the EOS position onward were fed
-                    # to verification but never resolved; count them as rejected so accepted + rejected equals
-                    # the number of drafted positions (no cache/state rollback needed, the pages are released).
-                    # The EOS stream event was already built inside receive_sample, so patch its counter too
+                    # to verification but never resolved; settle the target state and the page positions to
+                    # the accepted sequence before the job is released. The pages are about to be freed, but
+                    # the FlashStates frontier checkpoint stores the exact request end, and it must be paired
+                    # with a state that describes the K/V this request leaves behind.
                     if eos:
                         num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
                         if num_unresolved:
-                            job.rejected_draft_tokens += num_unresolved
+                            reject_remainder(job, j, i, batch_states)
+                            # The EOS stream event was built inside receive_sample, patch its counter too
                             for r_ in reversed(results):
                                 if r_.get("eos") and r_["job"] is job:
                                     if "rejected_draft_tokens" in r_:

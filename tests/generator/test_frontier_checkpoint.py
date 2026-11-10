@@ -60,7 +60,12 @@ def fake_job(pos, pages, state_position = None, enabled = True, cpu_tier = True,
         allocated_pages = pages,
         sequence_ids = SeqTensor.from_tensor(tokens.unsqueeze(0), seq_dim = -1),
     )]
-    job.recurrent_state = SimpleNamespace(
+
+    class FakeState(SimpleNamespace):
+        def rewind(self, num_tokens):
+            self.position -= num_tokens
+
+    job.recurrent_state = FakeState(
         position = pos if state_position is None else state_position,
         checkpoint_size = 64,
         stash = lambda: {"position": job.recurrent_state.position, "checkpoint_size": 64},
@@ -119,10 +124,38 @@ def test_mid_page_frontier_stores_the_partial_page_under_its_prefix_hash():
     assert job.last_recurrent_checkpoint_pos == pos
 
 
-def test_frontier_requires_state_and_kv_to_describe_the_same_prefix():
+def test_trailing_state_checkpoints_the_prefix_the_state_describes():
+    # At a request end the last sampled token is in its K/V page but has not been run through the model,
+    # so the recurrent state trails the K/V position by one token. The checkpoint must use the state's
+    # position (the prefix it actually describes), not fail on the mismatch.
     pages = complete_pages()
-    job = fake_job(K * PAGE_SIZE, pages, state_position = K * PAGE_SIZE - 1)
-    assert not job.frontier_checkpoint(FakeCache())
+    pos = K * PAGE_SIZE - 1
+    job = fake_job(K * PAGE_SIZE, pages, state_position = pos)
+    cache = FakeCache()
+
+    assert job.frontier_checkpoint(cache)
+    key, state, anchor, offset = cache.partials[0]
+    assert state is job.recurrent_state
+    assert offset == PAGE_SIZE - 1
+    assert anchor == pages[K - 2].phash
+    assert key == tensor_hash_checksum(
+        torch.arange((K - 1) * PAGE_SIZE, pos, dtype = torch.long), anchor
+    )
+    assert job.last_recurrent_checkpoint_pos == pos
+
+
+def test_frontier_rewinds_a_state_ahead_of_the_kv():
+    # A max_tokens stop can land inside a speculative draft window, leaving the target state past the
+    # accepted K/V. Settle it back to the accepted prefix instead of skipping the request end.
+    pages = complete_pages()
+    kv = K * PAGE_SIZE
+    job = fake_job(kv, pages, state_position = kv + 40)
+    cache = FakeCache()
+
+    assert job.frontier_checkpoint(cache)
+    assert job.recurrent_state.position == kv
+    assert cache.puts == [(pages[-1].phash, job.recurrent_state)]
+    assert job.last_recurrent_checkpoint_pos == kv
 
 
 def test_frontier_is_disabled_by_the_generator_option():

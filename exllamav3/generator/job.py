@@ -1766,6 +1766,14 @@ class Job:
 
             # Metrics
             self.cached_pages += cached_pages
+            # An arbitrary-position checkpoint resumes inside a page: count the tokens
+            # past the last complete page as reused too, or the metric understates the
+            # prefix this job actually skipped (page-aligned stashes add zero here)
+            if stashed_recurrent_state is not None:
+                self.cached_tokens += max(
+                    0,
+                    int(stashed_recurrent_state.get("position", 0)) - cached_pages * PAGE_SIZE,
+                )
             self.total_pages += allocated_pages
             self.non_sequential_pages += non_sequential_pages
 
@@ -1877,10 +1885,24 @@ class Job:
         if not getattr(self.generator, "recurrent_frontier_checkpoints", False):
             return False
         seq = self.sequences[0]
-        pos = seq.kv_position
-        if pos <= 0 or self.recurrent_state.position != pos:
-            # The state and the K/V must describe the same prefix
+        state_pos = self.recurrent_state.position
+        if state_pos > seq.kv_position:
+            # A max_tokens stop can land inside a speculative draft window: the target
+            # state has advanced through the draft tokens but the K/V only holds the
+            # accepted ones. Settle it back to the accepted prefix before stashing.
+            excess = state_pos - seq.kv_position
+            try:
+                self.recurrent_state.rewind(excess)
+            except AssertionError:
+                return False
+            state_pos = self.recurrent_state.position
+        if state_pos <= 0 or state_pos > seq.kv_position:
             return False
+        # The state can also trail by one token at an ordinary request end: the last
+        # sampled token is in the sequence but has not been run through the model yet.
+        # Checkpoint the prefix the state actually describes; the extra K/V row is
+        # harmless because resuming there overwrites it during the replay prefill.
+        pos = state_pos
         if self.last_recurrent_checkpoint_pos == pos:
             return False
 
@@ -1904,7 +1926,7 @@ class Job:
         if k >= len(seq.allocated_pages):
             return False
         page = seq.allocated_pages[k]
-        if page.kv_position != offset:
+        if page.kv_position < offset:
             return False
         anchor = seq.allocated_pages[k - 1].phash if k > 0 else None
         if anchor is not None and (not is_content_hash(anchor) or page.prev_hash != anchor):
