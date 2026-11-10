@@ -15,7 +15,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& locks = {}
 );
 
 int exl3_gemm
@@ -29,8 +30,11 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    const c10::optional<at::Tensor>& locks = {}
 );
+
+int64_t exl3_gemm_lock_elements(int64_t size_n);
 
 int exl3_mgemm_gr
 (
