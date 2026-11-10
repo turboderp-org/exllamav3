@@ -60,6 +60,7 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-ad", "--attn_device", type = int, default = None, help = "Split load: device for the attention layers of models that share K/V pools across layers (DeepSeek-V4.1), default: first device of the split")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -374,8 +375,10 @@ def init(
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
 
-    # Load draft model
-    if draft_model_dir:
+    # Load draft model (one that reads the target's cache in place loads with the target below)
+    if draft_model_dir and draft_model.caps.get("load_with_target"):
+        printp(not quiet, f" -- Loading {draft_model_dir} with the target model")
+    elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
             use_per_device = split,
@@ -391,6 +394,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        attn_device = args.attn_device,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,

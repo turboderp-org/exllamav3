@@ -46,6 +46,14 @@ HF_ROUTER_KEYS = (".mlp.gate.weight", ".block_sparse_moe.gate.weight", ".router.
 GGUF_ROUTER_KEYS = ("ffn_gate_inp.weight",)
 
 
+def row_views(ids: torch.Tensor, lengths: list[int] | None) -> list[torch.Tensor]:
+    """Per-row (1, len) views of right-padded ids, cut to each row's own length when given
+    (positions past the last scored one are causally inert, so this only saves compute)"""
+    if lengths is None:
+        return list(ids.split(1))
+    return [ids[r:r + 1, :n] for r, n in enumerate(lengths)]
+
+
 def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
     n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
@@ -67,14 +75,15 @@ class Exl3Backend:
             "module_streamed": True,
         }
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         from exllamav3.modules import Linear
         modules = self.model.modules
         # Per-row params, prepared by the architecture as Model.forward does before the module
         # chain (attention layout, recurrence, DeepSeek-V4's hash-routing ids / image chunks);
         # they carry state across modules, so each row keeps its own dict
         params_rows = [{} for _ in range(ids.shape[0])]
-        states = [self.model.prepare_inputs(row, p) for row, p in zip(ids.split(1), params_rows)]
+        rows = row_views(ids, lengths)
+        states = [self.model.prepare_inputs(row, p) for row, p in zip(rows, params_rows)]
         gen = torch.Generator(device = self.device)
         gen.manual_seed(1)
 
@@ -109,7 +118,7 @@ class Exl3Backend:
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
                     params = params_rows[r]
-                    params.setdefault("input_ids", ids[r:r + 1])
+                    params.setdefault("input_ids", rows[r])
                     x = module.prepare_for_device(states[r], params)
                     x = module.forward(x, params)
                     # Modules may hand back a view of a shared g_tensor_cache workspace (mHC /
@@ -423,21 +432,25 @@ class TransformersBackend:
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
         else:
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
-                )
-            except ValueError:
-                from transformers import AutoModelForImageTextToText
-                self.model = AutoModelForImageTextToText.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
-                )
+            # model_class: image_text_to_text loads the multimodal wrapper even where a text-only
+            # CausalLM class exists. Needed when a quantized checkpoint's module paths only match the
+            # wrapper (AutoRound/GPTQ block_name_to_quantize = model.language_model.layers): under
+            # the CausalLM class nothing gets replaced and the packed weights silently go unloaded
+            from transformers import AutoModelForImageTextToText
+            model_class = options.get("model_class", "causal_lm")
+            assert model_class in ("causal_lm", "image_text_to_text"), f"Unknown model_class: {model_class}"
+            load_args = dict(
+                dtype = dtype,
+                device_map = options.get("device_map", "auto"),
+                trust_remote_code = options.get("trust_remote_code", True),
+            )
+            if model_class == "image_text_to_text":
+                self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
+            else:
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(source, **load_args)
+                except ValueError:
+                    self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
             self.model.eval()
 
         self.time_step_limit = self._apply_time_step_limit(options.get("time_step_limit"))
@@ -1056,7 +1069,7 @@ class TransformersBackend:
                     sub._parameters[pn] = torch.nn.Parameter(p.to("meta"), requires_grad = False)
 
     @torch.inference_mode()
-    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         base, head = self._text_parts()
         layers = self._decoder_layers()
         embed = self.model.get_input_embeddings()
@@ -1097,7 +1110,7 @@ class TransformersBackend:
 
         nz = ids != 0
         row_len = (ids.shape[1] - nz.flip(1).int().argmax(dim = 1)) * nz.any(dim = 1).int()
-        row_len = row_len.clamp(min = 1).tolist()
+        row_len = row_len.clamp(min = 1).tolist() if lengths is None else list(lengths)
         num_rows = ids.shape[0]
 
         pb_state = {"n": 0}
@@ -1210,14 +1223,14 @@ class TransformersBackend:
                 h.remove()
 
     @torch.inference_mode()
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         if self.streaming:
-            return self._run_streaming(ids, callback, noise_eps)
+            return self._run_streaming(ids, callback, noise_eps, lengths)
         hooks = self._noise_hooks(noise_eps) if noise_eps else []
         try:
             with ProgressBar("Evaluating", ids.shape[0]) as pb:
                 for r in range(ids.shape[0]):
-                    row = ids[r:r + 1].to(self.model.device)
+                    row = row_views(ids, lengths)[r].to(self.model.device)
                     out = self.model(input_ids = row, use_cache = False)
                     callback(r, out.logits)
                     del out
@@ -1362,14 +1375,15 @@ class LlamaCppBackend:
             "llama_cpp": getattr(llama_cpp, "__version__", "?"),
         }
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
         with ProgressBar("Evaluating", ids.shape[0]) as pb:
             for r in range(ids.shape[0]):
                 self.model.reset()
-                self.model.eval(ids[r].tolist())
+                row = row_views(ids, lengths)[r]
+                self.model.eval(row[0].tolist())
                 logits = torch.from_numpy(self.model.scores).unsqueeze(0)
-                logits = logits[:, :ids.shape[1]].to(self.device)
+                logits = logits[:, :row.shape[1]].to(self.device)
                 callback(r, logits)
                 pb.update(r + 1)
 

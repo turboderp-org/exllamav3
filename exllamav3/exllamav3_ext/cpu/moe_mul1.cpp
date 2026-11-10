@@ -1787,10 +1787,17 @@ M1_ALWAYS_INLINE void avx2_row_codes(const __m256i (&preg)[avx2_regs(bits, hb)],
         const __m256i sh_hi = _mm256_setr_epi32(sh[8], sh[9], sh[10], sh[11], sh[12], sh[13], sh[14], sh[15]);
         const __m256i shc_lo = _mm256_setr_epi32(shc[0], shc[1], shc[2], shc[3], shc[4], shc[5], shc[6], shc[7]);
         const __m256i shc_hi = _mm256_setr_epi32(shc[8], shc[9], shc[10], shc[11], shc[12], shc[13], shc[14], shc[15]);
-        codes_lo = _mm256_and_si256(_mm256_or_si256(
-            _mm256_srlv_epi32(b_lo, sh_lo), _mm256_sllv_epi32(a_lo, shc_lo)), mask16);
-        codes_hi = _mm256_and_si256(_mm256_or_si256(
-            _mm256_srlv_epi32(b_hi, sh_hi), _mm256_sllv_epi32(a_hi, shc_hi)), mask16);
+        // When all shifts are <= 16, mask16 discards the left-shifted term (shift 32 is zero).
+        if constexpr (*std::max_element(sh.begin(), sh.begin() + 8) <= 16)
+            codes_lo = _mm256_and_si256(_mm256_srlv_epi32(b_lo, sh_lo), mask16);
+        else
+            codes_lo = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srlv_epi32(b_lo, sh_lo), _mm256_sllv_epi32(a_lo, shc_lo)), mask16);
+        if constexpr (*std::max_element(sh.begin() + 8, sh.end()) <= 16)
+            codes_hi = _mm256_and_si256(_mm256_srlv_epi32(b_hi, sh_hi), mask16);
+        else
+            codes_hi = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srlv_epi32(b_hi, sh_hi), _mm256_sllv_epi32(a_hi, shc_hi)), mask16);
         return;
     }
     constexpr int s0 = row_shift<bits, hb, row>(0);
@@ -1833,10 +1840,10 @@ M1_ALWAYS_INLINE void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const i
 // registers staying live across the even row's accumulate spills -- AVX2 has 16 architectural
 // ymm registers). At every other K the same restructure measured neutral-to-negative
 // (K3 -5% 1T / -14% 24T-cold on the 7960X); do not widen the gate without re-measuring.
-template <int bits, bool hb, int row = 0>
+template <int bits, bool hb, int row = 0, int Rows = MAX_M>
 M1_TARGET_AVX2
 M1_ALWAYS_INLINE void avx2_rows_accum(
-    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i (&preg)[avx2_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8 && !hb)
@@ -1855,30 +1862,31 @@ M1_ALWAYS_INLINE void avx2_rows_accum(
                 _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
             __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+            avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
             // Odd row: same gathered words, shifted by an extra `bits` (>= 32 shifts are
             // well-defined zero, so the slli term drops out cleanly when s - bits == 0)
             codes_lo = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
             codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
-            avx2_rows_accum<bits, hb, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
+            avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
+            avx2_rows_accum<bits, hb, row + 2, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
         }
     }
     else if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes<bits, hb, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum<bits, hb, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum<bits, hb, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
-template <int bits, bool hb>
+template <int bits, bool hb, int Rows = MAX_M>
 M1_TARGET_AVX2
 void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
+    const int rows = Rows == MAX_M ? m : Rows;
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
     constexpr int packed_size = tile_u16(bits, hb);
@@ -1900,8 +1908,8 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
-        __m256i acc[MAX_M][2];
-        for (int i = 0; i < m; ++i)
+        __m256i acc[Rows][2];
+        for (int i = 0; i < rows; ++i)
         {
             acc[i][0] = _mm256_setzero_si256();
             acc[i][1] = _mm256_setzero_si256();
@@ -1930,10 +1938,10 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
             else
                 preg[nreg - 1] = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i*>(packed + (nreg - 1) * 16));
-            avx2_rows_accum<bits, hb>(preg, splat_k, mat.k, m, acc, mult, ones32);
+            avx2_rows_accum<bits, hb, 0, Rows>(preg, splat_k, mat.k, rows, acc, mult, ones32);
         }
 
-        for (int i = 0; i < m; ++i)
+        for (int i = 0; i < rows; ++i)
         {
             const float scale = mul1_k_inv() * in.q[i];
             const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
@@ -1947,6 +1955,97 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 // -------------------------------------------------------------------------------------------
 //   AVX2 swizzle: band-2 kernel over the group-2 + planar layout
 // -------------------------------------------------------------------------------------------
+
+// Integer planes contain eight dwords; fractional planes contain eight chronological
+// halfwords, widened once on load. Neither representation changes the tile byte count.
+constexpr int avx2_planar_regs(int bits, bool hb) { return hb ? rate_k2(bits, true) : bits; }
+
+template <int bits, bool hb>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE void avx2_load_planar(const uint16_t* packed,
+    __m256i (&preg)[avx2_planar_regs(bits, hb)])
+{
+    static_assert(!hb || (bits >= 1 && bits <= 3), "fractional planar rate");
+    static_assert(tile_u16(bits, hb) == avx2_planar_regs(bits, hb) * (hb ? 8 : 16),
+                  "planar loads exactly cover the tile");
+    for (int i = 0; i < avx2_planar_regs(bits, hb); ++i)
+    {
+        if constexpr (hb)
+            preg[i] = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(packed + i * 8)));
+        else
+            preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + i * 16));
+    }
+}
+
+template <int bits, int row, bool second_word, int half>
+constexpr std::array<int32_t, 8> make_halfword_indices()
+{
+    constexpr auto inv = make_tc_perm_inv();
+    std::array<int32_t, 8> idx{};
+    for (int c = 0; c < 8; ++c)
+    {
+        const int end = state_end(bits, true, inv[row * 16 + half * 8 + c]);
+        idx[c] = ((end - (second_word ? 1 : 16)) / 16) % tile_u16(bits, true);
+    }
+    return idx;
+}
+
+template <int bits, int row, int half>
+constexpr bool halfword_planar_ok()
+{
+    constexpr int q = rate_k2(bits, true);
+    constexpr int count = tile_u16(bits, true);
+    constexpr auto inv = make_tc_perm_inv();
+    constexpr auto a = make_halfword_indices<bits, row, false, half>();
+    constexpr auto b = make_halfword_indices<bits, row, true, half>();
+    constexpr int shift = row_shift<bits, true, row>(half * 8) % 16;
+    for (int c = 0; c < 8; ++c)
+    {
+        const int end = state_end(bits, true, inv[row * 16 + half * 8 + c]);
+        if (a[c] < 0 || a[c] >= count || b[c] < 0 || b[c] >= count) return false;
+        if (a[c] % q != a[0] % q || b[c] % q != b[0] % q) return false;
+        if (a[c] / q != (a[0] / q + c) % 8 || b[c] / q != (b[0] / q + c) % 8) return false;
+        if ((16 - end % 16) % 16 != shift ||
+            row_shift<bits, true, row>(half * 8 + c) % 16 != shift) return false;
+        if (a[c] != (b[c] + count - (shift != 0)) % count) return false;
+    }
+    return true;
+}
+
+// The loader stores packed[8*(j%Q)+j/Q] = native[j xor 1]. The xor corrects
+// little-endian dword halfword order; the bytes within each halfword are unchanged.
+template <int bits, int row, bool second_word, int half>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_gather_halfword_planar(const __m256i (&preg)[2 * bits + 1])
+{
+    static_assert(bits >= 1 && bits <= 3 && row >= 0 && row < 16 && half >= 0 && half < 2,
+                  "fractional half-row bounds");
+    static_assert(halfword_planar_ok<bits, row, half>(), "fractional plane, lane or shift mismatch");
+    constexpr int q = rate_k2(bits, true);
+    constexpr auto idx = make_halfword_indices<bits, row, second_word, half>();
+    if constexpr (idx[0] / q == 0) return preg[idx[0] % q];
+    const __m256i lane = _mm256_setr_epi32(idx[0] / q, idx[1] / q, idx[2] / q, idx[3] / q,
+                                         idx[4] / q, idx[5] / q, idx[6] / q, idx[7] / q);
+    return _mm256_permutevar8x32_epi32(preg[idx[0] % q], lane);
+}
+
+// Only the selected 16-bit half is meaningful, as in avx2_half_state_planar.
+template <int bits, int row, int half, bool high>
+M1_TARGET_AVX2
+M1_ALWAYS_INLINE __m256i avx2_half_state_halfword(const __m256i (&preg)[2 * bits + 1])
+{
+    constexpr int shift = row_shift<bits, true, row>(half * 8) % 16;
+    const __m256i b = avx2_gather_halfword_planar<bits, row, true, half>(preg);
+    __m256i state = b;
+    if constexpr (shift != 0)
+    {
+        const __m256i a = avx2_gather_halfword_planar<bits, row, false, half>(preg);
+        state = _mm256_or_si256(_mm256_slli_epi32(a, 16 - shift), _mm256_srli_epi32(b, shift));
+    }
+    if constexpr (high) return _mm256_slli_epi32(state, 16);
+    else return state;
+}
 
 // Register holding a half-row's source dwords under the planar order: the half-row's dword
 // residue class mod bits. All 8 columns must agree (the orbit property); a disagreement is
@@ -2008,18 +2107,27 @@ M1_ALWAYS_INLINE void avx2_row_codes_planar(const __m256i (&preg)[bits], __m256i
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
-template <int bits, int row = 0, int Rows = MAX_M>
+template <int bits, int row = 0, int Rows = MAX_M, bool hb = false>
 M1_TARGET_AVX2
 M1_ALWAYS_INLINE void avx2_rows_accum_planar(
-    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
+    const __m256i (&preg)[avx2_planar_regs(bits, hb)], const int32_t* splat_dup, int k, int m, __m256i (&acc)[Rows][2],
     const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
-        avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
+        if constexpr (hb)
+        {
+            const __m256i lo = avx2_half_state_halfword<bits, row, 0, false>(preg);
+            const __m256i hi = avx2_half_state_halfword<bits, row, 1, false>(preg);
+            const __m256i mask16 = _mm256_set1_epi32(0xffff);
+            codes_lo = _mm256_and_si256(lo, mask16);
+            codes_hi = _mm256_and_si256(hi, mask16);
+        }
+        else
+            avx2_row_codes_planar<bits, row>(preg, codes_lo, codes_hi);
         avx2_accum_row<Rows>(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
-        avx2_rows_accum_planar<bits, row + 1, Rows>(preg, splat_dup, k, m, acc, mult, ones32);
+        avx2_rows_accum_planar<bits, row + 1, Rows, hb>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
@@ -2041,21 +2149,21 @@ M1_ALWAYS_INLINE void avx2_rows_accum_planar(
 // one vpermd (or nothing) instead of avx2_tiles' O(bits) register walk with blends. That
 // removes the rate-proportional ALU wall of the walk (every rate lands at the accumulate
 // ceiling) and frees the registers the walk needed -- without planar the band-2 body spills
-// at the odd and high rates, which would lock those rates out of the swizzle. Half-integer
-// rates are never packed on this tier: their per-column word step is not integral, so the residue classes do not
-// partition the tile, and avx2_swz2 has no hb instances. K1's dword permutation is the
-// identity, so "planar" is a no-op repack there and the gathers degenerate to the walking
-// gather of a single-register tile anyway.
+// at the odd and high rates, which would lock those rates out of the swizzle. Fractional
+// rates instead use Q = 2*bits+1 chronological halfword planes (see avx2_load_planar),
+// enabled separately and sharing only the band traversal and accumulation. K1's dword
+// permutation is the identity, so "planar" is a no-op repack there and the gathers
+// degenerate to the walking gather of a single-register tile anyway.
 //
 // tn0/tn1 are always even: assign_gemvs splits in 8-tile groups (2-tile aligned) and
 // tiles_n is a multiple of 8. There is no per-tile edge handling.
-template <int bits, int Rows = MAX_M>
+template <int bits, int Rows = MAX_M, bool hb = false>
 M1_TARGET_AVX2
 void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     const int rows = Rows == MAX_M ? m : Rows;
     const int tiles_k = mat.k / 16;
-    constexpr int packed_size = 16 * bits;
+    constexpr int packed_size = tile_u16(bits, hb);
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
     const __m256i ones32 = _mm256_set1_epi32(0x01010101);
     const int32_t* splat_dup = in.splat_dup;
@@ -2075,13 +2183,11 @@ void avx2_swz2(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
         {
             const int32_t* dup = splat_dup + tile_k * 16;
-            __m256i preg[bits];
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
-            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accA, mult, ones32);
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
-            avx2_rows_accum_planar<bits, 0, Rows>(preg, dup, mat.k, rows, accB, mult, ones32);
+            __m256i preg[avx2_planar_regs(bits, hb)];
+            avx2_load_planar<bits, hb>(pA, preg);
+            avx2_rows_accum_planar<bits, 0, Rows, hb>(preg, dup, mat.k, rows, accA, mult, ones32);
+            avx2_load_planar<bits, hb>(pB, preg);
+            avx2_rows_accum_planar<bits, 0, Rows, hb>(preg, dup, mat.k, rows, accB, mult, ones32);
         }
         for (int i = 0; i < rows; ++i)
         {
@@ -2127,16 +2233,21 @@ M1_ALWAYS_INLINE __m256i avx2_funnel_hi(__m256i a, __m256i b)   // state in bits
     else return _mm256_or_si256(_mm256_srli_epi32(b, s - 16), _mm256_slli_epi32(a, 48 - s));
 }
 
-template <int bits, int row, int half, bool high>
+template <int bits, int row, int half, bool high, bool hb = false>
 M1_TARGET_AVX2
-M1_ALWAYS_INLINE __m256i avx2_half_state_planar(const __m256i (&preg)[bits])
+M1_ALWAYS_INLINE __m256i avx2_half_state_planar(const __m256i (&preg)[avx2_planar_regs(bits, hb)])
 {
-    constexpr int sft = row_shift<bits, false, row>(half * 8);
-    const __m256i b = avx2_gather_half_planar<bits, row, true, half>(preg);
-    __m256i a = b;
-    if constexpr (sft > 16) a = avx2_gather_half_planar<bits, row, false, half>(preg);
-    if constexpr (high) return avx2_funnel_hi<sft>(a, b);
-    else return avx2_funnel_lo<sft>(a, b);
+    if constexpr (hb)
+        return avx2_half_state_halfword<bits, row, half, high>(preg);
+    else
+    {
+        constexpr int sft = row_shift<bits, false, row>(half * 8);
+        const __m256i b = avx2_gather_half_planar<bits, row, true, half>(preg);
+        __m256i a = b;
+        if constexpr (sft > 16) a = avx2_gather_half_planar<bits, row, false, half>(preg);
+        if constexpr (high) return avx2_funnel_hi<sft>(a, b);
+        else return avx2_funnel_lo<sft>(a, b);
+    }
 }
 
 struct Avx2PairConsts
@@ -2154,19 +2265,19 @@ M1_ALWAYS_INLINE __m256i avx2_bytesum16(__m256i st, const Avx2PairConsts& C)
 }
 
 // splat_pair: this tile's 8 pairs of the first token row, rows kh apart
-template <int bits, int Rows, int p = 0>
+template <int bits, int Rows, bool hb = false, int p = 0>
 M1_TARGET_AVX2
-M1_ALWAYS_INLINE void avx2_pair_rows_accum(const __m256i (&preg)[bits], const int32_t* splat_pair, int kh,
-                                           __m256i (&acc)[Rows][2], const Avx2PairConsts& C)
+M1_ALWAYS_INLINE void avx2_pair_rows_accum(const __m256i (&preg)[avx2_planar_regs(bits, hb)],
+    const int32_t* splat_pair, int kh, __m256i (&acc)[Rows][2], const Avx2PairConsts& C)
 {
     if constexpr (p < 8)
     {
         // Clang's _mm256_blend_epi16 is a macro: the template argument commas would split its
         // arguments, so the halves are named first
-        const __m256i lo_even = avx2_half_state_planar<bits, 2 * p, 0, false>(preg);
-        const __m256i lo_odd = avx2_half_state_planar<bits, 2 * p + 1, 0, true>(preg);
-        const __m256i hi_even = avx2_half_state_planar<bits, 2 * p, 1, false>(preg);
-        const __m256i hi_odd = avx2_half_state_planar<bits, 2 * p + 1, 1, true>(preg);
+        const __m256i lo_even = avx2_half_state_planar<bits, 2 * p, 0, false, hb>(preg);
+        const __m256i lo_odd = avx2_half_state_planar<bits, 2 * p + 1, 0, true, hb>(preg);
+        const __m256i hi_even = avx2_half_state_planar<bits, 2 * p, 1, false, hb>(preg);
+        const __m256i hi_odd = avx2_half_state_planar<bits, 2 * p + 1, 1, true, hb>(preg);
         const __m256i st_lo = _mm256_blend_epi16(lo_even, lo_odd, 0xAA);
         const __m256i st_hi = _mm256_blend_epi16(hi_even, hi_odd, 0xAA);
         const __m256i s_lo = avx2_bytesum16(st_lo, C);
@@ -2178,17 +2289,17 @@ M1_ALWAYS_INLINE void avx2_pair_rows_accum(const __m256i (&preg)[bits], const in
             acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(s_lo, xs));
             acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(s_hi, xs));
         }
-        avx2_pair_rows_accum<bits, Rows, p + 1>(preg, splat_pair, kh, acc, C);
+        avx2_pair_rows_accum<bits, Rows, hb, p + 1>(preg, splat_pair, kh, acc, C);
     }
 }
 
-template <int bits, int Rows>
+template <int bits, int Rows, bool hb = false>
 M1_TARGET_AVX2
 void avx2_swz2_pair(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
 {
     const int tiles_k = mat.k / 16;
     const int kh = mat.k / 2;
-    constexpr int packed_size = 16 * bits;
+    constexpr int packed_size = tile_u16(bits, hb);
     const Avx2PairConsts C {
         _mm256_set1_epi16(static_cast<short>(MUL1_MULT & 0xffff)),
         _mm256_set1_epi16(static_cast<short>(MUL1_MULT >> 16)),
@@ -2210,13 +2321,11 @@ void avx2_swz2_pair(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, 
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
         {
             const int32_t* px = in.splat_pair + tile_k * 8;
-            __m256i preg[bits];
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
-            avx2_pair_rows_accum<bits, Rows>(preg, px, kh, accA, C);
-            for (int i = 0; i < bits; ++i)
-                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
-            avx2_pair_rows_accum<bits, Rows>(preg, px, kh, accB, C);
+            __m256i preg[avx2_planar_regs(bits, hb)];
+            avx2_load_planar<bits, hb>(pA, preg);
+            avx2_pair_rows_accum<bits, Rows, hb>(preg, px, kh, accA, C);
+            avx2_load_planar<bits, hb>(pB, preg);
+            avx2_pair_rows_accum<bits, Rows, hb>(preg, px, kh, accB, C);
         }
         for (int i = 0; i < Rows; ++i)
         {
@@ -2230,6 +2339,16 @@ void avx2_swz2_pair(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, 
             _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
         }
     }
+}
+
+// Without splat_pair, use the unpaired kernel for the same packed fractional layout.
+template <int bits, int Rows>
+void avx2_swz2_half_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    if (in.splat_pair)
+        avx2_swz2_pair<bits, Rows, true>(mat, in, tout, tn0, tn1);
+    else
+        avx2_swz2<bits, Rows, true>(mat, in, tout, Rows, tn0, tn1);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2341,6 +2460,14 @@ Isa detect_isa()
 }
 
 const Isa g_isa = []{ return detect_isa(); }();
+
+// Layout policy is immutable after extension load, like the ISA cap. Fractional packing
+// is opt-in: its first streamed use can require the existing GPU inverse ring.
+const bool g_fractional_swizzle = []{
+    const char* e = std::getenv("EXL3_MOE_CPU_FRACTIONAL_SWIZZLE");
+    const char* swz = std::getenv("EXL3_MOE_CPU_SWIZZLE");
+    return e && std::strcmp(e, "1") == 0 && !(swz && std::strcmp(swz, "0") == 0);
+}();
 
 // ks (split-K slice, see KSlice): VBMI tier only and never K8, which that tier routes to the VNNI
 // kernels; decode_phase checks split_k_ok first
@@ -2527,10 +2654,24 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         }
         case Isa::Avx2:
         {
-            // Swizzled matrices on this tier are always group-2 + planar dwords (the rule
-            // couples the two, the loader repacks accordingly and make_matrix re-derives the
-            // flag from the same rule, so bytes and kernel cannot drift). Half rates are
-            // never swizzled here and take the hb branch below.
+            // The shared selectors couple group-2 with planar packing. Fractional planes
+            // contain halfwords, not dwords: dispatch them before any integer swz branch.
+            if (mat.hb && mat.swz)
+            {
+                #define AVX2_HB_SWZ2_ROWS(B) \
+                    switch (m) { \
+                        case 1: avx2_swz2_half_tiles<B, 1>(mat, in, tout, tn0, tn1); return; \
+                        case 2: avx2_swz2_half_tiles<B, 2>(mat, in, tout, tn0, tn1); return; \
+                        case 3: avx2_swz2_half_tiles<B, 3>(mat, in, tout, tn0, tn1); return; \
+                        default: avx2_swz2_half_tiles<B, 4>(mat, in, tout, tn0, tn1); return; }
+                switch (mat.bits)
+                {
+                    case 1: AVX2_HB_SWZ2_ROWS(1)
+                    case 2: AVX2_HB_SWZ2_ROWS(2)
+                    default: AVX2_HB_SWZ2_ROWS(3)
+                }
+                #undef AVX2_HB_SWZ2_ROWS
+            }
             if (mat.swz && in.splat_pair)
             {
                 #define AVX2_SWZ2P_ROWS(B) \
@@ -2587,12 +2728,21 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             }
             if (mat.hb)
             {
+                // Specialize up to three prepared rows (including wide tokens' high/low pairs);
+                // four-row passes keep the runtime bound.
+                #define AVX2_HB_ROWS(B) \
+                    switch (m) { \
+                        case 1: avx2_tiles<B, true, 1>(mat, in, tout, m, tn0, tn1); return; \
+                        case 2: avx2_tiles<B, true, 2>(mat, in, tout, m, tn0, tn1); return; \
+                        case 3: avx2_tiles<B, true, 3>(mat, in, tout, m, tn0, tn1); return; \
+                        default: avx2_tiles<B, true>(mat, in, tout, m, tn0, tn1); return; }
                 switch (mat.bits)
                 {
-                    case 1: avx2_tiles<1, true>(mat, in, tout, m, tn0, tn1); return;
-                    case 2: avx2_tiles<2, true>(mat, in, tout, m, tn0, tn1); return;
-                    case 3: avx2_tiles<3, true>(mat, in, tout, m, tn0, tn1); return;
+                    case 1: AVX2_HB_ROWS(1)
+                    case 2: AVX2_HB_ROWS(2)
+                    case 3: AVX2_HB_ROWS(3)
                 }
+                #undef AVX2_HB_ROWS
                 return;
             }
             switch (mat.bits)
@@ -3559,7 +3709,7 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
 }
 
 // Staged bytes are copied verbatim, packed or not: the GPU restores the native tile order (and
-// dword order) after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM
+// in-tile dword/halfword order) after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM
 // bandwidth instead of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
 // whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
@@ -3629,12 +3779,16 @@ bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 // share the structure); K8 is exempt (it routes to the dword kernel, which gains nothing);
 // half rates ride the hb template instances there. Band-2 + planar feeds the AVX2 kernels
 // (avx2_swz2_pair, avx2_swz2), which measure above native at every integer rate (see the
-// avx2_swz2 header comment); half rates stay native on this tier.
+// avx2_swz2 header comment); half rates use chronological halfword planes only when opted in.
 int exl3_moe_cpu_swizzle_group(double K)
 {
     const int bits = static_cast<int>(K);
     if (g_isa >= Isa::Bw) return bits != 8 ? 8 : 0;
-    if (g_isa == Isa::Avx2) return K == bits && bits >= 1 && bits <= 8 ? 2 : 0;
+    if (g_isa == Isa::Avx2)
+    {
+        if (K == bits && bits >= 1 && bits <= 8) return 2;
+        if (g_fractional_swizzle && K == bits + 0.5 && bits >= 1 && bits <= 3) return 2;
+    }
     return 0;
 }
 

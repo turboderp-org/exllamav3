@@ -268,6 +268,9 @@ class Gemma4AssistantModel(Model):
             "uncalibrated_quantize": True,
             "supports_tp": False,
             "attach_target": True,
+            # Reads the target's cache layers in place: loaded by the target's load (see modules_with_target),
+            # never on its own
+            "load_with_target": True,
             "mtp_draft": True,
             "draft_uses_target_cache": True,
             "default_draft_size": config.num_assistant_tokens,
@@ -308,6 +311,33 @@ class Gemma4AssistantModel(Model):
         self.draft_verifier_params.update({
             "export_state_layers": {tcfg.num_hidden_layers - 1},
         })
+
+
+    def modules_with_target(self, target) -> dict[int, list]:
+        """
+        Placement for the target's loader: the index of the target module each of this drafter's modules loads
+        right after, on the same device. A layer reading a target layer's K/V (paged pages or window ring) has to
+        sit where that layer's cache lives, so every block follows its source layer; the input layer goes with
+        the first block and the final norm and head with the last. Hops of the drafter's narrow residual stream
+        between devices cost nothing next to the attention itself. Call after attach_to()
+        """
+        assert self.attached_model is not None and self.attached_model() is target, \
+            "Gemma4 assistant: attach_to(target) before planning its placement"
+        src_index = {}
+        for i, m in enumerate(target.modules):
+            attn = getattr(m, "attn", None)
+            if attn is not None:
+                src_index[id(attn)] = i
+        block_targets = [src_index[id(attn.source_module)] for attn in self.attn_modules]
+        plan = {}
+        def place(module, t):
+            plan.setdefault(t, []).append(module)
+        place(self.input_layer, block_targets[0])
+        for i, t in enumerate(block_targets):
+            place(self.modules[self.first_block_idx + i], t)
+        place(self.final_norm, block_targets[-1])
+        place(self.head, block_targets[-1])
+        return plan
 
 
     @override

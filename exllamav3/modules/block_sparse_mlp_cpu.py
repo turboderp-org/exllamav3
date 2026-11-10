@@ -150,6 +150,31 @@ def run_pending_swap_sweeps(infer_params):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
 
 
+def register_split_module(infer_params, module):
+    """Add a split module to the config's dynamic-placement registry. Its first entry drives the per-step hooks
+    (_split_swap_tick), so a draft component sharing the config (an MTP head: loads first, drafts N times) goes last"""
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None)
+    if reg is None:
+        reg = []
+        infer_params.moe_cpu_swap_modules = reg
+        # A server killed with Ctrl-C never reaches unload: save what the session
+        # learned at interpreter exit as well (a no-op after a normal unload, which
+        # empties the registry; best effort, the CUDA tensors may already be gone)
+        import atexit, weakref
+        ref = weakref.ref(infer_params)
+        def _save_at_exit():
+            ip = ref()
+            if ip is None:
+                return
+            try:
+                save_expert_stats(ip)
+            except Exception:
+                pass
+        atexit.register(_save_at_exit)
+    reg.append(module)
+    reg.sort(key = lambda m: m.cpu_component != "text")
+
+
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
 _PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
@@ -160,11 +185,16 @@ _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 class _PromoteState:
     """Promote-on-miss bookkeeping over every split module with spares, as [modules, experts] host
     tensors so one step is a few vector ops: the hit-count snapshots (pinned, one device-to-host copy
-    per module per step, one event per device), the previous snapshot, the placement map mirror and
-    the in-flight mask. Per module, the free slot lists and the transfers in flight stay Python lists"""
+    and one event per device per step), the previous snapshot, the placement map mirror and the
+    in-flight mask. Per module, the free slot lists and the transfers in flight stay Python lists"""
 
     def __init__(self, modules):
-        self.modules = [m for m in modules if m._split_spares and m._split_pending is not None]
+        self.head = modules[0]
+        # Grouped by device, so each device's modules are one contiguous block of rows
+        self.modules = sorted(
+            (m for m in modules if m._split_spares and m._split_pending is not None),
+            key = lambda m: torch.device(m.device).index or 0
+        )
         n = len(self.modules)
         e = max(m.num_experts for m in self.modules)
         import numpy as np
@@ -182,6 +212,18 @@ class _PromoteState:
         self.devices = sorted({torch.device(m.device).index or 0 for m in self.modules})
         self.snap_ev = {}
         self.stats = dict(routed = 0, missed = 0, steps = 0, ms = 0.0)
+        # Per device, the modules' hit counts become row views of one [rows, experts] tensor (the
+        # issue kernels keep writing them in place), so the snapshot and the decay are one call each
+        self.hists = {}
+        for d in self.devices:
+            rows = [i for i, m in enumerate(self.modules) if (torch.device(m.device).index or 0) == d]
+            a, b = rows[0], rows[-1] + 1
+            hist = torch.zeros((b - a, e), dtype = torch.float, device = self.modules[a]._split_hist.device)
+            for i in rows:
+                m = self.modules[i]
+                hist[i - a, :m.num_experts].copy_(m._split_hist)
+                m._split_hist = hist[i - a, :m.num_experts]
+            self.hists[d] = (a, b, hist)
         for m in self.modules:
             m._split_snap = None          # the per-module snapshot is superseded by the shared one
 
@@ -204,7 +246,7 @@ def _split_promote_step(ip, modules, rows):
     import time
     t0 = time.perf_counter()
     ps = getattr(ip, "moe_cpu_promote_state", None)
-    if ps is None or ps.modules[0] is not modules[0]:
+    if ps is None or ps.head is not modules[0]:
         ps = ip.moe_cpu_promote_state = _PromoteState(modules)
     verify = os.environ.get("EXL3_MOE_CPU_PROMOTE_VERIFY")
     debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
@@ -245,16 +287,13 @@ def _split_promote_step(ip, modules, rows):
         cur = ps.snap_np.copy()
         routed = cur > ps.prev
         ps.prev = cur
-    for i, m in enumerate(ps.modules):
-        dev = torch.device(m.device)
-        with torch.cuda.device(dev):
-            ps.snap[i, :m.num_experts].copy_(m._split_hist, non_blocking = True)
-    for d in ps.devices:
-        ev = torch.cuda.Event()
-        ev.record(torch.cuda.current_stream(d))
-        ps.snap_ev[d] = ev
-    hists = [m._split_hist for m in ps.modules]
-    torch._foreach_mul_(hists, _PROMOTE_DECAY)
+    for d, (a, b, hist) in ps.hists.items():
+        with torch.cuda.device(d):
+            ps.snap[a:b].copy_(hist, non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(d))
+            ps.snap_ev[d] = ev
+            hist.mul_(_PROMOTE_DECAY)
     if have and rows < ps.modules[0].cpu_host.stream_min_rows:
         import numpy as np
         resident = ps.mp < ps.first
@@ -500,26 +539,7 @@ class BlockSparseMLP_CPU:
                 self._split_busy = set()        # router ids with a transfer in flight
                 self._split_promo_n = 0
                 self._split_demo_n = 0
-            ip2 = self.config.infer_params
-            reg = getattr(ip2, "moe_cpu_swap_modules", None)
-            if reg is None:
-                reg = []
-                ip2.moe_cpu_swap_modules = reg
-                # A server killed with Ctrl-C never reaches unload: save what the session
-                # learned at interpreter exit as well (a no-op after a normal unload, which
-                # empties the registry; best effort, the CUDA tensors may already be gone)
-                import atexit, weakref
-                ref = weakref.ref(ip2)
-                def _save_at_exit():
-                    ip = ref()
-                    if ip is None:
-                        return
-                    try:
-                        save_expert_stats(ip)
-                    except Exception:
-                        pass
-                atexit.register(_save_at_exit)
-            reg.append(self)
+            register_split_module(self.config.infer_params, self)
 
     def cpu_unload(self):
         if self.cpu_split_first is not None:

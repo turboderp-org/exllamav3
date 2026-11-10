@@ -71,6 +71,7 @@
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
+#include "dequant_blocks.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -134,13 +135,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ple_forward_streams_fused", &ple_forward_streams_fused, "ple_forward_streams_fused");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_fused", &hc_mix_fused, "hc_mix_fused");
+    m.def("dequant_blocks", &dequant_blocks, "dequant_blocks");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");

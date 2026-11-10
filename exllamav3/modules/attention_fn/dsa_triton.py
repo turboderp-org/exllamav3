@@ -93,8 +93,7 @@ def _dsa_attn_kernel(
     DEBUG_PAGES: tl.constexpr = 0,
     NC_BLOCK: tl.constexpr = 0,    # DSpark draft mode: every row sees the SAME range
                                    # [win_floor, q_pos0 + R) (window history ++ whole
-                                   # chunk, non-causal); history rows are PAGED, read
-                                   # via block_table at absolute-position pages
+                                   # chunk, non-causal); history rows come from the ring
     NC_CHUNK: tl.constexpr = 0,    # non-causal image chunk (DeepSeek-V4 vision): every
                                    # row sees the WHOLE chunk plus its own causal window
                                    # of NC_HIST history rows from the ring; win_len is
@@ -173,13 +172,7 @@ def _dsa_attn_kernel(
             mc = in_range & (abs_pos >= q_pos0)
             mr = in_range & (abs_pos < q_pos0)
             idx_c = tl.where(mc, abs_pos - q_pos0, 0)
-            if NC_BLOCK:
-                ap = tl.where(mr, abs_pos, 0)
-                w_phys = tl.load(block_table + row * num_pages_per_row + ap // page_size,
-                                 mask = mr, other = 0)
-                idx_r = w_phys * page_size + ap % page_size
-            else:
-                idx_r = tl.where(mr, abs_pos - ring_beg, 0)
+            idx_r = tl.where(mr, abs_pos - ring_beg, 0)
             vc = tl.load(kv_chunk + idx_c[:, None] * D + offs_c[None, :],
                          mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
@@ -659,7 +652,7 @@ def _dsa_indexer_kernel(
     acc = acc * scale
     bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
-    tl.store(scores + offs_m[:, None] * S_stride + offs_n[None, :], acc.to(tl.float16),
+    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
              mask = valid_m[:, None] & valid_n[None, :])
 
 
@@ -904,8 +897,8 @@ def dsa_attn(
     num_stages = 3,
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
-    nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
-                             # (single job per call; forces the one-shot kernel)
+    nc_block = False,        # DSpark draft mode: non-causal chunk + window history from the
+                             # ring (single job per call; forces the one-shot kernel)
     nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
                              # the whole chunk (bidirectional) plus its own win_len-wide
                              # causal window into the ring history; pool phases unchanged

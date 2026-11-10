@@ -68,6 +68,7 @@ def main(args):
     cache = QCache(project["logit_cache"])
 
     ids, ranges, trace_vocab = get_test_rows(project, cache)
+    lengths = [b for _, b in ranges]
     max_len = ids.shape[-1] + 64
     if project.get("test_trace"):
         data_key = sha_key({"v": 1, "test_trace": os.path.basename(project["test_trace"]),
@@ -118,7 +119,7 @@ def main(args):
         def ref_callback(r, logits):
             stats(r, logits)
             save_reference_row(ref_store, r, logits, ranges[r], conf_rows)
-        backend.run(ids, ref_callback)
+        backend.run(ids, ref_callback, lengths = lengths)
         save_tensors(os.path.join(ref_store, "conf.safetensors"), {"conf": torch.cat(conf_rows).half()})
         with open(ref_meta, "w") as f:
             json.dump({"rows": ids.shape[0], "ranges": [list(r) for r in ranges]}, f)
@@ -136,7 +137,7 @@ def main(args):
         if floor_results is None:
             backend = open_backend(ref, max_len, device)
             stats = DiffStats(ids, ranges, vocab_size, ref_store)
-            backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS)
+            backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS, lengths = lengths)
             floor_results = stats.results()
             floor_results.update(backend.info)
             cache.save_results(floor_results_key, floor_results)
@@ -158,7 +159,7 @@ def main(args):
         if res is None:
             backend = open_backend(mspec, max_len, device)
             stats = DiffStats(ids, ranges, vocab_size, ref_store)
-            backend.run(ids, stats)
+            backend.run(ids, stats, lengths = lengths)
             res = stats.results()
             res.update(backend.info)
             cache.save_results(results_key, res)

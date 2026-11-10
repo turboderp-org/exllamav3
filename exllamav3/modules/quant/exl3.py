@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 from ...model.config import Config
-from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n
+from .exl3_lib.quantize import frac_k, preapply_had_l_, preapply_had_r_, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
@@ -251,9 +251,9 @@ class LinearEXL3:
             for bi, b in enumerate(grp):
                 ext.reconstruct_slice(stack[bi], self.trellis, self.K, self.mcg, self.mul1, b * 128)
             w = stack.permute(1, 0, 2).reshape(k, 128 * len(grp))
-            w = preapply_had_l(w, had_k)
+            w = preapply_had_l_(w, had_k)
             w *= suh
-            w = preapply_had_r(w, had_n)
+            w = preapply_had_r_(w, had_n)
             svh_idx = (torch.tensor(grp, device = w.device).unsqueeze(1) * 128 + torch.arange(128, device = w.device)).view(-1)
             w *= self.svh[svh_idx].unsqueeze(0)
             # Requested columns inside this group: block index -> stacked offset
@@ -274,9 +274,9 @@ class LinearEXL3:
         suh = self.unpack_bf(self.su).unsqueeze(1) if self.su else self.suh.unsqueeze(1)
         svh = self.unpack_bf(self.sv).unsqueeze(0) if self.sv else self.svh.unsqueeze(0)
         w = self.get_inner_weight_tensor()
-        w = preapply_had_l(w, had_k)
+        w = preapply_had_l_(w, had_k)
         w *= suh
-        w = preapply_had_r(w, had_n)
+        w = preapply_had_r_(w, had_n)
         w *= svh
         # w *= self.scale
         return w

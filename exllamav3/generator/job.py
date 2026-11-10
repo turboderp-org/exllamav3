@@ -70,7 +70,7 @@ class Job:
         banned_strings: list[str] | None = None,
         embeddings: list[MMEmbedding] | None = None,
         max_rq_tokens: int | None = None,
-        stop_on_loop: tuple[int, int] = None,
+        stop_on_loop: bool | dict | tuple = False,
         rq_state: dict | None = None,
         **kwargs
     ):
@@ -141,8 +141,10 @@ class Job:
             the full cache size without limiting concurrency for other jobs.
 
         :param stop_on_loop:
-            Tuple of (window_size: int, min_reps: int), or None. If enabled, generation will end if the last
-            window_size tokens sampled make up >= min_reps consecutive instances of a looping string.
+            End generation (eos_reason "loop_detected") when the output settles into repeating the same text, exactly
+            or nearly, with nothing else happening in between. True enables it with the default LoopDetector settings,
+            a dict passes LoopDetector keyword arguments. The legacy (window_size, min_reps) tuple is accepted and
+            treated as True; the detector has no fixed window. See generator/loop_detect.py for what is detected.
 
         :param rq_state:
             Internal, passed when job requeues itself
@@ -309,14 +311,13 @@ class Job:
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
 
-        # Loop detector
-        self.loop_detector = None
+        # Loop detector. A requeued job continues the detector of its first pass (whose input is the original
+        # prompt, so it is primed only there)
         self.stop_on_loop = stop_on_loop
-        if stop_on_loop:
-            window_size, min_reps = stop_on_loop
-            assert window_size > 1, "Loop detector window size cannot be less than 1"
-            assert 1 < min_reps < window_size, "Number of reps must be > 1, < window_size"
-            self.loop_detector = LoopDetector(window_size, window_size // min_reps)
+        self.loop_detector = rq_state.get("loop_detector")
+        if stop_on_loop and self.loop_detector is None:
+            self.loop_detector = LoopDetector(**stop_on_loop) if isinstance(stop_on_loop, dict) else LoopDetector()
+            self.loop_detector.prime(self.sequences[0].input_ids.torch())
 
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
@@ -1230,6 +1231,7 @@ class Job:
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
             "sam": self.sam,
+            "loop_detector": self.loop_detector,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
         }

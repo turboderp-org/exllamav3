@@ -6,6 +6,7 @@ from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
+from .deepseek_v41 import DeepseekV41Model
 from .dflash import DFlashModel
 from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
@@ -35,6 +36,8 @@ from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
 from .lfm2_vl import Lfm2VlTextModel
+from .lfm3 import Lfm3Model
+from .lfm3_vl import Lfm3VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
@@ -79,6 +82,7 @@ ARCHITECTURES = {
         DeciLMModel,
         DeepseekV3Model,
         DeepseekV4Model,
+        DeepseekV41Model,
         DFlashModel,
         DFlash2Model,
         DFlashLagunaModel,
@@ -110,6 +114,8 @@ ARCHITECTURES = {
         Lfm2Model,
         Lfm2MoeModel,
         Lfm2VlTextModel,
+        Lfm3Model,
+        Lfm3VlTextModel,
         LlamaModel,
         MiMoModel,
         MiMoV2Model,
