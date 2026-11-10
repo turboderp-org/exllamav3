@@ -7,7 +7,8 @@ exl3_gemv contract: C (..., n) = A (..., k) @ W for W = diag(suh) H W_hat H diag
 leading dim of A flattened into m <= 8 rows, C fp16 or fp32; A is not modified, nothing outside C is written, and
 repeat launches are bit-identical. Eligible: k, n multiples of 128; K = 2..4 with mcg / mul1, K = 4 with 3INST,
 K = 1.5 / 2.5 / 3.5 with mul1; suh, A_had (scratch) and svh all given. Everything else is rejected with an error.
-Both kernel configurations are exercised (n <= 8192 narrow, n > 8192 wide), and m = 1 (MMODE 0) and 2..8.
+Both kernel configurations are exercised (n <= 8192 narrow, n > 8192 wide; narrow at n = 8192 runs past one wave of
+the unbounded integer instance, so it takes the two-blocks-per-SM one), and m = 1 (MMODE 0) and 2..8.
 
 Reference: testlib.trellis.linear, the float64 product with the independently decoded weight. Tolerance: the kernel
 rounds the rotated input to fp16 (A_had) and accumulates 64-term runs (4 tiles) of the MMA in fp16 before folding to
@@ -44,6 +45,8 @@ CASES = [
     (2, "mul1", 3, 1024, 640, True),
     (3, "mcg", 5, 384, 512, False),
     (3, "mul1", 7, 512, 8448, True),        # wide config
+    (4, "mul1", 4, 256, 8192, False),       # narrow, past one wave: two-blocks-per-SM instance
+    (3, "mcg", 2, 256, 8192, True),         # narrow, past one wave: two-blocks-per-SM instance
     (1.5, "mul1", 1, 1024, 1024, False),
     (2.5, "mul1", 4, 512, 768, True),
     (3.5, "mul1", 8, 256, 8320, False),     # wide config
