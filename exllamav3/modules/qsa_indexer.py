@@ -128,6 +128,13 @@ class QSAIndexer(Module):
         return self.index_qk_proj.optimizer_targets()
 
     @override
+    def unload(self):
+        super().unload()
+        # The selection weights are created lazily and owned by the indexer rather than g_tensor_cache, so
+        # release them with the module (layer streaming would otherwise keep one per unloaded layer)
+        self._sel_w = None
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         raise RuntimeError("QSAIndexer is not a standalone graph module; use project()/select()")
 
