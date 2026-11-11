@@ -962,6 +962,25 @@ def block_trace(A, B, block_size = 1024):
     return total
 
 
+def block_trace_pair_streamed(W, Q, H, device, col_block = 8192):
+    """
+    Compute (trace(E.T @ H @ E), trace(W.T @ H @ W)) with E = W - Q, streaming column blocks of W and Q
+    to the device. Each column of W contributes independently to the trace, so this matches
+    block_trace(W - Q, H), block_trace(W, H) without materializing a full-size error tensor on the host
+    or moving full-size copies of W and E to the device.
+    """
+    num = 0.0
+    den = 0.0
+    for c_start in range(0, W.shape[1], col_block):
+        c_end = min(c_start + col_block, W.shape[1])
+        Wb = W[:, c_start:c_end].to(device)
+        Eb = Wb - Q[:, c_start:c_end].to(device)
+        num += block_trace(Eb, H)
+        den += block_trace(Wb, H)
+        del Wb, Eb
+    return num, den
+
+
 def ldlq_batched(
     weights: torch.Tensor,
     Ls: torch.Tensor,
@@ -1842,7 +1861,18 @@ def quantize_exl3(
         pb.update(tiles_k)
 
         # Metrics
-        if not q_fallback:
+        if not q_fallback and H_out_r is None and weight_r.device.type == "cpu":
+            # Large tensors are quantized with CPU work buffers. Stream the one-sided proxy in column
+            # blocks instead of allocating a full-size fp32 error tensor on the host and on the device.
+            try:
+                Hd = H.to(device)
+                num, den = block_trace_pair_streamed(weight_r, weight_q, Hd, device)
+                proxy_err = num / max(den, 1e-8)
+            except torch.OutOfMemoryError:
+                proxy_err = -1.0
+            weight_r = None
+            Hd = None
+        elif not q_fallback:
             try:
                 E = weight_r - weight_q  # may run on CPU
                 W = weight_r
