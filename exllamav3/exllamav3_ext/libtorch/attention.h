@@ -178,7 +178,7 @@ struct BC_Attention
         at::Tensor qsa_q4;       // rope view (bsz, q_len, H_i, rotate_dims)
         at::Tensor qsa_kraw;     // (R, D_i) raw keys
         at::Tensor qsa_wts;      // (R, H_i) fp16, filled with 1.0 (uniform head weights)
-        at::Tensor qsa_scores;   // (R, S_max) fp16, -inf filled once
+        at::Tensor qsa_scores;   // (R, S_max) fp32 (fp16 accepted), -inf filled once
         at::Tensor qsa_pool_idx; // (R, KP_pool) i32 selected block ids
         at::Tensor qsa_indices;  // (R, K_pad) i32 expanded token indices
         std::shared_ptr<TritonKernel> k_qsa_stage, k_qsa_raw_append, k_qsa_pool_update,

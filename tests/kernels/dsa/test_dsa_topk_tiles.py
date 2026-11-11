@@ -13,6 +13,10 @@ workspace slot and touches no other slot. dsa_topk_merge_tiles over slots that h
 produce exactly what dsa_topk produces on the whole row -- bitwise, order included (the qsa_indexer docstring and the
 kernel comment claim this) -- which is also checked directly against dsa_topk.
 
+fp32 scores (test_fp32_*): the same contract on the 32-bit ordered key, through the single-pass, split and tiled
+paths, including rows whose scores all round to one or two fp16 values (what the fp32 path exists to resolve);
+score workspaces must carry the dtype of the scores.
+
 Empty inputs (test_empty_*): no rows is a no-op; k == 0 is an empty selection (every output slot -1 padding, a tile
 slot count of 0, merge counts 0, scores untouched); a tile with no entries contributes no candidates; selecting
 k > 0 from an empty row (dsa_topk with T == 0, a merge over zero slots) is undefined and raises, as does a
@@ -397,4 +401,100 @@ def test_empty_dsa_topk_merge_tiles(device, R, G, k, error, with_outputs):
         if with_outputs:
             assert (out_scr == 3.5).all()
             assert (out_cnt == (-9 if R == 0 else 0)).all()
+    _device_still_works(device)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# fp32 scores: same order contract on the 32-bit key
+
+NEG_INF_KEY_F32 = 0x007fffff
+
+
+def ref_topk_f32(scores: torch.Tensor, k: int, k_pad: int) -> torch.Tensor:
+    u = scores.cpu().contiguous().view(torch.int32).numpy().astype(np.int64) & 0xffffffff
+    keys = np.where(u & 0x80000000, (~u) & 0xffffffff, u | 0x80000000)
+    out = np.full((scores.shape[0], k_pad), -1, dtype = np.int32)
+    for r in range(scores.shape[0]):
+        fin = np.nonzero(keys[r] > NEG_INF_KEY_F32)[0]
+        if len(fin) < k:
+            o = fin.tolist()
+        else:
+            vstar = np.sort(keys[r][fin])[::-1][k - 1]
+            gt = np.nonzero(keys[r] > vstar)[0].tolist()
+            o = gt + np.nonzero(keys[r] == vstar)[0].tolist()[: k - len(gt)]
+        out[r, : len(o)] = o
+    return torch.from_numpy(out)
+
+
+def make_scores_f32(mode: str, R: int, T: int, seed: int) -> torch.Tensor:
+    if mode == "close":
+        # Every score inside one fp16 step above 7.0: an fp16 key cannot order them
+        g = torch.Generator().manual_seed(seed)
+        s = 7.0 + torch.rand((R, T), generator = g) * 2 ** -8
+        assert s.half().unique().numel() <= 3
+        return s
+    return make_scores(mode, R, T, seed).float() if mode in ("ties", "zeros", "allinf") else \
+        make_scores(mode, R, T, seed).float() + torch.rand((R, T), generator = torch.Generator().manual_seed(seed)) * 1e-4
+
+
+def run_tiled_f32(scores: torch.Tensor, k: int, t_tile: int, kp: int) -> torch.Tensor:
+    rows, T = scores.shape
+    dev = scores.device
+    out = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+    ws = [(torch.empty((rows, 2, kp), dtype = torch.int32, device = dev),
+           torch.empty((rows, 2, kp), dtype = torch.float, device = dev),
+           torch.zeros((rows, 2), dtype = torch.int32, device = dev)) for _ in range(2)]
+    cur = 0
+    tiles = list(range(0, T, t_tile))
+    for n, t0 in enumerate(tiles):
+        t1 = min(t0 + t_tile, T)
+        w_idx, w_scr, w_cnt = ws[cur]
+        ext.dsa_topk_tile(scores[:, t0 : t1].contiguous(), w_idx, w_scr, w_cnt, 1, min(k, t1 - t0), t0)
+        if n == len(tiles) - 1:
+            ext.dsa_topk_merge_tiles(w_idx, w_scr, w_cnt, out, None, None, k)
+        else:
+            n_idx, n_scr, n_cnt = ws[cur ^ 1]
+            ext.dsa_topk_merge_tiles(w_idx, w_scr, w_cnt, n_idx[:, 0], n_scr[:, 0], n_cnt[:, 0], k)
+            cur ^= 1
+    return out
+
+
+# (R, T, k, mode, tile); R <= 16 with T >= 32768 takes the split/merge path, R > 16 the single-block kernel
+F32_CASES = [
+    (4, 2048, 512, "randn", 512), (3, 1000, 64, "ties", 256), (2, 4096, 256, "zeros", 1024), (8, 3000, 128, "causal", 1000),
+    (3, 5000, 64, "sparse", 2048), (2, 512, 16, "allinf", 128), (5, 33, 3, "close", 16), (40, 8192, 512, "close", 2048),
+    (2, 40000, 512, "close", 8192), (2, 40000, 512, "ties", 8192), (3, 65536, 1024, "causal", 8192), (20, 33000, 512, "randn", 8192),
+]
+
+
+@pytest.mark.parametrize("R,T,k,mode,tile", F32_CASES, ids = [f"R{c[0]}-T{c[1]}-k{c[2]}-{c[3]}" for c in F32_CASES])
+@torch.inference_mode()
+def test_fp32_exact_order(device, R, T, k, mode, tile):
+    scores = make_scores_f32(mode, R, T, 23).to(device)
+    kp = -(-k // 32) * 32
+    expect = ref_topk_f32(scores, k, kp)
+    out = torch.empty((R, kp), dtype = torch.int32, device = device)
+    ext.dsa_topk(scores, out, k, None, 0)
+    check_rows(out, expect, scores, "dsa_topk fp32")
+    # a row view that is not 16-byte aligned takes the scalar kernel
+    padded = torch.full((R, T + 3), -float("inf"), dtype = torch.float, device = device)
+    padded[:, 1 : T + 1] = scores
+    ext.dsa_topk(padded[:, 1 : T + 1], out, k, None, 0)
+    check_rows(out, expect, scores, "dsa_topk fp32, unaligned rows")
+    check_rows(run_tiled_f32(scores, k, tile, kp), expect, scores, "tiled fp32")
+
+
+@torch.inference_mode()
+def test_fp32_workspace_dtype(device):
+    sc = torch.randn((2, 64), device = device)
+    idx = torch.zeros((2, 2, 32), dtype = torch.int32, device = device)
+    cnt = torch.zeros((2, 2), dtype = torch.int32, device = device)
+    out = torch.zeros((2, 32), dtype = torch.int32, device = device)
+    with pytest.raises(RuntimeError, match = "dsa_topk_tile: .*dtype of the scores"):
+        ext.dsa_topk_tile(sc, idx, torch.zeros((2, 2, 32), dtype = torch.half, device = device), cnt, 0, 8, 0)
+    with pytest.raises(RuntimeError, match = "dsa_topk_merge_tiles: .*dtype of ws_scr"):
+        ext.dsa_topk_merge_tiles(idx, torch.zeros((2, 2, 32), device = device), cnt, out,
+                                 torch.zeros((2, 32), dtype = torch.half, device = device), None, 8)
+    with pytest.raises(RuntimeError, match = "float16 or float32"):
+        ext.dsa_topk(sc.double(), out, 8, None, 0)
     _device_still_works(device)

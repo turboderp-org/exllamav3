@@ -601,7 +601,7 @@ def _dsa_indexer_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
     w,                   # (R, H_i) fp16 raw head weights (scales folded into `scale`)
     k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
-    scores,              # (R, S_stride) fp16 out
+    scores,              # (R, S_stride) fp16 or fp32 out (the accumulation is fp32 either way)
     T,                   # runtime: valid keys
     R,                   # runtime: valid query rows
     q_pos0,              # runtime: absolute position of query row 0
@@ -652,7 +652,7 @@ def _dsa_indexer_kernel(
     acc = acc * scale
     bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
-    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
+    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(scores.dtype.element_ty),
              mask = valid_m[:, None] & valid_n[None, :])
 
 
@@ -662,7 +662,7 @@ def _dsa_indexer_fewq_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
     w,                   # (R, H_i) fp16 raw head weights
     k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
-    scores,              # (R, S_stride) fp16 out
+    scores,              # (R, S_stride) fp16 or fp32 out (the accumulation is fp32 either way)
     T,
     R,
     q_pos0,
@@ -724,7 +724,7 @@ def _dsa_indexer_fewq_kernel(
 
     bound = tl.minimum((q_pos0 + loc + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n < bound, acc, -float("inf"))
-    tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
+    tl.store(scores + r * S_stride + offs_n, acc.to(scores.dtype.element_ty), mask = valid_n)
 
 
 @triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
@@ -1181,8 +1181,9 @@ def dsa_indexer_scores(
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
 ):
-    """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
-    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
+    """Indexer scores (R, T) with -inf past each query's causal entry bound
+    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk. fp16 unless the caller
+    hands in an fp32 backing, which keeps the scores unrounded (ext.dsa_topk takes either)."""
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
