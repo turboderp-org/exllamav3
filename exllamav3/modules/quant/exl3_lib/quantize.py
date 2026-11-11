@@ -1638,7 +1638,7 @@ def damping_share(quant_args: dict) -> float:
 
 
 def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
-                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
+                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0, report_before: bool = True):
     """
     Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
     the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
@@ -1646,7 +1646,8 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     per input row r solves ((Q Q^T) o H) r = rowsum(Q o (H W)); alternated. Returns the rescaled weight_q
     and the output error before / after, trace(E H E^T) / trace(W H W^T) = |X E|^2 / |X W|^2 over the
     calibration rows. The fits use H as given (damped); `damping` is the share of H's mean diagonal that
-    finalize_capture_H added, taken back out of the diagonal for the reported error only
+    finalize_capture_H added, taken back out of the diagonal for the reported error only. The error before
+    the refit costs a pass over the weight that nothing else needs: None without `report_before`
     """
     dev = weight_q.device
     H = H.to(dev)
@@ -1684,7 +1685,7 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
             E = cols(weight, a, b) - Qx[:, a:b]
             e += (E * (H_err @ E)).sum().item()
         return e / max(den_err, 1e-30)
-    e_before = err(Q)
+    e_before = err(Q) if report_before else None
     for _ in range(rounds):
         # output-side scales
         num = torch.zeros(n, device=dev)
@@ -1860,8 +1861,16 @@ def quantize_exl3(
 
         pb.update(tiles_k)
 
-        # Metrics
-        if not q_fallback and H_out_r is None and weight_r.device.type == "cpu":
+        # Metrics. The scale refit below reports the error of what is stored and replaces the regularized-domain
+        # proxy, so that one is only worked out where it is shown or returned
+        refit = not q_fallback and H is not None and not quant_args.get("no_refit")
+        if q_fallback:
+            proxy_err = mse_err
+        elif refit and not verbose:
+            proxy_err = None
+            weight_r = None
+            H_out_r = None
+        elif H_out_r is None and weight_r.device.type == "cpu":
             # Large tensors are quantized with CPU work buffers. Stream the one-sided proxy in column
             # blocks instead of allocating a full-size fp32 error tensor on the host and on the device.
             try:
@@ -1872,7 +1881,7 @@ def quantize_exl3(
                 proxy_err = -1.0
             weight_r = None
             Hd = None
-        elif not q_fallback:
+        else:
             try:
                 E = weight_r - weight_q  # may run on CPU
                 W = weight_r
@@ -1902,8 +1911,6 @@ def quantize_exl3(
                 W = None
                 Hd = None
                 proxy_err = -1.0
-        else:
-            proxy_err = mse_err
 
         # free_mem()
 
@@ -1914,11 +1921,12 @@ def quantize_exl3(
         weight_q *= sv
 
         # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
-        if not q_fallback and H is not None and not quant_args.get("no_refit"):
+        if refit:
             # On the quantization device whichever device H is parked on, so the result doesn't depend on swapping
             H_orig = unrotate_H(H.to(device), H_data["su"])
             weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv,
-                                                                   damping = damping_share(quant_args))
+                                                                   damping = damping_share(quant_args),
+                                                                   report_before = verbose)
             del H_orig
             su = su_f.view(-1, 1).to(su.dtype)
             sv = sv_f.view(1, -1).to(sv.dtype)
@@ -2214,19 +2222,24 @@ def quantize_exl3_batch(
                         dev_cache[("H", device.index)] = Hd
             else:
                 Hd = finalized[t][0].to(device)
-            try:
-                E = weight_rs[bi] - weight_qs[bi]
-                num = block_trace(E, Hd)
-                E = None
-                den = block_trace(weight_rs[bi], Hd)
-                proxy_err = num / max(den, 1e-8)
-            except torch.OutOfMemoryError:
-                E = None
-                proxy_err = -1.0
+            # As in quantize_exl3, the refit's error replaces the regularized-domain proxy
+            refit = not qa.get("no_refit")
+            if refit:
+                proxy_err = None
+            else:
+                try:
+                    E = weight_rs[bi] - weight_qs[bi]
+                    num = block_trace(E, Hd)
+                    E = None
+                    den = block_trace(weight_rs[bi], Hd)
+                    proxy_err = num / max(den, 1e-8)
+                except torch.OutOfMemoryError:
+                    E = None
+                    proxy_err = -1.0
             weight_rs[bi] = None
 
             # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
-            if not qa.get("no_refit"):
+            if refit:
                 wq = weight_qs[bi].to(device)
                 wq = preapply_had_l_(wq, had_k)
                 wq *= su
@@ -2234,7 +2247,8 @@ def quantize_exl3_batch(
                 wq *= sv
                 H_orig = unrotate_H(Hd, H_datas[t]["su"])
                 _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
-                                                                damping = damping_share(qa))
+                                                                damping = damping_share(qa),
+                                                                report_before = verbose)
                 del wq, H_orig
                 su = su_f.view(-1, 1).to(su.dtype)
                 sv = sv_f.view(1, -1).to(sv.dtype)
