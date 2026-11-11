@@ -196,6 +196,9 @@ def build_qwen4_block(
             key_down_split = "experts.down_proj",
             key_routing_gate = "gate",
             key_shared_gate = "shared_expert_gate",
+            # 512 experts: the margin between the 10th and 11th logit is routinely below fp16
+            # resolution, so the selection runs on the fp32 projection
+            router_dtype = torch.float,
             transpose_fused_weights = False,
             qmap = "block.mlp",
             qbits_key = qbits_key,

@@ -17,7 +17,7 @@ ROUTING_CACHE_ROWS = 128
 
 
 def _routing_buffers(cfg, bsz, device):
-    """Router outputs for a multi-row call: (router_logits (bsz, E) half, selected_experts
+    """Router outputs for a multi-row call: (router_logits (bsz, E) cfg.logits_dtype, selected_experts
     (bsz, K) long, routing_weights (bsz, K) half). Decode/MTP-class row counts (verify windows,
     small batches: up to ROUTING_CACHE_ROWS) take bucketed workspaces from the per-device static
     cache, shared by every MoE layer on the device: a layer's routing outputs are consumed by
@@ -31,7 +31,7 @@ def _routing_buffers(cfg, bsz, device):
     else:
         ws = lambda numel, dtype, tag: torch.empty((numel,), dtype = dtype, device = device)
     return (
-        ws(bsz * E, torch.half, "moe_route_logits").view(bsz, E),
+        ws(bsz * E, cfg.logits_dtype, "moe_route_logits").view(bsz, E),
         ws(bsz * K, torch.long, "moe_route_sel").view(bsz, K),
         ws(bsz * K, torch.half, "moe_route_w").view(bsz, K),
     )
@@ -74,16 +74,19 @@ class RoutingCFG:
     gate_tensor_f32: torch.Tensor | None = None       # grouped DS3 router: fp32 gate for multi-row logits, lazy
     e_score_bias_f32: torch.Tensor | None = None      # grouped DS3 router: fp32 selection bias, lazy
     router_logits_f32_bsz1: torch.Tensor | None = None   # grouped DS3 router: single-row fp32 logits, lazy
+    logits_dtype: torch.dtype = torch.half   # std routers: float = fp32 projection, top-k on unrounded logits
 
 
 def _gate_t(cfg):
     """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
     scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
     (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
-    projection leave the int8 slices unset and route on the half gate."""
+    projection leave the int8 slices unset and route on the half gate, as do fp32-logit routers
+    (their projection reads the half gate for every row count)."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half \
+            and cfg.logits_dtype == torch.half:
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)

@@ -165,6 +165,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         interm_dtype: torch.dtype = None,
         interm_div: float = 1.0,
         router_type: str = "std",
+        router_dtype: torch.dtype = torch.half,
         routing_gate: Linear | None = None,
         shared_gate: Linear | None = None,
         routed_scaling_factor: float | None = None,
@@ -194,6 +195,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.interm_dtype = interm_dtype
         self.interm_div = interm_div
         self.router_type = router_type
+        # Precision of the logits the top-k selects on (std routers): torch.float keeps the
+        # fp32 router projection instead of its fp16 rounding
+        assert router_dtype in (torch.half, torch.float), "router_dtype must be torch.half or torch.float"
+        assert router_dtype == torch.half or router_type in ("std", "std_bias"), \
+            "fp32 router logits are implemented for the std routers"
+        self.router_dtype = router_dtype
         if interm_div != 1.0:
             assert router_type in ("dots", "ds3", "std"), \
                 "interm_div requires a router type that can fold the compensation into the routing weights"
@@ -768,7 +775,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 per_expert_scale = (per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
 
-        router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
+        router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = self.router_dtype, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
         selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
 
@@ -789,6 +796,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             n_group = self.n_group,
             topk_group = self.topk_group,
             per_expert_scale = per_expert_scale,
+            logits_dtype = self.router_dtype,
         )
 
 
@@ -1840,6 +1848,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "interm_dtype": self.interm_dtype,
                 "interm_div": self.interm_div,
                 "router_type": self.router_type,
+                "router_dtype": self.router_dtype,
                 # The constructor folds interm_div into the routing scale again on import, so
                 # send the pre-fold value (the expert tensors arrive already rescaled)
                 "routed_scaling_factor": self.routed_scaling_factor / self.interm_div

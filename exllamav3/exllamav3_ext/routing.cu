@@ -473,10 +473,16 @@ __global__ void routing_ds3_nogroup_kernel
 }
 
 
+__device__ __forceinline__ float routing_score_f(half v) { return __half2float(v); }
+__device__ __forceinline__ float routing_score_f(float v) { return v; }
+
+// S: half or float logits. Selection and softmax run in fp32 either way; with float logits the
+// top-k sees the projection at full precision instead of its fp16 rounding
+template <typename S>
 __launch_bounds__(MAX_NUM_EXPERTS)
 __global__ void routing_std_topk_kernel
 (
-    const half* __restrict__ scores,
+    const S* __restrict__ scores,
     int64_t* __restrict__ topk_indices,
     half* __restrict__ topk_weights,
     const bfloat16* __restrict__ per_expert_scale,
@@ -501,7 +507,7 @@ __global__ void routing_std_topk_kernel
     float* max_red = sh_key + num_experts;
 
     bool mask = t < num_experts;
-    float logit = mask ? __half2float(scores[t]) : -1.0e30f;
+    float logit = mask ? routing_score_f(scores[t]) : -1.0e30f;
     // Router bias (gpt-oss): biased logits drive both the top-k selection and the softmax
     if (bias && mask)
         logit += __half2float(bias[t]);
@@ -803,6 +809,136 @@ void routing_gemv_f32_kernel
 }
 
 
+// Multi-row fp32 router projection: scores (R, E) = x (R, k) @ gate_t (E, k)^T. Every (row, expert)
+// sum accumulates in the order of routing_gemv_f32_kernel (per-lane strided FMA chain, then the
+// shuffle tree), so a row projects to the same bits whatever row count it arrives in, on every
+// architecture: prefill, batched decode and single-token decode route identically on identical
+// streams, as do tensor-parallel ranks. One warp per RGEMM32_ET experts x RGEMM32_RT rows; the
+// operand rows stay in L1 across the tile
+#define RGEMM32_ET 4
+#define RGEMM32_RT 4
+#define RGEMM32_WARPS 4
+
+__global__ __launch_bounds__(RGEMM32_WARPS * 32)
+void routing_gemm_f32_kernel
+(
+    const half* __restrict__ x,         // (R, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    float* __restrict__ scores,         // (R, E)
+    const int k,
+    const int E,
+    const int R
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int e0 = (blockIdx.x * RGEMM32_WARPS + warp) * RGEMM32_ET;
+    int r0 = blockIdx.y * RGEMM32_RT;
+    if (e0 >= E) return;
+
+    // Rows / experts past the end alias the last valid one (computed, never stored)
+    const half2* xp[RGEMM32_RT];
+    const half2* wp[RGEMM32_ET];
+    #pragma unroll
+    for (int i = 0; i < RGEMM32_RT; ++i)
+        xp[i] = (const half2*) (x + (size_t) min(r0 + i, R - 1) * k);
+    #pragma unroll
+    for (int j = 0; j < RGEMM32_ET; ++j)
+        wp[j] = (const half2*) (gate_t + (size_t) min(e0 + j, E - 1) * k);
+
+    float acc[RGEMM32_RT][RGEMM32_ET];
+    #pragma unroll
+    for (int i = 0; i < RGEMM32_RT; ++i)
+        #pragma unroll
+        for (int j = 0; j < RGEMM32_ET; ++j)
+            acc[i][j] = 0.0f;
+
+    for (int c = lane; c < k / 2; c += 32)
+    {
+        float2 xf[RGEMM32_RT];
+        float2 wf[RGEMM32_ET];
+        #pragma unroll
+        for (int i = 0; i < RGEMM32_RT; ++i) xf[i] = __half22float2(xp[i][c]);
+        #pragma unroll
+        for (int j = 0; j < RGEMM32_ET; ++j) wf[j] = __half22float2(wp[j][c]);
+        #pragma unroll
+        for (int i = 0; i < RGEMM32_RT; ++i)
+        {
+            #pragma unroll
+            for (int j = 0; j < RGEMM32_ET; ++j)
+            {
+                acc[i][j] = fmaf(xf[i].x, wf[j].x, acc[i][j]);
+                acc[i][j] = fmaf(xf[i].y, wf[j].y, acc[i][j]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < RGEMM32_RT; ++i)
+    {
+        #pragma unroll
+        for (int j = 0; j < RGEMM32_ET; ++j)
+        {
+            float sum = acc[i][j];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane == 0 && r0 + i < R && e0 + j < E)
+                scores[(size_t) (r0 + i) * E + e0 + j] = sum;
+        }
+    }
+}
+
+
+// fp32 router projection for any row count (see the kernels above): hidden (R, k) or (k) half,
+// gate_t (E, k) half, scores (R, E) or (E) float
+static void routing_proj_f32
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate_t,
+    at::Tensor& scores,
+    cudaStream_t stream
+)
+{
+    TORCH_CHECK_DTYPE(hidden, kHalf);
+    TORCH_CHECK_DTYPE(gate_t, kHalf);
+    TORCH_CHECK_DTYPE(scores, kFloat);
+    TORCH_CHECK(gate_t.dim() == 2, "routing_proj_f32: gate_t must be (E, k)");
+    int k = gate_t.size(1);
+    int E = gate_t.size(0);
+    TORCH_CHECK(k > 0 || hidden.numel() == 0, "routing_proj_f32: empty hidden dim");
+    if (k == 0) { scores.zero_(); return; }
+    int64_t R = hidden.numel() / k;
+    TORCH_CHECK(hidden.numel() == R * k && scores.numel() == R * E, "routing_proj_f32: shape mismatch");
+    TORCH_CHECK(hidden.is_contiguous() && gate_t.is_contiguous() && scores.is_contiguous(),
+                "routing_proj_f32: tensors must be contiguous");
+    TORCH_CHECK(!(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.data_ptr()) & 3),
+                "routing_proj_f32: hidden dim must be even and the operands 4-byte aligned");
+    if (R == 0) return;
+    if (R == 1)
+    {
+        routing_gemv_f32_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
+        (
+            (const half*) hidden.data_ptr(),
+            (const half*) gate_t.data_ptr(),
+            (float*) scores.data_ptr(),
+            k, E
+        );
+    }
+    else
+    {
+        dim3 grid(CEIL_DIVIDE(E, RGEMM32_WARPS * RGEMM32_ET), CEIL_DIVIDE((int) R, RGEMM32_RT));
+        routing_gemm_f32_kernel<<<grid, RGEMM32_WARPS * 32, 0, stream>>>
+        (
+            (const half*) hidden.data_ptr(),
+            (const half*) gate_t.data_ptr(),
+            (float*) scores.data_ptr(),
+            k, E, (int) R
+        );
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+
 /*
 Group-limited DS3 routing (n_group > 1) on fp32 logits
 
@@ -875,9 +1011,10 @@ void routing_ds3_group
 
 
 /*
-Single-row router projection with fp32 output: scores = hidden @ gate_t.T
+Router projection with fp32 output: scores = hidden @ gate_t.T, fixed accumulation order (the
+same bits per row for any row count)
 
-hidden: (k) float16; gate_t: (E, k) float16 (transposed gate copy); scores: (E) float32
+hidden: (k) or (R, k) float16; gate_t: (E, k) float16 (transposed gate copy); scores: (E) or (R, E) float32
 */
 
 void routing_gemv_f32
@@ -889,24 +1026,7 @@ void routing_gemv_f32
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK_DTYPE(hidden, kHalf);
-    TORCH_CHECK_DTYPE(gate_t, kHalf);
-    TORCH_CHECK_DTYPE(scores, kFloat);
-    int k = hidden.size(-1);
-    int E = gate_t.size(0);
-    TORCH_CHECK(hidden.numel() == k, "routing_gemv_f32: single rows only");
-    TORCH_CHECK(gate_t.size(1) == k && scores.numel() == E, "routing_gemv_f32: shape mismatch");
-    TORCH_CHECK(!(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.data_ptr()) & 3),
-                "routing_gemv_f32: hidden dim must be even and the operands 4-byte aligned");
-    if (k == 0) { scores.zero_(); return; }
-    routing_gemv_f32_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
-    (
-        (const half*) hidden.data_ptr(),
-        (const half*) gate_t.data_ptr(),
-        (float*) scores.data_ptr(),
-        k, E
-    );
-    cuda_check(cudaPeekAtLastError());
+    routing_proj_f32(hidden, gate_t, scores, stream);
 }
 
 
@@ -1433,7 +1553,8 @@ Standard softmax routing
 
 hidden: Input hidden states, float16, shape (..., hidden_dim)
 gate: Router gate matrix, float16, shape (hidden_dim, num_experts)
-scores: Output routing logits buffer, float16, shape (bsz, num_experts)
+scores: Output routing logits buffer, float16 or float32, shape (bsz, num_experts). float32 selects the
+        fp32 projection (needs gate_t) and a top-k on unrounded logits
 topk_indices: int64, shape (bsz, k)
 topk_weights: float16, shape (bsz, k)
 */
@@ -1463,7 +1584,8 @@ void routing_std
     TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
     TORCH_CHECK_SHAPES(topk_indices, 1, topk_weights, 1, 1);
     TORCH_CHECK_SHAPES_OPT(per_expert_scale, 0, scores, 1, 1);
-    TORCH_CHECK_DTYPE(scores, kHalf);
+    const bool f32 = scores.scalar_type() == at::kFloat;
+    TORCH_CHECK(f32 || scores.scalar_type() == at::kHalf, "routing_std: scores must be float16 or float32");
     TORCH_CHECK_DTYPE(topk_indices, kLong);
     TORCH_CHECK_DTYPE(topk_weights, kHalf);
     TORCH_CHECK_DTYPE_OPT(per_expert_scale, kBFloat16);
@@ -1482,23 +1604,44 @@ void routing_std
     TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_std: hidden and scores row counts differ");
     if (bsz == 0) return;
 
-    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
-
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
     size_t shmem = (num_experts + num_warps) * sizeof(float);
 
-    routing_std_topk_kernel<<<bsz, num_threads, shmem, stream>>>
-    (
-        (const half*) scores.data_ptr(),
-        (int64_t*) topk_indices.data_ptr(),
-        (half*) topk_weights.data_ptr(),
-        (const bfloat16*) OPTPTR(per_expert_scale),
-        (const half*) OPTPTR(bias),
-        num_experts,
-        K,
-        bsz
-    );
+    if (f32)
+    {
+        // float32 logits: the fixed-order fp32 projection for every row count, and the top-k
+        // selects on its full precision (the fp16 rounding of the logits is coarser than the
+        // margin between the K-th and the next expert on a share of the rows)
+        TORCH_CHECK(gate_t.has_value(), "routing_std: float32 logits need the transposed gate");
+        routing_proj_f32(hidden, gate_t.value(), scores, stream);
+        routing_std_topk_kernel<float><<<bsz, num_threads, shmem, stream>>>
+        (
+            (const float*) scores.data_ptr(),
+            (int64_t*) topk_indices.data_ptr(),
+            (half*) topk_weights.data_ptr(),
+            (const bfloat16*) OPTPTR(per_expert_scale),
+            (const half*) OPTPTR(bias),
+            num_experts,
+            K,
+            bsz
+        );
+    }
+    else
+    {
+        routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
+        routing_std_topk_kernel<half><<<bsz, num_threads, shmem, stream>>>
+        (
+            (const half*) scores.data_ptr(),
+            (int64_t*) topk_indices.data_ptr(),
+            (half*) topk_weights.data_ptr(),
+            (const bfloat16*) OPTPTR(per_expert_scale),
+            (const half*) OPTPTR(bias),
+            num_experts,
+            K,
+            bsz
+        );
+    }
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -1542,7 +1685,7 @@ void routing_std_logits
     if (use_topk)
     {
         size_t shmem = (num_experts + num_warps) * sizeof(float);
-        routing_std_topk_kernel<<<bsz, num_threads, shmem, stream>>>
+        routing_std_topk_kernel<half><<<bsz, num_threads, shmem, stream>>>
         (
             (const half*) scores.data_ptr(),
             (int64_t*) topk_indices.data_ptr(),
