@@ -21,6 +21,7 @@ from ..modules import (
 )
 from ..modules.gated_rmsnorm import GatedRMSNorm
 from ..modules.qsa_indexer import QSAIndexer
+from ..modules.control_vector import ControlVector
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.rope import RoPE
@@ -224,14 +225,18 @@ def build_qwen4_block(
 
 class Qwen4ExpModel(Model):
     config_class = Qwen4ExpConfig
+    supports_control_vector = True
 
     def __init__(
         self,
         config: Qwen4ExpConfig,
+        control_vector: ControlVector | None = None,
         **kwargs
     ):
         super().__init__(config, **kwargs)
         key_prefix = "model.language_model"
+        projections = control_vector.modules(config, key_prefix) if control_vector is not None else {}
+        self.control_vector_fingerprint = control_vector.fingerprint if control_vector is not None else None
 
         self.modules += [
             Embedding(
@@ -279,7 +284,10 @@ class Qwen4ExpModel(Model):
                 )
             ]
 
-        self.last_kv_module_idx = len(self.modules) - 1
+            # A projection after the last decoder affects logits, not the KV cache.
+            self.last_kv_module_idx = len(self.modules) - 1
+            if idx in projections:
+                self.modules.append(projections[idx])
 
         # No final model norm: the combine-less mixer collapses the stream stack
         self.modules += [
@@ -309,7 +317,7 @@ class Qwen4ExpModel(Model):
         self.calibration_all_experts = True
         self.caps.update({
             # QSA attention layers run whole on one device; PLE layers are replicated per rank
-            "supports_tp": True,
+            "supports_tp": control_vector is None,
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,

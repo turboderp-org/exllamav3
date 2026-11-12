@@ -184,12 +184,19 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param component:
             Which component model to load, for models with multiple component.
+
+        :keyword control_vector:
+            Optional ControlVector loaded before model construction. Currently supported
+            only by the Qwen4Exp text component; see doc/control_vectors.md.
         """
 
         assert component in config.model_classes, \
             f"{config.architecture} does not define a '{component}' component model"
 
-        model = config.model_classes[component](config, **kwargs)
+        model_class = config.model_classes[component]
+        if kwargs.get("control_vector") is not None and not getattr(model_class, "supports_control_vector", False):
+            raise ValueError(f"Control-vector projection is not supported by {model_class.__name__}")
+        model = model_class(config, **kwargs)
         model.component = component
 
         # Compile layer map after model is constructed (before any caches are attached)
