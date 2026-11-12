@@ -1,6 +1,7 @@
 """
 Reference test for add_sigmoid_gate_proj (z += x * sigmoid(y @ w)), the fused shared-expert gate used for
-batches of up to 32 rows. The gate logit is a block-wide sum broadcast to all 1024 threads, so a wrong
+batches of up to 32 rows, and for add_sigmoid_gate (z += x * sigmoid(y)), the pre-computed per-group gate
+form it shares the kernel with (y carries one gate value per row, size(-1) == 1). The gate logit is a block-wide sum broadcast to all 1024 threads, so a wrong
 broadcast shows up as a wrong gate. The one-hot case puts the whole dot product in thread 0. Checked against
 an fp32 torch reference. Rejects (TORCH_CHECK): wrong dtypes, w not (dim, 1), y or z not the size of x, and
 non-contiguous operands (rows are read at a flat dim stride).
@@ -81,3 +82,16 @@ def test_add_sigmoid_gate_proj_rejects(device):
     with pytest.raises(RuntimeError, match = "contiguous"):
         ext.add_sigmoid_gate_proj(x, torch.randn(256, 4, device = device).half().t(), z, w)
     assert_device_ok(device)
+
+
+@torch.inference_mode()
+def test_add_sigmoid_gate(device):
+    # The 3-arg form: y is the per-group gate (size(-1) == 1), broadcast over the last dim of x
+    x = torch.randn(4, 256, dtype = torch.float, device = device)
+    y = torch.randn(4, 1, dtype = torch.float, device = device)
+    z = torch.randn(4, 256, dtype = torch.float, device = device)
+    ref_z = z + x * torch.sigmoid(y)
+    ext.add_sigmoid_gate(x, y, z)
+    torch.testing.assert_close(z, ref_z, rtol = 1e-4, atol = 1e-4)
+    with pytest.raises(RuntimeError, match = "gate must have size"):
+        ext.add_sigmoid_gate(x, torch.randn(4, 256, dtype = torch.float, device = device), z)
