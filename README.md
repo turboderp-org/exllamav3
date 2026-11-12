@@ -181,9 +181,6 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -h
 ```
 
-Optional Qwen4Exp residual projection is available through the Python API and shared CLI loader; see
-[control vectors](doc/control_vectors.md) for the format, usage and compatibility limits.
-
 ## Architecture support
 
 | Model family                                      | HF architecture                                                               | Multimodal | Notes                 |
