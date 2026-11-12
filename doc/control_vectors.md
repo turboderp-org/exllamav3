@@ -8,13 +8,30 @@ in refusals follows from implementing the projection correctly.
 
 The first integration supports the Qwen4Exp text component. Tensor parallelism,
 layer remapping and quantization capture are unsupported with projection enabled.
-There is no per-request toggle. Draft-model integration and other architectures
-are outside the tested scope.
+There is no per-request toggle. Speculative decoding (draft model, MTP, n-gram or
+hybrid drafting) is rejected when projection is enabled. Other architectures are
+unsupported.
+
+## Command line
+
+Examples using the shared model loader accept three optional arguments:
+
+```sh
+python examples/chat.py -m /path/to/exl3-model -mode qwen35 \
+    --control_vector /path/to/vectors/control.safetensors \
+    --control_vector_scale 1.0 \
+    --control_vector_layer_range 4 44
+```
+
+Use the normal memory/offload and cache options for your hardware. Scale defaults
+to `1.0`; the range defaults to all directions in the file. A scale or range
+without a vector file is an error. Incompatible loading options are rejected
+before loading the weights.
 
 ## Python API
 
 ```python
-from exllamav3 import Config, ControlVector, Model
+from exllamav3 import Cache, Config, ControlVector, Generator, Model, Tokenizer
 
 config = Config.from_directory("/path/to/exl3-model")
 vector = ControlVector.from_file(
@@ -24,7 +41,20 @@ vector = ControlVector.from_file(
     layer_range=(4, 44),
 )
 model = Model.from_config(config, control_vector=vector)
-# Load the model and create its cache/generator as usual.
+cache = Cache(model, max_num_tokens=8192, max_batch_size=1)
+tokenizer = Tokenizer.from_config(config)
+model.load(max_batch_size=1, max_chunk_size=2048)
+generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
+                      max_batch_size=1, max_chunk_size=2048)
+try:
+    print(generator.generate(
+        prompt="The capital of France is",
+        max_new_tokens=32,
+        completion_only=True,
+    ))
+finally:
+    generator.close()
+    model.unload()
 ```
 
 The layer range is **zero-based and inclusive**: `(4, 44)` selects 41 decoder
@@ -75,9 +105,26 @@ contributes to effective strength. At unit effective strength this removes the
 component parallel to the direction. File metadata checks do not establish that
 a particular trained vector is suitable for a particular checkpoint.
 
-The inference API consumes safetensors, not GGUF. For an F32 `controlvector` GGUF,
-copy the `direction.N` arrays into safetensors without changing their values and
-add the metadata above. No vector weights are bundled with the library.
+## Converting a GGUF vector
+
+The inference API consumes safetensors. The optional converter copies F32
+`direction.N` arrays from a `controlvector` GGUF without changing their values,
+normalizing them or shifting their layer indices. It obtains the metadata above
+from the chosen model's `config.json`:
+
+```sh
+python -m pip install gguf
+python util/convert_control_vector.py control.gguf control.safetensors \
+    --model_dir /path/to/exl3-model
+```
+
+Run the conversion outside the checkpoint directory. Existing output files are
+never overwritten. The converter rejects wrong dimensions, non-F32 tensors,
+nonfinite or zero vectors, unknown tensor names and gaps in the layer indices.
+Conversion checks the container and shape; the source must already be a
+per-layer projection vector suitable for this checkpoint. It does not convert
+additive steering semantics into projection. `gguf` is needed only for this
+utility, and no vector weights are bundled with the library.
 
 ## Execution and cache behavior
 
@@ -93,6 +140,8 @@ tensors. Replacing or moving the source file does not change an existing model.
 Persistent-cache fingerprints include the effective directions, strengths,
 dimensions and selected layer indices. Stock and projected runs, or different
 projections over the same weights, therefore use different disk-cache identities.
+Fingerprints are computed from validated data even when constructing a
+`ControlVector` directly; they cannot be supplied as a constructor argument.
 In-memory KV/recurrent caches belong to the model/generator built for that vector;
 do not replace projection tensors on a live model.
 
@@ -101,14 +150,22 @@ do not replace projection tensors on a live model.
 From a checkout with its matching native extension built:
 
 ```sh
-pytest tests/modules/control_vector tests/model_setup/test_control_vector.py
+pytest tests/modules/control_vector tests/model_setup/test_control_vector.py \
+    tests/model_setup/test_control_vector_cli.py \
+    tests/conversion/test_control_vector_file.py \
+    tests/e2e/test_control_vector_inference.py
 ```
 
-The tests use generated vector files and a synthetic configuration. They cover
+The tests use generated vector files and a tiny random-weight Qwen4Exp checkpoint
+with GDN, QSA, hyperconnections and PLE. No model download is needed. They cover
 FP64-reference agreement, independent streams, noncontiguous input, invalid files,
-CUDA graph replay, layer indexing with PLE, disabled graph parity, ownership of
-directions and persistent-cache identity. GPU tests use the suite's `device`
-fixture. CPU-only cases are marked `nogpu`.
+CUDA graph replay, pending residual updates, layer indexing with PLE, disabled
+graph/logit parity, ownership of directions, CLI rejection paths and converter
+value preservation. Inference tests compare full forward with chunked prefill
+and batched decode, reuse a shared prefix, restore it from disk in a fresh model,
+and check that a changed vector cannot reuse that cache. Continuations are fixed
+when comparing logits. GPU tests use the suite's `device` fixture. CPU-only cases
+are marked `nogpu`; conversion tests skip if the optional `gguf` package is absent.
 
 These tests do not establish generation quality, refusal rates, end-to-end
 throughput or parity between the vector's original engine and a quantized EXL3

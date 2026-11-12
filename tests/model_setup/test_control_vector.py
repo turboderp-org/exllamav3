@@ -8,7 +8,7 @@ from exllamav3 import Config, ControlVector, Model
 from exllamav3.generator.disk_cache import cache_fingerprint
 from exllamav3.modules.control_vector import ResidualProjection
 from exllamav3.modules.transformer import TransformerBlock
-from tests.testlib.control_vector import write_control_vector
+from testlib.control_vector import write_control_vector
 
 pytestmark = pytest.mark.nogpu
 

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from . import Model, Config, Cache, Tokenizer
+from . import Model, Config, Cache, Tokenizer, ControlVector
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 import torch
 from .cache import CacheLayer_fp16, CacheLayer_quant
@@ -63,6 +63,12 @@ def add_args(
     parser.add_argument("-ad", "--attn_device", type = int, default = None, help = "Split load: device for the attention layers of models that share K/V pools across layers (DeepSeek-V4.1), default: first device of the split")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
+    parser.add_argument("--control_vector", type = str, default = None,
+                        help = "Qwen4Exp residual projection: path to an F32 safetensors control vector")
+    parser.add_argument("--control_vector_scale", type = float, default = None,
+                        help = "Control-vector strength (default: 1.0; 0 disables projection)")
+    parser.add_argument("--control_vector_layer_range", type = int, nargs = 2, default = None,
+                        metavar = ("FIRST", "LAST"), help = "Zero-based inclusive decoder range (default: all directions)")
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
@@ -208,6 +214,12 @@ def init(
     def printp(p: bool, s: str):
         if p: print(s)
 
+    vector_path = getattr(args, "control_vector", None)
+    vector_scale = getattr(args, "control_vector_scale", None)
+    vector_range = getattr(args, "control_vector_layer_range", None)
+    if not vector_path and (vector_scale is not None or vector_range is not None):
+        raise ValueError("--control_vector_scale and --control_vector_layer_range require --control_vector")
+
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
     if "mtp" in args:
@@ -220,6 +232,16 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
+    control_vector = ControlVector.from_file(
+        config, vector_path, scale = vector_scale if vector_scale is not None else 1.0,
+        layer_range = vector_range,
+    ) if vector_path else None
+    if control_vector is not None:
+        control_vector.validate(config)
+        if args.tensor_parallel:
+            raise ValueError("Control-vector projection does not support tensor parallelism")
+        if draft_model_dir or getattr(args, "ngram_match_min", 0) or getattr(args, "hybrid_draft_tokens", 0):
+            raise ValueError("Control-vector projection does not support speculative generation")
     if getattr(args, "moe_cpu_offload", 0):
         assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
         config.infer_params.moe_cpu_offload = args.moe_cpu_offload
@@ -281,7 +303,8 @@ def init(
             config.stc = vstc
 
     # Model instance
-    model = Model.from_config(config, swa_full = args.swa_full)
+    model_kwargs = {"control_vector": control_vector} if control_vector is not None else {}
+    model = Model.from_config(config, swa_full = args.swa_full, **model_kwargs)
     draft_model = Model.from_config(
         draft_config,
         swa_full = args.swa_full,

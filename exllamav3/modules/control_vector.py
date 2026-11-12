@@ -1,7 +1,7 @@
 """Opt-in, per-layer residual projection for Qwen4Exp inference."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -39,7 +39,39 @@ class ControlVector:
     hc_count: int
     # (zero-based decoder index, normalized F32 direction, effective F32 strength)
     directions: tuple[tuple[int, bytes, float], ...]
-    fingerprint: str
+    fingerprint: str = field(init = False)
+
+    def __post_init__(self):
+        shape = (self.hidden_size, self.num_hidden_layers, self.hc_count)
+        if any(type(v) is not int or v <= 0 for v in shape):
+            raise ValueError("Invalid control-vector model dimensions")
+        directions = []
+        previous = None
+        for i, data, strength in self.directions:
+            if type(i) is not int or not 0 <= i < self.num_hidden_layers or \
+                    (previous is not None and i != previous + 1):
+                raise ValueError("Control-vector layers must be contiguous, ordered and unique")
+            if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) != 4 * self.hidden_size:
+                raise ValueError(f"Invalid control-vector direction at layer {i}")
+            data = bytes(data)
+            value = torch.frombuffer(bytearray(data), dtype = torch.float32)
+            if not torch.isfinite(value).all() or abs(value.double().norm().item() - 1.0) > 1e-5:
+                raise ValueError(f"Control-vector direction must be finite and normalized at layer {i}")
+            strength = torch.tensor(float(strength), dtype = torch.float32).item()
+            if not math.isfinite(strength) or strength <= 0:
+                raise ValueError(f"Invalid control-vector strength at layer {i}")
+            directions.append((i, data, strength))
+            previous = i
+        if not directions:
+            raise ValueError("Control vector contains no directions")
+        # Own immutable data even when constructed directly with mutable inputs.
+        object.__setattr__(self, "directions", tuple(directions))
+        # Hash effective math, not the pathname or caller-provided identity.
+        digest = hashlib.sha256(json.dumps(["qwen4_exp.project.v1", *shape]).encode())
+        for i, data, strength in directions:
+            digest.update(json.dumps([i, strength]).encode())
+            digest.update(data)
+        object.__setattr__(self, "fingerprint", digest.hexdigest())
 
     @classmethod
     def from_file(cls, config, path, *, scale: float = 1.0,
@@ -58,7 +90,7 @@ class ControlVector:
         if not math.isfinite(scale) or scale < 0:
             raise ValueError("Control-vector scale must be finite and nonnegative")
         shape = (config.hidden_size, config.num_hidden_layers, config.hc_mult)
-        if any(v <= 0 for v in shape):
+        if any(type(v) is not int or v <= 0 for v in shape):
             raise ValueError("Invalid control-vector model dimensions")
         tensors = {}
         with safe_open(str(path), framework = "pt", device = "cpu") as reader:
@@ -81,6 +113,8 @@ class ControlVector:
                 tensors[int(match[1])] = value
         if not tensors:
             raise ValueError("Control-vector file contains no directions")
+        if layer_range is not None and (not isinstance(layer_range, (tuple, list)) or len(layer_range) != 2):
+            raise ValueError("Control-vector range must contain two decoder indices")
         first, last = layer_range if layer_range is not None else (min(tensors), max(tensors))
         if type(first) is not int or type(last) is not int or not 0 <= first <= last < shape[1]:
             raise ValueError("Control-vector range must contain valid zero-based decoder indices")
@@ -97,13 +131,7 @@ class ControlVector:
                 raise ValueError(f"Invalid control-vector norm at layer {i}")
             direction = (weighted.double() / norm).float().contiguous()
             directions.append((i, direction.numpy().tobytes(), strength))
-        # Hash actual effective directions, dimensions and layer indices, not the
-        # pathname. Moving a vector preserves identity; changing its math does not.
-        digest = hashlib.sha256(json.dumps(["qwen4_exp.project.v1", *shape]).encode())
-        for i, data, strength in directions:
-            digest.update(json.dumps([i, strength]).encode())
-            digest.update(data)
-        return cls(*shape, tuple(directions), digest.hexdigest())
+        return cls(*shape, tuple(directions))
 
     def validate(self, config):
         if getattr(config, "architecture", None) != "Qwen4ExpForConditionalGeneration" \

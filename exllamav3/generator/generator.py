@@ -247,6 +247,11 @@ class Generator:
         :param kwargs:
         """
 
+        if (getattr(model, "control_vector_fingerprint", None) and
+                (draft_model is not None or ngram_match_min or hybrid_draft_tokens)) or \
+                getattr(draft_model, "control_vector_fingerprint", None):
+            raise ValueError("Control-vector projection does not support speculative generation")
+
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer

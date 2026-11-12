@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +6,7 @@ import torch
 from safetensors.torch import save_file
 
 from exllamav3 import ControlVector
-from tests.testlib.control_vector import write_control_vector
+from testlib.control_vector import write_control_vector
 
 
 @pytest.fixture
@@ -80,6 +80,49 @@ def test_model_lifetime_snapshot_and_identity(vector, tmp_path):
     assert torch.equal(a.modules(config, "model")[1].direction_cpu, original)
     with pytest.raises(FrozenInstanceError):
         a.fingerprint = "changed"
+
+
+@pytest.mark.nogpu
+def test_direct_construction_owns_data_and_derives_identity(vector):
+    config, path, _, _ = vector
+    original = ControlVector.from_file(config, path)
+    mutable = [[i, bytearray(data), strength] for i, data, strength in original.directions]
+    copy = ControlVector(original.hidden_size, original.num_hidden_layers, original.hc_count, mutable)
+    mutable[0][1][:] = bytes(len(mutable[0][1]))
+    mutable.clear()
+    assert copy == original
+    with pytest.raises(TypeError):
+        ControlVector(original.hidden_size, original.num_hidden_layers, original.hc_count,
+                      original.directions, fingerprint = "unrelated")
+    changed = replace(original, directions = tuple((i, data, strength * 0.5)
+                                                  for i, data, strength in original.directions))
+    assert changed.fingerprint != original.fingerprint
+
+
+@pytest.mark.nogpu
+@pytest.mark.parametrize("fault", ["empty", "duplicate", "unordered", "outside", "bytes", "zero", "nan",
+                                  "norm", "strength", "infinity", "dimension"])
+def test_direct_construction_rejects_invalid_data(vector, fault):
+    config, path, _, _ = vector
+    spec = ControlVector.from_file(config, path)
+    entries = list(spec.directions)
+    i, data, strength = entries[0]
+    if fault == "empty": entries = []
+    elif fault == "duplicate": entries[1] = entries[0]
+    elif fault == "unordered": entries.reverse()
+    elif fault == "outside": entries[0] = (-1, data, strength)
+    elif fault == "bytes": entries[0] = (i, b"bad", strength)
+    elif fault in ("zero", "nan", "norm"):
+        value = torch.frombuffer(bytearray(data), dtype = torch.float32)
+        if fault == "zero": value.zero_()
+        elif fault == "nan": value[0] = float("nan")
+        else: value.mul_(2)
+        entries[0] = (i, value.numpy().tobytes(), strength)
+    elif fault == "strength": entries[0] = (i, data, -1)
+    elif fault == "infinity": entries[0] = (i, data, float("inf"))
+    with pytest.raises(ValueError):
+        ControlVector(0 if fault == "dimension" else spec.hidden_size,
+                      spec.num_hidden_layers, spec.hc_count, entries)
 
 
 @pytest.mark.nogpu
@@ -168,3 +211,18 @@ def test_cuda_graph_replay(device, vector):
         graph.replay()
         expected = reference(source.cpu(), p.direction_cpu, p.scale)
         torch.testing.assert_close(result.cpu().double(), expected, rtol = 3e-6, atol = 3e-6)
+
+
+def test_pending_residual_is_applied_before_projection(device, vector):
+    config, path, _, _ = vector
+    p = module(config, path, device)
+    x = torch.randn(1, 2, 4, 64, device = device)
+    y = torch.randn(1, 2, 64, device = device)
+    post = torch.randn(1, 2, 4, device = device)
+    comb = torch.eye(4, device = device).expand(1, 2, 4, 4).contiguous()
+    updated = x + post.unsqueeze(-1) * y.unsqueeze(-2)
+    expected = reference(updated.cpu(), p.direction_cpu, p.scale)
+    params = {"hc_pending": (x, y, post, comb), "gr_weighted": object()}
+    result = p.forward(x, params)
+    assert "hc_pending" not in params and "gr_weighted" not in params
+    torch.testing.assert_close(result.cpu().double(), expected, rtol = 3e-6, atol = 3e-6)
