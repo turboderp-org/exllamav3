@@ -3,7 +3,7 @@ Tiny random-weight checkpoints written in an architecture's native format, for m
 that need a whole model but no real weights. Each builder writes config.json plus model.safetensors into a
 directory and returns it.
 
-Qwen4Exp (make_qwen4_checkpoint): four decoder blocks with GDN, QSA, hyperconnections, a small PLE table
+Qwen4Exp (QWEN4_TINY, make_qwen4_checkpoint): four decoder blocks with GDN, QSA, hyperconnections, a small PLE table
 and a byte-level tokenizer, for cached inference tests without downloaded weights.
 
 DeepSeek-V4 (DSV4_TINY, make_dsv4_checkpoint): DeepSeek's native tensor namespace (the naming of the real
@@ -18,20 +18,45 @@ import torch
 from safetensors.torch import save_file
 
 
+QWEN4_TINY = dict(
+    hidden_size = 256,
+    num_hidden_layers = 4,
+    vocab_size = 512,
+    num_attention_heads = 4,
+    num_key_value_heads = 2,
+    head_dim = 64,
+    full_attention_interval = 2,
+    linear_num_key_heads = 2,
+    linear_num_value_heads = 4,
+    linear_key_head_dim = 64,
+    linear_value_head_dim = 64,
+    linear_conv_kernel_dim = 4,
+    moe_intermediate_size = 128,
+    shared_expert_intermediate_size = 128,
+    num_experts = 4,
+    num_experts_per_tok = 2,
+    rms_norm_eps = 1e-6,
+    hc_count = 4,
+    indexer_n_heads = 3,
+    indexer_head_dim = 64,
+    indexer_budget = 16,
+    ple_layer_ids = [2],
+    ple_embed_dim = 256,
+    ngram_size = 2,
+    heads_per_ngram = 1,
+    ple_conv_kernel_size = 4,
+    eos_token_id = 2,
+    bos_token_id = 1,
+    max_position_embeddings = 2048,
+    tie_word_embeddings = False,
+)
+
+
 def make_qwen4_checkpoint(out_dir, seed: int = 7) -> str:
     """Four small Qwen4Exp blocks, including PLE, GDN, QSA and real hyperconnection weights."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
-    c = dict(hidden_size = 256, num_hidden_layers = 4, vocab_size = 512,
-             num_attention_heads = 4, num_key_value_heads = 2, head_dim = 64,
-             full_attention_interval = 2, linear_num_key_heads = 2, linear_num_value_heads = 4,
-             linear_key_head_dim = 64, linear_value_head_dim = 64, linear_conv_kernel_dim = 4,
-             moe_intermediate_size = 128, shared_expert_intermediate_size = 128,
-             num_experts = 4, num_experts_per_tok = 2, rms_norm_eps = 1e-6,
-             hc_count = 4, indexer_n_heads = 3, indexer_head_dim = 64, indexer_budget = 16,
-             ple_layer_ids = [2], ple_embed_dim = 256, ngram_size = 2, heads_per_ngram = 1,
-             ple_conv_kernel_size = 4, eos_token_id = 2, bos_token_id = 1,
-             max_position_embeddings = 2048, tie_word_embeddings = False)
+    c = dict(QWEN4_TINY)
     rng = torch.Generator().manual_seed(seed)
     tensors = {}
 

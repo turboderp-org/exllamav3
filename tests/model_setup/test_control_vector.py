@@ -2,14 +2,15 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from safetensors.torch import save_file
 
 from exllamav3 import Config, Model
 from exllamav3.generator.disk_cache import cache_fingerprint
 from exllamav3.modules.arch_specific.qwen4_exp import Qwen4ExpControlVector, Qwen4ExpResidualProjection
 from exllamav3.modules.hyperconnections import GatedResidual
 from exllamav3.modules.transformer import TransformerBlock
+from testlib.checkpoint import write_tensors
 from testlib.control_vector import write_control_vector
+from testlib.tiny_models import QWEN4_TINY
 
 pytestmark = pytest.mark.nogpu
 
@@ -17,22 +18,10 @@ pytestmark = pytest.mark.nogpu
 @pytest.fixture
 def tiny_config(tmp_path):
     directory = tmp_path / "model"
-    directory.mkdir()
-    text = dict(
-        hidden_size = 256, num_hidden_layers = 4, vocab_size = 128,
-        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 64,
-        full_attention_interval = 2, linear_num_key_heads = 2, linear_num_value_heads = 4,
-        linear_key_head_dim = 64, linear_value_head_dim = 64,
-        moe_intermediate_size = 128, shared_expert_intermediate_size = 128,
-        num_experts = 4, num_experts_per_tok = 2, rms_norm_eps = 1e-6,
-        hc_count = 4, indexer_n_heads = 2, indexer_head_dim = 64, indexer_budget = 16,
-        ple_layer_ids = [2], ple_embed_dim = 8, ngram_size = 2, heads_per_ngram = 1,
-        eos_token_id = 1, max_position_embeddings = 128,
-    )
+    write_tensors({}, directory)
     (directory / "config.json").write_text(json.dumps({
-        "architectures": ["Qwen4ExpForConditionalGeneration"], "text_config": text,
+        "architectures": ["Qwen4ExpForConditionalGeneration"], "text_config": QWEN4_TINY,
     }))
-    save_file({}, str(directory / "model.safetensors"))
     return Config.from_directory(str(directory))
 
 
