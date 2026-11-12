@@ -186,8 +186,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             Which component model to load, for models with multiple component.
 
         :keyword control_vector:
-            Optional ControlVector loaded before model construction. Currently supported
-            only by the Qwen4Exp text component; see doc/control_vectors.md.
+            Optional Qwen4ExpControlVector loaded before model construction. Supported only
+            by the Qwen4Exp text component; see doc/control_vectors.md.
         """
 
         assert component in config.model_classes, \

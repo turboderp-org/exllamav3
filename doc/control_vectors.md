@@ -1,4 +1,4 @@
-# Residual control-vector projection
+# Qwen4Exp residual control-vector projection
 
 Qwen4Exp (`Qwen3.8-Flash-Next`) can apply an optional per-layer projection to
 each FP32 hyperconnection stream after a decoder block. This changes inference
@@ -6,7 +6,7 @@ behavior while preserving the model's stored weights. A vector trained to remove
 a refusal direction is one possible use; neither answer quality nor a reduction
 in refusals follows from implementing the projection correctly.
 
-The first integration supports the Qwen4Exp text component. Tensor parallelism,
+This implementation supports the Qwen4Exp text component. Tensor parallelism,
 layer remapping and quantization capture are unsupported with projection enabled.
 There is no per-request toggle. Speculative decoding (draft model, MTP, n-gram or
 hybrid drafting) is rejected when projection is enabled. Other architectures are
@@ -30,11 +30,14 @@ before loading the weights.
 
 ## Python API
 
+The vector loader is architecture-specific and imported from the Qwen4Exp module.
+
 ```python
-from exllamav3 import Cache, Config, ControlVector, Generator, Model, Tokenizer
+from exllamav3 import Cache, Config, Generator, Model, Tokenizer
+from exllamav3.modules.arch_specific.qwen4_exp import Qwen4ExpControlVector
 
 config = Config.from_directory("/path/to/exl3-model")
-vector = ControlVector.from_file(
+vector = Qwen4ExpControlVector.from_file(
     config,
     "/path/to/vectors/control.safetensors",
     scale=1.0,
@@ -145,7 +148,7 @@ Persistent-cache fingerprints include the effective directions, strengths,
 dimensions and selected layer indices. Stock and projected runs, or different
 projections over the same weights, therefore use different disk-cache identities.
 Fingerprints are computed from validated data even when constructing a
-`ControlVector` directly; they cannot be supplied as a constructor argument.
+`Qwen4ExpControlVector` directly; they cannot be supplied as a constructor argument.
 In-memory KV/recurrent caches belong to the model/generator built for that vector;
 do not replace projection tensors on a live model.
 

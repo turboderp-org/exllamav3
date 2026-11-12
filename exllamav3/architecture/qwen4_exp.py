@@ -21,7 +21,7 @@ from ..modules import (
 )
 from ..modules.gated_rmsnorm import GatedRMSNorm
 from ..modules.qsa_indexer import QSAIndexer
-from ..modules.control_vector import ControlVector, ResidualProjection
+from ..modules.arch_specific.qwen4_exp import Qwen4ExpControlVector, Qwen4ExpResidualProjection
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.rope import RoPE
@@ -230,7 +230,7 @@ class Qwen4ExpModel(Model):
     def __init__(
         self,
         config: Qwen4ExpConfig,
-        control_vector: ControlVector | None = None,
+        control_vector: Qwen4ExpControlVector | None = None,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -314,7 +314,7 @@ class Qwen4ExpModel(Model):
         self.logit_layer_idx = len(self.modules) - 1
         GatedResidual.link_sites(self.modules)
         if projections:
-            ResidualProjection.link_sites(self.modules)
+            Qwen4ExpResidualProjection.link_sites(self.modules)
 
         self.calibration_all_experts = True
         self.caps.update({

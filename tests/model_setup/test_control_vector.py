@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import pytest
 from safetensors.torch import save_file
 
-from exllamav3 import Config, ControlVector, Model
+from exllamav3 import Config, Model
 from exllamav3.generator.disk_cache import cache_fingerprint
-from exllamav3.modules.control_vector import ResidualProjection
+from exllamav3.modules.arch_specific.qwen4_exp import Qwen4ExpControlVector, Qwen4ExpResidualProjection
 from exllamav3.modules.hyperconnections import GatedResidual
 from exllamav3.modules.transformer import TransformerBlock
 from testlib.control_vector import write_control_vector
@@ -42,17 +42,21 @@ def test_graph_handoff_and_last_kv_index(tiny_config, tmp_path, bounds):
     path = tmp_path / "vectors" / "vector.safetensors"
     write_control_vector(config, path)
     stock = Model.from_config(config)
-    disabled = Model.from_config(config, control_vector = ControlVector.from_file(config, path, scale = 0))
-    enabled = Model.from_config(config, control_vector = ControlVector.from_file(config, path, layer_range = bounds))
+    disabled = Model.from_config(
+        config, control_vector = Qwen4ExpControlVector.from_file(config, path, scale = 0),
+    )
+    enabled = Model.from_config(
+        config, control_vector = Qwen4ExpControlVector.from_file(config, path, layer_range = bounds),
+    )
     signature = lambda model: [(type(m).__name__, m.key, m.layer_idx) for m in model.modules]
     assert signature(stock) == signature(disabled)
     assert signature(stock) == [(type(m).__name__, m.key, m.layer_idx) for m in enabled.modules
-                                if not isinstance(m, ResidualProjection)]
+                                if not isinstance(m, Qwen4ExpResidualProjection)]
     assert enabled.caps["supports_tp"] is False and disabled.caps["supports_tp"] is True
     assert disabled.control_vector_fingerprint is None
     projected = []
     for i, m in enumerate(enabled.modules):
-        if isinstance(m, ResidualProjection):
+        if isinstance(m, Qwen4ExpResidualProjection):
             previous = enabled.modules[i - 1]
             assert isinstance(previous, TransformerBlock)
             assert previous.layer_idx == m.steered_layer_idx
@@ -71,7 +75,7 @@ def test_unsupported_model_rejects_option(tiny_config, tmp_path):
     config = tiny_config
     path = tmp_path / "vector.safetensors"
     write_control_vector(config, path)
-    vector = ControlVector.from_file(config, path)
+    vector = Qwen4ExpControlVector.from_file(config, path)
     config.model_classes["text"] = Model
     with pytest.raises(ValueError, match = "not supported"):
         Model.from_config(config, control_vector = vector)
@@ -89,12 +93,12 @@ def test_persistent_cache_identity(tmp_path):
     assert cache_fingerprint([cache], [], 0) == (stock, stock_parts)
     hashes = {stock}
     for scale, bounds in [(1.0, (0, 3)), (0.5, (0, 3)), (1.0, (1, 2))]:
-        vector = ControlVector.from_file(config, path, scale = scale, layer_range = bounds)
+        vector = Qwen4ExpControlVector.from_file(config, path, scale = scale, layer_range = bounds)
         model.control_vector_fingerprint = vector.fingerprint
         identity, parts = cache_fingerprint([cache], [], 0)
         assert identity not in hashes
         assert parts["caches"][0]["control_vector"] == vector.fingerprint
         hashes.add(identity)
     write_control_vector(config, path, seed = 99)
-    model.control_vector_fingerprint = ControlVector.from_file(config, path).fingerprint
+    model.control_vector_fingerprint = Qwen4ExpControlVector.from_file(config, path).fingerprint
     assert cache_fingerprint([cache], [], 0)[0] not in hashes

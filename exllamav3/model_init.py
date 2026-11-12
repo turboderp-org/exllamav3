@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from . import Model, Config, Cache, Tokenizer, ControlVector
+from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 import torch
 from .cache import CacheLayer_fp16, CacheLayer_quant
@@ -232,10 +232,13 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
-    control_vector = ControlVector.from_file(
-        config, vector_path, scale = vector_scale if vector_scale is not None else 1.0,
-        layer_range = vector_range,
-    ) if vector_path else None
+    control_vector = None
+    if vector_path:
+        from .modules.arch_specific.qwen4_exp import Qwen4ExpControlVector
+        control_vector = Qwen4ExpControlVector.from_file(
+            config, vector_path, scale = vector_scale if vector_scale is not None else 1.0,
+            layer_range = vector_range,
+        )
     if control_vector is not None:
         control_vector.validate(config)
         if args.tensor_parallel:

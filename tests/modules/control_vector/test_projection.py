@@ -5,7 +5,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from exllamav3 import ControlVector
+from exllamav3.modules.arch_specific.qwen4_exp import Qwen4ExpControlVector
 from exllamav3.modules.hyperconnections import GatedResidual
 from testlib.control_vector import write_control_vector
 
@@ -20,7 +20,7 @@ def vector(tmp_path):
 
 
 def module(config, path, device = "cpu", scale = 0.3):
-    spec = ControlVector.from_file(config, path, scale = scale, layer_range = (1, 2))
+    spec = Qwen4ExpControlVector.from_file(config, path, scale = scale, layer_range = (1, 2))
     result = spec.modules(config, "model")[1]
     result.load(torch.device(device))
     return result
@@ -34,7 +34,7 @@ def reference(x, direction, scale):
 @pytest.mark.nogpu
 def test_normalization_and_independent_streams(vector):
     config, path, tensors, _ = vector
-    spec = ControlVector.from_file(config, path, scale = 0.7, layer_range = (1, 2))
+    spec = Qwen4ExpControlVector.from_file(config, path, scale = 0.7, layer_range = (1, 2))
     assert [i for i, _, _ in spec.directions] == [1, 2]
     for i, p in spec.modules(config, "model").items():
         weighted = tensors[f"direction.{i}"] * 0.7
@@ -65,19 +65,19 @@ def test_cpu_reference_layout_and_handoff(vector):
 @pytest.mark.nogpu
 def test_model_lifetime_snapshot_and_identity(vector, tmp_path):
     config, path, _, _ = vector
-    a = ControlVector.from_file(config, path)
+    a = Qwen4ExpControlVector.from_file(config, path)
     copy = tmp_path / "moved.safetensors"
     copy.write_bytes(path.read_bytes())
-    assert ControlVector.from_file(config, copy).fingerprint == a.fingerprint
-    assert ControlVector.from_file(config, path, scale = 0.5).fingerprint != a.fingerprint
-    assert ControlVector.from_file(config, path, layer_range = (1, 2)).fingerprint != a.fingerprint
+    assert Qwen4ExpControlVector.from_file(config, copy).fingerprint == a.fingerprint
+    assert Qwen4ExpControlVector.from_file(config, path, scale = 0.5).fingerprint != a.fingerprint
+    assert Qwen4ExpControlVector.from_file(config, path, layer_range = (1, 2)).fingerprint != a.fingerprint
     p = a.modules(config, "model")[1]
     original = p.direction_cpu.clone()
     # Modules own separate tensor copies and the spec owns only immutable bytes.
     p.direction_cpu.zero_()
     assert torch.equal(a.modules(config, "model")[1].direction_cpu, original)
     write_control_vector(config, path, seed = 43)
-    assert ControlVector.from_file(config, path).fingerprint != a.fingerprint
+    assert Qwen4ExpControlVector.from_file(config, path).fingerprint != a.fingerprint
     assert torch.equal(a.modules(config, "model")[1].direction_cpu, original)
     with pytest.raises(FrozenInstanceError):
         a.fingerprint = "changed"
@@ -86,15 +86,17 @@ def test_model_lifetime_snapshot_and_identity(vector, tmp_path):
 @pytest.mark.nogpu
 def test_direct_construction_owns_data_and_derives_identity(vector):
     config, path, _, _ = vector
-    original = ControlVector.from_file(config, path)
+    original = Qwen4ExpControlVector.from_file(config, path)
     mutable = [[i, bytearray(data), strength] for i, data, strength in original.directions]
-    copy = ControlVector(original.hidden_size, original.num_hidden_layers, original.hc_count, mutable)
+    copy = Qwen4ExpControlVector(original.hidden_size, original.num_hidden_layers, original.hc_count, mutable)
     mutable[0][1][:] = bytes(len(mutable[0][1]))
     mutable.clear()
     assert copy == original
     with pytest.raises(TypeError):
-        ControlVector(original.hidden_size, original.num_hidden_layers, original.hc_count,
-                      original.directions, fingerprint = "unrelated")
+        Qwen4ExpControlVector(
+            original.hidden_size, original.num_hidden_layers, original.hc_count,
+            original.directions, fingerprint = "unrelated",
+        )
     changed = replace(original, directions = tuple((i, data, strength * 0.5)
                                                   for i, data, strength in original.directions))
     assert changed.fingerprint != original.fingerprint
@@ -105,7 +107,7 @@ def test_direct_construction_owns_data_and_derives_identity(vector):
                                   "norm", "strength", "infinity", "dimension"])
 def test_direct_construction_rejects_invalid_data(vector, fault):
     config, path, _, _ = vector
-    spec = ControlVector.from_file(config, path)
+    spec = Qwen4ExpControlVector.from_file(config, path)
     entries = list(spec.directions)
     i, data, strength = entries[0]
     if fault == "empty": entries = []
@@ -122,8 +124,10 @@ def test_direct_construction_rejects_invalid_data(vector, fault):
     elif fault == "strength": entries[0] = (i, data, -1)
     elif fault == "infinity": entries[0] = (i, data, float("inf"))
     with pytest.raises(ValueError):
-        ControlVector(0 if fault == "dimension" else spec.hidden_size,
-                      spec.num_hidden_layers, spec.hc_count, entries)
+        Qwen4ExpControlVector(
+            0 if fault == "dimension" else spec.hidden_size,
+            spec.num_hidden_layers, spec.hc_count, entries,
+        )
 
 
 @pytest.mark.nogpu
@@ -131,7 +135,7 @@ def test_direct_construction_rejects_invalid_data(vector, fault):
 def test_invalid_strength(vector, scale):
     config, path, _, _ = vector
     with pytest.raises(ValueError, match = "scale"):
-        ControlVector.from_file(config, path, scale = scale)
+        Qwen4ExpControlVector.from_file(config, path, scale = scale)
 
 
 @pytest.mark.nogpu
@@ -139,7 +143,7 @@ def test_invalid_strength(vector, scale):
 def test_invalid_layer_range(vector, bounds):
     config, path, _, _ = vector
     with pytest.raises(ValueError, match = "range"):
-        ControlVector.from_file(config, path, layer_range = bounds)
+        Qwen4ExpControlVector.from_file(config, path, layer_range = bounds)
 
 
 @pytest.mark.nogpu
@@ -155,13 +159,13 @@ def test_invalid_vector_file(vector, fault):
     elif fault == "missing": del tensors["direction.1"]
     save_file(tensors, str(path), metadata = metadata)
     with pytest.raises(ValueError):
-        ControlVector.from_file(config, path, layer_range = (0, 3))
+        Qwen4ExpControlVector.from_file(config, path, layer_range = (0, 3))
 
 
 @pytest.mark.nogpu
 def test_invalid_runtime_and_unsupported_configuration(vector):
     config, path, _, _ = vector
-    spec = ControlVector.from_file(config, path)
+    spec = Qwen4ExpControlVector.from_file(config, path)
     config.layer_map = [0, 1, 1, 3]
     with pytest.raises(ValueError, match = "remapping"):
         spec.modules(config, "model")
@@ -181,7 +185,7 @@ def test_invalid_runtime_and_unsupported_configuration(vector):
         p.forward(x, {})
     config.architecture = "LlamaForCausalLM"
     with pytest.raises(ValueError, match = "Qwen4Exp"):
-        ControlVector.from_file(config, path)
+        Qwen4ExpControlVector.from_file(config, path)
 
 
 @pytest.mark.parametrize("width,streams,batch,tokens", [(64, 1, 1, 1), (257, 4, 2, 9),

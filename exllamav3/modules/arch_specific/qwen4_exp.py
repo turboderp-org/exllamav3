@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+from typing_extensions import override
 import hashlib
 import json
 import math
@@ -12,9 +14,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .module import Module
-from .hyperconnections import GatedResidual, hc_flush
-from ..util.tensor import g_tensor_cache
+from ..module import Module
+from ..hyperconnections import GatedResidual, hc_flush
+from ...util.tensor import g_tensor_cache
+
+if TYPE_CHECKING:
+    from ...model.config import Config
 
 
 @triton.jit
@@ -33,12 +38,12 @@ def _project_rows(X, V, W, XW, WIDTH: tl.constexpr, SCALE: tl.constexpr,
 
 
 @dataclass(frozen = True)
-class ControlVector:
+class Qwen4ExpControlVector:
     """A model-lifetime projection, loaded before constructing the model.
 
     Directions are stored as immutable F32 bytes. Each model gets its own tensors;
     changing the source file or retaining this object cannot mutate a live model.
-    The first integration supports Qwen4Exp's FP32 hyperconnection streams only.
+    Supports Qwen4Exp's FP32 hyperconnection streams only.
     """
     hidden_size: int
     num_hidden_layers: int
@@ -80,8 +85,8 @@ class ControlVector:
         object.__setattr__(self, "fingerprint", digest.hexdigest())
 
     @classmethod
-    def from_file(cls, config, path, *, scale: float = 1.0,
-                  layer_range: tuple[int, int] | None = None) -> ControlVector | None:
+    def from_file(cls, config: Config, path, *, scale: float = 1.0,
+                  layer_range: tuple[int, int] | None = None) -> Qwen4ExpControlVector | None:
         """Load direction.N tensors; layer_range is zero-based and inclusive.
 
         None selects the entire contiguous range present in the file. Zero scale
@@ -139,7 +144,7 @@ class ControlVector:
             directions.append((i, direction.numpy().tobytes(), strength))
         return cls(*shape, tuple(directions))
 
-    def validate(self, config):
+    def validate(self, config: Config):
         if getattr(config, "architecture", None) != "Qwen4ExpForConditionalGeneration" \
                 or (config.hidden_size, config.num_hidden_layers, config.hc_mult) != \
                    (self.hidden_size, self.num_hidden_layers, self.hc_count):
@@ -147,20 +152,20 @@ class ControlVector:
         if getattr(config, "layer_map", None) or getattr(config, "layer_map_str", None):
             raise ValueError("Control-vector projection does not support layer remapping")
 
-    def modules(self, config, key_prefix):
+    def modules(self, config: Config, key_prefix: str) -> dict[int, Qwen4ExpResidualProjection]:
         self.validate(config)
         return {
-            i: ResidualProjection(
+            i: Qwen4ExpResidualProjection(
                 config, f"{key_prefix}.layers.{i}.control_vector",
                 torch.frombuffer(bytearray(data), dtype = torch.float32), strength, i,
             ) for i, data, strength in self.directions
         }
 
 
-class ResidualProjection(Module):
+class Qwen4ExpResidualProjection(Module):
     """Project each FP32 residual stream independently after a decoder block."""
 
-    def __init__(self, config, key, direction, scale, steered_layer_idx):
+    def __init__(self, config: Config, key: str, direction: torch.Tensor, scale: float, steered_layer_idx: int):
         super().__init__(config, key, None)
         self.direction_cpu = direction.clone()
         self.direction = None
@@ -172,35 +177,41 @@ class ResidualProjection(Module):
         # layer_idx stays None: this module owns no attention or recurrent cache.
 
     @staticmethod
-    def link_sites(modules):
+    def link_sites(modules: list[Module]):
         """Link the immediately following residual mix; PLE and other intervening modules break the handoff."""
         for i, module in enumerate(modules):
-            if not isinstance(module, ResidualProjection):
+            if not isinstance(module, Qwen4ExpResidualProjection):
                 continue
             nxt = modules[i + 1] if i + 1 < len(modules) else None
             site = nxt if isinstance(nxt, GatedResidual) else getattr(nxt, "attn_hc", None)
             module.next_site = site if isinstance(site, GatedResidual) else None
 
-    def load(self, device, **kwargs):
+    @override
+    def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         self.direction = self.direction_cpu.to(device = device, dtype = torch.float32)
 
+    @override
     def unload(self):
         self.direction = None
         super().unload()
 
+    @override
     def weights_numel(self):
         return self.direction_cpu.numel()
 
+    @override
     def optimizer_targets(self):
         return []
 
-    def prepare_for_device(self, x, params):
+    @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         if "hc_pending" in params and x.device != self.device:
             hc_flush(params)
         return super().prepare_for_device(x, params)
 
-    def forward(self, x, params, out_dtype = None):
+    @override
+    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         if x.ndim != 4 or x.shape[-2:] != (self.streams, self.width) or x.dtype != torch.float32:
             raise ValueError("Expected FP32 [batch, tokens, streams, hidden_size] residual")
         if out_dtype not in (None, torch.float32):

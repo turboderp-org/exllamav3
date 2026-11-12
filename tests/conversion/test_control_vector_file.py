@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from exllamav3 import ControlVector
+from exllamav3.modules.arch_specific.qwen4_exp import Qwen4ExpControlVector
 from testlib.repo_scripts import load_repo_script
 
 convert = load_repo_script("util/convert_control_vector.py").convert
@@ -49,7 +49,7 @@ def test_conversion_preserves_values_and_refuses_overwrite(source, tmp_path):
     assert {k: v.tobytes() for k, v in copied.items()} == {k: v.tobytes() for k, v in tensors.items()}
     config = SimpleNamespace(architecture = "Qwen4ExpForConditionalGeneration", hidden_size = 64,
                              num_hidden_layers = 4, hc_mult = 4)
-    vector = ControlVector.from_file(config, destination)
+    vector = Qwen4ExpControlVector.from_file(config, destination)
     assert [i for i, _, _ in vector.directions] == [1, 2, 3]
     original = destination.read_bytes()
     with pytest.raises(FileExistsError): convert(path, destination, model)
