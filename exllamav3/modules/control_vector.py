@@ -13,17 +13,23 @@ import triton
 import triton.language as tl
 
 from .module import Module
-from .hyperconnections import hc_flush
+from .hyperconnections import GatedResidual, hc_flush
+from ..util.tensor import g_tensor_cache
 
 
 @triton.jit
-def _project_rows(X, V, WIDTH: tl.constexpr, SCALE: tl.constexpr, BLOCK: tl.constexpr):
+def _project_rows(X, V, W, XW, WIDTH: tl.constexpr, SCALE: tl.constexpr,
+                  STREAMS: tl.constexpr, WEIGHTED: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
     value = tl.load(X + row * WIDTH + col, col < WIDTH, other = 0).to(tl.float32)
     direction = tl.load(V + col, col < WIDTH, other = 0).to(tl.float32)
     dot = tl.sum(value * direction, axis = 0)
-    tl.store(X + row * WIDTH + col, value - (SCALE * dot) * direction, col < WIDTH)
+    projected = value - (SCALE * dot) * direction
+    tl.store(X + row * WIDTH + col, projected, col < WIDTH)
+    if WEIGHTED:
+        weight = tl.load(W + (row % STREAMS) * WIDTH + col, col < WIDTH, other = 0).to(tl.float32)
+        tl.store(XW + row * WIDTH + col, projected * weight, col < WIDTH)
 
 
 @dataclass(frozen = True)
@@ -162,7 +168,18 @@ class ResidualProjection(Module):
         self.steered_layer_idx = steered_layer_idx
         self.width = config.hidden_size
         self.streams = config.hc_mult
+        self.next_site = None
         # layer_idx stays None: this module owns no attention or recurrent cache.
+
+    @staticmethod
+    def link_sites(modules):
+        """Link the immediately following residual mix; PLE and other intervening modules break the handoff."""
+        for i, module in enumerate(modules):
+            if not isinstance(module, ResidualProjection):
+                continue
+            nxt = modules[i + 1] if i + 1 < len(modules) else None
+            site = nxt if isinstance(nxt, GatedResidual) else getattr(nxt, "attn_hc", None)
+            module.next_site = site if isinstance(site, GatedResidual) else None
 
     def load(self, device, **kwargs):
         super().load(device, **kwargs)
@@ -201,10 +218,21 @@ class ResidualProjection(Module):
         if x.numel() == 0:
             return x
         if x.is_cuda:
+            nxt = self.next_site
+            xw = None
+            # Prepare the successor's weighted streams in this launch, using the same
+            # shared scratch as GatedResidual.apply_. Prefill mixes apply their own weight.
+            if nxt is not None and x.shape[0] * x.shape[1] <= GatedResidual.FUSED_MAX_R \
+                    and nxt.w_h is not None and nxt.w_h.device == x.device:
+                xw = g_tensor_cache.get_bucketed(x.device, x.numel(), torch.float, "gr_apply_xw")
+                xw = xw.view(-1, self.streams, self.width)
             _project_rows[(x.numel() // self.width,)](
-                x, self.direction, WIDTH = self.width, SCALE = self.scale,
+                x, self.direction, nxt.w_h if xw is not None else None, xw,
+                WIDTH = self.width, SCALE = self.scale, STREAMS = self.streams, WEIGHTED = xw is not None,
                 BLOCK = triton.next_power_of_2(self.width), num_warps = 4, enable_fp_fusion = False,
             )
+            if xw is not None:
+                params["gr_weighted"] = (nxt, x.data_ptr(), xw)
         else:
             dots = (x * self.direction).sum(dim = -1, keepdim = True)
             x.sub_((self.scale * dots) * self.direction)

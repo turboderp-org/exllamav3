@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from exllamav3 import Config, ControlVector, Model
 from exllamav3.generator.disk_cache import cache_fingerprint
 from exllamav3.modules.control_vector import ResidualProjection
+from exllamav3.modules.hyperconnections import GatedResidual
 from exllamav3.modules.transformer import TransformerBlock
 from testlib.control_vector import write_control_vector
 
@@ -56,6 +57,9 @@ def test_graph_handoff_and_last_kv_index(tiny_config, tmp_path, bounds):
             assert isinstance(previous, TransformerBlock)
             assert previous.layer_idx == m.steered_layer_idx
             assert previous.mlp_hc.next_site is None
+            following = enabled.modules[i + 1]
+            next_site = following if isinstance(following, GatedResidual) else getattr(following, "attn_hc", None)
+            assert m.next_site is next_site  # PLE is a barrier; the final mixer is a valid successor.
             projected.append(m.steered_layer_idx)
     assert projected == list(range(bounds[0], bounds[1] + 1))
     assert enabled.modules[enabled.last_kv_module_idx].layer_idx == config.num_hidden_layers - 1

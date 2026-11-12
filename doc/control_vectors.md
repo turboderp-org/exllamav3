@@ -132,8 +132,12 @@ The projection is a separate module with a Triton GPU kernel and a CPU reference
 Its insertion breaks the precomputed weighted-copy handoff between the affected
 hyperconnection sites. Pending residual updates are completed and stale weighted
 copies invalidated before projection, so the following block sees the modified
-state. The last KV-producing module remains the last decoder block even when a
-projection follows that block.
+state. For decode-sized batches, the projection kernel also prepares the next
+GatedResidual site's norm-weighted stream copy in the same launch. This restores
+the optimized handoff without reusing an unprojected copy. Larger prefills, PLE
+boundaries and successors on another device use the normal mix path. The last
+KV-producing module remains the last decoder block even when a projection follows
+that block.
 
 Loaded directions are held as immutable bytes, and each model gets its own
 tensors. Replacing or moving the source file does not change an existing model.
@@ -161,7 +165,9 @@ with GDN, QSA, hyperconnections and PLE. No model download is needed. They cover
 FP64-reference agreement, independent streams, noncontiguous input, invalid files,
 CUDA graph replay, pending residual updates, layer indexing with PLE, disabled
 graph/logit parity, ownership of directions, CLI rejection paths and converter
-value preservation. Inference tests compare full forward with chunked prefill
+value preservation. Weighted-copy tests cover exact values, graph replay,
+consumption by the next site and fallback at prefill/device boundaries.
+Inference tests compare full forward with chunked prefill
 and batched decode, reuse a shared prefix, restore it from disk in a fresh model,
 and check that a changed vector cannot reuse that cache. Continuations are fixed
 when comparing logits. GPU tests use the suite's `device` fixture. CPU-only cases

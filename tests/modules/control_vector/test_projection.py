@@ -6,6 +6,7 @@ import torch
 from safetensors.torch import save_file
 
 from exllamav3 import ControlVector
+from exllamav3.modules.hyperconnections import GatedResidual
 from testlib.control_vector import write_control_vector
 
 
@@ -197,20 +198,51 @@ def test_cuda_reference(device, tmp_path, width, streams, batch, tokens):
     torch.testing.assert_close(actual, expected, rtol = 3e-6, atol = 3e-6)
 
 
-def test_cuda_graph_replay(device, vector):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_cuda_graph_replay(device, vector, weighted):
     config, path, _, _ = vector
     p = module(config, path, device)
+    if weighted:
+        p.next_site = GatedResidual(None, "next", 4, 64, 1e-6)
+        p.next_site.w_h = torch.randn(4 * 64, device = device).half()
     x = torch.randn(1, 1, 4, 64, device = device)
     p.forward(x, {})
     graph = torch.cuda.CUDAGraph()
+    params = {}
     with torch.cuda.graph(graph):
-        result = p.forward(x, {})
+        result = p.forward(x, params)
     for _ in range(2):
         source = torch.randn_like(x)
         x.copy_(source)
         graph.replay()
         expected = reference(source.cpu(), p.direction_cpu, p.scale)
         torch.testing.assert_close(result.cpu().double(), expected, rtol = 3e-6, atol = 3e-6)
+        if weighted:
+            expected_copy = result.view(1, 4, 64) * p.next_site.w_h.float().view(4, 64)
+            torch.testing.assert_close(params["gr_weighted"][2], expected_copy, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("rows,weights", [(1, "gpu"), (2, "gpu"), (8, "gpu"),
+                                        (9, "gpu"), (2, "cpu"), (2, "unloaded")])
+def test_weighted_handoff_and_fallback(device, vector, rows, weights):
+    config, path, _, _ = vector
+    p = module(config, path, device)
+    nxt = GatedResidual(None, "next", 4, 64, 1e-6)
+    if weights != "unloaded":
+        nxt.w_h = torch.randn(4 * 64, device = device if weights == "gpu" else "cpu").half()
+    p.next_site = nxt
+    x = torch.randn(rows, 1, 4, 64, device = device)
+    expected = reference(x.cpu(), p.direction_cpu, p.scale)
+    params = {"gr_weighted": object()}
+    result = p.forward(x, params)
+    torch.testing.assert_close(result.cpu().double(), expected, rtol = 3e-6, atol = 3e-6)
+    if rows <= GatedResidual.FUSED_MAX_R and weights == "gpu":
+        streams = result.view(rows, 4, 64)
+        copy = nxt._weighted_copy(streams, params)
+        torch.testing.assert_close(copy, streams * nxt.w_h.float().view(4, 64), rtol = 0, atol = 0)
+        assert nxt._weighted_copy(streams, params) is None
+    else:
+        assert "gr_weighted" not in params
 
 
 def test_pending_residual_is_applied_before_projection(device, vector):
