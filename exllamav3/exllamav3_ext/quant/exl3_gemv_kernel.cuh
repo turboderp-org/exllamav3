@@ -193,9 +193,12 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at 64. The integer narrow instances share this body and, unbounded, get 71-80
 // registers too (CUDA 12.8 and 13.1, sm_89), so they exist in both forms: BOUND (two blocks per SM) for grids larger
-// than one unbounded wave, unbounded for grids that fit in one, where the extra registers are a little faster
+// than one unbounded wave, unbounded for grids that fit in one, where the extra registers are a little faster.
+// The integer wide instances take a two-block minimum in their only form: unbounded, 3 bpw with the mcg codebook
+// goes past the register count that lets two 256-thread blocks share an SM, and a wide grid is always larger
+// than one block per SM. The other wide instances already fit two blocks and compile the same either way
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false, bool BOUND = HALF>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, BOUND && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? (BOUND ? 2 : 1) : (HALF ? 1 : 2))
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
