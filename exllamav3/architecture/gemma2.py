@@ -29,7 +29,7 @@ class Gemma2Config(Config):
 
         self.query_pre_attn_scalar = self.read_cfg(float, "query_pre_attn_scalar", 224)
         self.attn_logit_softcapping = self.read_cfg(float, "attn_logit_softcapping", 50.0)
-        self.sliding_window = self.read_cfg(int, "sliding_window_size", -1)
+        self.sliding_window = self.read_cfg(int, ["sliding_window", "sliding_window_size"], 4096)
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
