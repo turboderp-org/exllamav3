@@ -780,6 +780,11 @@ class Job:
         return next_token, next_k_tokens, next_k_probs, next_prob
 
 
+    def requeue_due(self):
+        """The accepted tokens have reached this segment's requeue point"""
+        return self.new_tokens > self.max_rq_tokens - self.rq_margin
+
+
     def receive_sample(
         self,
         logits: torch.Tensor | None,
@@ -814,7 +819,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.rq_margin
+        requeue_now = self.requeue_due()
 
         for seq in self.sequences:
 
@@ -1315,8 +1320,12 @@ class Job:
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
             # (early by the window misses the boundary and replays up to a checkpoint interval; early by
             # a page shortens every segment by a page and requeues up to twice as often)
-            self.rq_margin = 0
-            self.rq_headroom = self.generator.max_draft_tokens
+            # MTP keeps the last two tokens of a prompt out of the page cache (max_cached_pages below), so an MTP job
+            # requeues one token past the boundary: the next segment then finds the boundary page cached and resumes
+            # from the checkpoint there, instead of replaying the whole interval before it
+            mtp_lag = 1 if self.generator.mtp_draft else 0
+            self.rq_margin = -mtp_lag
+            self.rq_headroom = self.generator.max_draft_tokens + mtp_lag
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
