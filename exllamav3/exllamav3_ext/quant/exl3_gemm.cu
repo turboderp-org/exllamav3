@@ -28,7 +28,7 @@ int exl3_gemm_blockdim_g[] = {EXL3_GEMM_BLOCKDIM};
 EXL3 matmul, A @ B -> C
 
 - A: row-major A tensor, shape (m, k), dtype float16, contiguous
-- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*K), dtype uint16
+- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*K), dtype uint16, contiguous
 - C: empty row-major C tensor, shape (m, n), dtype float16 or float32, contiguous. Does not need to be zero-initialized
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
@@ -134,6 +134,9 @@ int exl3_gemm_gr
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIM(B, 3);
+    // The kernel takes B's row pitch from its shape, not its strides, so a strided view (e.g. a column slice of
+    // a wider B) passes the shape checks and reads the wrong tiles
+    TORCH_CHECK(B.is_contiguous(), "exl3_gemm: B must be contiguous");
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
     TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
     // TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
