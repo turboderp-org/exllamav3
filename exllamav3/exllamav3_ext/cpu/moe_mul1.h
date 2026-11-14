@@ -121,6 +121,8 @@ void exl3_moe_cpu_stage_experts
 void exl3_moe_cpu_set_prof(bool enabled);
 // Wake helpers before the GPU payload arrives; no work or completion barrier.
 void exl3_moe_cpu_pool_prime(int threads);
+// Pool threads pin from the first SMT sibling on (a draft component's worker beside the main model's)
+void exl3_moe_cpu_pool_pin_siblings();
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
 // Pool topology for host placement: physical-core-first encoded LP order and the physical core
 // count; empty when EXL3_MOE_CPU_PIN=0.

@@ -2952,11 +2952,12 @@ struct Pool
     static constexpr int DISPATCH_NW_BITS = 16;
     static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
     std::vector<int> core_order;
+    int pin_base = 0;       // first core_order entry the threads pin to (exl3_moe_cpu_pool_pin_siblings)
 
     void pin_self(int idx)
     {
         if (core_order.empty()) return;
-        const int enc = core_order[idx % core_order.size()];
+        const int enc = core_order[(pin_base + idx) % core_order.size()];
 #ifdef __linux__
         cpu_set_t set;
         CPU_ZERO(&set);
@@ -3926,6 +3927,15 @@ std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order()
     return { std::vector<int64_t>(co.order.begin(), co.order.end()), co.n_phys };
 }
 
+// Pin this process's pool threads from the first SMT sibling on: a second worker process (an MTP head's) then shares
+// the main model's physical cores instead of time-slicing the same LPs. Call before the pool's first use
+void exl3_moe_cpu_pool_pin_siblings()
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    TORCH_CHECK(g_pool.spawned == 0, "exl3_moe_cpu_pool_pin_siblings: pool threads already pinned");
+    g_pool.pin_base = physical_core_order().n_phys;
+}
+
 // Prime from the handoff worker before its GPU payload is ready.
 void exl3_moe_cpu_pool_prime(int threads)
 {
@@ -4213,6 +4223,7 @@ void exl3_moe_cpu_forward
 #define NO_MOE_CPU() TORCH_CHECK(false, "CPU MoE offload (moe_mul1) is not available on this CPU architecture (x86 AVX2/AVX-512 only)")
 void exl3_moe_cpu_set_prof(bool) {}
 void exl3_moe_cpu_pool_prime(int) {}
+void exl3_moe_cpu_pool_pin_siblings() {}
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { NO_MOE_CPU(); return 0; }
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order() { return { {}, 0 }; }
 void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { NO_MOE_CPU(); }

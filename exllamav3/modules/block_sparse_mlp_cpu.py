@@ -177,7 +177,8 @@ def register_split_module(infer_params, module):
 
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-_PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
+_PROMOTE_BUDGET = 3         # promotions issued per step over all layers (and as many demotions); each transfer's
+                            # copies queue ahead of the next draft forward (WDDM runs streams in submission order)
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 
@@ -226,31 +227,39 @@ class _PromoteState:
             self.hists[d] = (a, b, hist)
         for m in self.modules:
             m._split_snap = None          # the per-module snapshot is superseded by the shared one
+        # Landed map updates: (router id, slot) pairs staged in pinned memory and uploaded with one non-blocking copy
+        # per device (a pageable copy would wait for the queued pass). A (module, expert) lands at most once per pass,
+        # so n * e pairs always fit; land_ev keeps the staging until the previous upload has run
+        self.land = torch.empty((n * e, 2), dtype = torch.long).pin_memory()
+        self.land_np = self.land.numpy()
+        self.land_ev = []
+        self.decide_rows = None           # rows of the pass awaiting its decide (see promote_tick)
 
 
-def _split_promote_step(ip, modules, rows):
-    """One decode step of promote-on-miss for every split module (called from the first module's
-    submit, before any layer's selection translate of this step).
+def promote_tick(ip):
+    """Promote-on-miss decide for the last pass. The generator calls this once a verify pass is queued, so the host
+    work overlaps the GPU's; a pass nobody ticks (prefill, a driver without a generator) is decided at the start of
+    the next pass, ahead of its landing"""
+    ps = getattr(ip, "moe_cpu_promote_state", None)
+    if ps is None or ps.decide_rows is None:
+        return
+    rows, ps.decide_rows = ps.decide_rows, None
+    _split_promote_decide(ps, rows)
 
-    (1) Transfers that landed take effect in the map, on the compute stream ahead of this step's
-    translate kernels; the slot they vacated is free from this step on, since nothing maps to it any
-    more. (2) The previous step's hit counts (snapshotted to pinned memory) name the routed experts;
-    those the worker computed are the misses. (3) The misses, ranked by count over all layers, take
-    free GPU slots of their layer when their count clears the layer's least-used unrouted resident's
-    by _PROMOTE_RATIO, up to _PROMOTE_BUDGET per step: the block is copied from the arena on the
-    promotion stream, ordered after everything the compute stream had enqueued (the slot's last
-    reader was a previous step). (4) The worker slots promotions freed take the least-used unrouted
-    residents, copied out on the promotion stream; the map flips once the copy has landed. Every
-    transfer leaves the expert live where it was until its copy is complete, so a route always finds
-    valid weights. Nothing is issued on a prefill-size step (its stager reads worker slots)."""
+
+def _split_promote_land(ip, modules):
+    """(1) of the promote-on-miss step for every split module (called from the first module's submit, before any
+    layer's selection translate of the pass). Transfers that landed take effect in the map, on the compute stream
+    ahead of this pass's translate kernels; the slot they vacated is free from this pass on, since nothing maps to it
+    any more. Returns the step state"""
     import time
     t0 = time.perf_counter()
     ps = getattr(ip, "moe_cpu_promote_state", None)
     if ps is None or ps.head is not modules[0]:
         ps = ip.moe_cpu_promote_state = _PromoteState(modules)
     verify = os.environ.get("EXL3_MOE_CPU_PROMOTE_VERIFY")
-    debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
-    # (1) landed transfers
+    n = 0
+    uploads = {}                          # device -> [(module, first pair, end pair)], contiguous per device
     for i, m in enumerate(ps.modules):
         if not m._split_pending:
             continue
@@ -276,10 +285,43 @@ def _split_promote_step(ip, modules, rows):
         m._split_pending = keep
         if idx:
             ps.mp[i, idx] = val
-            dev = torch.device(m.device)
-            with torch.cuda.device(dev):
-                m._split_map[torch.tensor(idx, device = dev)] = torch.tensor(val, device = dev)
-    # (2) last step's routes: the snapshots land, the next ones go out
+            if n == 0:
+                for ev in ps.land_ev:
+                    ev.synchronize()
+            ps.land_np[n:n + len(idx), 0] = idx
+            ps.land_np[n:n + len(idx), 1] = val
+            uploads.setdefault(torch.device(m.device), []).append((m, n, n + len(idx)))
+            n += len(idx)
+    if uploads:
+        ps.land_ev = []
+    for dev, parts in uploads.items():
+        a, b = parts[0][1], parts[-1][2]
+        with torch.cuda.device(dev):
+            up = ps.land[a:b].to(dev, non_blocking = True)
+            for m, ma, mb in parts:
+                m._split_map.index_copy_(0, up[ma - a:mb - a, 0], up[ma - a:mb - a, 1])
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(dev))
+            ps.land_ev.append(ev)
+    if os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
+        ps.stats["ms"] += time.perf_counter() - t0
+    return ps
+
+
+def _split_promote_decide(ps, rows):
+    """(2)-(4) of the promote-on-miss step, once per pass after its launches (promote_tick). (2) The previous
+    pass's hit counts (snapshotted to pinned memory) name the routed experts; those the worker computed are the
+    misses. (3) The misses, ranked by count over all layers, take free GPU slots of their layer when their count
+    clears the layer's least-used unrouted resident's by _PROMOTE_RATIO, up to _PROMOTE_BUDGET per pass: the block is
+    copied from the arena on the promotion stream, ordered after everything the compute stream had enqueued (the
+    slot's last reader was a previous pass). (4) The worker slots promotions freed take the least-used unrouted
+    residents, copied out on the promotion stream; the map flips once the copy has landed (_split_promote_land).
+    Every transfer leaves the expert live where it was until its copy is complete, so a route always finds valid
+    weights. Nothing is issued after a prefill-size pass (its stager reads worker slots)."""
+    import time
+    t0 = time.perf_counter()
+    debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
+    # (2) last pass's routes: the snapshots land, the next ones go out
     have = bool(ps.snap_ev)
     for ev in ps.snap_ev.values():
         ev.synchronize()
@@ -355,11 +397,11 @@ def _split_promote_step(ip, modules, rows):
         st = ps.stats
         st["steps"] += 1
         st["ms"] += time.perf_counter() - t0
-        if modules[0]._split_step_count % 128 == 0:
+        if ps.head._split_step_count % 128 == 0:
             p = sum(m._split_promo_n for m in ps.modules)
             d = sum(m._split_demo_n for m in ps.modules)
             pend = sum(len(m._split_pending) for m in ps.modules)
-            print(f" -- promote-on-miss: step {modules[0]._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
+            print(f" -- promote-on-miss: step {ps.head._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
                   f"last {st['steps']} steps: {st['routed'] / st['steps']:.1f} routed/step, "
                   f"{st['missed'] / st['steps']:.1f} on the CPU ({100 * (1 - st['missed'] / max(st['routed'], 1)):.1f}% hit), "
                   f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step", flush = True)
@@ -968,8 +1010,11 @@ class BlockSparseMLP_CPU:
         if self._split_step_count % _STATS_SAVE_INTERVAL == 0:
             save_expert_stats(ip)
         if self._split_spares:
-            # Promote-on-miss replaces the sweep: one pass over every split module per step
-            _split_promote_step(ip, reg, self._split_submit_rows)
+            # Promote-on-miss replaces the sweep: the landed transfers take effect ahead of this pass's translates,
+            # and the pass is decided once its launches are queued (promote_tick)
+            promote_tick(ip)
+            ps = _split_promote_land(ip, reg)
+            ps.decide_rows = self._split_submit_rows
             return
         interval = int(os.environ.get("EXL3_MOE_CPU_SWAP_INTERVAL", 128))
         if self._swap_tick_count < interval:

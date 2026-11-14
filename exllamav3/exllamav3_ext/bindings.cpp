@@ -211,6 +211,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_core_order", &exl3_moe_cpu_core_order, "exl3_moe_cpu_core_order");
+    m.def("exl3_moe_cpu_pool_pin_siblings", &exl3_moe_cpu_pool_pin_siblings, "exl3_moe_cpu_pool_pin_siblings");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
