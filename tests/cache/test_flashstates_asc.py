@@ -17,7 +17,7 @@ from exllamav3.cache.recurrent import RecurrentCache, host_pool
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.generator.disk_cache import DiskPageCache
-from exllamav3.generator.pagetable import PageTable, Sequence, tensor_hash_checksum
+from exllamav3.generator.pagetable import PageTable, Sequence, tensor_hash_checksum, is_content_hash
 from exllamav3.util.tensor import SeqTensor
 from testlib.cache import FakeCacheLayer
 
@@ -250,25 +250,104 @@ def test_partial_page_round_trips_through_the_cpu_tier(device):
     assert pt.metrics["alloc_partial_pages"] == 1
 
 
-def test_partial_page_is_shared_when_it_is_still_in_vram(device):
+def test_live_partial_page_is_copied_rather_than_shared(device):
+    # Two requests can resume at the same exact-position checkpoint while the first one is still generating.
+    # Decode appends into the page the sequence owns, so the second request must not share the first one's
+    # partially filled page: it gets a private copy with the same K/V, and the key stays with the original
+    tokens = torch.arange(0, (K + 2) * PAGE_SIZE, dtype = torch.long)
+    tier, slab = fake_cache_tier(device = device)
+    pt = page_table(tier)
+    hashes = complete_chain(pt, tokens)
+    key, _ = make_partial(pt, tokens, hashes[-1], slab = slab, fill = 0.25)
+    full = tensor_hash_checksum(tokens[K * PAGE_SIZE:(K + 1) * PAGE_SIZE], hashes[-1])
+    rc = Recurrent(partial = {key: {"position": K * PAGE_SIZE + OFFSET, "offset": OFFSET,
+                                    "anchor": hashes[-1]}})
+
+    seq0 = make_sequence(tokens, hashes + [full], new_unique_pages = 1)
+    seq0.allocate_pages(pt, rc)
+    page = seq0.allocated_pages[K]
+    restores = tier.metrics["restores"]
+
+    seq1 = make_sequence(tokens, hashes + [full], new_unique_pages = 1)
+    seq1.allocate_pages(pt, rc)
+    copy = seq1.allocated_pages[K]
+
+    assert copy is not page, "a partially filled page must not be shared with another sequence"
+    assert page.ref_count == 1 and copy.ref_count == 1
+    assert seq1.kv_position == K * PAGE_SIZE + OFFSET
+    assert copy.kv_position == OFFSET
+    assert copy.prev_hash == hashes[-1]
+    assert not is_content_hash(copy.phash), "a copy under construction takes a placeholder hash"
+    assert torch.equal(copy.sequence[0, :OFFSET], page.sequence[0, :OFFSET])
+    assert tier.metrics["restores"] == restores + 1
+    assert torch.all(slab[copy.page_index] == 0.25), "the copy did not restore the partial K/V"
+
+
+def test_live_partial_page_without_a_tier_copy_falls_back_to_the_boundary(device):
+    # The first request holds the only copy of the partial image and the tier entry has since been evicted: the
+    # second request cannot share the page and has nothing to copy from, so it replays from the page boundary
     tokens = torch.arange(0, (K + 2) * PAGE_SIZE, dtype = torch.long)
     tier, _ = fake_cache_tier(device = device)
     pt = page_table(tier)
     hashes = complete_chain(pt, tokens)
     key, _ = make_partial(pt, tokens, hashes[-1])
-    # Put the partial page back into VRAM under its key (as a resume would leave it)
-    seq0 = make_sequence(tokens, hashes + [tensor_hash_checksum(tokens[K * PAGE_SIZE:(K + 1) * PAGE_SIZE],
-                                                                 hashes[-1])], new_unique_pages = 1)
-    rc = Recurrent(partial = {key: {"position": K * PAGE_SIZE + OFFSET, "offset": OFFSET, "anchor": hashes[-1]}})
+    full = tensor_hash_checksum(tokens[K * PAGE_SIZE:(K + 1) * PAGE_SIZE], hashes[-1])
+    rc = Recurrent(partial = {key: {"position": K * PAGE_SIZE + OFFSET, "offset": OFFSET,
+                                    "anchor": hashes[-1]}},
+                   boundary = {hashes[K - 1]: {"position": K * PAGE_SIZE}})
+
+    seq0 = make_sequence(tokens, hashes + [full], new_unique_pages = 1)
     seq0.allocate_pages(pt, rc)
     page = seq0.allocated_pages[K]
+    tier.entries.pop(key)
 
-    # A second request resuming from the same checkpoint references the same page object
-    seq1 = make_sequence(tokens, hashes + [tensor_hash_checksum(tokens[K * PAGE_SIZE:(K + 1) * PAGE_SIZE],
-                                                                 hashes[-1])], new_unique_pages = 1)
+    seq1 = make_sequence(tokens, hashes + [full], new_unique_pages = 1)
+    _, cached, _, stashed = seq1.allocate_pages(pt, rc)
+    assert seq1.allocated_pages[K] is not page
+    assert stashed is rc.boundary[hashes[K - 1]]
+    assert cached == K and seq1.kv_position == K * PAGE_SIZE
+    assert page.ref_count == 1
+
+
+def test_live_partial_page_copy_merges_back_on_completion(device):
+    # Two byte-identical requests fill their private copies with the same tokens, so both pages end up with the
+    # same content hash. hash_completed_page must move the second sequence onto the first page rather than
+    # colliding on the hash, or the duplicate would abort the engine as soon as the page fills
+    tokens = torch.arange(0, (K + 2) * PAGE_SIZE, dtype = torch.long)
+    tier, _ = fake_cache_tier(device = device)
+    pt = page_table(tier)
+    hashes = complete_chain(pt, tokens)
+    key, _ = make_partial(pt, tokens, hashes[-1])
+    full = tensor_hash_checksum(tokens[K * PAGE_SIZE:(K + 1) * PAGE_SIZE], hashes[-1])
+    rc = Recurrent(partial = {key: {"position": K * PAGE_SIZE + OFFSET, "offset": OFFSET,
+                                    "anchor": hashes[-1]}})
+
+    seq0 = make_sequence(tokens, hashes + [full], new_unique_pages = 2)
+    seq0.allocate_pages(pt, rc)
+    seq1 = make_sequence(tokens, hashes + [full], new_unique_pages = 2)
     seq1.allocate_pages(pt, rc)
+    page, copy = seq0.allocated_pages[K], seq1.allocated_pages[K]
+
+    from exllamav3.generator.job import Job
+
+    job = Job.__new__(Job)
+    job.generator = SimpleNamespace(recurrent_cache = None)
+    job.pagetable = pt
+
+    # Both sequences append the same tokens until the page is full
+    span = tokens[K * PAGE_SIZE + OFFSET:(K + 1) * PAGE_SIZE]
+    for s, p in ((seq0, page), (seq1, copy)):
+        p.sequence[0, OFFSET:PAGE_SIZE] = span
+        p.kv_position = PAGE_SIZE
+        p.prev_hash = hashes[-1]
+
+    job.hash_completed_page(seq0, K)
+    assert is_content_hash(page.phash)
+    job.hash_completed_page(seq1, K)
+
     assert seq1.allocated_pages[K] is page
-    assert page.ref_count == 2
+    assert page.ref_count == 2 and copy.ref_count == 0
+    assert seq1.block_index_tensor[0, K].item() == page.page_index
 
 
 def test_frontier_checkpoint_key_is_found_by_a_later_request(device):

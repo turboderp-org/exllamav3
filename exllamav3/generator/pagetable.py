@@ -672,7 +672,8 @@ class PageTable:
         partial_resume is (page_index, key, position) for a checkpoint that ends inside the prompt's page
         `page_index`: the complete pages before it are restored by hash, and the partially filled page is restored
         from `key` with kv_position = position - page_index * PAGE_SIZE. The sequence then resumes exactly at
-        `position` instead of at a page boundary.
+        `position` instead of at a page boundary. A partial image that another live sequence already holds is
+        copied into a page of its own: the image is not final, so it cannot be shared the way a complete page is.
         """
         allocated_pages = []
         available_pages = None
@@ -744,27 +745,34 @@ class PageTable:
         if partial_key is not None and new_unique_pages > 0:
             complete = len(allocated_pages) == partial_k and \
                        all(p.kv_position == PAGE_SIZE for p in allocated_pages[:partial_k])
-            # A page already carrying this partial image (a concurrent resume, or this job's own page after
-            # a previous allocation) can be shared, as complete pages are
+            # A page already carrying this partial image can be claimed when nothing references it, as a
+            # complete page can. A referenced one cannot be shared: unlike a complete page the image is still
+            # being written (decode appends into the page the sequence owns), so a second sequence resuming at
+            # the same checkpoint needs its own copy of the K/V.
             rp = self.referenced_pages.get(partial_key) or self.unreferenced_pages.get(partial_key) \
                 if complete else None
             if rp is not None and rp.kv_position != partial_offset and rp.ref_count > 0:
                 # Another job holds the key with a different image; leave this one to the page-boundary path
                 complete = False
             if complete:
-                if rp is not None and rp.kv_position == partial_offset:
+                if rp is not None and rp.kv_position == partial_offset and rp.ref_count == 0:
                     self.access_serial += 1
                     rp.add_ref(self.access_serial)
                     allocated_pages.append(rp)
                     restored_partial = True
                     new_unique_pages -= 1
                 else:
-                    if rp is not None:
-                        # A stale page still carrying the key (should not happen); release the key
-                        rp.clear()
                     self.access_serial += 1
                     op = next_evictable()
-                    op.add_ref_clear(self.access_serial, partial_key)
+                    # The key stays with the referenced page (the images are identical), so the copy takes a
+                    # placeholder hash, as any page under construction does
+                    if rp is not None and rp.ref_count > 0:
+                        op.add_ref_unique(self.access_serial)
+                    else:
+                        if rp is not None:
+                            # A stale page still carrying the key (should not happen); release the key
+                            rp.clear()
+                        op.add_ref_clear(self.access_serial, partial_key)
                     entry = self._restore_from_tier(partial_key, op, protected_hashes)
                     if entry is not None:
                         op.sequence.copy_(entry["tokens"])
