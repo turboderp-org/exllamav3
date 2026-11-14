@@ -36,8 +36,14 @@ def _env(name: str, cuda, rocm):
 
 # --- Tuning defaults --------------------------------------------------------------------------------------
 
-# Q/K/V projections as one sliced GEMM bundle (mgemm): the RDNA mgemv has no sliced form
-QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 0) != "0"
+def qkv_slice(device) -> bool:
+    """Q/K/V projections as one sliced GEMM bundle (mgemm). ROCm: only the RDNA3 matmul (gfx11,
+    rocm/quant/exl3_rdna3.cu) runs the sliced form; the generic RDNA mgemv has none, so elsewhere the bundle would
+    fall back to the cooperative GEMM. EXL3_QKV_SLICE overrides"""
+    env = os.environ.get("EXL3_QKV_SLICE")
+    if env is not None:
+        return env != "0"
+    return not ROCM or (gfx_arch(device).startswith("gfx11") and os.environ.get("EXL3_RDNA3_GEMM", "1") != "0")
 
 # int8-activation GEMV for mul1 tensors at small m (exl3_gemv_int8.cu, which holds the same default): off on
 # ROCm, where the RDNA fdot2 GEMVs are faster at these shapes
