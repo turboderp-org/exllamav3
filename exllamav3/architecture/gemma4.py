@@ -129,6 +129,17 @@ class Gemma4Config(Config):
             override_head_dim = self.global_head_dim
         )
 
+        processor_path = os.path.join(self.directory, "processor_config.json")
+        try:
+            with open(processor_path, encoding = "utf8") as f:
+                processor_config = json.load(f)
+        except FileNotFoundError:
+            # A text-only checkpoint does not establish a usable vision processor/schema.
+            self.vision = None
+            self.vision_pp = None
+            del self.model_classes["vision"]
+            return
+
         # Vision model settings
         self.boi_token_id = self.read_cfg(int, "boi_token_id", None)
         self.eoi_token_id = self.read_cfg(int, "eoi_token_id", None)
@@ -165,9 +176,6 @@ class Gemma4Config(Config):
                 rope_theta = self.read_cfg(float, "vision_config->rope_theta", 100.0),
             )
 
-        processor_path = os.path.join(self.directory, "processor_config.json")
-        with open(processor_path, encoding = "utf8") as f:
-            processor_config = json.load(f)
         image_processor = processor_config["image_processor"]
 
         self.vision_pp = SimpleNamespace(
@@ -492,6 +500,8 @@ class Gemma4VisionModel(Model):
         config: Gemma4Config,
         **kwargs,
     ):
+        if config.vision_pp is None:
+            raise FileNotFoundError("processor_config.json is required for Gemma 4 vision; this checkpoint supports text-only loading")
         super().__init__(config, **kwargs)
         self.config = config
         self.caps.update({
@@ -752,6 +762,8 @@ class Gemma4UnifiedVisionModel(Gemma4VisionModel):
         config: Gemma4UnifiedConfig,
         **kwargs,
     ):
+        if config.vision_pp is None:
+            raise FileNotFoundError("processor_config.json is required for Gemma 4 vision; this checkpoint supports text-only loading")
         Model.__init__(self, config, **kwargs)
         self.config = config
         self.caps.update({
