@@ -109,6 +109,10 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
                 for k, l in (cache.get_all_recurrent_layers() if hasattr(cache, "get_all_recurrent_layers") else {}).items()
             ],
         }
+        # Model weights do not change when residual projection is enabled, but
+        # all subsequently computed K/V and recurrent states can change.
+        if fingerprint := getattr(model, "control_vector_fingerprint", None):
+            c["control_vector"] = fingerprint
         parts["caches"].append(c)
     text = json.dumps(parts, sort_keys = True)
     return hashlib.blake2b(text.encode(), digest_size = 16).hexdigest(), parts
