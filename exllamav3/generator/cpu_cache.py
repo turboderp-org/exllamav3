@@ -300,12 +300,17 @@ class CPUPageCache:
         self._order_pops = 0
 
 
-    def store(self, page, serial: int, protect: set | None = None):
+    def store(self, page, serial: int, protect: set | None = None, key: bytes | None = None):
         """
         Copy a dying page's cache state into the tier (device-to-host, async on the current stream). Duplicate
         hashes only refresh the entry's recency.
+
+        `key` overrides the page's own hash. A recurrent checkpoint at an arbitrary token position stores the
+        partially filled page under the content hash of the prefix it covers, which is neither the page's
+        current hash nor its final one; the page's `prev_hash` links it into the same chain either way.
         """
-        e = self.entries.get(page.phash)
+        key = page.phash if key is None else key
+        e = self.entries.get(key)
         if e is not None:
             e["access_serial"] = serial
             self.metrics["dedup_hits"] += 1
@@ -318,7 +323,7 @@ class CPUPageCache:
             for m, ids in self.tp_groups:
                 m.tp_cpu_cache_store(ids, slot, page.page_index)
         tokens = page.sequence.clone()
-        self.entries[page.phash] = {
+        self.entries[key] = {
             "slot": slot,
             "prev_hash": page.prev_hash,
             "access_serial": serial,
@@ -330,7 +335,7 @@ class CPUPageCache:
             events = self._copy_events()
             self.slot_events[slot] = events
             # Write-through: the writer waits for the copies above before it reads the slab
-            self.disk_tier.write_page(page.phash, page.prev_hash, tokens, slot, events, page.persistable)
+            self.disk_tier.write_page(key, page.prev_hash, tokens, slot, events, page.persistable)
 
 
     def _copy_events(self) -> list:

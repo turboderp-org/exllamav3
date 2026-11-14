@@ -264,6 +264,48 @@ class Sequence:
             dtype = torch.int32,
         )
 
+    def find_resume(self, recurrent_cache, pagetable, page_hashes: list, prompt_len: int):
+        """
+        Deepest checkpoint this sequence can resume from, as (position, key, anchor_hash, offset), or None.
+
+        Candidates are the page-boundary checkpoints of the complete pages the prompt shares with the cache
+        and, deeper than any of them, the arbitrary-position checkpoints anchored on those same pages. A
+        partial candidate is accepted only if its recorded position is a prefix of this prompt: the K/V and
+        the recurrent state were computed from exactly those tokens, so the key is rebuilt from the prompt and
+        compared. The deepest candidate whose K/V chain is still restorable wins.
+        """
+        candidates = []
+        for i, ph in enumerate(page_hashes):
+            pos = (i + 1) * PAGE_SIZE
+            if pos <= prompt_len and recurrent_cache.has(ph):
+                candidates.append((pos, ph, None, 0))
+
+        partial_keys = getattr(recurrent_cache, "partial_keys", None)
+        position_of = getattr(recurrent_cache, "position", None)
+        if partial_keys is not None and position_of is not None:
+            for i in range(-1, len(page_hashes)):
+                anchor = None if i < 0 else page_hashes[i]
+                base = (i + 1) * PAGE_SIZE
+                for key in partial_keys(anchor):
+                    pos = position_of(key)
+                    if pos is None or pos > prompt_len:
+                        continue
+                    offset = pos - base
+                    if not 0 < offset < PAGE_SIZE:
+                        continue
+                    ids = self.sequence_ids.torch_slice(base, pos)
+                    if tensor_hash_checksum(ids, anchor) != key:
+                        continue
+                    candidates.append((pos, key, anchor, offset))
+
+        is_resumable = getattr(pagetable, "is_resumable", None)
+        candidates.sort(key = lambda c: c[0], reverse = True)
+        for pos, key, anchor, offset in candidates:
+            if is_resumable is None or is_resumable(key):
+                return pos, key, anchor, offset
+        return None
+
+
     def allocate_pages(
         self,
         pagetable: PageTable,
@@ -276,21 +318,39 @@ class Sequence:
             page_hashes = self.page_hashes[:self.max_cached_pages]
         new_unique_pages = self.new_unique_pages + len(self.page_hashes) - len(page_hashes)
 
-        # If recurrent model, find logest recurrent prefix
+        # If recurrent model, find the longest resumable prefix. An arbitrary-position checkpoint deeper than
+        # the last page boundary is a partial page: the K/V chain up to its anchor is restored as usual and
+        # the partial page is restored into the first page past the anchors.
         recurrent_pages = None
         restore_limit = None
+        partial_resume = None
         if recurrent_cache is not None:
-            recurrent_pages = []
-            for pi, ph in enumerate(page_hashes):
-                if recurrent_cache.has(ph):
-                    recurrent_pages.append(pi)
-            # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
-            # rewrites those pages anyway
-            restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
+            sequence_ids = getattr(self, "sequence_ids", None)
+            prompt_len = len(sequence_ids) - 1 if sequence_ids is not None else len(page_hashes) * PAGE_SIZE
+            resume = self.find_resume(recurrent_cache, pagetable, page_hashes, prompt_len)
+            if resume is not None:
+                position, key, anchor, offset = resume
+                limit_pages = position // PAGE_SIZE
+                # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
+                # rewrites those pages anyway
+                restore_limit = limit_pages
+                recurrent_pages = [pi for pi, ph in enumerate(page_hashes)
+                                   if pi < limit_pages and recurrent_cache.has(ph)]
+                if offset:
+                    partial_resume = (limit_pages, key, position)
+            else:
+                recurrent_pages = []
+                restore_limit = 0
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
-        self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
+        if partial_resume is None:
+            self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
+                pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes,
+                                         restore_limit)
+        else:
+            self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
+                pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes,
+                                         restore_limit, partial_resume = partial_resume)
 
         # A page's hash fixes its whole chain, so every sequence that claims the page computes the same flag
         for i, page in enumerate(self.allocated_pages):
@@ -305,6 +365,13 @@ class Sequence:
         # prefill writes them again, as it does when the page table limits the prefix to the last checkpoint.
         stashed_recurrent_state = None
         if recurrent_cache is not None:
+            if partial_resume is not None and self.kv_position == partial_resume[2]:
+                stashed_recurrent_state = recurrent_cache.get_stashed(partial_resume[1])
+                if stashed_recurrent_state is not None:
+                    return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
+                # The K/V was restored but the state could not be read back (for example, a damaged disk
+                # file): fall back to a page-aligned checkpoint, or replay, as if the partial one had missed
+                self.kv_position = cached_pages * PAGE_SIZE
             while cached_pages > 0:
                 stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
                 if stashed_recurrent_state is not None:
@@ -368,6 +435,8 @@ class PageTable:
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
             "alloc_disk_pages": 0,        # of those, read from the disk tier (by the prefetch or the allocation)
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+            "alloc_partial_pages": 0,     # partial pages restored for an arbitrary-position checkpoint
+            "partial_stores": 0,          # partial pages pushed to the CPU tier by a frontier checkpoint
         }
 
 
@@ -550,13 +619,42 @@ class PageTable:
         return None
 
 
+    def _restore_from_tier(self, phash: bytes, op: CachePage, protected_hashes: set | None) -> dict | None:
+        """Copy a page stored in the CPU tier, or on disk (promoting it first), into op. None if absent"""
+        tier = self.cpu_tier
+        if tier is None:
+            return None
+        if phash in tier:
+            return tier.fetch(phash, op.page_index, self.access_serial)
+        if tier.disk_tier is not None and tier.disk_tier.has_page(phash):
+            # On disk only: promote into a slot (waiting for the read) and restore from there
+            if tier.promote(phash, self.access_serial, protected_hashes) is not None:
+                return tier.fetch(phash, op.page_index, self.access_serial)
+        return None
+
+
+    def store_partial_page(self, page: CachePage, key: bytes, protect: set | None = None) -> bool:
+        """
+        Store a page holding the first `page.kv_position` tokens of a partial checkpoint under `key` (the
+        content hash of that prefix chained onto the previous page). Used by the frontier checkpoint: the
+        checkpoint at a prompt's or request's exact end usually sits inside a page, and its K/V has to be
+        restorable from the same key as the state. Returns False when there is no CPU tier to store it in.
+        """
+        if self.cpu_tier is None or page.kv_position <= 0:
+            return False
+        self.cpu_tier.store(page, self.access_serial, protect, key = key)
+        self.metrics["partial_stores"] += 1
+        return True
+
+
     def allocate_pages(
         self,
         page_hashes: list,
         new_unique_pages: int,
         recurrent_pages: list[int] | None,
         protected_hashes: set | None = None,
-        restore_limit: int | None = None
+        restore_limit: int | None = None,
+        partial_resume: tuple[int, bytes, int] | None = None
     ):
         """
         Allocate physical cache pages for one sequence.
@@ -570,9 +668,16 @@ class PageTable:
         hybrid recurrent/KV models, recurrent_pages marks which hashed pages also have stashed recurrent
         checkpoints; the usable cached prefix is capped to the longest page prefix that has both valid K/V pages
         and the matching recurrent state.
+
+        partial_resume is (page_index, key, position) for a checkpoint that ends inside the prompt's page
+        `page_index`: the complete pages before it are restored by hash, and the partially filled page is restored
+        from `key` with kv_position = position - page_index * PAGE_SIZE. The sequence then resumes exactly at
+        `position` instead of at a page boundary. A partial image that another live sequence already holds is
+        copied into a page of its own: the image is not final, so it cannot be shared the way a complete page is.
         """
         allocated_pages = []
         available_pages = None
+        prompt_pages = len(page_hashes)
 
         def next_evictable():
             # Deferred so allocations served entirely by hash matches never build the eviction order. Pages
@@ -586,6 +691,17 @@ class PageTable:
             page = available_pages.popleft()
             self.evict(page, protected_hashes)
             return page
+
+        # Split the prompt at the partial checkpoint's page: pages before it are complete and reusable by hash,
+        # the partial page itself and everything after it are new allocations
+        partial_k = partial_key = partial_offset = None
+        if partial_resume is not None:
+            partial_k, partial_key, partial_pos = partial_resume
+            partial_offset = partial_pos - partial_k * PAGE_SIZE
+            assert 0 < partial_offset < PAGE_SIZE, "Partial resume position must be inside a page"
+            assert 0 <= partial_k <= prompt_pages, "Partial resume anchor is past the prompt's complete pages"
+            new_unique_pages += prompt_pages - partial_k
+            page_hashes = page_hashes[:partial_k]
 
         # Allocate whole pages
         for lp, h in enumerate(page_hashes):
@@ -611,15 +727,8 @@ class PageTable:
                 else:
                     op = next_evictable()
                     op.add_ref_clear(self.access_serial, h)
-                    tier = self.cpu_tier
-                    if tier is not None and (restore_limit is None or lp < restore_limit):
-                        entry = None
-                        if h in tier:
-                            entry = tier.fetch(h, op.page_index, self.access_serial)
-                        elif tier.disk_tier is not None and tier.disk_tier.has_page(h):
-                            # On disk only: promote into a slot (waiting for the read) and restore from there
-                            if tier.promote(h, self.access_serial, protected_hashes) is not None:
-                                entry = tier.fetch(h, op.page_index, self.access_serial)
+                    if self.cpu_tier is not None and (restore_limit is None or lp < restore_limit):
+                        entry = self._restore_from_tier(h, op, protected_hashes)
                         if entry is not None:
                             op.sequence.copy_(entry["tokens"])
                             op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
@@ -629,6 +738,55 @@ class PageTable:
                             # the prefetch or this allocation brought it in; from then on it is a tier entry
                             if entry.pop("from_disk", False):
                                 self.metrics["alloc_disk_pages"] += 1
+                    allocated_pages.append(op)
+
+        # Restore the partial page at an arbitrary checkpoint position, if its complete ancestors all landed
+        restored_partial = False
+        if partial_key is not None and new_unique_pages > 0:
+            complete = len(allocated_pages) == partial_k and \
+                       all(p.kv_position == PAGE_SIZE for p in allocated_pages[:partial_k])
+            # A page already carrying this partial image can be claimed when nothing references it, as a
+            # complete page can. A referenced one cannot be shared: unlike a complete page the image is still
+            # being written (decode appends into the page the sequence owns), so a second sequence resuming at
+            # the same checkpoint needs its own copy of the K/V.
+            rp = self.referenced_pages.get(partial_key) or self.unreferenced_pages.get(partial_key) \
+                if complete else None
+            if rp is not None and rp.kv_position != partial_offset and rp.ref_count > 0:
+                # Another job holds the key with a different image; leave this one to the page-boundary path
+                complete = False
+            if complete:
+                if rp is not None and rp.kv_position == partial_offset and rp.ref_count == 0:
+                    self.access_serial += 1
+                    rp.add_ref(self.access_serial)
+                    allocated_pages.append(rp)
+                    restored_partial = True
+                    new_unique_pages -= 1
+                else:
+                    self.access_serial += 1
+                    op = next_evictable()
+                    # The key stays with the referenced page (the images are identical), so the copy takes a
+                    # placeholder hash, as any page under construction does
+                    if rp is not None and rp.ref_count > 0:
+                        op.add_ref_unique(self.access_serial)
+                    else:
+                        if rp is not None:
+                            # A stale page still carrying the key (should not happen); release the key
+                            rp.clear()
+                        op.add_ref_clear(self.access_serial, partial_key)
+                    entry = self._restore_from_tier(partial_key, op, protected_hashes)
+                    if entry is not None:
+                        op.sequence.copy_(entry["tokens"])
+                        op.prev_hash = page_hashes[-1] if partial_k > 0 else None
+                        op.kv_position = partial_offset
+                        restored_partial = True
+                        self.metrics["alloc_partial_pages"] += 1
+                        if entry.pop("from_disk", False):
+                            self.metrics["alloc_disk_pages"] += 1
+                    else:
+                        # The checkpoint's K/V could not be restored: reuse the page as an ordinary fresh one
+                        # and let the sequence fall back to a page-boundary checkpoint or replay
+                        op.make_unique()
+                    new_unique_pages -= 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -660,17 +818,21 @@ class PageTable:
             for rp in recurrent_pages:
                 if rp < cached_pages:
                     max_recur = rp + 1
-            # for cpi in range(max_recur, cached_pages):
-            #     allocated_pages[cpi].make_unique()
+            # An arbitrary-position checkpoint needs only the pages before its partial page: the partial page
+            # itself carries the state's position
+            if restored_partial and cached_pages >= partial_k:
+                max_recur = partial_k
             self.metrics["alloc_kv_only_pages"] += cached_pages - max_recur
             cached_pages = max_recur
 
         self.metrics["alloc_pages"] += len(allocated_pages)
-        self.metrics["alloc_prompt_pages"] += len(page_hashes)
+        self.metrics["alloc_prompt_pages"] += prompt_pages
         self.metrics["alloc_cached_pages"] += cached_pages
 
         # Advance cache over prefilled pages
         kv_position = cached_pages * PAGE_SIZE
+        if restored_partial and cached_pages == partial_k:
+            kv_position += partial_offset
 
         non_sequential_pages = 0
         for page_a, page_b in pairwise(allocated_pages):
@@ -701,7 +863,9 @@ class PageTable:
         disk = tier.disk_tier if tier is not None else None
         limit = self.max_pages + (len(tier) if tier is not None else 0) + (len(disk) if disk is not None else 0)
         while True:
-            page = self.get_live_page(h)
+            # Any page carrying this hash counts, not just a complete one: an arbitrary-position checkpoint's
+            # partial page is keyed by the hash of the prefix it covers and has kv_position < PAGE_SIZE
+            page = self.referenced_pages.get(h) or self.unreferenced_pages.get(h)
             if page is not None:
                 prev = page.prev_hash
             elif tier is not None and h in tier:

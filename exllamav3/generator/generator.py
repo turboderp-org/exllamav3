@@ -66,6 +66,9 @@ class Generator:
         recurrent_checkpoint_interval_pp: int = 32768,
         rolling_checkpoint: bool = True,
         pipelined_prefill: bool = True,
+        recurrent_frontier_checkpoints: bool = True,
+        recurrent_eviction: str = "lru",
+        prefill_cost_coefficients: tuple | list | None = None,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
@@ -244,6 +247,23 @@ class Generator:
             on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
             offload, attention pinned to one device, a draft model on several devices or reading the target's cache
 
+        :param recurrent_frontier_checkpoints:
+            Also checkpoint the exact end of every prompt and every finished or requeued request, even when it
+            falls inside a page (FlashStates' arbitrary state checkpointing). The partially filled page's K/V is
+            kept in the CPU page tier under the content hash of the prefix, so the next request that extends
+            that exact prefix resumes there instead of replaying up to the previous page boundary. Needs a CPU
+            page tier (cpu_cache_size > 0) for the partial page. Default True on recurrent models
+
+        :param recurrent_eviction:
+            Eviction policy for the recurrent cache: "lru" (default) or "gds". "gds" is GreedyDual-Size over the
+            prefill seconds a checkpoint saves per byte it occupies (see prefill_cost_coefficients), which keeps
+            states that are expensive to recompute and cheap to store, independent of workload tuning
+
+        :param prefill_cost_coefficients:
+            (D, E) for the "gds" policy: prefill seconds saved by a checkpoint are approximated as
+            D * saved_tokens + E. Only their ratio matters. Default (1.0, 0.0), i.e. value proportional to the
+            prefix length
+
         :param kwargs:
         """
 
@@ -390,6 +410,14 @@ class Generator:
         # Recurrent cache. A job's recurrent state is a PairedState over the target and draft sides;
         # both sides checkpoint together into this one pool (see PairedState)
         self.recurrent_cache_size = recurrent_cache_size
+        self.recurrent_frontier_checkpoints = bool(recurrent_frontier_checkpoints)
+        assert recurrent_eviction in ("lru", "gds"), \
+            f"recurrent_eviction must be 'lru' or 'gds', not {recurrent_eviction!r}"
+        self.recurrent_eviction = recurrent_eviction
+        if prefill_cost_coefficients is None:
+            prefill_cost_coefficients = (1.0, 0.0)
+        d, e = prefill_cost_coefficients
+        self.prefill_cost_coefficients = (float(d), float(e))
         self.target_recurrent = bool(self.model.caps.get("recurrent_states"))
         self.draft_recurrent = bool(draft_model is not None and draft_model.caps.get("recurrent_states"))
         if self.target_recurrent:
@@ -405,9 +433,18 @@ class Generator:
                 f"max_history >= {self.num_draft_tokens} (this cache has max_history = {draft_cache.max_history})"
             )
         if self.target_recurrent or self.draft_recurrent:
-            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size, draft_model)
+            self.recurrent_cache = RecurrentCache(
+                self.model,
+                recurrent_cache_size,
+                draft_model,
+                eviction_policy = self.recurrent_eviction,
+                prefill_cost_d = self.prefill_cost_coefficients[0],
+                prefill_cost_e = self.prefill_cost_coefficients[1],
+            )
             self.recurrent_cache.pagetable = self.pagetable
             self.recurrent_cache.disk_tier = self.disk_page_cache
+            # Arbitrary-position checkpoints persisted by an earlier process are indexed by their page chain
+            self.recurrent_cache.rebuild_partial_index()
             if self.disk_page_cache is not None:
                 # Which model and cache stash under each side of a PairedState: a tensor-parallel side's
                 # checkpoints are written and read by that model's ranks
@@ -522,6 +559,8 @@ class Generator:
             alloc_cached_pages: of those, pages that were reused from the prompt cache
             alloc_tier_pages: of those, pages restored from the system-memory tier (including pages that were
                 promoted there from disk first)
+            alloc_partial_pages: of those, partially filled pages restored for a checkpoint at an arbitrary
+                token position (FlashStates ASC), which resume a sequence inside a page
             alloc_disk_pages: of those, pages that came from the disk tier, whether the enqueue-time prefetch
                 or the allocation itself promoted them; a page counts here the first time it is restored after
                 its promotion and as an ordinary tier page from then on
@@ -549,6 +588,7 @@ class Generator:
             sum(1 for h in pt.referenced_pages if is_content_hash(h)),
             pt.metrics["alloc_pages"],
             pt.metrics["evictions"],
+            pt.metrics["partial_stores"],
             pt.last_defrag_serial,
             len(tier) if tier is not None else 0,
             (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
@@ -619,6 +659,7 @@ class Generator:
             "alloc_cached_pages": alloc_cached,
             "alloc_tier_pages": alloc_tier,
             "alloc_disk_pages": alloc_disk,
+            "alloc_partial_pages": pt.metrics["alloc_partial_pages"],
             "hit_rate": alloc_cached / alloc_prompt if alloc_prompt else None,
             "tier_hit_rate": alloc_tier / alloc_prompt if alloc_prompt else None,
             "disk_hit_rate": alloc_disk / alloc_prompt if alloc_prompt else None,
@@ -2030,13 +2071,15 @@ class Generator:
 
                     # EOS. Stop sampling this job immediately once a stop condition, filter condition or max
                     # token limit produces an EOS event. Draft positions from the EOS position onward were fed
-                    # to verification but never resolved; count them as rejected so accepted + rejected equals
-                    # the number of drafted positions (no cache/state rollback needed, the pages are released).
-                    # The EOS stream event was already built inside receive_sample, so patch its counter too
+                    # to verification but never resolved; settle the target state and the page positions to
+                    # the accepted sequence before the job is released. The pages are about to be freed, but
+                    # the FlashStates frontier checkpoint stores the exact request end, and it must be paired
+                    # with a state that describes the K/V this request leaves behind.
                     if eos:
                         num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
                         if num_unresolved:
-                            job.rejected_draft_tokens += num_unresolved
+                            reject_remainder(job, j, i, batch_states)
+                            # The EOS stream event was built inside receive_sample, patch its counter too
                             for r_ in reversed(results):
                                 if r_.get("eos") and r_["job"] is job:
                                     if "rejected_draft_tokens" in r_:
@@ -2222,8 +2265,14 @@ class Generator:
         # recurrent state.
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
-            if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            if self.recurrent_cache is not None:
+                # FlashStates frontier checkpoint: the finished (or requeued) request's hybrid state at its
+                # exact end, page-aligned or not. The next turn reuses exactly this prefix
+                job.frontier_checkpoint(self.recurrent_cache)
+                if job in requeuing_jobs:
+                    job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            # Leave the page-aligned rolling checkpoint the engine keeps for the job's last complete page, so a
+            # follow-up prompt extending the output replays less than a page (a no-op unless rolling_checkpoint)
             job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)

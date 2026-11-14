@@ -311,6 +311,9 @@ class Job:
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
         self.rolling_stash = None
+        # True when the state was restored from a checkpoint that ends inside a page, so prefill may start at a
+        # non-page-aligned position
+        self.partial_prefix = False
 
         # Loop detector. A requeued job continues the detector of its first pass (whose input is the original
         # prompt, so it is primed only there)
@@ -670,7 +673,10 @@ class Job:
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
         rc = self.generator.recurrent_cache
-        if rc is not None:
+        if rc is not None and not is_content_hash(old_hash):
+            # Only a deferred page has a placeholder hash while its checkpoint exists. A page restored for an
+            # arbitrary-position checkpoint carries the content hash of the partial prefix it was stored
+            # under; that checkpoint is not the state at the end of this page and must keep its own key
             rc.rekey(old_hash, new_hash)
 
         # If another referenced page has the same hash, switch to referencing that instead
@@ -1459,7 +1465,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or self.partial_prefix
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1746,15 +1752,28 @@ class Job:
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
                     self.recurrent_state = self.generator.new_recurrent_state()
+                    self.partial_prefix = False
                 else:
+                    # An arbitrary-position checkpoint carries the exact resume position, which need not be a
+                    # page boundary; the page-aligned prefix length is only the fallback
+                    position = stashed_recurrent_state.get("position", cached_pages * PAGE_SIZE)
                     self.recurrent_state = self.generator.recurrent_state_from_stashed(
                         stashed_recurrent_state,
-                        position = cached_pages * PAGE_SIZE,
+                        position = position,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+                    self.partial_prefix = bool(stashed_recurrent_state.get("offset"))
 
             # Metrics
             self.cached_pages += cached_pages
+            # An arbitrary-position checkpoint resumes inside a page: count the tokens
+            # past the last complete page as reused too, or the metric understates the
+            # prefix this job actually skipped (page-aligned stashes add zero here)
+            if stashed_recurrent_state is not None:
+                self.cached_tokens += max(
+                    0,
+                    int(stashed_recurrent_state.get("position", 0)) - cached_pages * PAGE_SIZE,
+                )
             self.total_pages += allocated_pages
             self.non_sequential_pages += non_sequential_pages
 
@@ -1851,6 +1870,80 @@ class Job:
             self._mm_exact_spans = spans
         return spans
 
+    def frontier_checkpoint(self, cache) -> bool:
+        """
+        Store the recurrent state at the sequence's exact current position, page-aligned or not.
+
+        This is FlashStates' frontier checkpoint: the end of a prompt or a request is rarely a page boundary,
+        and the next turn reuses exactly that prefix. A position inside a page stores the partially filled page
+        in the page tiers under the content hash of the prefix, then the state under the same key, so a later
+        request with a matching prefix restores K/V and state at the exact token instead of replaying up to the
+        next boundary. Returns True if a checkpoint was stored.
+        """
+        if self.recurrent_state is None or cache is None or len(self.sequences) != 1:
+            return False
+        if not getattr(self.generator, "recurrent_frontier_checkpoints", False):
+            return False
+        seq = self.sequences[0]
+        state_pos = self.recurrent_state.position
+        if state_pos > seq.kv_position:
+            # A max_tokens stop can land inside a speculative draft window: the target
+            # state has advanced through the draft tokens but the K/V only holds the
+            # accepted ones. Settle it back to the accepted prefix before stashing.
+            excess = state_pos - seq.kv_position
+            try:
+                self.recurrent_state.rewind(excess)
+            except AssertionError:
+                return False
+            state_pos = self.recurrent_state.position
+        if state_pos <= 0 or state_pos > seq.kv_position:
+            return False
+        # The state can also trail by one token at an ordinary request end: the last
+        # sampled token is in the sequence but has not been run through the model yet.
+        # Checkpoint the prefix the state actually describes; the extra K/V row is
+        # harmless because resuming there overwrites it during the replay prefill.
+        pos = state_pos
+        if self.last_recurrent_checkpoint_pos == pos:
+            return False
+
+        if pos % PAGE_SIZE == 0:
+            last_page = pos // PAGE_SIZE - 1
+            if last_page >= len(seq.allocated_pages):
+                return False
+            page = seq.allocated_pages[last_page]
+            if page.kv_position != PAGE_SIZE or not is_content_hash(page.phash):
+                return False
+            cache.put(page.phash, self.recurrent_state)
+            self.last_recurrent_checkpoint_pos = pos
+            return True
+
+        # Inside a page: needs a page tier to hold the partial K/V
+        pagetable = self.pagetable
+        if pagetable is None or pagetable.cpu_tier is None:
+            return False
+        k = pos // PAGE_SIZE
+        offset = pos - k * PAGE_SIZE
+        if k >= len(seq.allocated_pages):
+            return False
+        page = seq.allocated_pages[k]
+        if page.kv_position < offset:
+            return False
+        anchor = seq.allocated_pages[k - 1].phash if k > 0 else None
+        if anchor is not None and (not is_content_hash(anchor) or page.prev_hash != anchor):
+            # A deferred (not yet final) ancestor has no stable hash to anchor on; the page-boundary
+            # checkpoints already cover this sequence
+            return False
+        ids = seq.sequence_ids.torch_slice(k * PAGE_SIZE, pos)
+        key = tensor_hash_checksum(ids, anchor)
+        # Do not let the store evict any page of the chain this checkpoint depends on
+        protect = {p.phash for p in seq.allocated_pages if is_content_hash(p.phash)}
+        if not pagetable.store_partial_page(page, key, protect = protect):
+            return False
+        cache.put_partial(key, self.recurrent_state, anchor, offset)
+        self.last_recurrent_checkpoint_pos = pos
+        return True
+
+
     def maybe_stash_recurrent(self, cache, interval = None):
         """
         Store the current recurrent state if the sequence is at a checkpoint boundary.
@@ -1859,6 +1952,13 @@ class Job:
 
         if seq.kv_position == 0:
             return
+
+        # Prefill has just reached the end of the prompt (the last prompt token is still unprocessed), and the
+        # end is usually not page-aligned: capture it exactly. One attempt per position
+        if len(self.sequences) == 1 and self.new_tokens == 0 and self.is_prefill_done() and \
+                self.last_recurrent_checkpoint_pos != seq.kv_position:
+            if self.frontier_checkpoint(cache):
+                return
 
         if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:

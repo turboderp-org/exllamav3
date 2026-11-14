@@ -151,6 +151,25 @@ def test_chunk_ending_at_prompt_boundary_reuses_table():
     check_chunk(1024, 1175, 768, 1024)
 
 
+def test_partial_prefix_allows_a_non_aligned_prefill_start():
+    # A checkpoint restored at an arbitrary position starts prefill inside a page; the forward pass gets the
+    # exact prefix length and the token slice from that position
+    job = make_job(1175, 1175, 1124, image = False)
+    job.partial_prefix = True
+    with pytest.raises(ModelBoundaryReached):
+        job.prefill([])
+    ids, params = job.generator.model.calls[0]
+    assert params["cache_seqlens"].item() == 1124
+    assert ids.shape[-1] == 1174 - 1124
+    torch.testing.assert_close(ids, job.sequences[0].sequence_ids.torch_slice(1124, 1174))
+
+
+def test_non_aligned_prefill_start_is_rejected_without_a_partial_checkpoint():
+    job = make_job(1175, 1175, 1124, image = False)
+    with pytest.raises(AssertionError):
+        job.prefill([])
+
+
 def test_text_only_replay_needs_no_multimodal_metadata():
     _, params = check_chunk(1125, 1401, 1280, 1400, image = False)
     assert params["mm_span_prefix"] == 0
