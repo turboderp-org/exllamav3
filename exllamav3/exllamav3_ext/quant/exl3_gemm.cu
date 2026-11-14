@@ -33,6 +33,9 @@ EXL3 matmul, A @ B -> C
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
 - svh: optional, packed output scales/flips, shape (n//16), dtype float16
+- locks: optional, int32 tensor of at least exl3_gemm_lock_elements(n) zero-initialized elements on A's device,
+  used instead of the device's shared lock buffer. Launches on different streams that may run concurrently need
+  separate buffers, launches sharing one must be ordered. The kernel leaves the buffer zeroed. CUDA only
 
 limitations:
 - k % 16 == 0
@@ -127,7 +130,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& owned_locks
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -163,7 +167,21 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
-    int* locks = DevCtx::instance().get_locks(device);
+    int* locks;
+    if (owned_locks)
+    {
+        #if defined(USE_ROCM)
+            TORCH_CHECK(false, "exl3_gemm: caller-owned locks are not supported on ROCm (the grid barrier lives in the device lock buffer)");
+        #endif
+        const at::Tensor& l = owned_locks.value();
+        TORCH_CHECK(l.device() == A.device(), "exl3_gemm: locks must be on A's device");
+        TORCH_CHECK_DTYPE(l, kInt);
+        TORCH_CHECK(l.is_contiguous(), "exl3_gemm: locks must be contiguous");
+        TORCH_CHECK(l.numel() >= exl3_gemm_lock_elements(B.size(1) * 16), "exl3_gemm: locks buffer too small");
+        locks = (int*) l.data_ptr();
+    }
+    else
+        locks = DevCtx::instance().get_locks(device);
     // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
     // request would fail the launch there. Ask for what this device actually permits.
     int smem_max = DevCtx::instance().get_smem_request(device);
@@ -220,8 +238,8 @@ int exl3_gemm_gr
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
-    // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    // to the regular kernel. It keeps its own per-device workspace, so callers with their own locks skip it
+    if (mul1 && !owned_locks && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -417,7 +435,8 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    const c10::optional<at::Tensor>& locks
 )
 {
     return exl3_gemm_gr
@@ -432,8 +451,20 @@ int exl3_gemm
         mcg,
         mul1,
         force_num_sms,
-        nullptr
+        nullptr,
+        locks
     );
+}
+
+/*
+Number of lock elements exl3_gemm needs for an output width of size_n. The split-K reduction takes one counter per
+column of output tiles, and every TILESIZE_N is a multiple of 128
+*/
+
+int64_t exl3_gemm_lock_elements(int64_t size_n)
+{
+    TORCH_CHECK(size_n > 0 && size_n % 128 == 0, "exl3_gemm_lock_elements: size_n must be a positive multiple of 128");
+    return size_n / 128;
 }
 
 /*
