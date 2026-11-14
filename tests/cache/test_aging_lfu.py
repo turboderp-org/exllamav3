@@ -1,0 +1,272 @@
+"""
+Aging-LFU prompt-cache weights: the SQLite sidecar (generator/aging_lfu.py), the page table's hit credit and
+eviction ordering, and the CPU tier ordering it inherits.
+
+The policy is pure host-side bookkeeping over page records, so these drive a real PageTable over a stand-in
+cache (testlib.cache) and a real CPUPageCache over a stand-in cache layer. No model is loaded and no tokens
+are generated: a "hit" is a second allocation of hashes the page table already holds.
+"""
+
+import time
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from exllamav3.generator.aging_lfu import PrefixWeightStore
+from exllamav3.generator.cpu_cache import CPUPageCache
+from exllamav3.generator.pagetable import PAGE_SIZE, PageTable
+from testlib.cache import FakeCacheLayer, page, phash
+
+NUM_PAGES = 8
+
+
+def fake_cache(pages = 64):
+    # PageTable only reads max_num_tokens from the cache at construction
+    return SimpleNamespace(max_num_tokens = pages * PAGE_SIZE)
+
+
+def cached_chain(pt: PageTable, hashes: list[bytes], kv_complete = True):
+    """Allocate a chain of pages, link it root -> leaf and release it back into the prompt cache."""
+
+    pages, _, _, _ = pt.allocate_pages(hashes, 0, None)
+    for p in pages:
+        p.kv_position = PAGE_SIZE if kv_complete else 0
+    for p, prev in zip(pages[1:], hashes[:-1]):
+        p.prev_hash = prev
+    pt.deallocate_pages(pages)
+    return pages
+
+
+def test_weight_store_round_trips(tmp_path):
+    # Weights and prefix token IDs must survive the process that earned them
+    store = PrefixWeightStore(str(tmp_path))
+    store.put_weights([(b"\x00\x01", 1.5, 100.0), (b"\x00\x02", 2.0, 200.0)])
+    store.put_prefix("system", torch.arange(5, dtype = torch.int64).contiguous().numpy().tobytes())
+    store.close()
+
+    reopened = PrefixWeightStore(str(tmp_path))
+    assert reopened.load_weights() == {b"\x00\x01": (1.5, 100.0), b"\x00\x02": (2.0, 200.0)}
+    (label, blob), = reopened.load_prefixes()
+    assert label == "system"
+    assert torch.frombuffer(bytearray(blob), dtype = torch.int64).tolist() == [0, 1, 2, 3, 4]
+    reopened.close()
+
+
+def test_hit_credit_is_capped_per_hit_and_per_page():
+    # A 245K one-off document covers ~960 pages and must not dominate after a single read: the hit earns at
+    # most aging_hit_cap_pages total, spread over the pages it covered
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_hit_cap_pages = 64)
+    pages = [SimpleNamespace(phash = bytes([i % 256]), weight = 0.0, last_hit = 0.0) for i in range(960)]
+
+    pt._credit_hit(pages)
+    assert all(p.weight == pytest.approx(64 / 960) for p in pages)
+    assert pt.metrics["aging_hits"] == 1 and pt.metrics["aging_credit_pages"] == 960
+
+    pt._credit_hit(pages)
+    assert all(p.weight == pytest.approx(128 / 960) for p in pages)
+
+
+def test_hit_credit_respects_the_per_page_cap():
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_weight_cap = 3.0, aging_hit_cap_pages = 64)
+    pages = [SimpleNamespace(phash = b"\x00\x01", weight = 2.5, last_hit = 0.0)]
+    pt._credit_hit(pages)
+    assert pages[0].weight == 3.0
+
+
+def test_effective_weight_decays_with_the_half_life():
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_half_life_hours = 72.0)
+    past = time.time() - 72 * 3600
+    page_rec = SimpleNamespace(phash = b"\x00\x03", weight = 8.0, last_hit = past)
+    assert pt._effective_weight(page_rec) == pytest.approx(4.0)
+
+    pt._weights[b"\x00\x04"] = (8.0, past)
+    assert pt.effective_weight_hash(b"\x00\x04") == pytest.approx(4.0)
+    assert pt.effective_weight_hash(b"\x00\x05") == 0.0
+
+
+def test_allocation_credits_reused_pages():
+    pt = PageTable(None, fake_cache(), aging_lfu = True)
+    hashes = [b"\x10\x01", b"\x10\x02", b"\x10\x03"]
+    cached_chain(pt, hashes)
+
+    pages, _, cached, _ = pt.allocate_pages(hashes, 0, None)
+    assert cached == 3
+    # One hit over three pages earns three pages of credit, one per page
+    assert all(p.weight == pytest.approx(1.0) for p in pages)
+    assert pt.metrics["aging_hits"] == 1
+
+
+def test_weights_survive_a_restart(tmp_path):
+    hashes = [b"\x20\x01", b"\x20\x02"]
+    first = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path))
+    cached_chain(first, hashes)
+    first.allocate_pages(hashes, 0, None)
+    first.close()
+
+    # A new process: the pages are gone, the weights keyed by hash are not, and the pages recreated by a
+    # fresh prefill of the same token sequence inherit them
+    second = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path))
+    pages, _, _, _ = second.allocate_pages(hashes, 0, None)
+    assert all(p.weight == pytest.approx(1.0) for p in pages)
+    second.close()
+
+
+def filled_chain(pt, tokens, base = 0x40):
+    """Cache a chain holding the given tokens, which must cover whole pages, and return (pages, hashes)."""
+    assert len(tokens) % PAGE_SIZE == 0
+    hashes = [bytes([base, i]) for i in range(len(tokens) // PAGE_SIZE)]
+    pages, _, _, _ = pt.allocate_pages(hashes, 0, None)
+    for i, p in enumerate(pages):
+        p.sequence[0, :] = torch.tensor(tokens[i * PAGE_SIZE: (i + 1) * PAGE_SIZE], dtype = torch.long)
+        p.kv_position = PAGE_SIZE
+    for p, prev in zip(pages[1:], hashes[:-1]):
+        p.prev_hash = prev
+    pt.deallocate_pages(pages)
+    return pages, hashes
+
+
+def hit_chain(pt, hashes):
+    pages, _, _, _ = pt.allocate_pages(hashes, 0, None)
+    pt.deallocate_pages(pages)
+
+
+def test_capture_persists_hit_chain_tokens_and_replays(tmp_path):
+    # A hit whose chain earns weight also stores the chain's token IDs, so a fresh process can re-prefill it
+    tokens = list(range(1000, 1000 + 3 * PAGE_SIZE))
+    kwargs = dict(aging_lfu = True, aging_persist_dir = str(tmp_path), aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    first = PageTable(None, fake_cache(), **kwargs)
+    _, hashes = filled_chain(first, tokens)
+    hit_chain(first, hashes)
+
+    (label, ids), = first.stored_prefixes()
+    assert label.startswith("auto-")
+    assert ids.reshape(-1).tolist() == tokens
+    assert first.metrics["aging_prefix_captures"] == 1
+    first.close()
+
+    second = PageTable(None, fake_cache(), **kwargs)
+    (label, ids), = second.stored_prefixes()
+    assert label.startswith("auto-")
+    assert ids.reshape(-1).tolist() == tokens
+    # Replaying the stored tokens recreates the same hash chain, and those pages inherit the weight it earned
+    pages, _ = filled_chain(second, tokens)
+    assert all(p.weight > 0.0 for p in pages)
+    second.close()
+
+
+def test_capture_skips_short_chains(tmp_path):
+    tokens = list(range(1000, 1000 + PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    hit_chain(pt, hashes)
+    assert pt.stored_prefixes() == []
+    pt.close()
+
+
+def test_capture_truncates_to_max_tokens(tmp_path):
+    tokens = list(range(1000, 1000 + 4 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE, aging_prefix_max_tokens = 3 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    hit_chain(pt, hashes)
+    (_, ids), = pt.stored_prefixes()
+    assert ids.reshape(-1).tolist() == tokens[:3 * PAGE_SIZE]
+    pt.close()
+
+
+def test_capture_supersedes_a_shorter_chain(tmp_path):
+    tokens = list(range(1000, 1000 + 4 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, short = filled_chain(pt, tokens[:2 * PAGE_SIZE])
+    hit_chain(pt, short)
+    assert len(pt.stored_prefixes()) == 1
+
+    # Cache the longer chain (its first pages are the short one), then hit all of it
+    _, long = filled_chain(pt, tokens)
+    hit_chain(pt, long)
+
+    (_, ids), = pt.stored_prefixes()
+    assert ids.reshape(-1).tolist() == tokens, "the longer chain should replace the shorter one"
+    pt.close()
+
+
+def test_capture_drops_the_least_recent_prefix(tmp_path):
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE, aging_prefix_max_entries = 2)
+    for base in (0x50, 0x51, 0x52):
+        tokens = [base] * (2 * PAGE_SIZE)
+        _, hashes = filled_chain(pt, tokens, base = base)
+        hit_chain(pt, hashes)
+        time.sleep(0.01)
+    assert len(pt.stored_prefixes()) == 2
+    pt.close()
+
+
+def test_capture_skips_a_broken_chain(tmp_path):
+    # Replaying a suffix alone would rebuild a different hash chain, so a hit whose ancestry is gone is not stored
+    tokens = list(range(1000, 1000 + 3 * PAGE_SIZE))
+    pt = PageTable(None, fake_cache(), aging_lfu = True, aging_persist_dir = str(tmp_path),
+                   aging_prefix_min_tokens = 2 * PAGE_SIZE)
+    _, hashes = filled_chain(pt, tokens)
+    pt.unreferenced_pages[hashes[0]].clear()
+
+    hit_chain(pt, hashes[1:])
+    assert pt.stored_prefixes() == []
+    pt.close()
+
+
+def test_eviction_takes_cold_tails_before_hot_ones():
+    # Two cached sequences, the older one hot (its pages were repeatedly reused) and the newer one cold.
+    # Raw recency would eat the older tree first; aging-LFU has to prune the cold tail instead
+    pt = PageTable(None, fake_cache(), aging_lfu = True)
+    hot = [b"\x30\x01", b"\x30\x02"]
+    cold = [b"\x31\x01", b"\x31\x02"]
+    hot_pages = cached_chain(pt, hot)
+    cold_pages = cached_chain(pt, cold)
+
+    for p in hot_pages:
+        p.weight = 10.0
+        p.last_hit = time.time()
+
+    order = list(pt.build_eviction_order())
+    positions = {p.phash: i for i, p in enumerate(order)}
+    assert positions[cold[1]] < positions[cold[0]]
+    assert positions[cold[1]] < positions[hot[1]], "cold tail should go before the hot sequence"
+
+
+class FakePageTable:
+    """The CPU/disk tiers only need live-page lookup and hash weights from the page table."""
+
+    def __init__(self, weights = None):
+        self.weights = weights or {}
+
+    def get_live_page(self, h):
+        return None
+
+    def effective_weight_hash(self, h):
+        return self.weights.get(h, 0.0)
+
+
+def test_cpu_tier_orders_leaves_by_weight(device):
+    slots = 8
+    tensor = torch.zeros((NUM_PAGES, 64), dtype = torch.float16, device = device)
+    cache = CPUPageCache([SimpleNamespace(layers = {0: FakeCacheLayer([tensor, None])})], slots * 4096)
+    assert cache.max_slots == slots
+
+    # Chain A (older): root 1 -> leaf 2, and chain B (newer): root 3 -> leaf 4
+    cache.store(page(1, 0), serial = 1)
+    cache.store(page(2, 1, phash(1)), serial = 2)
+    cache.store(page(3, 2), serial = 3)
+    cache.store(page(4, 3, phash(3)), serial = 4)
+
+    # Make the older chain hot; with plain recency its leaf would lead the order
+    cache.attach(FakePageTable({phash(1): 10.0, phash(2): 10.0}))
+    cache._build_order()
+    order = list(cache._order)
+
+    assert order.index(phash(4)) < order.index(phash(2))
+    assert order.index(phash(3)) < order.index(phash(1))
+    cache.close()
