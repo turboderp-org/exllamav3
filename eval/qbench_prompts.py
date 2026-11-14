@@ -32,7 +32,8 @@ output is in-distribution by definition; a qbench project can point `test_trace`
 file and KLD/ppl are then computed only over the sampled (response) token positions, with each
 (context, response) pair as one variable-length row.
 
-Reasoning traces are kept in the scored response. For context in follow-up turns the previous
+Reasoning traces are kept in the scored response, and so is the end-of-turn token of a response
+the model finished by itself. For context in follow-up turns the previous
 response is cleaned the way deployment would (harmony final channel extracted / <think> blocks
 dropped) before re-templating; the stored ids are exactly what the model saw and sampled either
 way.
@@ -760,10 +761,13 @@ def sample_local(generator, config, tokenizer, args, convs, template_vars):
             )
             generator.enqueue(job)
             chunks = []
+            stop_token = None
             total_temp = total_out
             text_temp = ""
             while generator.num_remaining_jobs():
                 for result in generator.iterate():
+                    if result.get("eos_reason") == "stop_token":
+                        stop_token = result["eos_triggering_token_id"]
                     if result["stage"] == "streaming" and "token_ids" in result:
                         chunks.append(result["token_ids"])
                         total_temp += result["token_ids"].shape[-1]
@@ -781,6 +785,9 @@ def sample_local(generator, config, tokenizer, args, convs, template_vars):
             if response_ids.numel() == 0:
                 messages.pop()
                 continue
+            # The generator ends on the end-of-turn token without returning it. The model sampled it like any other
+            # token, so it belongs to the scored response, but not to the text that goes back into the context
+            sampled_ids = response_ids.tolist() + ([stop_token] if stop_token is not None else [])
             rows.append({
                 "conversation": c_idx,
                 "turn": t_idx,
@@ -788,10 +795,10 @@ def sample_local(generator, config, tokenizer, args, convs, template_vars):
                 "lang": conv["lang"],
                 "tools": conv["tools"] is not None,
                 "input_ids": input_ids[0].tolist(),
-                "response_ids": response_ids.tolist(),
+                "response_ids": sampled_ids,
             })
             total_in += input_ids.shape[-1]
-            total_out += response_ids.numel()
+            total_out += len(sampled_ids)
             pb.update(min(total_out, args.min_tokens))
             # Keep tool-call markup in context: cleaned only of reasoning segments, so a
             # scripted tool-role turn can follow it the way a deployed loop's transcript would
@@ -856,7 +863,7 @@ def sample_api(api, args, tokenizer, convs, template_vars):
     histories: "messages" is what the template renders, tool calls structured and reasoning dropped the way the
     local path drops it, and "wire" is what the API gets, with its tool call turns sent back as it returned them."""
     rows = []
-    total_in = total_out = 0
+    total_in = total_out = num_cut = 0
     for conv in convs:
         conv["wire"] = wire_messages(conv["messages"])
         conv["next_turn"] = 0
@@ -903,7 +910,8 @@ def sample_api(api, args, tokenizer, convs, template_vars):
                         if not (r["content"] or r["reasoning"] or r["tool_calls"]):
                             raise ValueError("empty response")
                         assistant = assistant_message(r["content"], r["reasoning"], r["tool_calls"])
-                        ids = response_token_ids(tokenizer, conv["messages"], assistant, template_kwargs)
+                        cut = r["finish_reason"] == "length"
+                        ids = response_token_ids(tokenizer, conv["messages"], assistant, template_kwargs, truncated = cut)
                     except Exception as e:
                         print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
                         continue
@@ -921,6 +929,10 @@ def sample_api(api, args, tokenizer, convs, template_vars):
                     pb.update(min(total_out, args.min_tokens))
                     print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}{len(ids):5}{col_default} tokens "
                           f"({r['finish_reason']}, reasoning {len(r['reasoning'] or '')} chars)")
+                    num_cut += cut
+                    if cut and not r["content"].strip() and not r["tool_calls"]:
+                        # The token limit fell inside the reasoning: there is no answer for a follow-up to refer to
+                        continue
                     conv["messages"].append({k: v for k, v in assistant.items() if k in ("role", "content", "tool_calls")})
                     conv["wire"].append(r["message"] if r["tool_calls"] else {"role": "assistant", "content": r["content"]})
                     active.append(c_idx)
@@ -928,6 +940,9 @@ def sample_api(api, args, tokenizer, convs, template_vars):
             rows += sorted(wave_rows, key = lambda row: row["conversation"])
             active.sort()
 
+    if num_cut:
+        print(f" !! {num_cut} of {len(rows)} responses ran into --max_new_tokens ({args.max_new_tokens}) before the model "
+              f"finished, reasoning included; raise it for complete responses")
     if total_out < args.min_tokens:
         print(f" !! Collected only {total_out:,} of {args.min_tokens:,} response tokens; "
               f"consider a higher --repeats or --max_new_tokens")
