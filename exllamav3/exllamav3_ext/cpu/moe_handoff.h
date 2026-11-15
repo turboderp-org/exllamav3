@@ -14,6 +14,8 @@
 //   [ctrl block]
 //     u32 quit          @ 0    parent -> child: exit the worker loop
 //     u32 pass_wake     @ 64   parent bumps at the start of every forward pass: child spins hard
+//     u32 hot           @ 68   parent -> child: keep polling between passes, the next one is a draft/verify
+//                              handoff away (bounded by MOE_HOT_SPIN_LIMIT after the last job)
 //     u32 abort         @ 128  set by the GPU wait kernel on timeout; parent checks per pass
 //     u32 ready         @ 192  child -> parent: worker loop entered, layers loaded
 //     u32 jobs_tail     @ 256  parent producer index (job ring)

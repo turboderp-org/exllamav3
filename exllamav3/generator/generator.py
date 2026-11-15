@@ -17,6 +17,8 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from ..model.moe_cpu_host import set_moe_cpu_hot
+from ..modules.block_sparse_mlp_cpu import promote_tick
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -840,7 +842,10 @@ class Generator:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
+                # The main model's CPU MoE worker stays hot through the draft, the head's until it ends
+                set_moe_cpu_hot(self.model.config, text = True, draft = True)
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results, draft_window)
+                set_moe_cpu_hot(self.model.config, text = True, draft = False)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results, draft_window)
 
@@ -859,6 +864,9 @@ class Generator:
             )
 
         self.iterate_gen(results, draft_tokens)
+        if not self.active_jobs and self.draft_model and self.mtp_draft:
+            # No draft follows the last verify: let the workers nap
+            set_moe_cpu_hot(self.model.config, text = False, draft = False)
         if round_start is not None and draft_tokens is not None:
             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
             drafted = draft_tokens.shape[-1]
@@ -1700,6 +1708,19 @@ class Generator:
         params["dev_cache"] = dev_cache
 
 
+    def _sync_verify_pass(self, device):
+        """Wait for the queued pass's sampled tokens. Ahead of the wait, while the GPU still runs the pass: the CPU MoE
+        workers' hot polling moves from the main model to the MTP head, and the promote-on-miss decide runs (its
+        transfers queue on the promotion stream, so only the compute stream is waited on)"""
+        config = self.model.config
+        if self.mtp_draft:
+            set_moe_cpu_hot(config, text = False, draft = False)
+        promote_tick(config.infer_params)
+        torch.cuda.current_stream(device).synchronize()
+        if self.mtp_draft:
+            set_moe_cpu_hot(config, text = False, draft = True)
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1908,7 +1929,7 @@ class Generator:
                     sampled = (pinned[k:k + 1],) + sampled[1:]
                 launched.append((job, token_logits, sampled))
             if launched:
-                torch.cuda.synchronize(batch_logits.device)
+                self._sync_verify_pass(batch_logits.device)
                 # The sampled tokens are the next forward's inputs
                 self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
@@ -1950,7 +1971,6 @@ class Generator:
             if pinned_w is None or pinned_w.shape[0] < batch_size or pinned_w.shape[1] < W:
                 pinned_w = torch.empty((max(batch_size, 32), max(W, 8)), dtype = torch.long, pin_memory = True)
                 self.draft_sample_pinned = pinned_w
-            any_cuda = False
             row = 0
             for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a == b: continue
@@ -1976,11 +1996,10 @@ class Generator:
                     if is_cuda:
                         pinned_w[r:r + 1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
                         sampled = (pinned_w[r:r + 1, i:i + 1],) + sampled[1:]
-                        any_cuda = True
                     staged.append((sampled, False))
                 staged_jobs[id(job)] = (staged, rng_state)
-            if any_cuda:
-                torch.cuda.synchronize(batch_logits.device)
+            # Also with nothing staged: the serial walk below waits for this pass anyway
+            self._sync_verify_pass(batch_logits.device)
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
