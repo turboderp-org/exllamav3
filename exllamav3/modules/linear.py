@@ -633,12 +633,7 @@ class Linear(Module):
         if swap_to_device is not None and override_swap_device is not None:
             swap_to_device = override_swap_device
 
-        if isinstance(self.inner, LinearFP16Packed):
-            # Dequantize straight onto the quantizing device (never the load device of a swapped layer)
-            dev = torch.device(swap_to_device) if swap_to_device is not None else self.inner.device
-            orig_weight = self.inner.dequant_weight(dev).float()
-        else:
-            orig_weight = self.inner.get_weight_tensor().float()
+        orig_weight = self.inner.get_weight_tensor().float()
         orig_bias = self.inner.get_bias_tensor()
         self.inner = None
 
@@ -1000,9 +995,8 @@ def convert_exl3_group(
         assert isinstance(linear.inner, LinearFP16), \
             "Inner layer is already quant type"
         # Checkpoint precision, usually still swapped to CPU: quantize_exl3_batch stages the
-        # upload through pinned memory and casts to fp32 on the device. Packed inners are handed
-        # over as they are and dequantized by the stager one at a time on the quantizing device
-        weights.append(linear.inner if isinstance(linear.inner, LinearFP16Packed) else linear.inner.get_weight_tensor())
+        # upload through pinned memory and casts to fp32 on the device
+        weights.append(linear.inner.get_weight_tensor())
         biases.append(linear.inner.get_bias_tensor())
         linear.inner = None
 

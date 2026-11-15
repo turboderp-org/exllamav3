@@ -153,14 +153,14 @@ class Segment:
 
     # Worker
 
-    def start(self, threads = 2, stage_threads = 2, timeout = 60.0):
+    def start(self, threads = 2, stage_threads = 2, timeout = 60.0, numa_tpn = 0):
         from exllamav3.ext import exllamav3_ext as ext
 
         def body():
             try:
                 ext.exl3_moe_cpu_worker_run(self.base, self.num_slots, self.slot_size, self.cap_rows, self.max_hi,
                                             self.max_ho, self.max_topk, self.wstage_off, self.num_wslots,
-                                            self.wslot_size, threads, stage_threads)
+                                            self.wslot_size, threads, stage_threads, numa_tpn)
             except Exception as e:
                 self.error.append(e)
 
