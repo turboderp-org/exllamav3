@@ -3928,7 +3928,8 @@ std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order()
 }
 
 // Pin this process's pool threads from the first SMT sibling on: a second worker process (an MTP head's) then shares
-// the main model's physical cores instead of time-slicing the same LPs. Call before the pool's first use
+// the main model's physical cores instead of time-slicing the same LPs. Short of siblings (no SMT, hybrid E-cores) the
+// order wraps onto the main pool's LPs, and set_moe_cpu_hot keeps only one pool hot. Call before the pool's first use
 void exl3_moe_cpu_pool_pin_siblings()
 {
     std::lock_guard<std::mutex> lock(g_pool_mutex);

@@ -107,7 +107,10 @@ class MoeCpuTuning:
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
         # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0 or the
         # topology is unreadable
-        _, n_phys = ext.exl3_moe_cpu_core_order()
+        order, n_phys = ext.exl3_moe_cpu_core_order()
+        # The pools' placement (moe_mul1.cpp): the main one pins the physical-core prefix of the core order, the
+        # others its SMT siblings, wrapping around when short
+        self.n_phys, self.n_lps = n_phys, len(order)
         self.threads = int(os.environ.get(
             "EXL3_MOE_CPU_THREADS",
             default_worker_threads(n_phys, self.host_cores) if n_phys and self.host_cores > 0
@@ -972,10 +975,23 @@ def _pinning_exhausted(e: Exception) -> bool:
     return "out of memory" in str(e).lower()
 
 
+def _pools_share_lps(hosts):
+    """Whether the main model's pool and the other components' would run on the same LPs: no SMT, fewer SMT siblings
+    than draft threads, or a main pool larger than the physical cores"""
+    text = hosts.get("text")
+    others = sum(host.threads for comp, host in hosts.items() if comp != "text")
+    return text is not None and others > 0 and \
+        (text.threads > TUNING.n_phys or others > TUNING.n_lps - TUNING.n_phys)
+
+
 def set_moe_cpu_hot(config, text, draft):
     """Hot polling of a config's CPU MoE workers across the MTP draft/verify handoff: `text` for the main model's,
     `draft` for every other component's"""
-    for comp, host in getattr(config, "moe_cpu_hosts", {}).items():
+    hosts = getattr(config, "moe_cpu_hosts", {})
+    if text and draft and _pools_share_lps(hosts):
+        # Two hot pools on the same LPs time-slice each other (2-3x slower steps): only the drafting one polls
+        text = False
+    for comp, host in hosts.items():
         host.set_hot(text if comp == "text" else draft)
 
 
@@ -1831,6 +1847,12 @@ class MoeCpuHost:
 
     def promo_stream(self, device):
         return self._promo_state(device)["stream"]
+
+
+    def promo_drain(self):
+        """Wait for the in-flight promote-on-miss transfers, ahead of releasing the GPU slots and arena pages they write"""
+        for P in self._promo.values():
+            P["stream"].synchronize()
 
 
     def _promo_parts(self, layer_idx, linears):

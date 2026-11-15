@@ -587,6 +587,8 @@ class BlockSparseMLP_CPU:
         if self.cpu_split_first is not None:
             host = getattr(self, "cpu_host", None)
             if host is not None:
+                # The generator waits on the compute stream only: a pass's transfers can still be running
+                host.promo_drain()
                 host.unregister()
             (self.gates, self.ups, self.downs, self.modules,
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved

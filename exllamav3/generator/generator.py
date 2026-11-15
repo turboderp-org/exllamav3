@@ -864,6 +864,9 @@ class Generator:
             )
 
         self.iterate_gen(results, draft_tokens)
+        if not self.active_jobs and self.draft_model and self.mtp_draft:
+            # No draft follows the last verify: let the workers nap
+            set_moe_cpu_hot(self.model.config, text = False, draft = False)
         if round_start is not None and draft_tokens is not None:
             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
             drafted = draft_tokens.shape[-1]
@@ -1968,7 +1971,6 @@ class Generator:
             if pinned_w is None or pinned_w.shape[0] < batch_size or pinned_w.shape[1] < W:
                 pinned_w = torch.empty((max(batch_size, 32), max(W, 8)), dtype = torch.long, pin_memory = True)
                 self.draft_sample_pinned = pinned_w
-            any_cuda = False
             row = 0
             for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a == b: continue
@@ -1994,11 +1996,10 @@ class Generator:
                     if is_cuda:
                         pinned_w[r:r + 1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
                         sampled = (pinned_w[r:r + 1, i:i + 1],) + sampled[1:]
-                        any_cuda = True
                     staged.append((sampled, False))
                 staged_jobs[id(job)] = (staged, rng_state)
-            if any_cuda:
-                self._sync_verify_pass(batch_logits.device)
+            # Also with nothing staged: the serial walk below waits for this pass anyway
+            self._sync_verify_pass(batch_logits.device)
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]

@@ -154,3 +154,25 @@ def test_landed_transfers_upload_in_one_copy_per_device(device):
         assert m._split_mp[5] == 2 and m._split_mp[1] == m.cpu_split_first + 3
         assert m._split_map.cpu().tolist() == m._split_mp.tolist()
         assert m._split_free_cpu == [1] and m._split_free_gpu == [1]
+
+
+def test_unload_drains_promotion_transfers_first():
+    """The generator waits on the compute stream only, so a pass's transfers can still run at unload: they write the
+    GPU slots and the worker's arena pages the unload releases"""
+    calls = []
+    host = SimpleNamespace(promo_drain = lambda: calls.append("drain"), unregister = lambda: calls.append("unregister"))
+    m = SimpleNamespace(
+        cpu_split_first = 4, cpu_host = host, cpu_offload = False, _split_map = None,
+        _split_saved = (None,) * 7, config = SimpleNamespace(infer_params = InferParams()),
+    )
+    BlockSparseMLP_CPU.cpu_unload(m)
+    assert calls == ["drain", "unregister"]
+
+
+def test_promo_drain_waits_on_every_device_stream():
+    import exllamav3.model.moe_cpu_host as mch
+    waited = []
+    host = object.__new__(mch.MoeCpuHost)
+    host._promo = {i: dict(stream = SimpleNamespace(synchronize = lambda i = i: waited.append(i))) for i in (0, 1)}
+    host.promo_drain()
+    assert waited == [0, 1]
