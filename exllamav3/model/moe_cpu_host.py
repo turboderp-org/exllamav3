@@ -984,9 +984,16 @@ def _pools_share_lps(hosts):
         (text.threads > TUNING.n_phys or others > TUNING.n_lps - TUNING.n_phys)
 
 
+# Hot polling trades busy cores for the wake-up of a napping worker. That wake-up is only slow enough to be worth the
+# trade on Windows; elsewhere a worker is back before polling would have saved anything
+HOT_POLLING = os.name == "nt"
+
+
 def set_moe_cpu_hot(config, text, draft):
     """Hot polling of a config's CPU MoE workers across the MTP draft/verify handoff: `text` for the main model's,
-    `draft` for every other component's"""
+    `draft` for every other component's. Does nothing where hot polling is off (HOT_POLLING)"""
+    if not HOT_POLLING:
+        return
     hosts = getattr(config, "moe_cpu_hosts", {})
     if text and draft and _pools_share_lps(hosts):
         # Two hot pools on the same LPs time-slice each other (2-3x slower steps): only the drafting one polls
