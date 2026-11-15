@@ -310,13 +310,14 @@ def test_partial_survival_merges_only_the_failed_groups():
 def test_trailing_run_reaches_the_end():
     """A run that ends at the text's end offers only its start as a candidate (the end is not a cut
     position), and once the cut lands there, the rest of the text is one whitespace run with nothing
-    left to cut: _cut_positions stops at the empty group and the cut still holds"""
+    left to cut: _cut_positions stops at the empty group. The run fills the window past the candidate,
+    which then shows nothing of where the run ends, so the cut is not taken and the text encodes whole"""
     wordy = ("w " * 12000).rstrip()
     text = wordy + "\n" * 26000
     a = len(wordy)
     assert _cut_positions(text) == [[a]]
     tok = _make_tok(_make_backend("byte-level"))
-    assert tok._verified_cuts(text, [[a]]) == [a]
+    assert tok._verified_cuts(text, [[a]]) == []
     assert encode_chunks(tok.tokenizer, tok._chunks(text)) == tok.tokenizer.encode(
         text, add_special_tokens = False).ids
 

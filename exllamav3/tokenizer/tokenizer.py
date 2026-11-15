@@ -37,9 +37,11 @@ _CHUNK_TARGET_CHARS = 16384
 _CHUNK_MAX = 128
 # Chars of text on each side of a cut for that check, comfortably past the longest piece of a vocabulary
 # (128 chars in the tokenizers of the corpus), so no piece straddling a cut can hide outside the window.
-# That proves the check for BPE, whose merges only look that far; a non-BPE backend (Unigram's Viterbi
-# spans the whole pre-token) can segment a piece longer than the window differently in the window than
-# in the whole text, so there the check degrades to a heuristic
+# The check is evidence rather than proof: a backend splits a pre-token as a whole, and one that reaches
+# past the window can come out differently in the window than in the whole text. With the usual
+# pre-tokenizers the pre-tokens that long at a cut are runs of whitespace, so a candidate whose window is
+# all whitespace on one side is not taken (see `_verified_cuts`). A backend with no pre-tokenizer, or a
+# Unigram one (its Viterbi spans the whole pre-token), keeps that risk on long unbroken runs of other text
 _CHUNK_WINDOW = 256
 
 
@@ -379,6 +381,15 @@ class Tokenizer:
                 flat += [text[a:b], text[a:p], text[p:b]]
             return flat
 
+        # The window only shows what the tokenizer does at a cut if it reaches past the whitespace on both
+        # sides of it. Whitespace that fills a whole side can be part of one piece that starts or ends outside
+        # the window, and how that piece splits at the cut depends on its full length, so such a candidate
+        # proves nothing and is not taken
+        def in_view(p: int) -> bool:
+            a, b = max(0, p - _CHUNK_WINDOW), min(n, p + _CHUNK_WINDOW)
+            return (a == 0 or not text[a:p].isspace()) and (b == n or not text[p:b].isspace())
+
+        groups = [[p for p in group if in_view(p)] for group in groups]
         groups = [group for group in groups if group]
         if not groups:
             return []
