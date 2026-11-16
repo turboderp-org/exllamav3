@@ -1517,7 +1517,7 @@ def _paged_attn_prefill_kernel(
     v_new,
     sinks,
     num_splits,          # runtime: only enters the split-span arithmetic; IS_SPLIT gates the code
-    resume,              # runtime: reload the running state of the earlier kv slices (staging)
+    resume: tl.constexpr,              # constexpr: reload the running state of the earlier kv slices (staging)
     IS_SPLIT: tl.constexpr,   # num_splits > 1: store partials for the combine pass
     NEW_KV: tl.constexpr,     # 0: all kv in cache; 1: kv >= cache_seqlens[b] read from k_new/v_new;
                               # 2: like 1 but the cache is known empty (keeps the maskless split)
