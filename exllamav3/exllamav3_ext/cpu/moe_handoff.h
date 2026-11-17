@@ -105,6 +105,85 @@ struct MoeJob
 #define MOE_STAGE_JOBS_OFFSET (MOE_STAGE_TAIL_OFFSET + 128)
 #define MOE_CTRL_SIZE (MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * sizeof(MoeJob))
 
+// Multi-NUMA N-split (moe_cpu_numa_nodes): W worker processes, one per NUMA node, each holding a
+// slice of every CPU-resident expert's intermediate dimension and writing a partial output that
+// the collecting stream sums. Worker 0 uses the single-worker layout above unchanged. Workers 1..W-1 each get an
+// extension block with their own rings, followed by one shared bank of arrival counters, all
+// appended after the rest of the segment at the layout's wext_off (a single worker allocates
+// none):
+//
+//   [extension block w]  @ wext_off + (w - 1) * MOE_WEXT_SIZE
+//     u32 ready, jobs_tail, jobs_head, the job ring, stage_tail, stage_head and the stage ring,
+//     as in the legacy block
+//   [arrival counters]   @ wext_off + (W - 1) * MOE_WEXT_SIZE, MOE_ARRIVE_SIZE bytes
+//     u32 arrive_done[MAX_SLOTS], arrive_stage[MAX_WSLOTS], each 64-byte strided
+//
+// Shared by all workers: quit, pass_wake, hot, abort, every flag (data_ready[], done[], consumed[],
+// stage_done[], pinned_free[] at their single-worker places) and the slot inputs. A worker
+// finishing its part of a job (or a stage job) bumps the slot's arrival counter; the one that
+// completes the set resets it and publishes the flag, so the GPU waits on one flag whatever the
+// worker count. The reset can't race the next tenant: a slot's next job starts only after the
+// GPU consumed this one, which follows the flag, which follows the reset. Each slot carries one
+// fp32 output section per worker, worker w's at off_out + w * align64(cap_rows * max_ho * 4) (a
+// single worker's sits where it always did). Each worker stages into its own weight-staging
+// region; worker 0's is the legacy one.
+#define MOE_MAX_WORKERS 8
+#define MOE_WEXT_READY 0
+#define MOE_WEXT_JOBS_TAIL 64
+#define MOE_WEXT_JOBS_HEAD 128
+#define MOE_WEXT_JOBS 192
+#define MOE_WEXT_STAGE_TAIL (MOE_WEXT_JOBS + MOE_JOB_RING * sizeof(MoeJob))
+#define MOE_WEXT_STAGE_HEAD (MOE_WEXT_STAGE_TAIL + 64)
+#define MOE_WEXT_STAGE_JOBS (MOE_WEXT_STAGE_HEAD + 64)
+#define MOE_WEXT_SIZE (MOE_WEXT_STAGE_JOBS + MOE_STAGE_RING * sizeof(MoeJob))
+#define MOE_ARRIVE_SIZE (64 * (MOE_MAX_SLOTS + MOE_MAX_WSLOTS))
+
+// One worker's control words and rings (worker 0: the legacy block)
+struct MoeWorkerCtrl
+{
+    uint32_t* ready;
+    uint32_t* jobs_tail;
+    uint32_t* jobs_head;
+    MoeJob* jobs;
+    uint32_t* stage_tail;
+    uint32_t* stage_head;
+    MoeJob* stage_jobs;
+};
+
+inline MoeWorkerCtrl moe_worker_ctrl(uint8_t* base, int64_t worker, int64_t wext_offset)
+{
+    if (worker == 0)
+        return {
+            reinterpret_cast<uint32_t*>(base + 192),
+            reinterpret_cast<uint32_t*>(base + 256),
+            reinterpret_cast<uint32_t*>(base + 320),
+            reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET),
+            reinterpret_cast<uint32_t*>(base + MOE_STAGE_TAIL_OFFSET),
+            reinterpret_cast<uint32_t*>(base + MOE_STAGE_HEAD_OFFSET),
+            reinterpret_cast<MoeJob*>(base + MOE_STAGE_JOBS_OFFSET),
+        };
+    uint8_t* b = base + wext_offset + size_t(worker - 1) * MOE_WEXT_SIZE;
+    return {
+        reinterpret_cast<uint32_t*>(b + MOE_WEXT_READY),
+        reinterpret_cast<uint32_t*>(b + MOE_WEXT_JOBS_TAIL),
+        reinterpret_cast<uint32_t*>(b + MOE_WEXT_JOBS_HEAD),
+        reinterpret_cast<MoeJob*>(b + MOE_WEXT_JOBS),
+        reinterpret_cast<uint32_t*>(b + MOE_WEXT_STAGE_TAIL),
+        reinterpret_cast<uint32_t*>(b + MOE_WEXT_STAGE_HEAD),
+        reinterpret_cast<MoeJob*>(b + MOE_WEXT_STAGE_JOBS),
+    };
+}
+
+// The arrival counters of a W-worker segment (W > 1)
+inline uint32_t* moe_arrive_done(uint8_t* base, int64_t wext_offset, int64_t num_workers)
+{
+    return reinterpret_cast<uint32_t*>(base + wext_offset + size_t(num_workers - 1) * MOE_WEXT_SIZE);
+}
+inline uint32_t* moe_arrive_stage(uint8_t* base, int64_t wext_offset, int64_t num_workers)
+{
+    return moe_arrive_done(base, wext_offset, num_workers) + 16 * MOE_MAX_SLOTS;
+}
+
 // GPU-side flag ops on the current torch CUDA stream (addresses inside the registered region).
 // Prefer stream memory operations (front-end executed, no SM occupancy, no launch cost) over the
 // kernel fallback; exl3_moe_cpu_set_memops toggles this process-wide (called once, parent-side
@@ -114,24 +193,30 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag);
 
 // Fused split-path handoff (see moe_handoff.cu): the job descriptor, the slot's consumed wait,
 // the issue kernel and the data_ready flag in one call; the done wait, the collect kernel and the
-// consumed flag in the other
+// consumed flag in the other. num_workers > 1 publishes the descriptor into every worker's ring
+// (wext_offset locates workers 1..W-1, see above) and sums the W partials, which sit
+// partial_stride floats apart starting at h_out_ptr, once the last worker has published done
 bool exl3_moe_split_issue_fused
 (
     uintptr_t shm_base, int64_t seq, int64_t layer, int64_t rows, int64_t topk, int64_t slot, int64_t prev_seq,
     at::Tensor sel, const c10::optional<at::Tensor>& map, const c10::optional<at::Tensor>& hist,
     const at::Tensor& y, const at::Tensor& w, int64_t h_sel_ptr, int64_t h_x_ptr, int64_t h_w_ptr,
     at::Tensor dev_count, int64_t hi, int64_t first_cpu,
-    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag
+    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag,
+    int64_t num_workers, int64_t wext_offset
 );
 void exl3_moe_split_collect_fused
 (
     at::Tensor final_out, int64_t h_out_ptr, const at::Tensor& dev_count, int64_t slot, int64_t ho,
-    uintptr_t done_flag, int64_t seq, uintptr_t consumed_flag, uintptr_t abort_flag
+    uintptr_t done_flag, int64_t seq, uintptr_t consumed_flag, uintptr_t abort_flag,
+    int64_t num_workers, int64_t partial_stride
 );
 void exl3_moe_cpu_set_memops(bool enabled);
 
 // Child worker loop: consumes jobs until quit is set. Layer indices in job descriptors refer to
 // the registration order of exl3_moe_cpu_make_layer calls made in this (child) process.
+// worker_idx selects this worker's control block and output section (0 for a single worker, with
+// num_workers 1); wstage_offset is this worker's own weight-staging region.
 void exl3_moe_cpu_worker_run
 (
     uintptr_t shm_base,
@@ -145,5 +230,8 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t worker_idx,
+    int64_t num_workers,
+    int64_t wext_offset
 );

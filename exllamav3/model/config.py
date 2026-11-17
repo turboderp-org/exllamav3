@@ -61,6 +61,10 @@ class InferParams:
         # (see moe_cpu_host.MoeCpuTuning)
         self.moe_cpu_threads = None
         self.draft_moe_cpu_threads = None
+        # Multi-NUMA CPU MoE offload (Linux): the NUMA nodes to run the main model's CPU experts on,
+        # "all" or node IDs (a list or "0,2"), one worker process per node holding a slice of every
+        # CPU expert (see moe_cpu_host.MoeCpuHost). None: the single worker
+        self.moe_cpu_numa_nodes = None
         # Store the vision component's linear-layer weights (fp16 weight or EXL3 trellis) in
         # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
         # Set before loading the vision component

@@ -52,6 +52,27 @@ void cuda_memcpy_async(uintptr_t dst, uintptr_t src, size_t nbytes, int kind)
     TORCH_CHECK(cr == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(cr));
 }
 
+void cuda_memcpy2d_async_batch(const at::Tensor& plan, int kind)
+{
+    TORCH_CHECK(kind == 1 || kind == 2, "cuda_memcpy2d_async_batch: kind must be 1 (host to device) or 2 (device to host)");
+    TORCH_CHECK(plan.device().is_cpu() && plan.scalar_type() == at::kLong && plan.dim() == 2 && plan.size(1) == 6
+                && plan.is_contiguous(), "cuda_memcpy2d_async_batch: plan must be a contiguous CPU int64 (n, 6) tensor");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    const cudaMemcpyKind k = kind == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
+    const int64_t* p = plan.data_ptr<int64_t>();
+    for (int64_t i = 0; i < plan.size(0); ++i, p += 6)
+    {
+        void* dst = reinterpret_cast<void*>(p[0]);
+        const void* src = reinterpret_cast<const void*>(p[2]);
+        const size_t dpitch = (size_t) p[1], spitch = (size_t) p[3], width = (size_t) p[4], height = (size_t) p[5];
+        cudaError_t cr = height == 1
+            ? cudaMemcpyAsync(dst, src, width, k, stream)
+            : cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, k, stream);
+        consume_error(cr);
+        TORCH_CHECK(cr == cudaSuccess, "cudaMemcpy2DAsync failed: ", cudaGetErrorString(cr));
+    }
+}
+
 uintptr_t cuda_host_get_device_pointer(uintptr_t ptr)
 {
     // Device-side alias of memory registered with cudaHostRegisterMapped. Equal to the host

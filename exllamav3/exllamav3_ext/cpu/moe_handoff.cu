@@ -264,25 +264,35 @@ bool exl3_moe_split_issue_fused
     int64_t first_cpu,
     uintptr_t data_ready_flag,
     uintptr_t consumed_flag,
-    uintptr_t abort_flag
+    uintptr_t abort_flag,
+    int64_t num_workers,
+    int64_t wext_offset
 )
 {
     uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
-    uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
-    uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
-    MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
-    const uint32_t tail = *jobs_tail;
-    if (tail - load_acquire_u32(jobs_head) >= MOE_JOB_RING - 4) return false;
+    TORCH_CHECK(num_workers >= 1 && num_workers <= MOE_MAX_WORKERS, "exl3_moe_split_issue_fused: bad worker count");
+    // Every worker's ring must have room before any of them gets the descriptor, so a declined
+    // call leaves all rings untouched
+    for (int64_t wi = 0; wi < num_workers; ++wi)
+    {
+        const MoeWorkerCtrl c = moe_worker_ctrl(base, wi, wext_offset);
+        if (*c.jobs_tail - load_acquire_u32(c.jobs_head) >= MOE_JOB_RING - 4) return false;
+    }
     // Descriptor first: host-visible before the GPU can publish the data flag
-    MoeJob& job = jobs[tail % MOE_JOB_RING];
-    job.seq = (uint32_t) (seq & 0xFFFFFFFFull);
-    job.seq_hi = (uint32_t) ((uint64_t) seq >> 32);
-    job.layer = (uint32_t) layer;
-    job.rows = (uint32_t) rows;
-    job.topk = (uint32_t) topk;
-    job.slot = (uint32_t) slot;
-    job.kind = MOE_JOB_KIND_COMPUTE_GATED;
-    store_release_u32(jobs_tail, tail + 1);
+    for (int64_t wi = 0; wi < num_workers; ++wi)
+    {
+        const MoeWorkerCtrl c = moe_worker_ctrl(base, wi, wext_offset);
+        const uint32_t tail = *c.jobs_tail;
+        MoeJob& job = c.jobs[tail % MOE_JOB_RING];
+        job.seq = (uint32_t) (seq & 0xFFFFFFFFull);
+        job.seq_hi = (uint32_t) ((uint64_t) seq >> 32);
+        job.layer = (uint32_t) layer;
+        job.rows = (uint32_t) rows;
+        job.topk = (uint32_t) topk;
+        job.slot = (uint32_t) slot;
+        job.kind = MOE_JOB_KIND_COMPUTE_GATED;
+        store_release_u32(c.jobs_tail, tail + 1);
+    }
 
     const at::cuda::OptionalCUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
@@ -302,13 +312,16 @@ void exl3_moe_split_collect_fused
     uintptr_t done_flag,
     int64_t seq,
     uintptr_t consumed_flag,
-    uintptr_t abort_flag
+    uintptr_t abort_flag,
+    int64_t num_workers,
+    int64_t partial_stride
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(final_out.get_device()).stream();
+    // With several workers the last one to finish publishes done, so every partial is complete
     flag_wait_on(stream, done_flag, seq, abort_flag);
-    moe_split_collect_add(final_out, h_out_ptr, dev_count, slot, ho);
+    moe_split_collect_add(final_out, h_out_ptr, dev_count, slot, ho, num_workers, partial_stride);
     // Consumption is published AFTER the readback on this same stream: the slot's next tenant
     // (possibly issuing from another device) gates on it
     flag_write_on(stream, consumed_flag, seq);
@@ -344,6 +357,24 @@ inline void store_release_flag(uint32_t* p, const MoeJob& job)
 #endif
 }
 
+// Publish a job's completion: directly with one worker; with several, the worker whose arrival
+// completes the set resets the counter and publishes (the others' parts happen-before through the
+// counter's acq_rel read-modify-writes, so the GPU sees every partial once it sees the flag)
+inline void publish_flag(uint32_t* flag, uint32_t* arrive, uint32_t num_workers, const MoeJob& job)
+{
+    if (arrive)
+    {
+#if defined(_MSC_VER) && !defined(__clang__)
+        const uint32_t n = (uint32_t) _InterlockedIncrement(reinterpret_cast<volatile long*>(arrive));
+#else
+        const uint32_t n = __atomic_add_fetch(arrive, 1u, __ATOMIC_ACQ_REL);
+#endif
+        if (n != num_workers) return;
+        store_release_u32(arrive, 0);
+    }
+    store_release_flag(flag, job);
+}
+
 inline size_t align64(size_t x) { return (x + 63) & ~size_t(63); }
 
 } // namespace
@@ -361,7 +392,10 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t worker_idx,
+    int64_t num_workers,
+    int64_t wext_offset
 )
 {
     // GIL is released by the binding's call_guard; do not release it again here
@@ -369,17 +403,22 @@ void exl3_moe_cpu_worker_run
     uint32_t* quit = reinterpret_cast<uint32_t*>(base + 0);
     uint32_t* pass_wake = reinterpret_cast<uint32_t*>(base + 64);
     uint32_t* hot = reinterpret_cast<uint32_t*>(base + 68);
-    uint32_t* ready = reinterpret_cast<uint32_t*>(base + 192);
-    uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
-    uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
-    MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
+    // This worker's control block (worker 0: the legacy block; see moe_handoff.h)
+    const MoeWorkerCtrl ctrl = moe_worker_ctrl(base, worker_idx, wext_offset);
+    uint32_t* ready = ctrl.ready;
+    uint32_t* jobs_tail = ctrl.jobs_tail;
+    uint32_t* jobs_head = ctrl.jobs_head;
+    MoeJob* jobs = ctrl.jobs;
     uint32_t* data_ready = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET);
     uint32_t* done = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS);
     uint32_t* stage_done = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS);
     uint32_t* pinned_free = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS + 64 * MOE_MAX_WSLOTS);
-    uint32_t* stage_tail = reinterpret_cast<uint32_t*>(base + MOE_STAGE_TAIL_OFFSET);
-    uint32_t* stage_head = reinterpret_cast<uint32_t*>(base + MOE_STAGE_HEAD_OFFSET);
-    MoeJob* stage_jobs = reinterpret_cast<MoeJob*>(base + MOE_STAGE_JOBS_OFFSET);
+    // Several workers: the shared flags are published by whichever worker completes the set
+    uint32_t* arrive_done = num_workers > 1 ? moe_arrive_done(base, wext_offset, num_workers) : nullptr;
+    uint32_t* arrive_stage = num_workers > 1 ? moe_arrive_stage(base, wext_offset, num_workers) : nullptr;
+    uint32_t* stage_tail = ctrl.stage_tail;
+    uint32_t* stage_head = ctrl.stage_head;
+    MoeJob* stage_jobs = ctrl.stage_jobs;
     uint8_t* data = base + MOE_CTRL_SIZE;
     uint8_t* wstage = base + wstage_offset;
 
@@ -433,15 +472,18 @@ void exl3_moe_cpu_worker_run
                 wstage + size_t(job.slot) * wslot_size,
                 stage_threads_
             );
-            store_release_flag(stage_done + size_t(job.slot) * 16, job);
+            publish_flag(stage_done + size_t(job.slot) * 16, arrive_stage ? arrive_stage + size_t(job.slot) * 16 : nullptr,
+                         (uint32_t) num_workers, job);
         }
     });
 
-    // Fixed slot section offsets from the registered maxima
+    // Fixed slot section offsets from the registered maxima; with several workers, each writes
+    // its partial output into its own section after the first
     const size_t off_x = 0;
     const size_t off_sel = align64(off_x + size_t(cap_rows) * max_hi * 2);
     const size_t off_w = align64(off_sel + size_t(cap_rows) * max_topk * 4);
-    const size_t off_out = align64(off_w + size_t(cap_rows) * max_topk * 2);
+    const size_t off_out = align64(off_w + size_t(cap_rows) * max_topk * 2)
+        + size_t(worker_idx) * align64(size_t(cap_rows) * max_ho * 4);
 
     // Handoff profiling (EXL3_MOE_HANDOFF_PROF): per-job wall times for the three segments the
     // worker can observe -- idle gap since the previous job, spin-on-data_ready, and compute
@@ -559,7 +601,8 @@ void exl3_moe_cpu_worker_run
                 );
         }
 
-        store_release_flag(done + size_t(job.slot) * 16, job);
+        publish_flag(done + size_t(job.slot) * 16, arrive_done ? arrive_done + size_t(job.slot) * 16 : nullptr,
+                     (uint32_t) num_workers, job);
         last_job = std::chrono::steady_clock::now();
 
         if (hprof)
@@ -575,10 +618,13 @@ void exl3_moe_cpu_worker_run
             hp_prev_end = hp_t2;
             if (++hp_jobs % 64 == 0)
             {
-                printf(" -- handoff prof (%ld jobs, ms/job avg|max): gap %.3f|%.3f "
+                // Several workers: each labels its lines (a single worker's are unchanged)
+                char wtag[16] = "";
+                if (wext_offset) snprintf(wtag, sizeof(wtag), " w%d", (int) worker_idx);
+                printf(" -- handoff prof%s (%ld jobs, ms/job avg|max): gap %.3f|%.3f "
                        "spin %.3f|%.3f compute %.3f|%.3f | empty %ld/64, "
                        "cpu-assign/row %.2f\n",
-                       hp_jobs, hp_gap / 64, hp_gap_mx, hp_spin / 64, hp_spin_mx,
+                       wtag, hp_jobs, hp_gap / 64, hp_gap_mx, hp_spin / 64, hp_spin_mx,
                        hp_comp / 64, hp_comp_mx, hp_empty,
                        hp_rows ? (double) hp_assign / (double) hp_rows : 0.0);
                 fflush(stdout);

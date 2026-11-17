@@ -14,5 +14,9 @@ uintptr_t cuda_host_get_device_pointer(uintptr_t ptr);
 // For host memory registered with cuda_host_register, which torch's copy_ does not always recognize as
 // pinned (it then copies synchronously through a staging buffer)
 void cuda_memcpy_async(uintptr_t dst, uintptr_t src, size_t nbytes, int kind);
+// A batch of cudaMemcpy2DAsync calls on the current stream, as above: plan is a CPU int64 tensor of
+// rows (dst, dpitch, src, spitch, width, height), all in bytes; height 1 issues a plain cudaMemcpyAsync.
+// One call per batch keeps a many-piece gather/scatter (the CPU MoE N-split) off the Python loop
+void cuda_memcpy2d_async_batch(const at::Tensor& plan, int kind);
 int cuda_device_get_attribute(int attr, int device);
 at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device);

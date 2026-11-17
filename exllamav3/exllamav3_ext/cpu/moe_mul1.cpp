@@ -3937,6 +3937,16 @@ void exl3_moe_cpu_pool_pin_siblings()
     g_pool.pin_base = physical_core_order().n_phys;
 }
 
+// Pin this process's pool threads to `cpus` instead of physical_core_order(): a multi-NUMA worker pins to the
+// physical cores of its own node. Call before the pool's first use; ignored when pinning is off (EXL3_MOE_CPU_PIN=0)
+void exl3_moe_cpu_set_core_order(const std::vector<int64_t>& cpus)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    TORCH_CHECK(g_pool.spawned == 0, "exl3_moe_cpu_set_core_order: pool threads already pinned");
+    if (!pin_threads_enabled()) return;
+    g_pool.core_order.assign(cpus.begin(), cpus.end());
+}
+
 // Prime from the handoff worker before its GPU payload is ready.
 void exl3_moe_cpu_pool_prime(int threads)
 {
@@ -4227,6 +4237,7 @@ void exl3_moe_cpu_pool_prime(int) {}
 void exl3_moe_cpu_pool_pin_siblings() {}
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { NO_MOE_CPU(); return 0; }
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order() { return { {}, 0 }; }
+void exl3_moe_cpu_set_core_order(const std::vector<int64_t>&) {}
 void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { NO_MOE_CPU(); }
 bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }

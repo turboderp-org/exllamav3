@@ -11,7 +11,9 @@ from ..util.device_copy import host_to_device
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
-from .moe_cpu_affinity import plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus
+from .moe_cpu_affinity import (plan_host_cpus, default_worker_threads, apply_process_affinity, process_cpus,
+                               numa_topology, pci_bdf_numa_node, parse_numa_nodes, bind_memory_to_node,
+                               check_node_memory)
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -61,6 +63,29 @@ MOE_STAGE_TAIL_OFFSET = MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE
 MOE_STAGE_HEAD_OFFSET = MOE_STAGE_TAIL_OFFSET + 64
 MOE_STAGE_JOBS_OFFSET = MOE_STAGE_TAIL_OFFSET + 128
 MOE_CTRL_SIZE = MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * MOE_JOB_BYTES
+# Multi-NUMA N-split: workers 1..W-1 each own an extension block (their rings) appended at the
+# layout's wext_off, then one bank of arrival counters; worker 0 keeps the legacy block above, and
+# every flag stays where a single worker has it (moe_handoff.h, MoeWorkerCtrl)
+MOE_MAX_WORKERS = 8
+MOE_WEXT_READY = 0
+MOE_WEXT_JOBS_TAIL = 64
+MOE_WEXT_JOBS_HEAD = 128
+MOE_WEXT_JOBS = 192
+MOE_WEXT_STAGE_TAIL = MOE_WEXT_JOBS + MOE_JOB_RING * MOE_JOB_BYTES
+MOE_WEXT_STAGE_HEAD = MOE_WEXT_STAGE_TAIL + 64
+MOE_WEXT_STAGE_JOBS = MOE_WEXT_STAGE_HEAD + 64
+MOE_WEXT_SIZE = MOE_WEXT_STAGE_JOBS + MOE_STAGE_RING * MOE_JOB_BYTES
+MOE_ARRIVE_SIZE = 64 * (MOE_MAX_SLOTS + MOE_MAX_WSLOTS)
+
+
+def _worker_ctrl_offsets(w: int, wext_off: int) -> dict:
+    """Byte offsets of worker w's (w >= 1) control words and rings, in its extension block"""
+    b = wext_off + (w - 1) * MOE_WEXT_SIZE
+    return dict(
+        ready = b + MOE_WEXT_READY, jobs_tail = b + MOE_WEXT_JOBS_TAIL, jobs_head = b + MOE_WEXT_JOBS_HEAD,
+        jobs = b + MOE_WEXT_JOBS, stage_tail = b + MOE_WEXT_STAGE_TAIL,
+        stage_head = b + MOE_WEXT_STAGE_HEAD, stage_jobs = b + MOE_WEXT_STAGE_JOBS,
+    )
 
 
 def _set_job_seq(job, seq: int):
@@ -79,6 +104,125 @@ def _write_flag(u32: np.ndarray, offset: int, value: int):
 
 def _align64(x):
     return (x + 63) & ~63
+
+
+def _slice_ranges(interm: int, workers: int) -> list[tuple[int, int]]:
+    """
+    Intermediate-dim slice [lo, hi) per worker for the multi-NUMA N-split. Cuts at whole
+    128-column Hadamard blocks, so every per-worker tensor stays a legal input to the unmodified
+    kernels and packed layouts: gate/up are sliced along n, down along k (worker w's down input
+    is its own gate/up output slice). Remainder blocks go to the lowest-indexed workers. Parent
+    and workers both call this, so the rule lives in one place.
+    """
+    if interm % 128:
+        raise ValueError(f"CPU MoE workers: intermediate dimension {interm} is not a multiple of "
+                         f"the 128-column N-split block")
+    blocks = interm // 128
+    if workers < 1 or workers > blocks:
+        raise ValueError(f"CPU MoE workers: {workers} workers do not fit the intermediate dimension "
+                         f"{interm} ({blocks} 128-column blocks)")
+    base, extra = divmod(blocks, workers)
+    out, b = [], 0
+    for w in range(workers):
+        nb = base + (1 if w < extra else 0)
+        out.append((b * 128, (b + nb) * 128))
+        b += nb
+    return out
+
+
+def _slice_expert_proj(t, n_sliced, lo, hi, drop_bias = False, trellis_presliced = False):
+    """One worker's slice of an expert projection (trellis, suh, svh, bias) in native order,
+    to intermediate columns [lo, hi). Gate/up (n_sliced) cut trellis dim 1, svh and bias (the
+    n side); suh (the hidden input side) stays whole. Down cuts trellis dim 0 and suh; svh (the
+    hidden output side) stays whole, and so does its bias, which only worker 0 keeps (drop_bias
+    elsewhere): every worker adding it would count it W - 1 extra times in the summed partials.
+    trellis_presliced: the trellis was already read ranged (DiskTensorHandle.read_range /
+    read_dim1_range), only the small aux tensors remain to cut."""
+    tr, suh, svh, bias = t
+    if not trellis_presliced:
+        tr = tr[:, lo // 16:hi // 16, :] if n_sliced else tr[lo // 16:hi // 16, :, :]
+    suh = suh if n_sliced else suh[lo:hi]
+    svh = svh[lo:hi] if n_sliced else svh
+    if drop_bias:
+        bias = None
+    elif bias is not None and n_sliced:
+        bias = bias[lo:hi]
+    return (tr, suh, svh, bias)
+
+
+def _nsplit_pieces(proj_dims, layout, workers):
+    """
+    How the workers' N-split slices of one expert tile its full packed trellis block (the
+    [gate | up | down] block a single worker stores, streams and promotes). Every packed layout
+    permutes whole 16x16 tiles -- tile (kt, nt) to (nt / group, kt, nt % group), or native
+    (kt, nt) order for group 0 -- and transforms bytes only within a tile, and every slice
+    boundary is a multiple of 8 tiles (a multiple of any group), so each worker's slice of each
+    projection is one 2D block of the full one:
+
+        gate/up (n sliced, tiles [a, b)): packed: contiguous at tile a * tk; native: tk rows of
+            b - a tiles, full pitch tn
+        down (k sliced, tiles [a, b)): packed: tn / group bands of (b - a) * group tiles, full
+            pitch tk * group, from tile a * group; native: contiguous at tile a * tn
+
+    Returns (worker_bytes, pieces): each worker's expert block size, and per worker the pieces
+    (src offset in the worker's block, dst offset in the full block, width, height, src pitch,
+    dst pitch), all in bytes. A copy plan for any direction is built from these.
+    """
+    ranges = _slice_ranges(proj_dims["u"][1], workers)
+    names = [nm for nm in ("g", "u", "d") if proj_dims.get(nm)]
+    worker_bytes, pieces = [], []
+    for lo, hi in ranges:
+        a, b = lo // 16, hi // 16
+        wp, w_off, f_off = [], 0, 0
+        for nm in names:
+            k, n, K = proj_dims[nm]
+            tk, tn, tb = k // 16, n // 16, int(16 * K) * 2
+            group = layout[("g", "u", "d").index(nm)][0]
+            if nm != "d":
+                w_bytes = tk * (b - a) * tb
+                if group:
+                    assert a % group == 0 and b % group == 0
+                    wp.append((w_off, f_off + a * tk * tb, w_bytes, 1, w_bytes, w_bytes))
+                else:
+                    row = (b - a) * tb
+                    wp.append((w_off, f_off + a * tb, row, tk, row, tn * tb))
+            else:
+                w_bytes = (b - a) * tn * tb
+                if group:
+                    assert tn % group == 0
+                    row = (b - a) * group * tb
+                    wp.append((w_off, f_off + a * group * tb, row, tn // group, row, tk * group * tb))
+                else:
+                    wp.append((w_off, f_off + a * tn * tb, w_bytes, 1, w_bytes, w_bytes))
+            w_off += w_bytes
+            f_off += tk * tn * tb
+        # Rows that already sit back to back on both sides are one plain copy
+        wp = [(s, d, wd * h, 1, wd * h, wd * h) if h > 1 and wd == sp == dp else (s, d, wd, h, sp, dp)
+              for s, d, wd, h, sp, dp in wp]
+        worker_bytes.append(w_off)
+        pieces.append(wp)
+    return worker_bytes, pieces
+
+
+def _gather_plan(pieces, dst_bases, src_bases):
+    """cuda_memcpy2d_async_batch rows gathering worker slices into full expert blocks:
+    dst_bases[i] is expert i's full block, src_bases[i][w] its block in worker w"""
+    rows = []
+    for dst, srcs in zip(dst_bases, src_bases):
+        for w, wp in enumerate(pieces):
+            for s_off, d_off, width, height, spitch, dpitch in wp:
+                rows.append((dst + d_off, dpitch, srcs[w] + s_off, spitch, width, height))
+    return torch.tensor(rows, dtype = torch.int64)
+
+
+def _scatter_plan(pieces, src_base, dst_bases):
+    """The inverse of _gather_plan for one expert: its full block at src_base into worker w's
+    block at dst_bases[w]"""
+    rows = []
+    for w, wp in enumerate(pieces):
+        for s_off, d_off, width, height, spitch, dpitch in wp:
+            rows.append((dst_bases[w] + s_off, spitch, src_base + d_off, dpitch, width, height))
+    return torch.tensor(rows, dtype = torch.int64)
 
 
 class MoeCpuTuning:
@@ -187,9 +331,10 @@ _HOST_AFFINITY_THREADS: int | None = None
 _HOST_ORIG_CPUS: list[int] | None = None
 
 
-def _apply_host_affinity(threads: int, host_cores: int):
+def _apply_host_affinity(threads: int, host_cores: int, cpus: list[int] | None = None):
     """Confine the host process to the CPUs the worker pool leaves free. Never raises: an OS
-    failure leaves the host unpinned with a notice."""
+    failure leaves the host unpinned with a notice. `cpus`: the multi-NUMA plan's host LPs
+    (MoeCpuHost._worker_plan) instead of the single-worker tail of the pool's core order"""
     global _HOST_AFFINITY_THREADS, _HOST_ORIG_CPUS
     if _HOST_AFFINITY_THREADS is not None:
         if threads > _HOST_AFFINITY_THREADS:
@@ -197,8 +342,10 @@ def _apply_host_affinity(threads: int, host_cores: int):
                   f"kept for a {threads}-thread worker")
         return
     _HOST_AFFINITY_THREADS = threads
-    order, n_phys = ext.exl3_moe_cpu_core_order()
-    cpus = plan_host_cpus(order, n_phys, threads, host_cores)
+    multi_numa = cpus is not None
+    if not multi_numa:
+        order, n_phys = ext.exl3_moe_cpu_core_order()
+        cpus = plan_host_cpus(order, n_phys, threads, host_cores)
     if cpus is None:
         if host_cores > 0 and n_phys:
             print(" -- CPU MoE host affinity: no LP free of workers in one processor group; "
@@ -214,6 +361,11 @@ def _apply_host_affinity(threads: int, host_cores: int):
         print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
         return
     _HOST_ORIG_CPUS = orig
+    if multi_numa:
+        # Torch sized its intra-op pool from the machine's CPU count; confined to a core or two, the
+        # host's CPU-side ops fork-join that whole pool onto them (GLM-5.3-Flash on 4 nodes:
+        # streamed prefill at 500 instead of 700 tok/s)
+        torch.set_num_threads(max(1, len(cpus)))
     print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
 
 
@@ -480,14 +632,17 @@ class _HugeArena:
     WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
     CHECK_STEP = 256 << 20   # host-memory guard granularity for lazily committed chunks
 
-    def __init__(self, shared = False, huge = "", conn = None):
+    def __init__(self, shared = False, huge = "", conn = None, node = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
         ("chunk", index, size, name) so the parent can map the same pages and page-lock them
         for DMA: Linux sends a memfd descriptor after the message (SCM_RIGHTS, name = None),
-        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux)."""
+        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux).
+        node: the NUMA node a multi-NUMA worker's memory is bound to (bind_memory_to_node), for the
+        per-node memory check."""
         self.shared = shared
         self.huge = huge
         self.conn = conn
+        self.node = node
         self.chunks = []
         self.cur = None
         self.cur_off = 0
@@ -509,6 +664,7 @@ class _HugeArena:
         if not self.lazy:
             check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
                                     f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
+            check_node_memory(size, self.node, f"CPU MoE expert arena chunk {len(self.chunks)}")
         if self.shared and os.name == "nt":
             # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
             # trips on the layer tensors' exports at worker exit). It charges commit and gets
@@ -662,6 +818,7 @@ class _HugeArena:
             if self.written + aligned > self.checked:
                 step = max(aligned, self.CHECK_STEP)
                 check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                check_node_memory(step, self.node, "CPU MoE expert arena")
                 self.checked = self.written + step
             self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
@@ -678,11 +835,15 @@ class _HugeArena:
 
 
 def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None,
-                        pin_siblings = False):
+                        pin_siblings = False, node = None, worker_idx = 0, num_workers = 1, core_order = None):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
     worker loop. Errors are reported over the pipe before exiting.
+
+    Multi-NUMA (num_workers > 1): this is worker `worker_idx` of NUMA node `node`, its pool pinned
+    along `core_order` (the node's LPs but the host's) and its memory bound to the node, and
+    it loads only its slice of every expert's intermediate dimension (_slice_ranges).
     """
     import ctypes
     import signal
@@ -706,6 +867,16 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
     if pin_siblings:
         # A draft component's pool beside the main model's: share its physical cores, not its LPs
         cext.exl3_moe_cpu_pool_pin_siblings()
+    if num_workers > 1:
+        # Before anything is allocated: a bound allocation reclaims the node's page cache instead of
+        # spilling onto another node, and every thread started from here on inherits the policy
+        if not bind_memory_to_node(node):
+            print(f" !! CPU MoE worker {worker_idx}: could not bind memory to NUMA node {node}")
+        cext.exl3_moe_cpu_set_core_order(core_order)
+        # Torch sizes its intra-op pool (the loader's repacks) from the machine's CPU count, one
+        # thread per LP for a single worker; every worker sized that way oversubscribes the machine
+        # W times over (GLM-5.3-Flash on 4 nodes: 44 s load instead of 600 s)
+        torch.set_num_threads(threads)
 
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
@@ -725,12 +896,23 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                   f"({time.time() - t_entry:.2f} s)", flush = True)
         cpu = torch.device("cpu")
         # Pinned mode: memfd-backed chunks, published to the parent as they are created
-        arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None)
+        arena = _HugeArena(shared = pinned, huge = huge, conn = conn if pinned else None, node = node)
 
-        def fetch(keys):
+        def fetch(keys, ranged = None):
+            """Per expert (trellis, suh, svh, bias). ranged = (n_sliced, lo, hi): read only this
+            multi-NUMA worker's slice of the trellis from disk (see _slice_expert_proj)"""
             out = []
             for k in keys:
-                trellis = stc.get_tensor(k + ".trellis", cpu)
+                if ranged is None:
+                    trellis = stc.get_tensor(k + ".trellis", cpu)
+                else:
+                    n_sliced, lo, hi = ranged
+                    hnd = stc.get_tensor_handle(k + ".trellis")
+                    try:
+                        trellis = hnd.read_dim1_range(lo // 16, hi // 16) if n_sliced \
+                            else hnd.read_range(lo // 16, hi // 16)
+                    finally:
+                        hnd.close()
                 suh = stc.get_tensor(k + ".suh", cpu, float2half = True)
                 svh = stc.get_tensor(k + ".svh", cpu, float2half = True)
                 bias = stc.get_tensor(k + ".bias", cpu, optional = True, float2half = True)
@@ -792,6 +974,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         # expert's weights. The parent quiesces (full sync, ring drained) before sending an
         # install, so the workers never observe a torn write
         layer_views = []
+        # Per layer: this worker's intermediate slice under the N-split (installs re-slice with it)
+        layer_ranges = []
 
         # The pipe is drained by its own thread into a queue: the parent registers layers as
         # fast as it loads its own, and a send that had to wait for a child busy rehoming the
@@ -835,13 +1019,31 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     d.extend(bd_)
                     blocks.extend(bb)
                     auxlocs.extend(ba)
+                # Multi-NUMA: this worker's slice of the intermediate dim, from the up trellis's
+                # header (dim 1 is n / 16), known before any trellis is read so the reads are ranged
+                rng = None
+                if num_workers > 1:
+                    hnd = stc.get_tensor_handle(spec["up_keys"][0] + ".trellis")
+                    rng = _slice_ranges(hnd.shape[1] * 16, num_workers)[worker_idx]
+                    hnd.close()
+                layer_ranges.append(rng)
+                ranged_n = (True,) + rng if rng is not None else None
+                ranged_k = (False,) + rng if rng is not None else None
                 for e0 in range(0, num_experts, batch):
                     sl = slice(e0, e0 + batch)
                     stc.begin_deferred_load()
-                    bg = fetch(spec["gate_keys"][sl])
-                    bu = fetch(spec["up_keys"][sl])
-                    bd = fetch(spec["down_keys"][sl])
+                    bg = fetch(spec["gate_keys"][sl], ranged_n)
+                    bu = fetch(spec["up_keys"][sl], ranged_n)
+                    bd = fetch(spec["down_keys"][sl], ranged_k)
                     stc.end_deferred_load()
+                    if rng is not None:
+                        # The aux tensors cut to the slice (the trellis was read ranged); down's bias
+                        # belongs to worker 0 alone
+                        lo, hi = rng
+                        bg = [_slice_expert_proj(t, True, lo, hi, trellis_presliced = True) for t in bg]
+                        bu = [_slice_expert_proj(t, True, lo, hi, trellis_presliced = True) for t in bu]
+                        bd = [_slice_expert_proj(t, False, lo, hi, drop_bias = worker_idx != 0,
+                                                 trellis_presliced = True) for t in bd]
                     # Copy into the hugepage-backed arena now that the deferred reads have
                     # actually populated these tensors; the loader tensors die with this batch.
                     # The copy runs on the rehome thread while the next batch is fetched
@@ -890,19 +1092,25 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             the same packed representation as the initial rehome."""
             views = layer_views[li]
             projs = views if len(keys) == 3 else views[1:]
-            for key, plist in zip(keys, projs):
+            rng = layer_ranges[li]
+            for pi, (key, plist) in enumerate(zip(keys, projs)):
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
-                new = stc.get_tensor(key + ".trellis", cpu)
-                assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
-                grp = cext.exl3_moe_cpu_swizzle_group(new.shape[2] / 16.0) if swz else 0
+                # Multi-NUMA: the same slice as the load (the last projection is the down)
+                ranged = None if rng is None else (pi < len(projs) - 1,) + rng
+                new = fetch([key], ranged)[0]
+                if ranged is not None:
+                    new = _slice_expert_proj(new, *ranged, trellis_presliced = True)
+                new_tr, new_suh, new_svh, new_bias = new
+                assert new_tr.shape == v_tr.shape, f"install shape mismatch: {key}"
+                grp = cext.exl3_moe_cpu_swizzle_group(new_tr.shape[2] / 16.0) if swz else 0
                 if grp:
-                    _copy_repacked(v_tr, new, grp, cext.exl3_moe_cpu_planar_layout(new.shape[2] / 16.0))
+                    _copy_repacked(v_tr, new_tr, grp, cext.exl3_moe_cpu_planar_layout(new_tr.shape[2] / 16.0))
                 else:
-                    v_tr.copy_(new)
-                v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
-                v_svh.copy_(stc.get_tensor(key + ".svh", cpu, float2half = True))
+                    v_tr.copy_(new_tr)
+                v_suh.copy_(new_suh)
+                v_svh.copy_(new_svh)
                 if v_bias is not None:
-                    v_bias.copy_(stc.get_tensor(key + ".bias", cpu, float2half = True))
+                    v_bias.copy_(new_bias)
 
         # The compute loop runs on its own thread (worker_run releases the GIL); the main
         # thread keeps serving the pipe for runtime installs
@@ -915,6 +1123,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                 layout["max_hi"], layout["max_ho"], layout["max_topk"],
                 layout["wstage_off"], layout["num_wslots"], layout["wslot_size"],
                 threads, stage_threads,
+                worker_idx, num_workers, layout.get("wext_off", 0),
             ),
             daemon = True,
         )
@@ -1002,7 +1211,30 @@ def set_moe_cpu_hot(config, text, draft):
         host.set_hot(text if comp == "text" else draft)
 
 
+class _ExtraWorker:
+    """Process and bookkeeping of multi-NUMA worker w >= 1. Worker 0's live in MoeCpuHost's own
+    fields of the same names, so code taking a worker state (MoeCpuHost._wst) runs the single
+    worker on exactly the fields it always used"""
+
+    def __init__(self):
+        self.proc = None
+        self.conn = None
+        self._send_queue = None
+        self._sender = None
+        self.acked = 0
+        self.layer_blocks = []
+        self.layer_auxloc = []
+        self.arena_maps = []
+        self.arena_views = []
+        self.arena_registered = None
+        self._arena_pending = None
+
+
 class MoeCpuHost:
+
+    # Single-worker defaults (also for hosts built without __init__)
+    workers = 1
+    _xw = ()
 
     @classmethod
     def for_config(cls, config):
@@ -1077,58 +1309,198 @@ class MoeCpuHost:
         self._promo = {}
         self.batch_recon = TUNING.stream_batch_recon
 
+        # Multi-NUMA (infer_params.moe_cpu_numa_nodes, Linux): one worker process per NUMA node,
+        # each holding a slice of every CPU expert's intermediate dimension, pinned to its node's
+        # physical cores with its memory bound there; the collecting stream sums the workers'
+        # partial outputs. A single worker (the default) runs exactly the single-process path
+        self.numa_nodes = self._resolve_numa_nodes(getattr(config.infer_params, "moe_cpu_numa_nodes", None))
+        self.workers = len(self.numa_nodes) if self.numa_nodes else 1
+        self._xw = [_ExtraWorker() for _ in range(1, self.workers)]
+        self.threads_explicit = cfg_threads is not None or "EXL3_MOE_CPU_THREADS" in os.environ
+        self.host_cpus = None
+        self.worker_threads = [self.threads]
+        self.wext_off = 0
+        self.partial_stride = 0
+
+    # -- multi-NUMA helpers ------------------------------------------------------------------------
+
+    def _resolve_numa_nodes(self, value):
+        """
+        The NUMA nodes of a moe_cpu_numa_nodes value (see parse_numa_nodes), one worker each, or
+        None for a single worker: unset, a component other than the main model (an MTP head keeps
+        the single worker), or "all" with fewer than two nodes this process may run on. Listed
+        nodes must be nodes this process may run on, at least two and at most MOE_MAX_WORKERS.
+        """
+        nodes = parse_numa_nodes(value)
+        if nodes is None or self.component != "text":
+            return None
+        usable = sorted(self._usable_topology())
+        if nodes == "all":
+            if len(usable) < 2:
+                print(f" -- CPU MoE: moe_cpu_numa_nodes = all, but this process may run on {len(usable)} "
+                      f"NUMA node(s); using one worker", flush = True)
+                return None
+            nodes = usable
+        else:
+            missing = [n for n in nodes if n not in usable]
+            if missing:
+                raise ValueError(f"moe_cpu_numa_nodes: NUMA node(s) {missing} are not available to this "
+                                 f"process (available: {usable})")
+            if len(nodes) < 2:
+                raise ValueError(f"moe_cpu_numa_nodes needs at least two NUMA nodes (got {nodes})")
+        if len(nodes) > MOE_MAX_WORKERS:
+            raise ValueError(f"moe_cpu_numa_nodes: at most {MOE_MAX_WORKERS} NUMA nodes (got {nodes})")
+        return nodes
+
+    def _wst(self, w):
+        """Worker w's process/bookkeeping fields: the host itself for worker 0, see _ExtraWorker"""
+        return self if w == 0 else self._xw[w - 1]
+
+    def _states(self):
+        return [self] + list(self._xw)
+
+    def _alive(self):
+        return all(st.proc is not None and st.proc.is_alive() for st in self._states())
+
+    def _send_all(self, msg):
+        for st in self._states():
+            st._send_queue.put(msg)
+
+    @staticmethod
+    def _usable_topology():
+        """NUMA node -> its LPs this process may run on (Linux sysfs): the pre-pin mask once a host
+        has confined it (a reload, an MTP head), so a later load sees the same nodes as the first"""
+        try:
+            allowed = {c & 0xFFFF for c in _HOST_ORIG_CPUS} if _HOST_ORIG_CPUS is not None \
+                else set(process_cpus())
+        except OSError:
+            allowed = None
+        topo = {n: [c for c in cpus if allowed is None or c in allowed] for n, cpus in numa_topology().items()}
+        return {n: cpus for n, cpus in topo.items() if cpus}
+
+    def _worker_plan(self):
+        """
+        Per worker, (the LPs its pool pins to, its physical core count): the pool's own pin order
+        (physical cores first, then their SMT siblings) restricted to the worker's NUMA node, less
+        the host's LPs. The host's are planned as for a single worker (plan_host_cpus), but on the
+        current CUDA device's node (the first worker's when that is unknown), and kept in
+        self.host_cpus -- or, when an earlier host in this process already placed it, are the LPs
+        it is confined to. As with a single worker, nothing else in a worker is confined.
+        """
+        topo = self._usable_topology()
+        order, n_phys = ext.exl3_moe_cpu_core_order()
+
+        def node_order(n, exclude = ()):
+            lps = set(topo[n]) - set(exclude)
+            cores = [c for c in order[:n_phys] if c in lps]
+            return cores + [c for c in order[n_phys:] if c in lps], len(cores)
+
+        host_node = None
+        try:
+            p = torch.cuda.get_device_properties(torch.cuda.current_device())
+            host_node = pci_bdf_numa_node(f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0")
+        except Exception:
+            pass
+        if host_node not in topo:
+            host_node = self.numa_nodes[0]
+        if _HOST_ORIG_CPUS is not None:
+            try:
+                host = process_cpus()
+            except OSError:
+                host = []
+            self.host_cpus = None
+        else:
+            hord, hn = node_order(host_node)
+            host = plan_host_cpus(hord, hn, hn - TUNING.host_cores, TUNING.host_cores) or []
+            self.host_cpus = host or None
+        plan = []
+        for n in self.numa_nodes:
+            pins, cores = node_order(n, host)
+            if not cores:
+                raise RuntimeError(f"CPU MoE worker on NUMA node {n} has no CPU left after the host's "
+                                   f"reserved cores; lower EXL3_MOE_HOST_CORES")
+            plan.append((pins, cores))
+        print(f" -- CPU MoE: {self.workers} workers on NUMA nodes {self.numa_nodes}, "
+              f"{[c for _, c in plan]} cores, host on LPs {sorted(host)}", flush = True)
+        return plan
+
     def _spawn(self):
         if self.proc is not None:
             return
         ctx = multiprocessing.get_context("spawn")
-        self.conn, child_conn = ctx.Pipe(duplex = True)
-        self.proc = ctx.Process(
-            target = _moe_cpu_child_main,
-            args = (child_conn, self.model_dir, self.threads, self.stage_threads,
-                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS,
-                    self.component != "text"),
-            daemon = True,
-        )
-        self.proc.start()
-        child_conn.close()
-        # Parent -> child messages go through a queue and a sender thread: a layer spec is tens
-        # of KB, and a direct send would block the loading thread until the child's receiver
-        # takes it, which it only gets to do between its own loader calls
-        import queue
-        import threading
-        self._send_queue = queue.Queue()
-        def sender():
-            while True:
-                msg = self._send_queue.get()
-                if msg is None:
-                    return
-                try:
-                    self.conn.send(msg)
-                except Exception:
-                    return
-        self._sender = threading.Thread(target = sender, daemon = True)
-        self._sender.start()
+        huge = TUNING.arena_huge if self.pinned else ""
+        if self.workers > 1:
+            # The thread count as for a single worker: an explicit one as given (past the node's
+            # physical cores onto their SMT siblings), by default the node's physical cores
+            plan = self._worker_plan()
+            self.worker_threads = [self.threads if self.threads_explicit else cores for _, cores in plan]
+        for w in range(self.workers):
+            st = self._wst(w)
+            st.conn, child_conn = ctx.Pipe(duplex = True)
+            if self.workers > 1:
+                args = (child_conn, self.model_dir, self.worker_threads[w], self.stage_threads,
+                        self.pinned, huge, _HOST_ORIG_CPUS, False, self.numa_nodes[w], w, self.workers,
+                        plan[w][0])
+            else:
+                args = (child_conn, self.model_dir, self.threads, self.stage_threads,
+                        self.pinned, huge, _HOST_ORIG_CPUS, self.component != "text")
+            st.proc = ctx.Process(target = _moe_cpu_child_main, args = args, daemon = True)
+            st.proc.start()
+            child_conn.close()
+            # Parent -> child messages go through a queue and a sender thread: a layer spec is tens
+            # of KB, and a direct send would block the loading thread until the child's receiver
+            # takes it, which it only gets to do between its own loader calls
+            import queue
+            import threading
+            st._send_queue = queue.Queue()
+            def sender(st = st):
+                while True:
+                    msg = st._send_queue.get()
+                    if msg is None:
+                        return
+                    try:
+                        st.conn.send(msg)
+                    except Exception:
+                        return
+            st._sender = threading.Thread(target = sender, daemon = True)
+            st._sender.start()
         # Cleanupper fires at the end of the __main__ scope, before interpreter teardown breaks
         # the shm views and pipe machinery that shutdown() needs; PDEATHSIG in the child covers
         # the paths where no Python hook runs at all
         cleanupper.register_atexit(self.shutdown)
 
     def _pump(self, timeout):
-        """Receive one message from the child, surfacing errors and death"""
-        if self.conn.poll(timeout):
-            msg = self.conn.recv()
+        """Receive one message from the child, surfacing errors and death. With several workers:
+        one message from each worker that has one, waiting up to `timeout` for the first"""
+        if self._xw:
+            from multiprocessing.connection import wait
+            ready = wait([st.conn for st in self._states()], timeout)
+            got = False
+            for w, st in enumerate(self._states()):
+                if st.conn in ready:
+                    got |= self._pump_worker(w, 0)
+            if not got and not self._alive():
+                raise RuntimeError("CPU MoE worker process died")
+            return got
+        return self._pump_worker(0, timeout)
+
+    def _pump_worker(self, w, timeout):
+        st = self._wst(w)
+        tag = f"CPU MoE worker {w}" if self._xw else "CPU MoE worker"
+        if st.conn.poll(timeout):
+            msg = st.conn.recv()
             if msg[0] == "err":
-                raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
+                raise RuntimeError(f"{tag} failed:\n{msg[1]}")
             if msg[0] == "ok":
                 # Layer acks arrive in registration order: entry i describes specs[i]
-                self.layer_blocks.append(msg[1] if len(msg) > 1 else None)
-                self.layer_auxloc.append(msg[2] if len(msg) > 2 else None)
-                self.acked += 1
+                st.layer_blocks.append(msg[1] if len(msg) > 1 else None)
+                st.layer_auxloc.append(msg[2] if len(msg) > 2 else None)
+                st.acked += 1
             elif msg[0] == "chunk":
-                self._attach_chunk(msg[1], msg[2], msg[3])
+                self._attach_chunk(msg[1], msg[2], msg[3], w)
             return True
-        if not self.proc.is_alive():
-            raise RuntimeError("CPU MoE worker process died")
+        if not st.proc.is_alive():
+            raise RuntimeError(f"{tag} process died")
         return False
 
     def _register_handoff(self, size):
@@ -1142,19 +1514,24 @@ class MoeCpuHost:
                                    flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
                 return
             except Exception as e:
-                last = max((i for i, v in enumerate(self.arena_views) if v is not None), default = None)
-                if not _pinning_exhausted(e) or last is None:
+                # The worker with the most page-locked chunks gives one back (any with several)
+                cand = [(max((i for i, v in enumerate(st.arena_views) if v is not None), default = -1), w)
+                        for w, st in enumerate(self._states())]
+                last, w = max(cand)
+                if not _pinning_exhausted(e) or last < 0:
                     raise
-                cuda_host_unregister(self.arena_views[last].data_ptr())
-                self.arena_views[last] = None
-                self.arena_maps[last].close()
-                self.arena_maps[last] = None
-                self.arena_registered = last
-                print(f" !! CPU MoE pinned arena: chunk {last} released to page-lock the handoff "
+                st = self._wst(w)
+                cuda_host_unregister(st.arena_views[last].data_ptr())
+                st.arena_views[last] = None
+                st.arena_maps[last].close()
+                st.arena_maps[last] = None
+                st.arena_registered = last
+                which = f"worker {w} chunk" if self._xw else "chunk"
+                print(f" !! CPU MoE pinned arena: {which} {last} released to page-lock the handoff "
                       f"segment; experts in it and the remaining chunks use the staged path", flush = True)
 
 
-    def _attach_chunk(self, index, size, name):
+    def _attach_chunk(self, index, size, name, w = 0):
         """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
         ("chunk", ...) message; Windows: section `name`) and page-lock the chunk before it. The
         worker fills its chunks strictly in order, so a chunk is complete once its successor is
@@ -1165,13 +1542,14 @@ class MoeCpuHost:
         this frame."""
         import mmap
         import socket
-        self._pin_pending_chunk()
-        assert index == len(self.arena_maps), "arena chunk published out of order"
+        st = self._wst(w)
+        self._pin_pending_chunk(w)
+        assert index == len(st.arena_maps), "arena chunk published out of order"
         if name is not None:
             # Opening by name fails loudly if the worker already dropped the section
             m = shared_memory.SharedMemory(name = name)
         else:
-            with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
+            with socket.socket(fileno = os.dup(st.conn.fileno())) as sock:
                 _, fds, _, _ = socket.recv_fds(sock, 1, 1)
             assert len(fds) == 1, "arena chunk descriptor missing"
             fd = fds[0]
@@ -1179,21 +1557,22 @@ class MoeCpuHost:
                 m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
             finally:
                 os.close(fd)
-        if self.arena_registered is not None:
+        if st.arena_registered is not None:
             # Page-locked memory ran out at an earlier chunk: nothing past it is pinned, and the
             # mapping is not needed either (the staged path reads the arena in the worker)
             m.close()
-            self.arena_maps.append(None)
-            self.arena_views.append(None)
+            st.arena_maps.append(None)
+            st.arena_views.append(None)
             return
-        self._arena_pending = (index, size, name, m)
+        st._arena_pending = (index, size, name, m)
 
-    def _pin_pending_chunk(self):
+    def _pin_pending_chunk(self, w = 0):
         """Page-lock the chunk published last (see _attach_chunk), once the worker has finished it"""
-        if self._arena_pending is None:
+        st = self._wst(w)
+        if st._arena_pending is None:
             return
-        index, size, name, m = self._arena_pending
-        self._arena_pending = None
+        index, size, name, m = st._arena_pending
+        st._arena_pending = None
         view = None
         try:
             # count = size // 2: a section opened by name reports its page-rounded size, and
@@ -1208,9 +1587,9 @@ class MoeCpuHost:
                 # The driver has no page-locked memory left for this process (WDDM and WSL2 cap
                 # it at about half of RAM; the KV tiers and other processes share the budget).
                 # Not a fault: keep what is pinned, stage the rest
-                self.arena_registered = index
-                self.arena_maps.append(None)
-                self.arena_views.append(None)
+                st.arena_registered = index
+                st.arena_maps.append(None)
+                st.arena_views.append(None)
                 print(f" !! CPU MoE pinned arena: no page-locked memory left for chunk {index} "
                       f"({index * (size >> 20)} MiB registered); experts in the remaining chunks "
                       f"use the staged path", flush = True)
@@ -1218,11 +1597,11 @@ class MoeCpuHost:
             raise RuntimeError(
                 f"CPU MoE pinned arena: chunk {index} ({size >> 20} MiB) could not be attached "
                 f"({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
-        self.arena_maps.append(m)
-        self.arena_views.append(view)
+        st.arena_maps.append(m)
+        st.arena_views.append(view)
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
-            print(f" -- pinned arena: mapped + registered chunk {index} ({size >> 20} MiB)",
-                  flush = True)
+            print(f" -- pinned arena: mapped + registered {f'worker {w} ' if w else ''}chunk {index} "
+                  f"({size >> 20} MiB)", flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
                        proj_dims = None, aux = None, interm_fp32 = False):
@@ -1258,13 +1637,17 @@ class MoeCpuHost:
             ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
             spec["proj_bytes"] = (gb, ub, db)
             spec["expert_bytes"] = gb + ub + db
+            if self.workers > 1:
+                # The N-split must fit this layer (128-column blocks, at least one per worker);
+                # fail before the workers load anything
+                _slice_ranges(proj_dims["u"][1], self.workers)
         self.specs.append(spec)
         self.live_layers += 1
         idx = len(self.specs) - 1
         self.by_key[key] = idx
         if aux is not None:
             self.aux[idx] = aux
-        self._send_queue.put(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
+        self._send_all(("layer", {k: v for k, v in spec.items() if k != "proj_dims"}))
         return idx
 
     def commit_module(self, module_key):
@@ -1277,15 +1660,17 @@ class MoeCpuHost:
         """
         if self.proc is None or self.conn is None:
             return
-        while self.conn.poll(0):
-            self._pump(0)
+        for w, st in enumerate(self._states()):
+            while st.conn.poll(0):
+                self._pump_worker(w, 0)
 
     def ensure_started(self):
         if self.started or not self.specs:
             return
-        while self.acked < len(self.specs):
+        while any(st.acked < len(self.specs) for st in self._states()):
             self._pump(1.0)
-        self._pin_pending_chunk()
+        for w in range(self.workers):
+            self._pin_pending_chunk(w)
 
         max_hi = max(s["hi"] for s in self.specs)
         max_ho = max(s["ho"] for s in self.specs)
@@ -1302,6 +1687,12 @@ class MoeCpuHost:
         off_w = _align64(off_sel + self.cap_rows * max_topk * 4)
         off_out = _align64(off_w + self.cap_rows * max_topk * 2)
         slot_size = _align64(off_out + self.cap_rows * max_ho * 4)
+        if self.workers > 1:
+            # One output section per worker; worker w's partial sits partial_stride floats after
+            # worker w-1's (moe_handoff.h)
+            out_stride = _align64(self.cap_rows * max_ho * 4)
+            self.partial_stride = out_stride // 4
+            slot_size = _align64(off_out + self.workers * out_stride)
         self.layout = dict(
             num_slots = self.num_slots, slot_size = slot_size, cap_rows = self.cap_rows,
             max_hi = max_hi, max_ho = max_ho, max_topk = max_topk,
@@ -1312,10 +1703,21 @@ class MoeCpuHost:
         self.layout["wslot_size"] = self.wslot_size
         self.layout["cpu_prof"] = TUNING.cpu_prof
         size = MOE_CTRL_SIZE + self.num_slots * slot_size + self.num_wslots * self.wslot_size
+        wstage_offs = [self.layout["wstage_off"]]
+        if self.workers > 1:
+            # Workers 1..W-1: their control blocks, the arrival counters, then their own
+            # weight-staging regions
+            self.wext_off = _align64(size)
+            self.layout["wext_off"] = self.wext_off
+            xstage = self.wext_off + (self.workers - 1) * MOE_WEXT_SIZE + MOE_ARRIVE_SIZE
+            wstage_offs += [xstage + (w - 1) * self.num_wslots * self.wslot_size for w in range(1, self.workers)]
+            size = xstage + (self.workers - 1) * self.num_wslots * self.wslot_size
         check_shm_capacity(size, "The CPU MoE offload handoff segment")
         self.shm = shared_memory.SharedMemory(create = True, size = size)
         buf = np.frombuffer(self.shm.buf, dtype = np.uint8)
         buf[:MOE_CTRL_SIZE] = 0
+        if self.workers > 1:
+            buf[self.wext_off:self.wext_off + (self.workers - 1) * MOE_WEXT_SIZE + MOE_ARRIVE_SIZE] = 0
         self.base_ptr = buf.ctypes.data
         self._register_handoff(size)
         # GPU-visible alias of the registered buffer: equal to base_ptr under UVA (Linux
@@ -1379,7 +1781,31 @@ class MoeCpuHost:
         # Per-device CUDA state for the streamed-prefill path (copy stream, VRAM ring, events)
         self.sstate = {}
 
+        if self.workers > 1:
+            # Workers 1..W-1: control words, rings and staging views, as above for worker 0 (the
+            # flags are shared)
+            for w, x in enumerate(self._xw, start = 1):
+                o = _worker_ctrl_offsets(w, self.wext_off)
+                x.v_ready = u32[o["ready"] // 4 : o["ready"] // 4 + 1]
+                x.v_jobs_tail = u32[o["jobs_tail"] // 4 : o["jobs_tail"] // 4 + 1]
+                x.v_jobs_head = u32[o["jobs_head"] // 4 : o["jobs_head"] // 4 + 1]
+                x.v_jobs = np.frombuffer(
+                    self.shm.buf, dtype = np.uint32, offset = o["jobs"],
+                    count = MOE_JOB_RING * (MOE_JOB_BYTES // 4)).reshape(MOE_JOB_RING, MOE_JOB_BYTES // 4)
+                x.v_stage_tail = u32[o["stage_tail"] // 4 : o["stage_tail"] // 4 + 1]
+                x.v_stage_head = u32[o["stage_head"] // 4 : o["stage_head"] // 4 + 1]
+                x.v_stage_jobs = np.frombuffer(
+                    self.shm.buf, dtype = np.uint32, offset = o["stage_jobs"],
+                    count = MOE_STAGE_RING * (MOE_JOB_BYTES // 4)).reshape(MOE_STAGE_RING, MOE_JOB_BYTES // 4)
+                x.wviews = [torch.frombuffer(self.shm.buf, dtype = torch.int16, count = self.wslot_size // 2,
+                                             offset = wstage_offs[w] + s_ * self.wslot_size)
+                            for s_ in range(self.num_wslots)]
+            # Collect gates for the plain path's sum, which has no issue-kernel counts
+            self._collect_ones = {}
+
         self._send_queue.put(("start", self.shm.name, self.layout))
+        for w, x in enumerate(self._xw, start = 1):
+            x._send_queue.put(("start", self.shm.name, dict(self.layout, wstage_off = wstage_offs[w])))
 
         import time
         t0 = time.time()
@@ -1387,8 +1813,8 @@ class MoeCpuHost:
         # (hugepage promotion runs in the worker's background); the limit stays generous for
         # slow hosts and is overridable
         timeout = float(os.environ.get("EXL3_MOE_CPU_START_TIMEOUT", "60"))
-        while not self.v_ready[0]:
-            if not self.proc.is_alive():
+        while not self.v_ready[0] or not all(x.v_ready[0] for x in self._xw):
+            if not self._alive():
                 raise RuntimeError("CPU MoE worker process died during startup")
             if time.time() - t0 > timeout:
                 raise RuntimeError(
@@ -1401,6 +1827,14 @@ class MoeCpuHost:
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
+        if self.workers > 1:
+            print(f" -- CPU MoE workers started: {len(self.specs)} layers, {kern}, {self.workers} workers, "
+                  f"{self.worker_threads} threads")
+            # Planned with the workers (_worker_plan): on the GPU's node, or the placement an earlier
+            # host in this process already made
+            if self.host_cpus:
+                _apply_host_affinity(self.threads, TUNING.host_cores, cpus = self.host_cpus)
+            return
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
         # The worker was spawned before this and pins its own threads; keep the host off them
         _apply_host_affinity(self.threads, TUNING.host_cores)
@@ -1418,7 +1852,7 @@ class MoeCpuHost:
             while True:
                 if not self.started or self.proc is None:
                     return
-                if not self.proc.is_alive():
+                if not self._alive():
                     try:
                         u32 = self._flags_u32
                         seq, wseq = self.seq + 1, self.wseq + 1
@@ -1543,11 +1977,13 @@ class MoeCpuHost:
         args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
                 selected_experts.view(-1), split_map, split_hist, y, routing_weights,
                 slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
-                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
+                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128,
+                self.workers, self.wext_off)
         if not ext.exl3_moe_split_issue_fused(*args):
             import time
-            while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                if self.v_abort[0] or not self.proc.is_alive():
+            while any(int(st.v_jobs_tail[0]) - int(st.v_jobs_head[0]) >= MOE_JOB_RING - 4
+                      for st in self._states()):
+                if self.v_abort[0] or not self._alive():
                     raise RuntimeError("CPU MoE worker failed (ring stall)")
                 time.sleep(0.0002)
             ext.exl3_moe_split_issue_fused(*args)
@@ -1562,7 +1998,8 @@ class MoeCpuHost:
         slot = self.slots[slot_idx]
         ext.exl3_moe_split_collect_fused(
             final_2d, slot["out_dev"], counts, slot_idx, ho,
-            slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128)
+            slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128,
+            self.workers, self.partial_stride)
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """
@@ -1585,7 +2022,7 @@ class MoeCpuHost:
         # full-width block (see the assert in ensure_started for why this matters)
         y_pad = torch.nn.functional.pad(y, (0, hi - h_)) if hi != h_ else y
         rtmp = torch.empty((min(self.cap_rows, rows), ho), dtype = torch.float, device = y.device) \
-            if ho != h_ else None
+            if ho != h_ and self.workers == 1 else None
         jobs = []
         for a in range(0, rows, self.cap_rows):
             if len(jobs) >= self.num_slots:
@@ -1600,22 +2037,24 @@ class MoeCpuHost:
 
             # Descriptor first (host-visible before the GPU can publish the data flag). Throttle
             # against ring overflow: a long prefill enqueues every job of the pass with no host
-            # sync, and overwriting unconsumed descriptors corrupts the whole stream
-            tail = int(self.v_jobs_tail[0])
-            if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                import time
-                while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (ring stall)")
-                    time.sleep(0.0002)
-            job = self.v_jobs[tail % MOE_JOB_RING]
-            _set_job_seq(job, seq)
-            job[1] = layer_idx
-            job[2] = n
-            job[3] = spec["topk"]
-            job[4] = slot_idx
-            job[5] = 0    # MOE_JOB_KIND_COMPUTE
-            self.v_jobs_tail[0] = tail + 1
+            # sync, and overwriting unconsumed descriptors corrupts the whole stream. Every
+            # worker of an N-split gets the same descriptor
+            for st in self._states():
+                tail = int(st.v_jobs_tail[0])
+                if tail - int(st.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                    import time
+                    while tail - int(st.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                        if self.v_abort[0] or not self._alive():
+                            raise RuntimeError("CPU MoE worker failed (ring stall)")
+                        time.sleep(0.0002)
+                job = st.v_jobs[tail % MOE_JOB_RING]
+                _set_job_seq(job, seq)
+                job[1] = layer_idx
+                job[2] = n
+                job[3] = spec["topk"]
+                job[4] = slot_idx
+                job[5] = 0    # MOE_JOB_KIND_COMPUTE
+                st.v_jobs_tail[0] = tail + 1
 
             # Serialize on the previous tenant's output having been read back (consumed flag,
             # written by the collecting stream after its D2H), not merely computed (done flag):
@@ -1634,6 +2073,19 @@ class MoeCpuHost:
     def _collect_one(self, job, out, rtmp, h):
         seq, slot_idx, a, b, n = job
         slot = self.slots[slot_idx]
+        if self.workers > 1:
+            # N-split: once the last worker has published done, every worker's partial, summed in
+            # worker order straight from the slot (the kernel trims a padded width); all-ones
+            # gate counts, since this path has no issue-kernel counts
+            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
+            ones = self._collect_ones.get(out.device)
+            if ones is None:
+                ones = self._collect_ones[out.device] = \
+                    torch.ones((self.num_slots,), dtype = torch.int32, device = out.device)
+            ext.moe_split_collect_add(out[a:b], slot["out_dev"], ones, slot_idx, slot["out"].shape[1],
+                                      self.workers, self.partial_stride, False)
+            ext.exl3_moe_flag_write(slot["consumed"], seq)
+            return
         ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
         if rtmp is None:
             out[a:b].copy_(slot["out"][:n], non_blocking = True)
@@ -1705,7 +2157,7 @@ class MoeCpuHost:
                 recon = {},
             )
             self._dev_bufs[key] = d
-        if spec is not None and d["native_slots"] is None and self._stream_layout(spec)[1]:
+        if spec is not None and d["native_slots"] is None and (self._stream_layout(spec)[1] or self.workers > 1):
             d["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                                  for _ in range(self.num_wslots)]
         # Reconstruct scratch sized for the largest projection registered so far; grows if a
@@ -1829,15 +2281,19 @@ class MoeCpuHost:
 
     def promote_ready(self, layer_idx, cpu_local):
         """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
-        mapped here and the expert's chunks were page-locked (the pinning may have stopped short)"""
+        mapped here and the expert's chunks were page-locked (the pinning may have stopped short),
+        in every worker"""
         if not self.pinned or layer_idx >= len(self.layer_blocks) or self.layer_blocks[layer_idx] is None:
             return False
         if layer_idx not in self.aux or self.specs[layer_idx].get("expert_bytes") is None:
             return False
-        chunks = {self.layer_blocks[layer_idx][cpu_local][0]}
-        for proj in self.layer_auxloc[layer_idx][cpu_local]:
-            chunks |= {loc[0] for loc in proj if loc is not None}
-        return all(c < len(self.arena_views) and self.arena_views[c] is not None for c in chunks)
+        for st in self._states():
+            chunks = {st.layer_blocks[layer_idx][cpu_local][0]}
+            for proj in st.layer_auxloc[layer_idx][cpu_local]:
+                chunks |= {loc[0] for loc in proj if loc is not None}
+            if not all(c < len(st.arena_views) and st.arena_views[c] is not None for c in chunks):
+                return False
+        return True
 
 
     def _promo_state(self, device):
@@ -1883,8 +2339,6 @@ class MoeCpuHost:
         their GPU copies. Enqueued on the device's promotion stream; returns the event after it"""
         spec = self.specs[layer_idx]
         eb = spec["expert_bytes"]
-        ci, off = self.layer_blocks[layer_idx][cpu_local]
-        src = self.arena_views[ci][off // 2 : (off + eb) // 2]
         layout, _ = self._stream_layout(spec)
         aux = self.aux[layer_idx]
         up = linears[1]
@@ -1892,9 +2346,16 @@ class MoeCpuHost:
         stream = P["stream"]
         with torch.cuda.stream(stream):
             raw = P["raw"][:eb // 2]
-            # Raw memcpy: torch's copy_ does not take the registered arena for pinned memory and would
-            # copy synchronously (the same for the device-to-host copies of demote_expert)
-            ext.cuda_memcpy_async(raw.data_ptr(), src.data_ptr(), eb, 1)
+            if self.workers > 1:
+                # N-split: the workers' slices gathered into the full packed block
+                ext.cuda_memcpy2d_async_batch(_gather_plan(
+                    self._nsplit(spec)[1], [raw.data_ptr()], [self._expert_blocks(layer_idx, cpu_local)]), 1)
+            else:
+                ci, off = self.layer_blocks[layer_idx][cpu_local]
+                src = self.arena_views[ci][off // 2 : (off + eb) // 2]
+                # Raw memcpy: torch's copy_ does not take the registered arena for pinned memory and
+                # would copy synchronously (the same for the device-to-host copies of demote_expert)
+                ext.cuda_memcpy_async(raw.data_ptr(), src.data_ptr(), eb, 1)
             for li, name, lin, o, nb in self._promo_parts(layer_idx, linears):
                 dst = lin.trellis.view(torch.int16)
                 piece = raw[o // 2 : (o + nb) // 2]
@@ -1921,8 +2382,9 @@ class MoeCpuHost:
         until the returned event has landed"""
         spec = self.specs[layer_idx]
         eb = spec["expert_bytes"]
-        ci, off = self.layer_blocks[layer_idx][cpu_local]
-        dst_block = self.arena_views[ci][off // 2 : (off + eb) // 2]
+        if self.workers == 1:
+            ci, off = self.layer_blocks[layer_idx][cpu_local]
+            dst_block = self.arena_views[ci][off // 2 : (off + eb) // 2]
         layout, _ = self._stream_layout(spec)
         aux = self.aux[layer_idx]
         locs = self.layer_auxloc[layer_idx][cpu_local]
@@ -1946,6 +2408,12 @@ class MoeCpuHost:
                     if lst is None or lst[cpu_local] is None or t is None:
                         continue
                     lst[cpu_local].copy_(t, non_blocking = True)
+                    if self.workers > 1:
+                        tc = t.contiguous()
+                        if tc is not t:
+                            hold.append(tc)
+                        self._demote_aux_nsplit(layer_idx, cpu_local, li, j, name, tc)
+                        continue
                     loc = locs[li][j]
                     if loc is not None:
                         lc, lo, ln = loc
@@ -1953,7 +2421,12 @@ class MoeCpuHost:
                         if tc is not t:
                             hold.append(tc)      # a temporary: kept alive until the copy has landed
                         ext.cuda_memcpy_async(self.arena_views[lc].data_ptr() + lo, tc.data_ptr(), ln, 2)
-            ext.cuda_memcpy_async(dst_block.data_ptr(), raw.data_ptr(), eb, 2)
+            if self.workers > 1:
+                # N-split: the packed block scattered back into the workers' slices
+                ext.cuda_memcpy2d_async_batch(_scatter_plan(
+                    self._nsplit(spec)[1], raw.data_ptr(), self._expert_blocks(layer_idx, cpu_local)), 2)
+            else:
+                ext.cuda_memcpy_async(dst_block.data_ptr(), raw.data_ptr(), eb, 2)
             ev = torch.cuda.Event()
             ev.record(stream)
             if hold:
@@ -1967,11 +2440,88 @@ class MoeCpuHost:
         """Dynamic placement: replace worker expert `local_idx` of `layer_idx` with the
         checkpoint tensors at `keys` (per-projection prefixes, gate first when gated). The
         caller must have quiesced (full stream sync => job ring drained, worker idle) before
-        calling; blocks until the child acks the in-place arena copy."""
-        self._send_queue.put(("install", layer_idx, local_idx, keys))
-        msg = self.conn.recv()
-        if msg[0] != "ok":
-            raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
+        calling; blocks until the child acks the in-place arena copy (every worker its slice)."""
+        self._send_all(("install", layer_idx, local_idx, keys))
+        # Every worker's ack before raising: an unread one would answer the next install
+        msgs = [st.conn.recv() for st in self._states()]
+        for w, msg in enumerate(msgs):
+            if msg[0] != "ok":
+                tag = f"CPU MoE worker {w}" if self._xw else "CPU MoE worker"
+                raise RuntimeError(f"{tag} expert install failed: {msg[1] if len(msg) > 1 else msg}")
+
+    def _expert_blocks(self, layer_idx, cpu_local):
+        """Host address of expert `cpu_local`'s arena block in each worker (pinned arena)"""
+        out = []
+        for wst in self._states():
+            ci, off = wst.layer_blocks[layer_idx][cpu_local]
+            out.append(wst.arena_views[ci].data_ptr() + off)
+        return out
+
+    def _nsplit_aux_slices(self, name, j, numel):
+        """Per worker, the [lo, hi) element range of a projection's aux tensor j (suh, svh, bias)
+        that worker holds, None where it holds none. Gate/up are cut along their output (svh,
+        bias), down along its input (suh); down's bias stays with worker 0"""
+        ranges = None
+        out = []
+        for w in range(self.workers):
+            sliced = (name != "d" and j in (1, 2)) or (name == "d" and j == 0)
+            if not sliced:
+                out.append(None if (name == "d" and j == 2 and w != 0) else (0, numel))
+                continue
+            if ranges is None:
+                ranges = _slice_ranges(numel, self.workers)
+            out.append(ranges[w])
+        return out
+
+    def _demote_aux_nsplit(self, layer_idx, cpu_local, li, j, name, t):
+        """A demoted expert's aux tensor j of projection `name` (GPU, contiguous) into each
+        worker's arena copy of its slice"""
+        es = t.element_size()
+        for w, (wst, rng) in enumerate(zip(self._states(), self._nsplit_aux_slices(name, j, t.numel()))):
+            loc = wst.layer_auxloc[layer_idx][cpu_local][li][j]
+            if loc is None or rng is None:
+                continue
+            lc, lo, ln = loc
+            assert ln == (rng[1] - rng[0]) * es, "N-split aux slice size mismatch"
+            ext.cuda_memcpy_async(wst.arena_views[lc].data_ptr() + lo, t.data_ptr() + rng[0] * es, ln, 2)
+
+    def arena_expert(self, layer_idx, cpu_local):
+        """Expert `cpu_local`'s packed trellis block as a single worker holds it (a view of the
+        arena; a copy gathered from the workers' slices under the N-split), for verification"""
+        spec = self.specs[layer_idx]
+        eb = spec["expert_bytes"]
+        if self.workers == 1:
+            ci, off = self.layer_blocks[layer_idx][cpu_local]
+            return self.arena_views[ci][off // 2 : (off + eb) // 2]
+        out = torch.empty(eb, dtype = torch.uint8)
+        srcs = [wst.arena_views[wst.layer_blocks[layer_idx][cpu_local][0]].view(torch.uint8)
+                [wst.layer_blocks[layer_idx][cpu_local][1]:] for wst in self._states()]
+        for w, wp in enumerate(self._nsplit(spec)[1]):
+            for s_off, d_off, width, height, spitch, dpitch in wp:
+                for r in range(height):
+                    out[d_off + r * dpitch : d_off + r * dpitch + width] = \
+                        srcs[w][s_off + r * spitch : s_off + r * spitch + width]
+        return out.view(torch.int16)
+
+    def arena_aux(self, layer_idx, cpu_local, li, j, name, numel):
+        """An expert's aux tensor j of projection `name` as the CPU kernels see it, int16 (a view of
+        the arena; a copy reassembled from the workers' slices under the N-split); None if not stored"""
+        if self.workers == 1:
+            loc = self.layer_auxloc[layer_idx][cpu_local][li][j]
+            if loc is None:
+                return None
+            lc, lo, ln = loc
+            return self.arena_views[lc][lo // 2 : (lo + ln) // 2]
+        out = torch.empty(numel, dtype = torch.int16)
+        have = False
+        for wst, rng in zip(self._states(), self._nsplit_aux_slices(name, j, numel)):
+            loc = wst.layer_auxloc[layer_idx][cpu_local][li][j]
+            if loc is None or rng is None:
+                continue
+            lc, lo, ln = loc
+            out[rng[0]:rng[1]] = wst.arena_views[lc][lo // 2 : (lo + ln) // 2]
+            have = True
+        return out if have else None
 
     def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
         """
@@ -2085,6 +2635,62 @@ class MoeCpuHost:
         batched = recon.worst_case_bytes(A, slot_mode = False) if recon is not None else 0
         return fixed, max(per_expert, batched)
 
+    def _nsplit(self, spec):
+        """(worker block bytes, pieces) of a layer's experts under the N-split, cached on the spec"""
+        ns = spec.get("nsplit")
+        if ns is None:
+            ns = spec["nsplit"] = _nsplit_pieces(spec["proj_dims"], self._stream_layout(spec)[0], self.workers)
+        return ns
+
+    def _nsplit_restore(self, spec):
+        """Per projection of a layer: the N-split's tile boundaries (along n for gate/up, along k
+        for down) and each worker's byte offset of the projection within its expert block"""
+        ns = spec.get("nsplit_restore")
+        if ns is None:
+            pd = spec["proj_dims"]
+            ranges = _slice_ranges(pd["u"][1], self.workers)
+            split = [lo // 16 for lo, _ in ranges] + [ranges[-1][1] // 16]
+            names = [nm for nm in ("g", "u", "d") if pd.get(nm)]
+            pieces = self._nsplit(spec)[1]
+            ns = spec["nsplit_restore"] = {nm: (split, [pieces[w][i][0] for w in range(self.workers)])
+                                           for i, nm in enumerate(names)}
+        return ns
+
+    def _nsplit_pinned(self, layer_idx, experts):
+        """Whether every worker's arena block of these experts is mapped and page-locked here (the
+        pinning may stop short in any worker; those experts take the staged path)"""
+        for wst in self._states():
+            blocks = wst.layer_blocks[layer_idx] if layer_idx < len(wst.layer_blocks) else None
+            if blocks is None:
+                return False
+            reg = wst.arena_registered
+            for e in experts:
+                ci = blocks[e][0]
+                if (reg is not None and ci >= reg) or ci >= len(wst.arena_views) or wst.arena_views[ci] is None:
+                    return False
+        return True
+
+    def _push_stage_job(self, st, seq, layer_idx, batch, ws):
+        """Stage job into one worker's stage ring (its stager copies its slices of `batch` into
+        its staging slot ws once the slot's previous tenant has been DMA'd out)"""
+        stail = int(st.v_stage_tail[0])
+        while stail - int(st.v_stage_head[0]) >= MOE_STAGE_RING - 2:
+            import time
+            if self.v_abort[0] or not self._alive():
+                raise RuntimeError("CPU MoE worker failed (stage ring stall)")
+            time.sleep(0.0002)
+        job = st.v_stage_jobs[stail % MOE_STAGE_RING]
+        _set_job_seq(job, seq)
+        job[1] = layer_idx
+        job[2] = len(batch)
+        job[3] = 0
+        job[4] = ws
+        job[5] = 1    # MOE_JOB_KIND_STAGE
+        job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
+        for bi, e in enumerate(batch):
+            job[7 + bi] = e
+        st.v_stage_tail[0] = stail + 1
+
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
         from ..modules.moe_batch_recon import plan_groups
@@ -2144,6 +2750,13 @@ class MoeCpuHost:
         # Packed-layout policy of this layer's projections (see _stream_layout): packed bytes
         # are restored to native order after the DMA, so the kernels below always see native
         layout, restore = self._stream_layout(spec)
+        # N-split: every worker holds a slice of each expert, DMA'd verbatim and reassembled into
+        # the full native expert by the restore pass (moe_unswizzle_trellis_nsplit), so the GPU
+        # tiers below run as for a single worker
+        nsplit = self._nsplit(spec) if self.workers > 1 else None
+        if nsplit is not None:
+            nsplit_off = [sum(nsplit[0][:w]) for w in range(self.workers)]
+            nsplit_restore = self._nsplit_restore(spec)
 
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;
         # experts too hot for the temp buffers take the per-expert reconstruct path. Same
@@ -2163,7 +2776,50 @@ class MoeCpuHost:
             self.wseq += 1
             seq = self.wseq
 
-            if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
+            if nsplit is not None and self.pinned and self._nsplit_pinned(layer_idx, batch):
+                # Pinned arena, N-split: each worker's block of each expert DMA'd verbatim (one 2D
+                # copy per worker when the batch's blocks sit at a regular stride in its arena) to
+                # the expert's slot, worker blocks back to back; the restore below reassembles
+                # the full native expert
+                with torch.cuda.stream(copy_stream):
+                    if st["wslot_used"][ws]:
+                        copy_stream.wait_event(st["wconsumed_ev"][ws])
+                    raw = st["vram_slots"][ws].data_ptr()
+                    dma = []
+                    for w, wst in enumerate(self._states()):
+                        locs = [wst.layer_blocks[layer_idx][e] for e in batch]
+                        addrs = [wst.arena_views[ci].data_ptr() + off for ci, off in locs]
+                        # Fold into one 2D copy only within one arena chunk: the pitched span is
+                        # what the driver checks for page-locking, and separate chunks can be far
+                        # apart (or out of order) in the address space
+                        stride = locs[1][1] - locs[0][1] if len(locs) > 1 else 0
+                        if len(locs) > 1 and all(ci == locs[0][0] for ci, _ in locs) and \
+                                stride >= nsplit[0][w] and all(b[1] - a[1] == stride for a, b in zip(locs, locs[1:])):
+                            dma.append((raw + nsplit_off[w], exp_b, addrs[0], stride, nsplit[0][w], len(batch)))
+                        else:
+                            dma += [(raw + bi * exp_b + nsplit_off[w], 0, a, 0, nsplit[0][w], 1)
+                                     for bi, a in enumerate(addrs)]
+                    ext.cuda_memcpy2d_async_batch(torch.tensor(dma, dtype = torch.int64), 1)
+                nsplit_src = (nsplit_off, [exp_b] * self.workers)
+            elif nsplit is not None:
+                # Staged, N-split: every worker's stager writes its block of each expert into its
+                # own staging region; once the last has (it publishes stage_done), one DMA per
+                # worker, then pinned_free releases the slot to every stager
+                wexp = nsplit[0]
+                for wst in self._states():
+                    self._push_stage_job(wst, seq, layer_idx, batch, ws)
+                self.wslot_prev_seq[ws] = seq
+                with torch.cuda.stream(copy_stream):
+                    if st["wslot_used"][ws]:
+                        copy_stream.wait_event(st["wconsumed_ev"][ws])
+                    ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
+                    raw = st["vram_slots"][ws].data_ptr()
+                    dma = [(raw + len(batch) * nsplit_off[w], 0, wst.wviews[ws].data_ptr(), 0,
+                             len(batch) * wexp[w], 1) for w, wst in enumerate(self._states())]
+                    ext.cuda_memcpy2d_async_batch(torch.tensor(dma, dtype = torch.int64), 1)
+                    ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
+                nsplit_src = ([len(batch) * o for o in nsplit_off], wexp)
+            elif blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
                 # Pinned arena: DMA each expert's contiguous block straight out of the
                 # registered arena mapping on the copy stream (no worker involvement, the
                 # stager thread stays idle)
@@ -2206,7 +2862,7 @@ class MoeCpuHost:
                     st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
-            if restore and st["native_slots"] is None:
+            if (restore or nsplit is not None) and st["native_slots"] is None:
                 # First batch on this device that needs native-order bytes: adopt the ring the
                 # measured load allocated, or allocate it now (manual loads) on the compute
                 # stream. The caching allocator ties the block to the stream it was carved on,
@@ -2214,7 +2870,21 @@ class MoeCpuHost:
                 st["native_slots"] = self._device_buffers(y.device, spec)["native_slots"]
                 copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
-                if restore:
+                if nsplit is not None:
+                    # N-split: reassemble every full native projection from the workers' blocks
+                    # (and restore the native order of packed ones) on the copy stream, one
+                    # launch per projection over the whole batch
+                    w_off, w_stride = nsplit_src
+                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
+                        if not pd.get(name):
+                            continue
+                        k, n, K = pd[name]
+                        split, w_proj = nsplit_restore[name]
+                        ext.moe_unswizzle_trellis_nsplit(
+                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
+                            k // 16, n // 16, K, layout[pi][0], layout[pi][1], name == "d",
+                            split, w_off, w_stride, w_proj)
+                elif restore:
                     # Restore native tile and dword/halfword order on the copy stream, one launch per
                     # projection over the whole batch (group-0 projections in an otherwise
                     # packed layer take the plain-copy path in the same kernel)
@@ -2230,7 +2900,7 @@ class MoeCpuHost:
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
+            vslot = st["native_slots"][ws] if (restore or nsplit is not None) else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
@@ -2384,26 +3054,34 @@ class MoeCpuHost:
 
     def shutdown(self):
         if self.proc is not None:
-            try:
-                if self.started and self.shm is not None:
-                    self.v_quit[0] = 1
-                    # The child's main thread serves the pipe at runtime (expert installs);
-                    # the flag stops its compute thread, the message unblocks the recv loop
-                    if self.conn is not None:
-                        self._send_queue.put(("quit",))
-                elif self.conn is not None:
-                    self._send_queue.put(("quit",))
-                self._send_queue.put(None)
-                self._sender.join(timeout = 5)
-                self.proc.join(timeout = 5)
-                if self.proc.is_alive():
-                    self.proc.terminate()
-                    self.proc.join(timeout = 2)
-                if self.proc.is_alive():
-                    self.proc.kill()
-            except Exception:
-                pass
-            self.proc = None
+            if self.started and self.shm is not None:
+                # The flag stops every worker's compute thread
+                self.v_quit[0] = 1
+            for st in self._states():
+                if st.proc is None:
+                    continue
+                try:
+                    # The child's main thread serves the pipe at runtime (expert installs); the
+                    # message unblocks its recv loop
+                    if st.conn is not None:
+                        st._send_queue.put(("quit",))
+                    st._send_queue.put(None)
+                    st._sender.join(timeout = 5)
+                except Exception:
+                    pass
+            for st in self._states():
+                if st.proc is None:
+                    continue
+                try:
+                    st.proc.join(timeout = 5)
+                    if st.proc.is_alive():
+                        st.proc.terminate()
+                        st.proc.join(timeout = 2)
+                    if st.proc.is_alive():
+                        st.proc.kill()
+                except Exception:
+                    pass
+                st.proc = None
         # Full reset: a later re-registration must not resolve stale indices against a child
         # that no longer exists
         self.specs = []
@@ -2416,12 +3094,18 @@ class MoeCpuHost:
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         cleanupper.unregister_atexit(self.shutdown)
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = None
+        for st in self._states():
+            if st.conn is not None:
+                try:
+                    st.conn.close()
+                except Exception:
+                    pass
+                st.conn = None
+        for x in self._xw:
+            # Drop every view over the segment before it is closed below
+            for nm in ("v_ready", "v_jobs_tail", "v_jobs_head", "v_jobs", "v_stage_tail", "v_stage_head",
+                       "v_stage_jobs", "wviews"):
+                setattr(x, nm, None)
         if self.shm is not None:
             try:
                 cuda_host_unregister(self.base_ptr)
@@ -2440,21 +3124,24 @@ class MoeCpuHost:
             gc.collect()
         # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
         # the worker (memfd, no name to unlink; a Windows section goes with its last handle)
-        for view in self.arena_views:
-            if view is None:
-                continue
-            try:
-                cuda_host_unregister(view.data_ptr())
-            except Exception:
-                pass
-        self.arena_views = []
-        self.layer_blocks = []
-        self.layer_auxloc = []
+        maps = []
+        for st in self._states():
+            for view in st.arena_views:
+                if view is None:
+                    continue
+                try:
+                    cuda_host_unregister(view.data_ptr())
+                except Exception:
+                    pass
+            st.arena_views = []
+            st.layer_blocks = []
+            st.layer_auxloc = []
+            maps += st.arena_maps
+            st.arena_maps = []
+            if st._arena_pending is not None:
+                maps.append(st._arena_pending[3])
+                st._arena_pending = None
         self._promo = {}
-        maps, self.arena_maps = self.arena_maps, []
-        if self._arena_pending is not None:
-            maps.append(self._arena_pending[3])
-            self._arena_pending = None
         if maps:
             import gc
             gc.collect()
@@ -2474,3 +3161,5 @@ class MoeCpuHost:
             self.shm = None
         self.started = False
         self.by_key = {}
+        # Workers 1..W-1 start a later load from scratch (worker 0's state is reset above)
+        self._xw = [_ExtraWorker() for _ in range(1, self.workers)]

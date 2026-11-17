@@ -17,6 +17,7 @@ that a wrong expert mapping, stale weights or a broken handoff (KL of order 1) c
 
 import json
 import os
+import sys
 
 import pytest
 
@@ -78,15 +79,47 @@ def gpu_reference(model_registry, device):
 
 @pytest.mark.parametrize("placement", ["layer", "split", "promote"])
 def test_offload_matches_gpu(model_id, model_dir, placement, device, gpu_reference):
+    _check_offload(model_id, model_dir, placement, device, gpu_reference, placement_args(model_dir, placement))
+
+
+def _numa_nodes() -> list[int]:
+    if not sys.platform.startswith("linux"):
+        return []
+    from exllamav3.model.moe_cpu_affinity import numa_topology
+    return sorted(numa_topology())
+
+
+# Multi-NUMA (--moe_cpu_numa_nodes): every placement on two NUMA nodes and on all of them; layer
+# offload both staged and from the pinned arena, so streamed prefill gathers the workers' expert
+# slices through both paths. All of it in one process, so each load after the first also plans
+# around an already-confined host
+@pytest.mark.parametrize("workers", [2, 4])
+@pytest.mark.parametrize("placement", ["layer", "layer-pinned", "split", "promote"])
+def test_offload_multi_numa_matches_gpu(model_id, model_dir, workers, placement, device, gpu_reference, monkeypatch):
+    nodes = _numa_nodes()
+    if len(nodes) < workers:
+        pytest.skip(f"needs a Linux machine with {workers} NUMA nodes (has {len(nodes)})")
+    # A low fused-tier cap sends the hotter streamed experts through the batched and per-expert
+    # reconstruct tiers too (with the test's short prompt the fused tier would take them all)
+    from exllamav3.model.moe_cpu_host import TUNING
+    monkeypatch.setattr(TUNING, "stream_fused_t", 16)
+    base = placement.removesuffix("-pinned")
+    args = placement_args(model_dir, base) + (["-mcpa"] if placement.endswith("-pinned") else []) \
+        + ["-mcn", ",".join(map(str, nodes[:workers]))]
+    _check_offload(model_id, model_dir, base, device, gpu_reference, args, tag = f"{workers} nodes, {placement}")
+
+
+def _check_offload(model_id, model_dir, placement, device, gpu_reference, args, tag = None):
+    tag = tag or placement
     ref = gpu_reference(model_id)
-    with load_model(model_dir, device, *placement_args(model_dir, placement)) as lm:
+    with load_model(model_dir, device, *args) as lm:
         got = _run(lm)
         if placement == "promote":
             mods = getattr(lm.model.config.infer_params, "moe_cpu_swap_modules", [])
             moved = sum(getattr(m, "_split_promo_n", 0) for m in mods)
             assert moved > 0, "promote placement: no expert was promoted during the decode runs"
     floor = ref["floor"]
-    assert_logits_agree(ref["forward"], got["forward"], floor, f"{placement} prefill", abs_median_kl = ABS_MEDIAN_KL)
-    assert_logits_agree(ref["decode"], got["decode"], floor, f"{placement} decode", abs_median_kl = ABS_MEDIAN_KL)
+    assert_logits_agree(ref["forward"], got["forward"], floor, f"{tag} prefill", abs_median_kl = ABS_MEDIAN_KL)
+    assert_logits_agree(ref["decode"], got["decode"], floor, f"{tag} decode", abs_median_kl = ABS_MEDIAN_KL)
     for i, (r, g) in enumerate(zip(ref["batched"], got["batched"])):
-        assert_logits_agree(r, g, floor, f"{placement} batched decode, job {i}", abs_median_kl = ABS_MEDIAN_KL)
+        assert_logits_agree(r, g, floor, f"{tag} batched decode, job {i}", abs_median_kl = ABS_MEDIAN_KL)
