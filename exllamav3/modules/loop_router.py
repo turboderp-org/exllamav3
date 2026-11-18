@@ -1,10 +1,26 @@
 """SenseNova Loop's FP32 router (distinct from DeepSeek hyperconnections)."""
+import os
 import torch
 import torch.nn.functional as F
 from .module import Module
 
 
 def route(residual, weight, bias, streams, iterations, fixed_identity, pre_scale):
+    if (os.environ.get("EXL3_LOOP_ROUTER_TRITON", "1") != "0" and
+        residual.is_cuda and residual.is_contiguous() and weight.is_contiguous() and bias.is_contiguous() and
+        residual.dtype in (torch.float16, torch.bfloat16, torch.float32) and
+        weight.dtype == bias.dtype == torch.float32 and streams in (2, 4) and
+        residual.ndim >= 2 and residual.shape[-2] == streams and residual.shape[-1] > 0 and
+        streams * residual.shape[-1] <= 16384 and weight.device == bias.device == residual.device and
+        weight.shape == (2 * streams + (0 if fixed_identity else streams * streams), streams * residual.shape[-1]) and
+        bias.shape == (weight.shape[0],) and not residual.requires_grad and
+        not weight.requires_grad and not bias.requires_grad):
+        try:
+            from .loop_router_triton import route_triton
+        except ImportError:
+            pass
+        else:
+            return route_triton(residual, weight, bias, streams, iterations, fixed_identity, pre_scale)
     with torch.autocast(device_type = residual.device.type, enabled = False):
         flat = residual.flatten(-2).float()
         normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim = True) + 1e-6)
