@@ -17,6 +17,7 @@ from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
+from .loop_replay import replay_region
 from .compile import compile_model, dsize
 from .ngram import quantize_embedding
 from .moe_affinity import make_store as make_affinity_store, merge_stores as merge_affinity_stores, \
@@ -1509,6 +1510,50 @@ def main(args, job_state):
         print(f" -- Affinity-weighted expert Hessians: eps {moe_aff_eps}, "
               f"up to {args['moe_affinity_rows']:,} of {cal_tokens:,} calibration tokens sampled per layer")
 
+    # Loop's repeated physical blocks are a region-level transaction.  Both visits
+    # share each capture dictionary, so the converter adds their H and row counts.
+    loop = config.config_dict.get("loop_settings") if config.architecture == "SenseNovaLoopForConditionalGeneration" else None
+    loop_start = loop_end = None
+    if loop:
+        if (loop.get("eval_count") != 2 or loop.get("counts") != [2]
+            or config.mhc_settings["start"] != loop["start"] or config.mhc_settings["end"] != loop["end"]):
+            raise ValueError("Loop conversion currently requires two visits and mHC matching the loop region")
+        if len(devices) != 1 or not use_reference_state or args.get("hessians"):
+            raise ValueError("Loop conversion requires one GPU and online calibration")
+        loop_start = model.first_block_idx + loop["start"]
+        loop_end = model.first_block_idx + loop["end"]
+        if loop_start < job_state["next_module_idx"] < loop_end:
+            raise ValueError("Cannot resume inside a Loop region; resume from the preceding checkpoint")
+        if any(m.num_slices != 1 for m in model.modules[loop_start:loop_end]):
+            raise ValueError("Sliced Loop blocks are not supported for calibration")
+
+    def loop_load_original(m):
+        defer = m.can_defer_load()
+        if defer: config.stc.begin_deferred_load()
+        try:
+            m.load(device, keep_source_weights = True)
+        finally:
+            if defer: config.stc.end_deferred_load()
+        config.stc.close()
+
+    def loop_load_quantized(m):
+        from safetensors.torch import load_file
+        path = os.path.join(args["work_dir"], "qtensors", m.key + ".safetensors")
+        tensors = load_file(path, device = "cpu")
+        config.stc.set_new_tensors(tensors)
+        try:
+            m.load(device, source = tensors, keep_source_weights = True)
+        finally:
+            config.stc.set_new_tensors(None)
+
+    def loop_unload(m):
+        m.unload()
+        config.stc.close()
+        free_mem()
+
+    loop_initial_state = None
+    loop_rows = None
+    loop_bad_initial = None
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -1526,6 +1571,29 @@ def main(args, job_state):
         if args["max_module"] is not None and idx > args["max_module"]:
             print(" !! --max_module reached, stopping job")
             sys.exit()
+
+        if loop and idx == loop_start:
+            if any(p.get(idx - 1) for p in quant_preserves):
+                raise ValueError("Loop calibration does not support preserved cross-layer state")
+            loop_rows = len(state)
+            loop_bad_initial = set(bad_rows)
+            loop_initial_state = state.copy()
+            second_visit = [x.clone() for x in state]
+            replay_region(second_visit, model.modules[loop_start:loop_end], original_input_ids,
+                          bad_rows, loop_load_original, loop_unload, "Loop reference first visit")
+            # The second pass starts from the original first-pass output.  As layers
+            # are quantized, both visit states advance with the quantized layer.
+            state = state + second_visit
+            del second_visit
+            original_input_ids = original_input_ids + original_input_ids
+            quant_preserves = quant_preserves + [{} for _ in range(loop_rows)]
+            bad_rows |= {i + loop_rows for i in bad_rows}
+            print(f" -- Loop calibration: {loop_rows} rows x 2 visits; quantizing each physical layer once")
+
+        if loop and loop_start <= idx < loop_end and loop_rows is not None:
+            bad_physical_rows = {i % loop_rows for i in bad_rows}
+            bad_rows = bad_physical_rows | {i + loop_rows for i in bad_physical_rows}
+            check_bad_rows(bad_physical_rows, loop_rows)
 
         # Collect output tensors
         q_tensors = {}
@@ -1812,6 +1880,25 @@ def main(args, job_state):
                 sqnr_ /= n
                 check_bad_rows(bad_rows, len(state))
 
+        if loop and loop_start <= idx < loop_end and loop_rows is not None:
+            if {i % loop_rows for i in bad_rows} != loop_bad_initial:
+                raise ValueError("Non-finite Loop calibration row; restart from the preceding checkpoint")
+
+        if loop and idx == loop_end - 1:
+            # The preliminary second-visit input was produced with original weights.
+            # Recompute both complete visits with the newly quantized physical layers
+            # so the state passed to the epilogue reflects the actual model.
+            original_input_ids = original_input_ids[:loop_rows]
+            bad_rows = {i % loop_rows for i in bad_rows}
+            module.unload()
+            state = loop_initial_state
+            loop_initial_state = None
+            for visit in range(2):
+                replay_region(state, model.modules[loop_start:loop_end], original_input_ids,
+                              bad_rows, loop_load_quantized, loop_unload, f"Loop quantized replay {visit + 1}/2")
+            quant_preserves = [{idx: {}} for _ in range(loop_rows)]
+            print(" -- Loop quantized replay completed for both visits", flush = True)
+
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding
         malloc_trim()
@@ -1826,7 +1913,7 @@ def main(args, job_state):
 
         # Checkpoint
         job_state["next_module_idx"] = idx + 1
-        if can_resume_quant and \
+        if can_resume_quant and not (loop and loop_start <= idx < loop_end - 1) and \
             time.time() > last_checkpoint_time + args["checkpoint_interval"] and \
             (args.get("last_checkpoint_index", -1) < 0 or idx <= args["last_checkpoint_index"]):
             print(f" -- Saving checkpoint")
