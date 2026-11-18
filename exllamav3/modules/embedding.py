@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+from functools import partial
 import torch
 from torch import nn
 from ..model.config import Config
@@ -44,22 +45,30 @@ class TableEmbedding:
         pin.inverse[:ids.numel()] = inverse.view(-1)
         return uids, False
 
-    def decode(self, rows: torch.Tensor, pin, U: int) -> torch.Tensor:
+    def decode(self, rows: torch.Tensor, pin, U: int, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         if self.signs is None:
+            if out_dtype == torch.float32:
+                return rows.float()
             return rows if rows.dtype == torch.bfloat16 else rows.half()
         rings = rows.view(U * self.groups, -1)
         if rows.is_cuda:
-            out = torch.empty((U * self.groups, GROUP_DIM), dtype = torch.half, device = rows.device)
+            # fp32 straight from the kernel: exact dequant_rows values, and it skips the fp16
+            # round trip plus a separate upcast pass
+            dtype = torch.float32 if out_dtype == torch.float32 else torch.half
+            out = torch.empty((U * self.groups, GROUP_DIM), dtype = dtype, device = rows.device)
             ext.ngram_dequant(rings, self.K, None, self.signs, out, True)
         else:
-            out = dequant_rows(rings, self.K, self.codebook, signs = self.signs.repeat(U, 1)).half()
+            out = dequant_rows(rings, self.K, self.codebook, signs = self.signs.repeat(U, 1))
+            if out_dtype != torch.float32:
+                out = out.half()
         out = out.view(U, -1)
         return out if out.shape[1] == self.hidden_size else out[:, :self.hidden_size]
 
-    def forward(self, ids: torch.Tensor, synced: bool = False) -> torch.Tensor:
+    def forward(self, ids: torch.Tensor, synced: bool = False, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         shape = ids.shape
         ids = ids.to("cpu", torch.int64).contiguous()
-        out = self.table.lookup(ids, ids.numel(), self.resolve, self.decode, self.device, synced)
+        decode = partial(self.decode, out_dtype = out_dtype)
+        out = self.table.lookup(ids, ids.numel(), self.resolve, decode, self.device, synced)
         return out.view(*shape, self.hidden_size)
 
     __call__ = forward
@@ -256,7 +265,7 @@ class Embedding(Module):
         # No indexed embeddings, or none in current batch
         else:
             if isinstance(self.embedding, TableEmbedding):
-                x = self.embedding.forward(x, bool(params.get("pinned_staging")))
+                x = self.embedding.forward(x, bool(params.get("pinned_staging")), out_dtype)
             else:
                 # Drafting loops hand over device-resident ids; a CPU-resident table gathers on the host
                 w_dev = self.embedding.weight.device

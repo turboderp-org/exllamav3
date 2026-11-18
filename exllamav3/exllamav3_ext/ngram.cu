@@ -318,41 +318,46 @@ void ngram_gather_cpu
 
 #endif  // ^ Linux (pread); the Windows version (overlapped ReadFile) is in ngram_gather_win.cpp
 
-__global__ __launch_bounds__(MAX_RING_DIM)
-void ngram_dequant_kernel
+// The 16-bit state of position i is the (q-1) preceding K-bit symbols below its own in the
+// ring: a window of q*K <= 21 bits starting at stream bit (((i - (q - 1)) mod dim) * K),
+// symbols read low-to-high = positions i-(q-1) ... i, stacked into the state with position i
+// in the LOW bits. Word 0 holds the scale; the window spans at most three stream words
+// (two words carry 32 - off bits, which covers 21 bits only when off <= 11).
+__device__ __forceinline__ float ring_decode
 (
-    const int16_t* __restrict__ packed,   // (U, 1 + dim * K / 16)
-    const int32_t* __restrict__ heads,    // (U) row of aux per ring, or null for ring index mod num_heads
-    const half* __restrict__ aux,         // (num_heads, dim) bias, or signs when rotating; may be null
-    half* __restrict__ out,               // (U, dim)
-    const int K,
-    const int words,                      // 1 + dim * K / 16
-    const int num_heads,
-    const bool rotate
+    const uint16_t* __restrict__ row,
+    int i,
+    int dim,
+    int K,
+    int words,
+    float scale
 )
 {
-    const int r = blockIdx.x;
-    const int i = threadIdx.x;
-    const int dim = blockDim.x;
-
-    extern __shared__ float sf[];
-    uint16_t* sw = (uint16_t*) (sf + dim);
-    if (i < words) sw[i] = (uint16_t) packed[(size_t) r * words + i];
-    __syncthreads();
-
-    float scale = __half2float(__ushort_as_half(sw[0]));
-
-    // stream bit m of element i lives at ring position ((i - m / K) mod dim) * K + m % K
-    uint32_t state = 0;
-    #pragma unroll 4
-    for (int m = 0; m < 16; ++m)
+    int q = (15 + K) / K;
+    int p = i - (q - 1);
+    if (p < 0) p += dim;
+    int start = p * K;
+    int off = start & 15;
+    int w0 = 1 + (start >> 4);
+    uint32_t win = (uint32_t) row[w0] >> off;
+    if (q * K > 16 - off)
     {
-        int pos = i - m / K;
-        if (pos < 0) pos += dim;
-        int sb = pos * K + m % K;
-        uint32_t bit = (sw[1 + (sb >> 4)] >> (sb & 15)) & 1;
-        state |= bit << m;
+        int w1 = w0 + 1;
+        if (w1 >= words) w1 = 1;
+        win |= (uint32_t) row[w1] << (16 - off);
+        if (q * K > 32 - off)
+        {
+            int w2 = w1 + 1;
+            if (w2 >= words) w2 = 1;
+            win |= (uint32_t) row[w2] << (32 - off);
+        }
     }
+    uint32_t mask = (1u << K) - 1u;
+    uint32_t state = 0;
+    #pragma unroll 16
+    for (int t = 0; t < q; ++t)
+        state |= ((win >> ((q - 1 - t) * K)) & mask) << (t * K);
+    state &= 0xFFFFu;
 
     // mul1 codebook value, rounded to fp16 like the cached table
     uint32_t prod = state * MUL1;
@@ -360,7 +365,197 @@ void ngram_dequant_kernel
                                  ((prod >> 16) & 0xff) + ((prod >> 24) & 0xff));
     float k_inv = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
-    float v = __half2float(__float2half_rn(h * k_inv + k_bias)) * scale;
+    return __half2float(__float2half_rn(h * k_inv + k_bias)) * scale;
+}
+
+// Decode four consecutive elements of a K == 8 ring. K is not an argument: the host dispatch
+// (ngram_dequant) launches both fast kernels only under its K == 8 gate, the single source of
+// truth, so a wrong K cannot reach this decoder. ring_decode stays the general path for other K.
+__device__ __forceinline__ void ring_decode4
+(
+    const uint16_t* __restrict__ row,
+    int i0,               // first of four consecutive elements, i0 % 4 == 0
+    int dim,
+    int words,
+    float scale,
+    float out4[4]
+)
+{
+    // Element i's state is stream bytes (i-1, i) = row bytes (i+1, i+2), so with
+    // w0 = row bytes (i0, i0+1), w1 = (i0+2, i0+3), w2 = (i0+4, i0+5) the four
+    // (sym_{i-1}, sym_i) pairs are w0hi|w1lo, w1, w1hi|w2lo, w2. Three aligned
+    // u16 loads (row stride is 2 mod 4, so u32 loads are forbidden) replace the
+    // two per state of the scalar decoder; the third is the row's final word at
+    // i0 == dim - 4, in range because the dispatch checked words == 1 + dim * K / 16.
+    const uint32_t w0 = row[i0 >> 1], w1 = row[(i0 >> 1) + 1], w2 = row[(i0 >> 1) + 2];
+    uint32_t pair[4] = { (w0 >> 8) | (w1 << 8), w1, (w1 >> 8) | (w2 << 8), w2 };
+    float k_inv = __half2float(__ushort_as_half(0x1eee));
+    float k_bias = __half2float(__ushort_as_half(0xc931));
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        if (i0 == 0 && j == 0)
+            out4[j] = ring_decode(row, 0, dim, 8, words, scale);      // element 0's pair wraps
+        else
+        {
+            uint32_t p = pair[j] & 0xffffu;
+            uint32_t state = ((p & 0xffu) << 8) | (p >> 8);   // sym_i in the low byte
+            uint32_t prod = state * MUL1;
+            float h = 1024.0f + (float) ((prod & 0xff) + ((prod >> 8) & 0xff) +
+                                         ((prod >> 16) & 0xff) + ((prod >> 24) & 0xff));
+            out4[j] = __half2float(__float2half_rn(h * k_inv + k_bias)) * scale;
+        }
+    }
+}
+
+// dim == 256 rotated rings (token embedding groups), K == 8: 64 lanes x float4.
+// H-256 keeps the generic kernel's stage order and pairing (s = 1, 2, ..., 128,
+// element with the bit set gets old[lo] - old[hi]): s = 1, 2 on the lane's four
+// registers, s = 4..64 as component shuffles (distance s >> 2), s = 128 as one
+// smem round trip, so the result is bit-exact with the generic kernel.
+__global__ __launch_bounds__(64)
+void ngram_dequant_rot4
+(
+    const int16_t* __restrict__ packed,
+    const int32_t* __restrict__ heads,
+    const half* __restrict__ aux,
+    void* __restrict__ out,
+    const int words,
+    const int num_heads,
+    const bool f32
+)
+{
+    const int r = blockIdx.x;
+    const int i = threadIdx.x;
+    const uint16_t* row = (const uint16_t*) packed + (size_t) r * words;
+    const float scale = __half2float(__ushort_as_half(row[0]));
+    float v[4];
+    ring_decode4(row, 4 * i, 256, words, scale, v);
+
+    float a[4] = { 0.0f };
+    if (aux)
+    {
+        // issue #525 bound as in the generic kernel
+        int head = heads ? heads[r] : r % num_heads;
+        head = max(0, min(head, num_heads - 1));
+        const half* ar = aux + (size_t) head * 256;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            a[j] = __half2float(ar[4 * i + j]);
+    }
+
+    {   // s = 1
+        float t0 = v[0] + v[1], t1 = v[0] - v[1];
+        float t2 = v[2] + v[3], t3 = v[2] - v[3];
+        v[0] = t0; v[1] = t1; v[2] = t2; v[3] = t3;
+    }
+    {   // s = 2
+        float t0 = v[0] + v[2], t2 = v[0] - v[2];
+        float t1 = v[1] + v[3], t3 = v[1] - v[3];
+        v[0] = t0; v[1] = t1; v[2] = t2; v[3] = t3;
+    }
+    #pragma unroll
+    for (int d = 1; d <= 16; d <<= 1)     // s = 4, 8, 16, 32, 64
+    {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            float o = __shfl_xor_sync(0xffffffffu, v[j], d);
+            v[j] = (i & d) ? o - v[j] : v[j] + o;
+        }
+    }
+    __shared__ float4 sf[64];             // s = 128: across the two warps
+    sf[i] = make_float4(v[0], v[1], v[2], v[3]);
+    __syncthreads();
+    const float4 p = sf[i ^ 32];
+    if (i < 32)
+    {
+        v[0] += p.x; v[1] += p.y; v[2] += p.z; v[3] += p.w;
+    }
+    else
+    {
+        v[0] = p.x - v[0]; v[1] = p.y - v[1]; v[2] = p.z - v[2]; v[3] = p.w - v[3];
+    }
+
+    const float norm = 1.0f / sqrtf(256.0f);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        v[j] = aux ? v[j] * norm * a[j] : v[j] * norm;
+
+    if (f32)
+        ((float4*) out)[(size_t) r * 64 + i] = make_float4(v[0], v[1], v[2], v[3]);
+    else
+    {
+        union { uint2 u; half h[4]; } pk;
+        pk.h[0] = __float2half_rn(v[0]); pk.h[1] = __float2half_rn(v[1]);
+        pk.h[2] = __float2half_rn(v[2]); pk.h[3] = __float2half_rn(v[3]);
+        ((uint2*) out)[(size_t) r * 64 + i] = pk.u;
+    }
+}
+
+// dim == 160 non-rotated rings (PLE rows) with per-head bias, K == 8, fp16 out:
+// grid-striding over U * 40 lanes of four consecutive elements. Same decode as
+// the generic kernel, same bias add in fp32, so bit-exact with it.
+__global__ __launch_bounds__(256)
+void ngram_dequant_bias4
+(
+    const int16_t* __restrict__ packed,
+    const int32_t* __restrict__ heads,
+    const half* __restrict__ aux,
+    half* __restrict__ out,
+    const int U,
+    const int words,
+    const int num_heads
+)
+{
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < U * 40; idx += gridDim.x * blockDim.x)
+    {
+        const int r = idx / 40;
+        const int l = idx - r * 40;
+        const int i0 = 4 * l;
+        const uint16_t* row = (const uint16_t*) packed + (size_t) r * words;
+        float v[4];
+        ring_decode4(row, i0, 160, words, __half2float(__ushort_as_half(row[0])), v);
+
+        float a[4] = { 0.0f };
+        if (aux)
+        {
+            int head = heads ? heads[r] : r % num_heads;
+            head = max(0, min(head, num_heads - 1));
+            const half* ar = aux + (size_t) head * 160;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                a[j] = __half2float(ar[i0 + j]);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            v[j] += a[j];
+        union { uint2 u; half h[4]; } pk;
+        pk.h[0] = __float2half_rn(v[0]); pk.h[1] = __float2half_rn(v[1]);
+        pk.h[2] = __float2half_rn(v[2]); pk.h[3] = __float2half_rn(v[3]);
+        ((uint2*) out)[(size_t) r * 40 + l] = pk.u;
+    }
+}
+
+__global__ __launch_bounds__(MAX_RING_DIM)
+void ngram_dequant_kernel
+(
+    const int16_t* __restrict__ packed,   // (U, 1 + dim * K / 16)
+    const int32_t* __restrict__ heads,    // (U) row of aux per ring, or null for ring index mod num_heads
+    const half* __restrict__ aux,         // (num_heads, dim) bias, or signs when rotating; may be null
+    void* __restrict__ out,               // (U, dim), half or float: element type must match f32
+    const int K,
+    const int words,                      // 1 + dim * K / 16
+    const int num_heads,
+    const bool rotate,
+    const bool f32
+)
+{
+    const int r = blockIdx.x;
+    const int i = threadIdx.x;
+    const int dim = blockDim.x;
+    const uint16_t* row = (const uint16_t*) packed + (size_t) r * words;
+    float v = ring_decode(row, i, dim, K, words, __half2float(__ushort_as_half(row[0])));
 
     float a = 0.0f;
     if (aux)
@@ -374,23 +569,87 @@ void ngram_dequant_kernel
 
     if (rotate)
     {
-        // Walsh-Hadamard transform across the block, one butterfly stage per bit of the index
-        sf[i] = v;
-        __syncthreads();
-        for (int s = 1; s < dim; s <<= 1)
+        __shared__ float sf[MAX_RING_DIM];
+        if (dim >= 32)
         {
-            float lo = sf[i & ~s];
-            float hi = sf[i | s];
-            __syncthreads();
-            sf[i] = (i & s) ? lo - hi : lo + hi;
-            __syncthreads();
+            // Walsh-Hadamard, stage order s = 1, 2, 4, ..., dim/2: inside each warp the stages
+            // up to s = 16 run on shuffles (no smem, no syncs); across the warps, one smem
+            // round trip exchanges the warp results and a register butterfly per lane finishes
+            // the remaining stages. Same op order and pairing as the torch reference, so the
+            // result is bit-exact with it (and with the older smem butterfly below).
+            const int lane = i & 31;
+            #pragma unroll
+            for (int s = 1; s < 32; s <<= 1)
+            {
+                float o = __shfl_xor_sync(0xffffffffu, v, s);
+                v = (lane & s) ? o - v : v + o;
+            }
+            const int w = dim >> 5;
+            if (w > 1)
+            {
+                sf[i] = v;
+                __syncthreads();
+                float w0 = sf[lane], w1 = sf[32 + lane], w2 = 0, w3 = 0, w4 = 0, w5 = 0, w6 = 0, w7 = 0;
+                if (w >= 4)
+                {
+                    w2 = sf[64 + lane];
+                    w3 = sf[96 + lane];
+                }
+                if (w >= 8)
+                {
+                    w4 = sf[128 + lane];
+                    w5 = sf[160 + lane];
+                    w6 = sf[192 + lane];
+                    w7 = sf[224 + lane];
+                }
+                { float t = w1; w1 = w0 - t; w0 = w0 + t; }
+                if (w >= 4)
+                {
+                    { float t = w3; w3 = w2 - t; w2 = w2 + t; }
+                    { float t = w5; w5 = w4 - t; w4 = w4 + t; }
+                    { float t = w7; w7 = w6 - t; w6 = w6 + t; }
+                    { float t = w2; w2 = w0 - t; w0 = w0 + t; }
+                    { float t = w3; w3 = w1 - t; w1 = w1 + t; }
+                    { float t = w6; w6 = w4 - t; w4 = w4 + t; }
+                    { float t = w7; w7 = w5 - t; w5 = w5 + t; }
+                    if (w >= 8)
+                    {
+                        { float t = w4; w4 = w0 - t; w0 = w0 + t; }
+                        { float t = w5; w5 = w1 - t; w1 = w1 + t; }
+                        { float t = w6; w6 = w2 - t; w2 = w2 + t; }
+                        { float t = w7; w7 = w3 - t; w3 = w3 + t; }
+                    }
+                }
+                const int warp = i >> 5;
+                v = (w == 2) ? (warp ? w1 : w0)
+                    : (warp == 0 ? w0 : warp == 1 ? w1 : warp == 2 ? w2 : warp == 3 ? w3 :
+                       warp == 4 ? w4 : warp == 5 ? w5 : warp == 6 ? w6 : w7);
+            }
         }
-        v = sf[i] * (1.0f / sqrtf((float) dim));
+        else
+        {
+            // Rings below one warp (dim = 16) keep the smem butterfly
+            sf[i] = v;
+            __syncthreads();
+            for (int s = 1; s < dim; s <<= 1)
+            {
+                float lo = sf[i & ~s];
+                float hi = sf[i | s];
+                __syncthreads();
+                sf[i] = (i & s) ? lo - hi : lo + hi;
+                __syncthreads();
+            }
+            v = sf[i];
+        }
+        v *= (1.0f / sqrtf((float) dim));
         if (aux) v *= a;
     }
     else v += a;
 
-    out[(size_t) r * dim + i] = __float2half_rn(v);
+    if (f32)
+        ((float*) out)[(size_t) r * dim + i] = v;
+    else
+        ((half*) out)[(size_t) r * dim + i] = __float2half_rn(v);
 }
 
 void ngram_dequant
@@ -399,7 +658,7 @@ void ngram_dequant
     int64_t K,
     const c10::optional<at::Tensor>& heads,     // (U) int32 CUDA
     const c10::optional<at::Tensor>& aux,       // (num_heads, dim) half CUDA
-    at::Tensor out,                             // (U, dim) half CUDA
+    at::Tensor out,                             // (U, dim) half or float CUDA
     bool rotate
 )
 {
@@ -407,7 +666,7 @@ void ngram_dequant
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(packed, kShort);
-    TORCH_CHECK_DTYPE(out, kHalf);
+    TORCH_CHECK(out.scalar_type() == at::kHalf || out.scalar_type() == at::kFloat, "ngram_dequant: out must be half or float");
     TORCH_CHECK(packed.is_contiguous() && out.is_contiguous(), "ngram_dequant: contiguous inputs required");
     int64_t U = packed.size(0);
     int words = (int) packed.size(1);
@@ -428,17 +687,29 @@ void ngram_dequant
     }
     if (!U || !dim) return;
 
-    size_t smem = dim * sizeof(float) + ((words + 1) & ~1) * sizeof(uint16_t);
-    ngram_dequant_kernel<<<(unsigned int) U, dim, smem, stream>>>
-    (
-        (const int16_t*) packed.data_ptr(),
-        heads ? (const int32_t*) heads->data_ptr() : nullptr,
-        aux ? (const half*) aux->data_ptr() : nullptr,
-        (half*) out.data_ptr(),
-        (int) K,
-        words,
-        aux ? (int) aux->size(0) : 1,
-        rotate
-    );
+    const bool f32 = out.scalar_type() == at::kFloat;
+    const int16_t* packed_ptr = (const int16_t*) packed.data_ptr();
+    const int32_t* heads_ptr = heads ? (const int32_t*) heads->data_ptr() : nullptr;
+    const half* aux_ptr = aux ? (const half*) aux->data_ptr() : nullptr;
+    const int heads_per_row = aux ? (int) aux->size(0) : 1;
+
+    if (K == 8 && rotate && dim == 256)
+        ngram_dequant_rot4<<<(unsigned int) U, 64, 0, stream>>>
+        (
+            packed_ptr, heads_ptr, aux_ptr, out.data_ptr(),
+            words, heads_per_row, f32
+        );
+    else if (K == 8 && !rotate && !f32 && dim == 160)
+        ngram_dequant_bias4<<<((unsigned int) U * 40 + 255) / 256, 256, 0, stream>>>
+        (
+            packed_ptr, heads_ptr, aux_ptr, (half*) out.data_ptr(),
+            (int) U, words, heads_per_row
+        );
+    else
+        ngram_dequant_kernel<<<(unsigned int) U, dim, 0, stream>>>
+        (
+            packed_ptr, heads_ptr, aux_ptr, out.data_ptr(),
+            (int) K, words, heads_per_row, rotate, f32
+        );
     cuda_check(cudaPeekAtLastError());
 }
