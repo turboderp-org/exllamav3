@@ -770,6 +770,8 @@ class GatedDeltaNet(Module):
 
         self.a_log = None
         self.dt_bias = None
+        self.dt_bias_source = dt_bias
+        self.conv_round_bf16 = False
         self.conv1d_weight = None
         self.conv1d_weight_flat = None
         self.conv1d_bias = None
@@ -1031,7 +1033,12 @@ class GatedDeltaNet(Module):
             self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
             # Kimi Linear stores A_log as (1, 1, H, 1); the kernels take it as (H,)
             self.a_log = self.a_log.reshape(-1)
-            self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
+            self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True, no_defer = True)
+            self.dt_bias_source = self.dt_bias
+            # Cast only after loading: a deferred tensor would otherwise be copied before it is filled.
+            # Fused GDN kernels take dt_bias as bf16; some checkpoints store it as fp32.
+            if self.dt_bias.dtype == torch.float:
+                self.dt_bias = self.dt_bias.to(torch.bfloat16)
         if self.key_conv1d_weight is not None:
             # no_defer: load_local concatenates/flattens (copies) these immediately, which a
             # deferred (unfilled) tensor would corrupt
@@ -1060,6 +1067,7 @@ class GatedDeltaNet(Module):
         self.prealloc_qkvz_carrier = None
         self.a_log = None
         self.dt_bias = None
+        self.dt_bias_source = None
         self.conv1d_weight = None
         self.conv1d_weight_flat = None
         self.conv1d_bias = None
@@ -1423,7 +1431,7 @@ class GatedDeltaNet(Module):
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
-            if _conv_token_major and bsz * seqlen > 32:
+            if _conv_token_major and bsz * seqlen > 32 and not self.conv_round_bf16:
                 mixed_qkv, conv_token_major = qkv, True   # the decode kernel wants channel-major bf16
             else:
                 mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
@@ -1493,7 +1501,7 @@ class GatedDeltaNet(Module):
         t = super().get_tensors()
         for x, k in [
             (self.a_log, self.key_a_log),
-            (self.dt_bias, self.key_dt_bias),
+            (self.dt_bias_source, self.key_dt_bias),
             (self.conv1d_weight, self.key_conv1d_weight),
             (self.conv1d_bias, self.key_conv1d_bias),
         ]:
