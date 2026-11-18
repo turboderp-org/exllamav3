@@ -170,6 +170,46 @@ def test_kernel_rotated_groups(K):
     assert torch.equal(out, ref.half())
 
 
+@pytest.mark.parametrize("K", range(1, 9))
+def test_kernel_out_dtypes(K):
+    """fp32 stores are the exact dequant_rows values (fused upcast), not an fp16 round trip"""
+    gen = torch.Generator().manual_seed(300 + K)
+    n, heads = 40, 16
+    packed = rand_packed(n, K, ROW_DIM, gen).to(DEV)
+    bias = (torch.randn((heads, ROW_DIM), generator = gen) * 0.01).half().to(DEV)
+    head = torch.randint(0, heads, (n,), generator = gen, dtype = torch.int32).to(DEV)
+    out = torch.empty((n, ROW_DIM), dtype = torch.float32, device = DEV)
+    ext.ngram_dequant(packed, K, head, bias, out, False)
+    assert torch.equal(out, dequant_rows(packed, K, mul1_codebook(DEV), bias.float()[head.long()]))
+    groups, rows = 5, 9
+    packed = rand_packed(rows * groups, K, GROUP_DIM, gen).to(DEV)
+    signs = (torch.randint(0, 2, (groups, GROUP_DIM), generator = gen) * 2 - 1).half().to(DEV)
+    out = torch.empty((rows * groups, GROUP_DIM), dtype = torch.float32, device = DEV)
+    ext.ngram_dequant(packed, K, None, signs, out, True)
+    assert torch.equal(out, dequant_rows(packed, K, mul1_codebook(DEV), signs = signs.repeat(rows, 1)))
+
+
+def test_table_embedding_out_dtype():
+    """decode answers an fp32 request in fp32 (exact), and half otherwise, on both table paths"""
+    K, groups, rows = 8, 5, 7
+    gen = torch.Generator().manual_seed(400)
+    packed = rand_packed(rows * groups, K, GROUP_DIM, gen).to(DEV)
+    signs = (torch.randint(0, 2, (groups, GROUP_DIM), generator = gen) * 2 - 1).half().to(DEV)
+    table = TableEmbedding(SimpleNamespace(row_words = groups * words_per_row(K, GROUP_DIM)),
+                           groups * GROUP_DIM, DEV, signs)
+    ref = dequant_rows(packed, K, mul1_codebook(DEV), signs = signs.repeat(rows, 1)).view(rows, -1)
+    out = table.decode(packed, None, rows, torch.float32)
+    assert out.dtype == torch.float32
+    assert torch.equal(out, ref)
+    out = table.decode(packed, None, rows)
+    assert out.dtype == torch.half
+    assert torch.equal(out, ref.half())
+    # Raw (unrotated) table path: same dtype contract
+    table = TableEmbedding(SimpleNamespace(), groups * GROUP_DIM, DEV, None)
+    raw = torch.randn((rows, groups * GROUP_DIM), generator = gen).half().to(DEV)
+    assert torch.equal(table.decode(raw, None, rows, torch.float32), raw.float())
+
+
 @pytest.mark.parametrize("hidden", (640, 1024))
 @pytest.mark.parametrize("K", (2, 4, 6, 8))
 def test_quantize_embedding(hidden, K):
