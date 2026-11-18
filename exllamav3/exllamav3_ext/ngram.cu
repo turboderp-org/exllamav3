@@ -324,11 +324,12 @@ void ngram_dequant_kernel
     const int16_t* __restrict__ packed,   // (U, 1 + dim * K / 16)
     const int32_t* __restrict__ heads,    // (U) row of aux per ring, or null for ring index mod num_heads
     const half* __restrict__ aux,         // (num_heads, dim) bias, or signs when rotating; may be null
-    half* __restrict__ out,               // (U, dim)
+    void* __restrict__ out,               // (U, dim), half or float: element type must match f32
     const int K,
     const int words,                      // 1 + dim * K / 16
     const int num_heads,
-    const bool rotate
+    const bool rotate,
+    const bool f32
 )
 {
     const int r = blockIdx.x;
@@ -390,7 +391,10 @@ void ngram_dequant_kernel
     }
     else v += a;
 
-    out[(size_t) r * dim + i] = __float2half_rn(v);
+    if (f32)
+        ((float*) out)[(size_t) r * dim + i] = v;
+    else
+        ((half*) out)[(size_t) r * dim + i] = __float2half_rn(v);
 }
 
 void ngram_dequant
@@ -399,7 +403,7 @@ void ngram_dequant
     int64_t K,
     const c10::optional<at::Tensor>& heads,     // (U) int32 CUDA
     const c10::optional<at::Tensor>& aux,       // (num_heads, dim) half CUDA
-    at::Tensor out,                             // (U, dim) half CUDA
+    at::Tensor out,                             // (U, dim) half or float CUDA
     bool rotate
 )
 {
@@ -407,7 +411,7 @@ void ngram_dequant
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(packed, kShort);
-    TORCH_CHECK_DTYPE(out, kHalf);
+    TORCH_CHECK(out.scalar_type() == at::kHalf || out.scalar_type() == at::kFloat, "ngram_dequant: out must be half or float");
     TORCH_CHECK(packed.is_contiguous() && out.is_contiguous(), "ngram_dequant: contiguous inputs required");
     int64_t U = packed.size(0);
     int words = (int) packed.size(1);
@@ -434,11 +438,12 @@ void ngram_dequant
         (const int16_t*) packed.data_ptr(),
         heads ? (const int32_t*) heads->data_ptr() : nullptr,
         aux ? (const half*) aux->data_ptr() : nullptr,
-        (half*) out.data_ptr(),
+        out.data_ptr(),
         (int) K,
         words,
         aux ? (int) aux->size(0) : 1,
-        rotate
+        rotate,
+        out.scalar_type() == at::kFloat
     );
     cuda_check(cudaPeekAtLastError());
 }
