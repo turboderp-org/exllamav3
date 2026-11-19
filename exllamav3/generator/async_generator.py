@@ -144,12 +144,15 @@ class AsyncGenerator:
         # After a generator exception the sync generator's state is suspect and every job was already delivered
         # the error; don't poke it from consumers' cleanup handlers, or their except/finally blocks can be hit
         # with a second exception.
-        if self.error is None:
-            self.generator.cancel(job.job)
-        if job.job not in self.jobs:
-            return
-        del self.jobs[job.job]
-        job.put_result(_CANCELLED_SENTINEL)
+        # The mapping goes even if the sync generator raises, or the iteration loop would keep spinning on a job
+        # that produces nothing
+        try:
+            if self.error is None:
+                self.generator.cancel(job.job)
+        finally:
+            if job.job in self.jobs:
+                del self.jobs[job.job]
+                job.put_result(_CANCELLED_SENTINEL)
 
 
 class AsyncJob:

@@ -282,7 +282,12 @@ class PrefillPipeline:
             for s, layers in by_stage.items():
                 steps[s] = lambda layers = layers: side.update(snapshot.stash_layers(layers))
         if state.draft is not None:
-            steps[self.draft_stage] = lambda: stashed.__setitem__("draft", state.draft.stash())
+            def draft_step():
+                stashed["draft"] = state.draft.stash()
+                # Without a target side the pair's position is the draft side's, which hadn't taken the chunk above
+                if state.target is None:
+                    stashed["position"] = stashed["draft"]["position"]
+            steps[self.draft_stage] = draft_step
         item = _Item(steps, owner, False)
         self.pending_stashes.add(id(stashed))
 

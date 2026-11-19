@@ -1076,16 +1076,23 @@ class Job:
                 # roll back in place, else the pair is restored from a stash
                 if self.recurrent_state.can_rewind_to(target):
                     self.recurrent_state.rewind_to(target)
+                    # A checkpoint stashed past the target was of the tokens that are going
+                    if (self.last_recurrent_checkpoint_pos or 0) > target:
+                        self.last_recurrent_checkpoint_pos = None
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.free_recurrent_state()
                     if stashed is not None:
                         replay_from = stashed["position"]
                         self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
+                        # The rolling checkpoint isn't in the cache yet, so it doesn't count as the last one there
+                        # (which is below it), or it would be dropped instead of committed when the job ends
+                        if stashed is not self.rolling_stash:
+                            self.last_recurrent_checkpoint_pos = replay_from
                     else:
                         replay_from = 0
                         self.recurrent_state = self.generator.new_recurrent_state()
-                    self.last_recurrent_checkpoint_pos = replay_from or None
+                        self.last_recurrent_checkpoint_pos = None
 
             for seq in self.sequences:
                 p_page = seq.kv_position // PAGE_SIZE
@@ -1612,7 +1619,9 @@ class Job:
                 to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
                 if to_output:
                     params["last_tokens_only"] = 1
-                then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None
+                then = None
+                if dm:
+                    then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start, prefill_end)
                 if gen.pipeline is not None and len(self.sequences) == 1:
                     gen.pipeline.prefill(prefill_ids, params, self, to_output, then)
                 else:
@@ -1627,8 +1636,11 @@ class Job:
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
-                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
-                    self.recurrent_state.rewind_to(prefill_end)
+                # Only the target side has taken the chunk by now if it went through the pipeline; the draft
+                # side does the same once it has (update_draft_from_prefill)
+                target_state = self.recurrent_state.target if self.recurrent_state is not None else None
+                if target_state is not None and target_state.position > prefill_end:
+                    target_state.rewind(target_state.position - prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1682,11 +1694,15 @@ class Job:
             results.append(r)
 
 
-    def update_draft_from_prefill(self, seq, prefill_ids: torch.Tensor, prefill_start: int, params: dict):
+    def update_draft_from_prefill(
+        self, seq, prefill_ids: torch.Tensor, prefill_start: int, prefill_end: int, params: dict
+    ):
         """
         Bring the draft model up to a prefill chunk of the target, from the finished chunk's params: the states it
         exported go in as they are, or the draft model takes the chunk itself. Runs on the draft model's device when
         the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
+        prefill_ids may run past prefill_end (atomic multimodal prefill), in which case the draft side's recurrent
+        state is brought back to prefill_end afterwards, as prefill does for the target side.
         """
         if self.generator.dflash_draft:
             self.generator.draft_model.update_kv_from_target(
@@ -1723,6 +1739,10 @@ class Job:
                                         and self.recurrent_state.draft is not None else None,
                 }
             )
+
+        draft_state = self.recurrent_state.draft if self.recurrent_state is not None else None
+        if draft_state is not None and draft_state.position > prefill_end:
+            draft_state.rewind(draft_state.position - prefill_end)
 
 
     def allocate_pages(self):

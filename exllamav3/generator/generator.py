@@ -681,6 +681,7 @@ class Generator:
         return job.serial_number
 
 
+    @torch.inference_mode()
     def cancel(
         self,
         job: Job
@@ -699,9 +700,12 @@ class Generator:
         if job in self.pending_jobs:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
-            job.commit_recurrent_checkpoint()
-            job.deallocate_pages()
-            self.active_jobs.remove(job)
+            # The checkpoint may have rolled the state back by the time it fails: the job has to go either way
+            try:
+                job.commit_recurrent_checkpoint()
+            finally:
+                job.deallocate_pages()
+                self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
 
@@ -901,7 +905,8 @@ class Generator:
             self.model.pipeline = None
             if self.draft_model is not None:
                 self.draft_model.pipeline = None
-            self.recurrent_cache and setattr(self.recurrent_cache, "pipeline", None)
+            if self.recurrent_cache is not None:
+                self.recurrent_cache.pipeline = None
             self.pipeline = None
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
