@@ -1304,7 +1304,7 @@ class Job:
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
-            # An MTP job requeues one token past the boundary and reserves it (rq_margin, rq_headroom below)
+            # An MTP job requeues one token past the boundary and reserves it, so the final cut leaves room for it too
             mtp_lag = 1 if self.generator.mtp_draft else 0
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
@@ -1314,8 +1314,7 @@ class Job:
                 # The final segment: a budget aligned to the end of the cache leaves no room for the
                 # speculative window past it, and no requeue can follow it anyway, so it is cut to what
                 # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
-                # 31-token draft window could not be enqueued at all). The cut makes room for everything
-                # reserved past the budget (rq_headroom), so for an MTP job the token past the window too
+                # 31-token draft window could not be enqueued at all)
                 y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens - mtp_lag)
                 self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
