@@ -32,6 +32,24 @@ if TYPE_CHECKING:
     from .model import Model
 
 
+def update_lora_flags(model: Model):
+    """
+    Set has_lora on every module that has an adapter attached to a Linear at
+    or below it. Fused and graph-captured paths (mgemm bundles, BC classes)
+    read their layers' weights directly and never reach Linear.forward, where
+    adapters are applied, so they check the flag and take the per-layer path.
+    """
+    def visit(module) -> bool:
+        flag = isinstance(module, Linear) and bool(module.lora_a_tensors)
+        for child in module.modules:
+            flag = visit(child) or flag
+        module.has_lora = flag
+        return flag
+
+    for module in model.modules:
+        visit(module)
+
+
 class LoRA:
     """
     LoRA adapter loaded from PEFT format.
@@ -79,6 +97,7 @@ class LoRA:
             lora_scaling: float = 1.0,
     ):
         self.target_modules = {}
+        self.model = model
         self.name = os.path.basename(os.path.dirname(config_path))
 
         # Read adapter config
@@ -194,6 +213,8 @@ class LoRA:
                 f"on tensor-parallel sliced modules"
             )
 
+        update_lora_flags(model)
+
     @staticmethod
     def _parse_key(key: str) -> tuple[str | None, str | None]:
         """
@@ -219,3 +240,4 @@ class LoRA:
             target.lora_b_tensors.pop(self, None)
 
         self.target_modules = {}
+        update_lora_flags(self.model)
