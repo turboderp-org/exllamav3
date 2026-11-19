@@ -107,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_memcpy_async", &cuda_memcpy_async, py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("kind"));
+    m.def("cuda_memcpy2d_async_batch", &cuda_memcpy2d_async_batch, py::arg("plan"), py::arg("kind"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
@@ -126,7 +127,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
-    m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
+    m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add",
+          py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
+          py::arg("workers") = 1, py::arg("worker_stride") = 0, py::arg("accumulate") = true);
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
@@ -204,6 +207,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
     m.def("exl3_moe_split_issue_fused", &exl3_moe_split_issue_fused, "exl3_moe_split_issue_fused");
     m.def("exl3_moe_split_collect_fused", &exl3_moe_split_collect_fused, "exl3_moe_split_collect_fused");
+    m.def("moe_unswizzle_trellis_nsplit", &moe_unswizzle_trellis_nsplit, "moe_unswizzle_trellis_nsplit");
     m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
           py::arg("group") = 0, py::arg("planar") = 0);
@@ -212,6 +216,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_core_order", &exl3_moe_cpu_core_order, "exl3_moe_cpu_core_order");
     m.def("exl3_moe_cpu_pool_pin_siblings", &exl3_moe_cpu_pool_pin_siblings, "exl3_moe_cpu_pool_pin_siblings");
+    m.def("exl3_moe_cpu_set_core_order", &exl3_moe_cpu_set_core_order, "exl3_moe_cpu_set_core_order");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");

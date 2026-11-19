@@ -7,6 +7,7 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#include "cpu/moe_handoff.h"
 #if defined(USE_ROCM)
     #include "rocm/routing_gemv_rdna.cuh"
 #endif
@@ -1414,7 +1415,10 @@ void moe_split_issue
 // Fused collect for the split path: fold the worker's partial into the routed sum straight
 // from the pinned slot (replacing the H2D memcpy, the width trim and the separate add), or
 // do nothing at all -- no PCIe reads -- when the issue kernel recorded an empty job. Loads
-// go through volatile so no stale line can be served for a slot's previous tenant
+// go through volatile so no stale line can be served for a slot's previous tenant.
+// Multi-NUMA: `workers` partials, worker_stride floats apart, summed in worker order onto
+// final_out, or into it (accumulate 0); every load is issued before any add so the mapped-host
+// round trips overlap
 __global__ void moe_split_collect_add_kernel
 (
     float* __restrict__ final_out,       // (rows, h_) device, contiguous
@@ -1423,7 +1427,10 @@ __global__ void moe_split_collect_add_kernel
     const int total,                     // rows * h_
     const int h_,
     const int ho,
-    const int slot_idx
+    const int slot_idx,
+    const int workers,
+    const int64_t worker_stride,
+    const int accumulate
 )
 {
     if (dev_count[slot_idx] == 0) return;
@@ -1431,8 +1438,16 @@ __global__ void moe_split_collect_add_kernel
     if (i >= total) return;
     const int row = i / h_;
     const int c = i - row * h_;
-    const volatile float* vo = h_out;
-    final_out[i] += vo[row * ho + c];
+    const volatile float* vo = h_out + (int64_t) row * ho + c;
+    float v[MOE_MAX_WORKERS];
+    #pragma unroll
+    for (int w = 0; w < MOE_MAX_WORKERS; ++w)
+        if (w < workers) v[w] = vo[(int64_t) w * worker_stride];
+    float acc = accumulate ? final_out[i] + v[0] : v[0];
+    #pragma unroll
+    for (int w = 1; w < MOE_MAX_WORKERS; ++w)
+        if (w < workers) acc += v[w];
+    final_out[i] = acc;
 }
 
 void moe_split_collect_add
@@ -1441,7 +1456,10 @@ void moe_split_collect_add
     int64_t h_out_ptr,
     const at::Tensor& dev_count,
     const int64_t slot_idx,
-    const int64_t ho
+    const int64_t ho,
+    const int64_t workers,
+    const int64_t worker_stride,
+    const bool accumulate
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
@@ -1449,6 +1467,7 @@ void moe_split_collect_add
     TORCH_CHECK_DTYPE(final_out, kFloat);
     TORCH_CHECK_DTYPE(dev_count, kInt);
     TORCH_CHECK(final_out.is_contiguous(), "moe_split_collect_add: output must be contiguous");
+    TORCH_CHECK(workers >= 1 && workers <= MOE_MAX_WORKERS, "moe_split_collect_add: bad worker count");
     int rows = (int) final_out.size(0);
     int h_ = (int) final_out.size(1);
     int total = rows * h_;
@@ -1460,7 +1479,8 @@ void moe_split_collect_add
         (float*) final_out.data_ptr(),
         reinterpret_cast<const float*>(h_out_ptr),
         (const int32_t*) dev_count.data_ptr(),
-        total, h_, (int) ho, (int) slot_idx
+        total, h_, (int) ho, (int) slot_idx,
+        (int) workers, worker_stride, (int) accumulate
     );
     cuda_check(cudaPeekAtLastError());
 }

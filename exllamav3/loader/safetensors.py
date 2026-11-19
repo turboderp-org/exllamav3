@@ -353,6 +353,35 @@ class DiskTensorHandle:
             self._ref_fd_close(fd, transient)
         return torch.frombuffer(buf, dtype = self.dtype).view(end - start, *self.row_shape)
 
+    def read_dim1_range(self, start: int, end: int) -> torch.Tensor:
+        """
+        The [:, start:end] slice (dim 1) as a contiguous CPU tensor in the stored dtype, reading
+        only the slice's span of every row (one positioned read per row) instead of the whole
+        tensor: (end - start) / shape[1] of the bytes.
+        """
+        assert len(self.shape) >= 2 and 0 <= start <= end <= self.shape[1]
+        esize = torch.empty(0, dtype = self.dtype).element_size()
+        inner = math.prod(self.shape[2:]) if len(self.shape) > 2 else 1
+        seg = (end - start) * inner * esize
+        buf = bytearray(self.num_rows * seg)
+        mv = memoryview(buf)
+        fd, transient = self._ref_fd()
+        try:
+            for r in range(self.num_rows):
+                base = self.abs_offset + r * self.row_bytes + start * inner * esize
+                dst = mv[r * seg:(r + 1) * seg]
+                pos = 0
+                while pos < seg:
+                    if os.name == "nt":
+                        got = _win_pread_into(fd, dst[pos:], base + pos)
+                    else:
+                        got = os.preadv(fd, [dst[pos:]], base + pos)
+                    assert got > 0, f"short read from {self.filename}"
+                    pos += got
+        finally:
+            self._ref_fd_close(fd, transient)
+        return torch.frombuffer(buf, dtype = self.dtype).view(self.num_rows, end - start, *self.shape[2:])
+
     def read_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """
         Gather of arbitrary rows, returned in the order given, as a CPU tensor in the stored
