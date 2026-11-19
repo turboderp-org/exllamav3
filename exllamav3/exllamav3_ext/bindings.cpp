@@ -186,7 +186,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
-    m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_gemm", &exl3_gemm, "exl3_gemm",
+          py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
+          py::arg("force_shape_idx"), py::arg("mcg"), py::arg("mul1"), py::arg("force_num_sms"),
+          py::arg("locks") = py::none());
+    m.def("exl3_gemm_lock_elements", &exl3_gemm_lock_elements, "exl3_gemm_lock_elements");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
