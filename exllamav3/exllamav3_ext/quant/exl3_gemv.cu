@@ -71,11 +71,13 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     return -1;
 }
 
-static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+// bound: the narrow config's two-blocks-per-SM instance (the wide config has one form)
+static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem, bool bound)
 {
     #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
         if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
-            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+            return (cfg_ == 0 && bound) ? (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_, false, cfg_ == 0> \
+                                        : (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
     #define SEL_GRID(bits_, cb_, sm_) \
         SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
         SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
@@ -145,12 +147,12 @@ bool exl3_gemv_try_launch
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
 
-    auto select = [&] (int cfg_) -> void*
+    auto select = [&] (int cfg_, bool bound) -> void*
     {
         return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem, bound);
     };
-    void* narrow_kernel = select(0);
+    void* narrow_kernel = select(0, true);
     if (!narrow_kernel) return false;
     int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
 
@@ -159,8 +161,15 @@ bool exl3_gemv_try_launch
     int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
-    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
+    void* kernel = cfg == 0 ? narrow_kernel : select(cfg, false);
     if (!kernel) return false;
+
+    // A narrow grid that fits in one wave without the bound runs the unbounded integer instance
+    if (cfg == 0 && !half_k)
+    {
+        void* unbounded = select(0, false);
+        if (unbounded && size_n / 32 <= occupancy(unbounded, 512) * num_sms) kernel = unbounded;
+    }
 
     int block_dim = cfg == 0 ? 512 : 256;
     int cols = cfg == 0 ? 32 : 64;

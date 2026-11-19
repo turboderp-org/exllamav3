@@ -183,12 +183,28 @@ def assistant_message(content: str, reasoning: str | None, tool_calls: list | No
     return m
 
 
-def response_token_ids(tokenizer, messages: list, assistant: dict, template_vars: dict, warn = print):
+def produced_end(response_text: str, assistant: dict) -> int:
+    """Where the model's own output ends in the rendered turn of a response that ran into the token limit: after
+    the last text it wrote. What follows is the template closing a turn the model never finished"""
+    text = assistant["content"].rstrip() or (assistant.get("reasoning_content") or "").rstrip()
+    tail = text[-80:]
+    pos = response_text.rfind(tail) if tail else -1
+    if pos < 0:
+        raise ValueError("end of a truncated response not found in the rendered turn")
+    return pos + len(tail)
+
+
+def response_token_ids(tokenizer, messages: list, assistant: dict, template_vars: dict, warn = print,
+                       truncated: bool = False):
     """
     The response token stream a local generator would have produced for `assistant`, as the difference
     between the template rendered with the generation prompt and rendered with the finished turn, tokenized
     with special tokens (think tags, end-of-turn). A template whose finished turn does not extend its own
     generation prompt falls back to the longest common prefix.
+
+    Only what the model produced is kept. Whitespace the template puts after the end-of-turn token is dropped,
+    and for a response that ran into the token limit (truncated) so is everything the template adds to close
+    the unfinished turn: the closing think tag and the end-of-turn token the model never reached.
     Returns a list of ints.
     """
     prompt_text = tokenizer.hf_render_chat_template(messages, add_generation_prompt = True, **template_vars)
@@ -204,4 +220,7 @@ def response_token_ids(tokenizer, messages: list, assistant: dict, template_vars
         warn(f" !! Chat template's finished turn does not extend its generation prompt; "
              f"response taken from the common prefix ({len(prompt_text) - n} prompt characters dropped)")
         response_text = full_text[n:]
+    response_text = response_text.rstrip()
+    if truncated and not assistant.get("tool_calls"):
+        response_text = response_text[:produced_end(response_text, assistant)]
     return tokenizer.encode(response_text, add_bos = False, encode_special_tokens = True)[0].tolist()

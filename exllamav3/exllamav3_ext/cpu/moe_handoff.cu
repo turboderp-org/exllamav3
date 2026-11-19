@@ -368,6 +368,7 @@ void exl3_moe_cpu_worker_run
     uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
     uint32_t* quit = reinterpret_cast<uint32_t*>(base + 0);
     uint32_t* pass_wake = reinterpret_cast<uint32_t*>(base + 64);
+    uint32_t* hot = reinterpret_cast<uint32_t*>(base + 68);
     uint32_t* ready = reinterpret_cast<uint32_t*>(base + 192);
     uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
     uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
@@ -455,6 +456,10 @@ void exl3_moe_cpu_worker_run
     if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
     store_release_u32(ready, 1);
 
+    // Hot polling (the hot word): a host that forgets to clear it holds the cores this long at most
+    constexpr auto MOE_HOT_SPIN_LIMIT = std::chrono::seconds(1);
+    auto last_job = std::chrono::steady_clock::now() - MOE_HOT_SPIN_LIMIT;
+
     uint32_t head = load_acquire_u32(jobs_head);
     uint32_t last_wake = 0;
     int idle = 0;
@@ -476,6 +481,14 @@ void exl3_moe_cpu_worker_run
             // Spin hard in-pass (jobs arrive within microseconds of the GPU reaching the layer),
             // back off to two-tier naps (100us for first ~50ms, then 10ms between prompts)
             if (++idle < 65536) { cpu_pause_(); continue; }
+            // The host expects the next pass within milliseconds (the MTP draft/verify handoff), sooner than a nap's
+            // wake-up: keep the pool primed and polling instead
+            if (load_acquire_u32(hot) && std::chrono::steady_clock::now() - last_job < MOE_HOT_SPIN_LIMIT)
+            {
+                if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
+                idle = 65536 - 16384;
+                continue;
+            }
                 {
                 // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
                 // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
@@ -547,6 +560,7 @@ void exl3_moe_cpu_worker_run
         }
 
         store_release_flag(done + size_t(job.slot) * 16, job);
+        last_job = std::chrono::steady_clock::now();
 
         if (hprof)
         {

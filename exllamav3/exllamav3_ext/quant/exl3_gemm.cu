@@ -596,6 +596,11 @@ int exl3_mgemm_gr
         if (bszm_out > num_indices) bszm_out = num_indices;
     }
 
+    // Range filtering stages the filtered indices and weights in fixed device arrays of MAX_INDICES entries
+    // (exl3_gemm_kernel.cuh), written with no bound check
+    TORCH_CHECK(min_index < 0 || MAX(bszm_in, bszm_out) <= MAX_INDICES,
+                "exl3_mgemm: expert-range filtering supports at most ", MAX_INDICES, " slots");
+
     // Slot j reads A[j] unless A is broadcast, and (without output pointers) writes C[j]. With no matrices
     // no slot runs. The weighted reduction then sums each token's slots into C[t]
     if (B.size(0))

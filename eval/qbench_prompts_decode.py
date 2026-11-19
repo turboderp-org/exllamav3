@@ -79,8 +79,9 @@ def main(args):
         input_text = tokenizer.decode(input_ids, decode_special_tokens = True)
         response_text = tokenizer.decode(response_ids, decode_special_tokens = True)
         f = fence_for(input_text, response_text)
+        origin = f", {row['domain']}/{row['lang']}" if "domain" in row else ""
         lines += [
-            f"## Row {i} (conversation {row['conversation']}, turn {row['turn']})",
+            f"## Row {i} (conversation {row['conversation']}, turn {row['turn']}{origin})",
             "",
             f"### Input ({input_ids.numel()} tokens)",
             "",

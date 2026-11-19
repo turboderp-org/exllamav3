@@ -27,9 +27,13 @@ quantized models are needed, and no combination of pre-quantized checkpoints is 
 output is only a recipe, so a subsequent convert.py run can LDLQ-compensate against the actual
 noise of the tensors as quantized.
 
-Output: YAML recipe mapping each quantizable tensor to an integer bitrate, plus head_bits,
+Output: YAML recipe mapping each quantizable tensor to a bitrate, plus head_bits,
 intended to be consumed by convert.py in place of --bits/--head_bits.
 """
+
+
+# Half-integer trellis rates with kernel instances (mul1 codebook only); above 3.5 bpw the steps are whole bits
+HALF_RATES = (1.5, 2.5, 3.5)
 
 
 def main(args):
@@ -132,35 +136,49 @@ def main(args):
     if num_tied:
         print(f" -- Tied groups: {num_tied} ({args.tie})")
 
-    # Exact greedy: all groups start at min_k, spend budget one bit-per-weight increment at a
-    # time on the largest marginal KL reduction per storage bit
+    # Supported bitrates within [min_k, max_k], ascending: whole bits, plus the half-integer rates with --k_step 0.5
+    all_rates = sorted(set(range(1, 9)) | (set(HALF_RATES) if args.k_step == 0.5 else set()))
+    assert args.min_k in all_rates and args.max_k in all_rates, \
+        f"--min_k and --max_k must be supported bitrates: {', '.join(str(k) for k in all_rates)}"
+    rates = [k for k in all_rates if args.min_k <= k <= args.max_k]
+    assert rates, "--min_k is above --max_k"
+
+    # Exact greedy: all groups start at min_k, spend budget one supported increment at a time on the largest
+    # marginal KL reduction per storage bit. Increments differ in size (half a bit up to 4 bpw, a whole bit above),
+    # which the per-bit ranking accounts for; the curve is convex, so each group's increments still rank in order
     sum_numel = sum(r["numel"] for r in tensors)
     budget = int(args.bitrate * sum_numel)
     numel_g = [sum(r["numel"] for r in g) for g in groups]
-    step = args.k_step
-    k_group = [float(args.min_k) if step != 1 else int(args.min_k)] * len(groups)
-    spent = args.min_k * sum_numel
-    assert spent <= budget, f"target bitrate below min_k = {args.min_k}"
+    level = [0] * len(groups)                               # index into rates, per group
+    spent = rates[0] * sum_numel
+    assert spent <= budget, f"target bitrate below min_k = {rates[0]}"
 
     def kld_at_g(g, k):
         return sum(kld_at(r, k) for r in g)
 
+    # KL reduction and storage cost of raising group i from rates[l] to rates[l + 1]
+    def step_gain(i, l):
+        return kld_at_g(groups[i], rates[l]) - kld_at_g(groups[i], rates[l + 1])
+
+    def step_cost(i, l):
+        return numel_g[i] * (rates[l + 1] - rates[l])
+
     heap = []
-    for i, g in enumerate(groups):
-        if args.min_k < args.max_k:
-            gain = kld_at_g(g, args.min_k) - kld_at_g(g, args.min_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, args.min_k + step))
+    def push(i, l):
+        if l + 1 < len(rates):
+            heapq.heappush(heap, (-step_gain(i, l) / step_cost(i, l), i, l))
+
+    for i in range(len(groups)):
+        push(i, 0)
     while heap:
-        neg_density, i, next_k = heapq.heappop(heap)
-        if spent + numel_g[i] * step > budget:
+        _, i, l = heapq.heappop(heap)
+        if spent + step_cost(i, l) > budget:
             # Later increments for this group only get worse per bit; drop it and let smaller
             # groups keep filling the remainder
             continue
-        k_group[i] = next_k
-        spent += numel_g[i] * step
-        if next_k < args.max_k - 1e-9:
-            gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], next_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, next_k + step))
+        level[i] = l + 1
+        spent += step_cost(i, l)
+        push(i, l + 1)
 
     # Exchange repair: a group (especially a tied pair, whose increments are twice the size) can
     # be stranded at a low K when its next increment stops fitting the remaining budget while
@@ -174,26 +192,26 @@ def main(args):
         leftover = budget - spent
         # Demotion candidates, cheapest loss per freed bit first, shared across promotions
         cands = []
-        for j, h in enumerate(groups):
-            if k_group[j] > args.min_k + 1e-9:
-                loss = kld_at_g(h, k_group[j] - step) - kld_at_g(h, k_group[j])
-                cands.append((loss / (numel_g[j] * step), loss, numel_g[j] * step, j))
+        for j in range(len(groups)):
+            if level[j] > 0:
+                loss, freed = step_gain(j, level[j] - 1), step_cost(j, level[j] - 1)
+                cands.append((loss / freed, loss, freed, j))
         cands.sort()
         best = None  # (kld improvement, promote group, [demote groups])
-        for i, g in enumerate(groups):
-            if k_group[i] >= args.max_k - 1e-9:
+        for i in range(len(groups)):
+            if level[i] + 1 >= len(rates):
                 continue
-            gain = kld_at_g(g, k_group[i]) - kld_at_g(g, k_group[i] + step)
-            need = numel_g[i] * step - leftover
+            gain = step_gain(i, level[i])
+            need = step_cost(i, level[i]) - leftover
             demote, loss_sum = [], 0.0
-            for _, loss, nj, j in cands:
+            for _, loss, freed, j in cands:
                 if need <= 0:
                     break
                 if j == i:
                     continue
                 demote.append(j)
                 loss_sum += loss
-                need -= nj
+                need -= freed
             if need > 0:
                 continue
             delta = gain - loss_sum
@@ -202,16 +220,16 @@ def main(args):
         if best is None:
             break
         _, i, demote = best
-        k_group[i] += step
-        spent += numel_g[i] * step
+        spent += step_cost(i, level[i])
+        level[i] += 1
         for j in demote:
-            k_group[j] -= step
-            spent -= numel_g[j] * step
+            level[j] -= 1
+            spent -= step_cost(j, level[j])
         exchanges += 1
     if exchanges:
         print(f" -- Exchange repair: {exchanges} move(s)")
 
-    k_assign = {r["key"]: k_group[i] for i, g in enumerate(groups) for r in g}
+    k_assign = {r["key"]: rates[level[i]] for i, g in enumerate(groups) for r in g}
     achieved_bpw = spent / sum_numel
     pred_kld = sum(kld_at(r, k_assign[r["key"]]) for r in tensors)
 
@@ -267,8 +285,7 @@ def main(args):
         head_bits = args.head_bits,
         tie = args.tie,
         # A grouped target's bitrate applies to every member tensor (one K per MoE layer's experts)
-        tensors = {m: (int(k_assign[r["key"]]) if float(k_assign[r["key"]]).is_integer() else float(k_assign[r["key"]]))
-                   for r in tensors for m in r.get("members", [r["key"]])},
+        tensors = {m: k_assign[r["key"]] for r in tensors for m in r.get("members", [r["key"]])},
     )
     with open(args.out, "w") as f:
         f.write("# Quantization recipe generated by sc_optimize.py\n")
@@ -287,14 +304,14 @@ def main(args):
             model = meas["model"],
             alpha = alpha,
             bit_ratio = ratio,
-            k_range = [args.min_k, args.max_k],
+            k_range = [rates[0], rates[-1]],
             tensors = [
                 dict(
                     key = r["key"],
                     qbits_key = r["qbits_key"],
                     numel = r["numel"],
                     S = r["S"],
-                    kld = {k: kld_at(r, k) for k in range(args.min_k, args.max_k + 1)},
+                    kld = {k: kld_at(r, k) for k in rates},
                 )
                 for r in tensors + head
             ],
@@ -323,7 +340,9 @@ if __name__ == "__main__":
     parser.add_argument("-all", "--alpha_low", type = float, default = None, help = "Scaling exponent for the curve below the anchor K (demotions to high noise, e.g. K=1); default: same as --alpha.")
     parser.add_argument("-mink", "--min_k", type = float, default = 1)
     parser.add_argument("-maxk", "--max_k", type = float, default = 8)
-    parser.add_argument("-ks", "--k_step", type = float, default = 1.0, help = "Bitrate increment of the allocation: 1 (default) or 0.5 (half-integer trellis rates, e.g. 1.5 bpw)")
+    parser.add_argument("-ks", "--k_step", type = float, default = 1.0, choices = (1.0, 0.5),
+                        help = "Bitrate increment of the allocation: 1 (default) or 0.5 (adds the half-integer trellis rates 1.5, 2.5 and 3.5; whole bits above "
+                               "those). Half-integer rates need the mul1 codebook")
     parser.add_argument("-tie", "--tie", type = str, default = "q_proj+k_proj+v_proj,gate_proj+up_proj,in_proj_qkv+in_proj_z",
                         help = "Suffix groups forced to share a bitrate (fused GEMMs in the inference paths), tied within the same parent module. Pass \"\" to optimize all "
                                "tensors independently. Default: k_proj+v_proj,gate_proj+up_proj")

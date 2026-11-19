@@ -618,7 +618,12 @@ def run_api_wave(api, args, tokenizer, convs, pending, template_vars, t_idx, pro
                 print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
                 continue
             assistant = assistant_message(r["content"], r["reasoning"])
-            ids = response_token_ids(tokenizer, convs[c_idx]["messages"], assistant, template_vars)
+            try:
+                ids = response_token_ids(tokenizer, convs[c_idx]["messages"], assistant, template_vars,
+                                         truncated = r["finish_reason"] == "length")
+            except ValueError as e:
+                print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
+                continue
             if not ids:
                 print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}empty{col_default} response")
                 continue

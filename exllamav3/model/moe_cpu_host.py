@@ -107,7 +107,10 @@ class MoeCpuTuning:
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
         # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0 or the
         # topology is unreadable
-        _, n_phys = ext.exl3_moe_cpu_core_order()
+        order, n_phys = ext.exl3_moe_cpu_core_order()
+        # The pools' placement (moe_mul1.cpp): the main one pins the physical-core prefix of the core order, the
+        # others its SMT siblings, wrapping around when short
+        self.n_phys, self.n_lps = n_phys, len(order)
         self.threads = int(os.environ.get(
             "EXL3_MOE_CPU_THREADS",
             default_worker_threads(n_phys, self.host_cores) if n_phys and self.host_cores > 0
@@ -674,7 +677,8 @@ class _HugeArena:
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
-def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None):
+def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False, huge = "", cpus = None,
+                        pin_siblings = False):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
@@ -699,6 +703,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         err = apply_process_affinity(cpus)
         if err is not None:
             print(f" !! CPU MoE worker affinity: {err}; worker confined to the host's LPs")
+    if pin_siblings:
+        # A draft component's pool beside the main model's: share its physical cores, not its LPs
+        cext.exl3_moe_cpu_pool_pin_siblings()
 
     if os.name == "nt":
         # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
@@ -968,6 +975,33 @@ def _pinning_exhausted(e: Exception) -> bool:
     return "out of memory" in str(e).lower()
 
 
+def _pools_share_lps(hosts):
+    """Whether the main model's pool and the other components' would run on the same LPs: no SMT, fewer SMT siblings
+    than draft threads, or a main pool larger than the physical cores"""
+    text = hosts.get("text")
+    others = sum(host.threads for comp, host in hosts.items() if comp != "text")
+    return text is not None and others > 0 and \
+        (text.threads > TUNING.n_phys or others > TUNING.n_lps - TUNING.n_phys)
+
+
+# Hot polling trades busy cores for the wake-up of a napping worker. That wake-up is only slow enough to be worth the
+# trade on Windows; elsewhere a worker is back before polling would have saved anything
+HOT_POLLING = os.name == "nt"
+
+
+def set_moe_cpu_hot(config, text, draft):
+    """Hot polling of a config's CPU MoE workers across the MTP draft/verify handoff: `text` for the main model's,
+    `draft` for every other component's. Does nothing where hot polling is off (HOT_POLLING)"""
+    if not HOT_POLLING:
+        return
+    hosts = getattr(config, "moe_cpu_hosts", {})
+    if text and draft and _pools_share_lps(hosts):
+        # Two hot pools on the same LPs time-slice each other (2-3x slower steps): only the drafting one polls
+        text = False
+    for comp, host in hosts.items():
+        host.set_hot(text if comp == "text" else draft)
+
+
 class MoeCpuHost:
 
     @classmethod
@@ -1005,6 +1039,7 @@ class MoeCpuHost:
         # draft_moe_cpu_threads for anything else (MTP head / draft model); falls back to the
         # tuning default (EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)
         comp = getattr(config.infer_params, "moe_cpu_component", "text")
+        self.component = comp
         cfg_threads = getattr(config.infer_params,
             "moe_cpu_threads" if comp == "text" else "draft_moe_cpu_threads", None)
         self.threads = cfg_threads or TUNING.threads
@@ -1037,7 +1072,7 @@ class MoeCpuHost:
         self._arena_pending = None
         self.layer_blocks = []
         self.layer_auxloc = []
-        # Promote-on-miss transfers (see BlockSparseMLP_CPU._split_promote_step): per device a
+        # Promote-on-miss transfers (see block_sparse_mlp_cpu._split_promote_decide): per device a
         # stream of its own and two expert-sized staging buffers (packed and native order)
         self._promo = {}
         self.batch_recon = TUNING.stream_batch_recon
@@ -1050,7 +1085,8 @@ class MoeCpuHost:
         self.proc = ctx.Process(
             target = _moe_cpu_child_main,
             args = (child_conn, self.model_dir, self.threads, self.stage_threads,
-                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS),
+                    self.pinned, TUNING.arena_huge if self.pinned else "", _HOST_ORIG_CPUS,
+                    self.component != "text"),
             daemon = True,
         )
         self.proc.start()
@@ -1290,6 +1326,7 @@ class MoeCpuHost:
         u32 = np.frombuffer(self.shm.buf, dtype = np.uint32)
         self.v_quit = u32[0:1]
         self.v_pass_wake = u32[16:17]
+        self.v_hot = u32[17:18]
         self.v_abort = u32[32:33]
         self.v_ready = u32[48:49]
         self.v_jobs_tail = u32[64:65]
@@ -1781,7 +1818,14 @@ class MoeCpuHost:
     # (_stream_layout), the GPU slots in native order, so a transfer repacks through the staging
     # buffers with the same bounded strided copies the child loader uses, including fractional
     # halfword planes. The caller orders the transfers against the compute streams
-    # (BlockSparseMLP_CPU._split_promote_step).
+    # (block_sparse_mlp_cpu._split_promote_decide).
+
+    def set_hot(self, hot):
+        """Keep the worker polling between passes (the next one is a draft/verify handoff away, sooner than a nap's
+        wake-up), or let it nap again"""
+        if self.started:
+            self.v_hot[0] = 1 if hot else 0
+
 
     def promote_ready(self, layer_idx, cpu_local):
         """Whether worker expert `cpu_local` of `layer_idx` can be moved by DMA: the arena is
@@ -1810,6 +1854,12 @@ class MoeCpuHost:
 
     def promo_stream(self, device):
         return self._promo_state(device)["stream"]
+
+
+    def promo_drain(self):
+        """Wait for the in-flight promote-on-miss transfers, ahead of releasing the GPU slots and arena pages they write"""
+        for P in self._promo.values():
+            P["stream"].synchronize()
 
 
     def _promo_parts(self, layer_idx, linears):
@@ -2382,7 +2432,7 @@ class MoeCpuHost:
             self.wviews = None
             self.sstate = None
             self._dev_bufs = {}
-            self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
+            self.v_quit = self.v_pass_wake = self.v_hot = self.v_abort = self.v_ready = None
             self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
             self.v_stage_tail = self.v_stage_head = self.v_stage_jobs = None
             self._flags_u32 = None

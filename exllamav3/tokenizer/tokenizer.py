@@ -1,11 +1,12 @@
 from __future__ import annotations
 import torch
-import os, re
+import os, re, threading
 from tokenizers import Tokenizer as HFTokenizer, models
 from ..util import synchronized
 from ..util.file import maybe_read_json
 from ..model.config import Config
 from functools import lru_cache, cached_property
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from ..util import profile_opt
 if TYPE_CHECKING:
@@ -16,47 +17,104 @@ if TYPE_CHECKING:
 # path below turns it on around its own batched call only
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Long inputs are cut into chunks at newline runs and encoded as one parallel batch. The backend's single-
-# sequence encode is single-threaded, and the parallel batch over the chunks gives the same ids as long as
-# every cut falls on a pre-token boundary: a complete run of newlines is one on every pre-tokenizer seen
-# (GPT-style regexes keep newline runs as their own pre-token and attach leading spaces to the following
-# word, Metaspace splits on the whitespace), and a probe is checked per tokenizer before the first use
-# anyway. Inputs below the threshold are not worth the pool's fork/join
+# Long inputs are cut into chunks and encoded as one parallel batch: the backend's single-sequence encode
+# is single-threaded, and on a long prompt the batch is an order of magnitude faster. A cut may only fall
+# on a pre-token boundary, or the chunked ids differ from the whole-text ids and a growing prompt then
+# reuses none of its cached prefix -- and which positions are boundaries is a property of the tokenizer
+# rather than of the text. A run of newlines is one on most pre-tokenizers seen (issue #564: a CRLF blank
+# line, which some tokenizers fuse into a single token); but a tokenizer whose pieces span whitespace
+# fuses a whitespace-only line like "\\n \\n" into one token too, so even the cut after the whole newline
+# run sits inside it (issue #599). Rather than keep up a list of the whitespace kinds that fuse, which
+# has now missed twice, the tokenizer is asked about the cuts it is about to get: a cut on a boundary
+# leaves the ids of a short window across it unchanged. A cut that fails is dropped and the chunks around
+# it merge; a prompt none of whose cuts survives encodes whole, single-threaded, and correct. Checking is
+# a batched call of its own: the cut just past each run's newlines is windowed first, and only the other
+# candidates of the groups that fail it (the run start, the run end) take a second batch, so a tokenizer
+# whose newline-end cut always survives pays 1024 checked chars per 16384 chunked one, and a failing
+# group pays its second batch (up to 2048 more) on top
 _CHUNK_MIN_CHARS = 32768
 _CHUNK_TARGET_CHARS = 16384
 _CHUNK_MAX = 128
-_CHUNK_PROBE = (
-    "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n    def f(x):\n        return x  \n\n\n"
-    "Tabs\there\r\nand CRLF.\r\n\r\nCRLF blank line.\n  leading spaces\ntrailing spaces   \n\n日本語のテキスト\n\nЁлки-палки, 12345 678\n"
-    "<|im_start|>user\nmixed <s> markup </s>\n\n\n\nend"
-) * 3
+# Chars of text on each side of a cut for that check, comfortably past the longest piece of a vocabulary
+# (128 chars in the tokenizers of the corpus), so no piece straddling a cut can hide outside the window.
+# The check is evidence rather than proof: a backend splits a pre-token as a whole, and one that reaches
+# past the window can come out differently in the window than in the whole text. With the usual
+# pre-tokenizers the pre-tokens that long at a cut are runs of whitespace, so a candidate whose window is
+# all whitespace on one side is not taken (see `_verified_cuts`). A backend with no pre-tokenizer, or a
+# Unigram one (its Viterbi spans the whole pre-token), keeps that risk on long unbroken runs of other text
+_CHUNK_WINDOW = 256
 
 
-def _split_chunks(text: str, target: int = _CHUNK_TARGET_CHARS, max_chunks: int = _CHUNK_MAX) -> list[str]:
-    """Cut text after complete newline runs, about every `target` characters. Text without a newline
-    past a cut point simply runs on into the next chunk. A run takes in carriage returns too: a CRLF
-    blank line is one token to some tokenizers, and a cut inside it would make the chunked encoding
-    (and so a growing prompt's prefix) differ from the whole-text encoding (issue #564)"""
+def _cut_positions(text: str, target: int = _CHUNK_TARGET_CHARS, max_chunks: int = _CHUNK_MAX) -> list[list[int]]:
+    """Positions to cut `text` at, one group of candidates per cut point, about every `target` characters,
+    in check preference order: for the first newline at or past the target, where the newlines of the
+    whitespace run it belongs to end -- the cut the old splitter always used, which survives on the most
+    tokenizers -- then where the run starts and where it ends. Text without a newline past a cut point
+    simply runs on into the next chunk; which candidate of a group to take is `Tokenizer._verified_cuts`"""
     n = len(text)
     k = min(max_chunks, max(1, n // target))
-    if k <= 1:
-        return [text]
-    step = n // k
-    out, start = [], 0
+    step, groups, start = n // k, [], 0
     for _ in range(k - 1):
         p = text.find("\n", start + step)
         if p < 0:
             break
-        while p < n and text[p] in "\r\n":
-            p += 1
-        if p > start:
-            out.append(text[start:p])
-            start = p
-        if start >= n:
+        a = p
+        while a > start and text[a - 1].isspace():
+            a -= 1
+        # the newlines end where the \r\n walk stops, the run where the isspace walk does: \r and \n are
+        # isspace, so the one walk takes the run past CRLF runs too
+        m = p
+        while m < n and text[m] in "\r\n":
+            m += 1
+        b = p
+        while b < n and text[b].isspace():
+            b += 1
+        cands = {a, m, b} - {start, n}
+        if cands:
+            # m and b coincide for a run that ends on newlines; keep the preference order, dedup'd
+            groups.append(list(dict.fromkeys(p for p in (m, a, b) if p in cands)))
+            start = max(cands)
+        else:
+            # the rest of the text is one whitespace run with no cut candidates, nothing left to cut
             break
-    if start < n:
+    return groups
+
+
+def _split_at(text: str, cuts: list[int]) -> list[str]:
+    """`text` cut at the given ascending positions"""
+    out, start = [], 0
+    for p in cuts:
+        out.append(text[start:p])
+        start = p
+    if start < len(text):
         out.append(text[start:])
     return out
+
+
+# Not expected to survive a fork (a child forked while a thread held it inherits a dead lock); the
+# held window is nanoseconds and the old save/restore already left the env "true" across a fork
+_parallel_backend_lock = threading.Lock()
+_parallel_backend_owners = 0
+
+
+@contextmanager
+def _parallel_backend():
+    """Have the backend run the batched calls inside on its thread pool (see the note on
+    `TOKENIZERS_PARALLELISM` above). Ownership is counted, so overlapping calls from other threads
+    leave the pool on while any of them is inside and restore the default "false" only when the last
+    of them leaves, whatever order they exit in"""
+    global _parallel_backend_owners
+    with _parallel_backend_lock:
+        _parallel_backend_owners += 1
+        if _parallel_backend_owners == 1:
+            os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    try:
+        yield
+    finally:
+        with _parallel_backend_lock:
+            _parallel_backend_owners -= 1
+            if _parallel_backend_owners == 0:
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class Tokenizer:
@@ -307,49 +365,74 @@ class Tokenizer:
         tid = self.extended_piece_to_id.get(token, self.get_piece_to_id_dict().get(token))
         return tid
 
-    # Encode string with added, unspecial tokens
-    def _chunking_ok(self) -> bool:
-        """Whether cutting at newline runs reproduces this tokenizer's single-sequence ids, decided once
-        on the probe text, cut after every one of its newline runs (both special-token modes). Cutting
-        at every run rather than at a few length-dependent positions exercises each boundary kind the
-        probe contains (indented lines, trailing spaces, CRLF runs, markup) whatever the probe's length"""
-        ok = getattr(self, "_chunking_verified", None)
-        if ok is None:
-            ok = True
-            previous_mode = self.tokenizer.encode_special_tokens
-            try:
-                for special in (False, True):
-                    self.tokenizer.encode_special_tokens = not special
-                    ref = self.tokenizer.encode(_CHUNK_PROBE, add_special_tokens = False).ids
-                    parts = _split_chunks(_CHUNK_PROBE, target = 1, max_chunks = len(_CHUNK_PROBE))
-                    encs = self.tokenizer.encode_batch(parts, add_special_tokens = False)
-                    if [i for e in encs for i in e.ids] != ref:
-                        ok = False
-            finally:
-                # The actual input must still use the mode selected by encode_part_base.
-                self.tokenizer.encode_special_tokens = previous_mode
-            self._chunking_verified = ok
-        return ok
+    def _verified_cuts(self, text: str, groups: list[list[int]]) -> list[int]:
+        """Per group of candidates, the first cut in check preference order that this tokenizer proves
+        lands on a pre-token boundary: a cut does when the ids of a window across it are unchanged by
+        splitting that window at the cut, so the ids of the chunks are the ids of the whole text. A
+        group whose candidates all fail is dropped, which merges the chunks around it. The first
+        candidate of each group is checked alone, and only the remaining candidates of the groups
+        that fail it take a second batch"""
+        n = len(text)
+
+        def windows(cands: list[int]) -> list[str]:
+            flat = []
+            for p in cands:
+                a, b = max(0, p - _CHUNK_WINDOW), min(n, p + _CHUNK_WINDOW)
+                flat += [text[a:b], text[a:p], text[p:b]]
+            return flat
+
+        # The window only shows what the tokenizer does at a cut if it reaches past the whitespace on both
+        # sides of it. Whitespace that fills a whole side can be part of one piece that starts or ends outside
+        # the window, and how that piece splits at the cut depends on its full length, so such a candidate
+        # proves nothing and is not taken
+        def in_view(p: int) -> bool:
+            a, b = max(0, p - _CHUNK_WINDOW), min(n, p + _CHUNK_WINDOW)
+            return (a == 0 or not text[a:p].isspace()) and (b == n or not text[p:b].isspace())
+
+        groups = [[p for p in group if in_view(p)] for group in groups]
+        groups = [group for group in groups if group]
+        if not groups:
+            return []
+        first = [group[0] for group in groups]
+        with _parallel_backend():
+            encs = self.tokenizer.encode_batch(windows(first), add_special_tokens = False)
+        cuts, retry = [None] * len(groups), []
+        for j, group in enumerate(groups):
+            if encs[3 * j + 1].ids + encs[3 * j + 2].ids == encs[3 * j].ids:
+                cuts[j] = group[0]
+            elif len(group) > 1:
+                retry.append((j, group[1:]))
+        if retry:
+            with _parallel_backend():
+                encs = self.tokenizer.encode_batch(windows([p for _, cands in retry for p in cands]),
+                                                   add_special_tokens = False)
+            i = 0
+            for j, cands in retry:
+                for k, p in enumerate(cands):
+                    window, left, right = encs[i + 3 * k].ids, encs[i + 3 * k + 1].ids, encs[i + 3 * k + 2].ids
+                    if left + right == window:
+                        cuts[j] = p
+                        break
+                i += 3 * len(cands)
+        return [p for p in cuts if p is not None]
+
+    def _chunks(self, text: str) -> list[str]:
+        """Long texts cut at the boundaries this tokenizer accepts, short ones not at all"""
+        if len(text) < _CHUNK_MIN_CHARS:
+            return [text]
+        return _split_at(text, self._verified_cuts(text, _cut_positions(text)))
 
     def _encode_texts(self, texts: list[str]) -> list[list[int]]:
         """Backend encode of several texts (special-token mode already set on the backend). Long
-        texts are cut at newline runs and everything goes through one batch call with the backend's
-        parallelism on, so a single long prompt is spread over the cores; short inputs take the
-        plain call"""
+        texts are cut at pre-token boundaries and everything goes through one batch call with the
+        backend's parallelism on, so a single long prompt is spread over the cores; short inputs take
+        the plain call"""
         if sum(len(t) for t in texts) < _CHUNK_MIN_CHARS or len(texts) == 1 and len(texts[0]) < _CHUNK_MIN_CHARS:
             return [self.tokenizer.encode(t, add_special_tokens = False).ids for t in texts]
-        chunk = self._chunking_ok()
-        groups = [_split_chunks(t) if chunk and len(t) >= _CHUNK_MIN_CHARS else [t] for t in texts]
+        groups = [self._chunks(t) for t in texts]
         flat = [c for g in groups for c in g]
-        prev = os.environ.get("TOKENIZERS_PARALLELISM")
-        os.environ["TOKENIZERS_PARALLELISM"] = "true"
-        try:
+        with _parallel_backend():
             encs = self.tokenizer.encode_batch(flat, add_special_tokens = False)
-        finally:
-            if prev is None:
-                del os.environ["TOKENIZERS_PARALLELISM"]
-            else:
-                os.environ["TOKENIZERS_PARALLELISM"] = prev
         out, i = [], 0
         for g in groups:
             ids = []

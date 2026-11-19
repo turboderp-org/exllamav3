@@ -3,6 +3,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import copy
+import itertools
 import json
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +32,8 @@ output is in-distribution by definition; a qbench project can point `test_trace`
 file and KLD/ppl are then computed only over the sampled (response) token positions, with each
 (context, response) pair as one variable-length row.
 
-Reasoning traces are kept in the scored response. For context in follow-up turns the previous
+Reasoning traces are kept in the scored response, and so is the end-of-turn token of a response
+the model finished by itself. For context in follow-up turns the previous
 response is cleaned the way deployment would (harmony final channel extracted / <think> blocks
 dropped) before re-templating; the stored ids are exactly what the model saw and sampled either
 way.
@@ -40,6 +42,15 @@ With --tool_frac > 0 (default 0.3) a portion of the conversations define tools (
 the chat template's `tools` support) and ask questions expected to elicit a reasoning trace 
 plus a tool invocation; scripted tool-role results feed follow-up turns when the model actually
 produced a tool call.
+
+--domain and --lang each take one name or a comma-separated list (or "all"), and a trace then
+holds every listed domain in every listed language it exists in:
+
+    python eval/qbench_prompts.py -m <model_dir> -o qbench_prompts.json \
+        --domain general,literature,tools --lang en,zh,fr --min_tokens 150000
+
+The sets take turns, so a token budget that runs out early still covers all of them, and each
+row records the domain and language it came from.
 
 Without hardware for a good quant, --api_model sources the responses from an OpenAI-compatible
 chat API instead, OpenRouter by default:
@@ -111,7 +122,7 @@ CONVERSATIONS = [
       "Retell the same events as a sequence of terse incident reports filed by the guard."]),
 ]
 
-# Chinese counterparts of the same conversations (same tasks, so a comparison between the two traces
+# Chinese counterparts of the same conversations (same tasks, so a comparison between traces
 # isolates the language). Selected with --lang zh; tool specs and scripted tool results stay as they
 # are (English JSON), only the user turns change.
 CONVERSATIONS_ZH = [
@@ -152,6 +163,78 @@ CONVERSATIONS_ZH = [
     ("写一篇400字的短篇小说：一位博物馆夜班保安发现某幅画每天早上都有细微的不同，结尾要让整个故事的意义发生反转。",
      ["评价你这篇故事中伏笔的运用，并重写最弱的一段。",
       "把同样的事件改写成保安提交的一系列简短事件报告。"]),
+]
+
+# French counterparts, on the same terms as the Chinese ones. Selected with --lang fr
+CONVERSATIONS_FR = [
+    ("Quatre randonneurs arrivent de nuit devant un pont de corde avec une seule lampe torche. Ils "
+     "mettent respectivement 1, 2, 5 et 10 minutes à traverser ; le pont supporte deux personnes à "
+     "la fois, et deux randonneurs qui traversent ensemble avancent au rythme du plus lent. La "
+     "lampe doit être rapportée à pied, pas lancée. Trouve le temps total de traversée minimal et "
+     "démontre qu'on ne peut pas faire mieux.",
+     ["Refais le raisonnement si les temps sont de 1, 3, 4 et 6 minutes, et explique quelle "
+      "stratégie change et pourquoi.",
+      "Maintenant cinq randonneurs : 1, 2, 5, 10 et 12 minutes. Quel est le temps optimal ?"]),
+    ("Écris une classe Python qui implémente un limiteur de débit à seau de jetons (token bucket) : "
+     "capacité et taux de remplissage configurables, une méthode try_acquire(n), une horloge "
+     "monotone, pas d'attente active. Explique la conception.",
+     ["Quels cas limites pourraient le mettre en défaut (comportement de l'horloge, rafales, "
+      "remplissage fractionnaire), et comment ton implémentation gère-t-elle chacun d'eux ?",
+      "Porte-le en TypeScript avec la même sémantique."]),
+    ("Estime combien de stations-service sont en activité en Allemagne, en détaillant ton "
+     "raisonnement depuis la population et les habitudes de conduite jusqu'au chiffre final.",
+     ["Quelle hypothèse pèse le plus dans la marge d'erreur, et quelle fourchette couvre "
+      "l'estimation si cette hypothèse est fausse d'un facteur 2 dans un sens ou dans l'autre ?",
+      "Refais l'estimation pour la Norvège, où les véhicules électriques sont bien plus répandus."]),
+    ("Explique pourquoi on entend le tonnerre après avoir vu l'éclair, d'abord pour un enfant "
+     "curieux de 10 ans, puis pour un étudiant en école d'ingénieurs. La seconde version doit "
+     "couvrir l'acoustique réelle de l'onde de choc et expliquer pourquoi un tonnerre lointain "
+     "gronde au lieu de claquer.",
+     ["L'étudiant demande : pourquoi voit-on parfois des éclairs sans jamais entendre le moindre "
+      "tonnerre ?",
+      "Rédige un quiz de cinq questions couvrant les deux explications, avec un corrigé."]),
+    ("Planifie un voyage de 12 jours en voiture sur l'île du Sud de la Nouvelle-Zélande pour deux "
+     "voyageurs qui adorent la montagne et la faune sauvage mais veulent éviter les foules des "
+     "autocars de tourisme, début mars. Itinéraire jour par jour avec les temps de trajet.",
+     ["Revois le plan pour un budget total de 4 500 NZ$ hors vols.",
+      "Une tempête ferme la route de la côte ouest le sixième jour. Replanifie les jours restants "
+      "au pied levé."]),
+    ("Démontre que le logarithme en base 2 de 3 est irrationnel, puis explique précisément sur "
+     "quelle propriété des entiers repose la démonstration.",
+     ["Généralise : pour quels couples d'entiers a, b > 1 le logarithme en base a de b est-il "
+      "rationnel ? Démontre ta caractérisation.",
+      "Explique la démonstration à quelqu'un qui est à l'aise avec les fractions mais n'a jamais "
+      "vu de raisonnement par l'absurde."]),
+    ("Concevez un schéma de base de données pour un cabinet de kinésithérapie réparti sur "
+     "plusieurs sites : praticiens, patients, types de rendez-vous, salles, disponibilités "
+     "récurrentes, réservations, annulations et listes d'attente. Donnez le DDL et justifiez les "
+     "principaux choix de modélisation.",
+     ["Le cabinet ajoute des consultations vidéo qui n'occupent pas de salle mais sont tout de "
+      "même facturées. Qu'est-ce qui change ?",
+      "Écrivez les quatre requêtes que l'accueil exécute en permanence, avec les index qui les "
+      "accompagnent."]),
+    ("Trois colocataires partagent un appartement. Le loyer est de 2 340 $, réparti au prorata de "
+     "la surface des chambres : celle de Dana fait 14 m², celle d'Eli 11 m², celle de Fern 9 m². "
+     "Les charges ajoutent 187 $ répartis à parts égales, et Eli bénéficie d'un crédit de 40 $ "
+     "parce qu'il s'occupe de l'entretien. Calcule ce que doit chaque personne, au centime près, "
+     "et vérifie que les totaux concordent.",
+     ["Présente le calcul complet sous forme de tableau et revérifie chaque étape d'arrondi.",
+      "Refais maintenant la répartition si les charges sont elles aussi divisées dans la même "
+      "proportion que le loyer."]),
+    ("Résumez les principaux arguments économiques pour et contre un salaire minimum nettement "
+     "plus élevé, en vous appuyant sur les modèles classiques de concurrence et de monopsone, puis "
+     "donnez votre lecture d'ensemble de la littérature empirique.",
+     ["Défendez, de la manière la plus convaincante possible, la position que votre lecture "
+      "d'ensemble écartait.",
+      "Comment ces arguments changent-ils pour un salaire minimum régional indexé sur le revenu "
+      "médian local ?"]),
+    ("Écris une nouvelle de 400 mots sur un gardien de nuit de musée qui remarque qu'un tableau "
+     "est légèrement différent chaque matin, avec une fin qui éclaire toute l'histoire sous un "
+     "jour nouveau.",
+     ["Fais la critique de l'usage des indices annonciateurs dans ta nouvelle et réécris le "
+      "paragraphe le plus faible.",
+      "Raconte les mêmes événements sous la forme d'une série de rapports d'incident laconiques "
+      "rédigés par le gardien."]),
 ]
 
 # Tool-calling conversations: (tools, seed prompt, follow-ups). Tools are OpenAI-style specs
@@ -317,6 +400,39 @@ TOOL_USER_FOLLOWUPS_ZH = [
     None,
 ]
 
+# French user turns for the tool conversations
+TOOL_SEEDS_FR = [
+    "Je prends l'avion pour Bergen jeudi pour un long week-end de randonnée. Dois-je prévoir des "
+    "affaires de pluie, et la qualité de l'air convient-elle à quelqu'un qui a un asthme léger ? "
+    "Vérifie avant de répondre.",
+    "Je détiens 120 actions ASML et 300 actions NVO, et je raisonne en euros. Combien vaut ma "
+    "position en ce moment, en EUR ? Va chercher les données dont tu as besoin.",
+    "Trouve un créneau libre de 90 minutes pour une revue de conception avec Priya et Tomás mardi "
+    "ou mercredi prochain, entre 9 h et 17 h, et réserve-le. Mon agenda fait foi : consulte-le "
+    "d'abord.",
+    "Où en est le calendrier du premier plasma du projet de fusion ITER, et combien de fois "
+    "a-t-il été repoussé ? Fais une recherche pour trouver des informations récentes plutôt que "
+    "de répondre de mémoire.",
+    "À partir de l'entrepôt de données, calcule notre chiffre d'affaires net (commandes moins "
+    "remboursements) par pays sur le dernier trimestre complet, et signale tout pays où les "
+    "remboursements dépassent 10 % du brut. Écris et exécute la requête, puis interprète les "
+    "résultats.",
+    "Compare les conditions de ce week-end à Chamonix et à Zermatt et dis-moi laquelle des deux "
+    "est le meilleur choix pour de la photographie en haute altitude. Rassemble d'abord les "
+    "données nécessaires.",
+]
+TOOL_USER_FOLLOWUPS_FR = [
+    "Compte tenu de tout cela, détermine lequel des trois jours convient le mieux à la plus "
+    "longue randonnée.",
+    "Si ASML perd encore 5 % et que l'euro s'apprécie de 2 %, quelle est la nouvelle valeur ?",
+    "En fait, Priya est absente mardi après-midi. Déplace la réunion sur le meilleur créneau de "
+    "mercredi.",
+    "Résume les principales causes techniques du dernier report en date.",
+    "DE et BR font mauvaise figure. Écris une requête complémentaire qui ventile leurs "
+    "remboursements par statut de commande, pour qu'on voie d'où vient le problème.",
+    None,
+]
+
 # --domain literature: close reading, criticism and writing in verse and prose (no tools)
 CONVERSATIONS_LIT = [
     ("Give a close reading of Shelley's \"Ozymandias\": how the nested narrators (the speaker, the "
@@ -434,17 +550,87 @@ def longctx_conversations():
     return convs
 
 
-def conversations_for_domain(domain: str, lang: str):
-    """(base conversations, tool conversations) for --domain and --lang"""
-    if domain == "general":
-        return conversations_for_lang(lang)
-    assert lang == "en", "--lang zh is only available for --domain general"
+DOMAINS = ["general", "literature", "longctx", "tools"]
+LANGS = ["en", "zh", "fr"]
+
+GENERAL_CONVERSATIONS = {"en": CONVERSATIONS, "zh": CONVERSATIONS_ZH, "fr": CONVERSATIONS_FR}
+TOOL_USER_TURNS = {"zh": (TOOL_SEEDS_ZH, TOOL_USER_FOLLOWUPS_ZH), "fr": (TOOL_SEEDS_FR, TOOL_USER_FOLLOWUPS_FR)}
+
+# The languages each domain exists in. The agentic sessions of the tools domain are English only
+DOMAIN_LANGS = {"general": LANGS, "literature": ["en"], "longctx": ["en"], "tools": LANGS}
+
+
+def tool_conversations(lang: str):
+    """The scripted tool conversations with their user turns in the given language"""
+    if lang == "en":
+        return TOOL_CONVERSATIONS
+    seeds, followups = TOOL_USER_TURNS[lang]
+    convs = []
+    for (tools, _, fus), seed, fu in zip(TOOL_CONVERSATIONS, seeds, followups):
+        fus = [(kind, fu if kind == "user" else content) for kind, content in fus]
+        assert all(c is not None for _, c in fus)
+        convs.append((tools, seed, fus))
+    return convs
+
+
+def conversations_for(domain: str, lang: str, tool_frac: float):
+    """One domain's conversations in one language, ready to sample. Only the general domain mixes the two kinds:
+    about tool_frac of its conversations define tools, interleaved evenly so a small token budget that stops early
+    still samples both"""
+    def plain(convs):
+        return [{"tools": None, "messages": [], "turns": [("user", seed)] + [("user", fu) for fu in fus]}
+                for seed, fus in convs]
+    def tooled(convs):
+        return [{"tools": tools, "messages": [], "turns": [("user", seed)] + list(fus)}
+                for tools, seed, fus in convs]
+
     if domain == "literature":
-        return CONVERSATIONS_LIT, []
+        return plain(CONVERSATIONS_LIT)
+    if domain == "longctx":
+        return plain(longctx_conversations())
     if domain == "tools":
-        return [], TOOL_CONVERSATIONS
-    assert domain == "longctx", domain
-    return longctx_conversations(), []
+        return tooled(tool_conversations(lang))
+    assert domain == "general", domain
+    base = plain(GENERAL_CONVERSATIONS[lang])
+    if tool_frac <= 0:
+        return base
+    if tool_frac >= 1.0:
+        return tooled(tool_conversations(lang))
+    tool_convs = tool_conversations(lang)
+    n_tools = min(len(tool_convs), max(1, round(tool_frac / (1 - tool_frac) * len(base))))
+    tool_convs = tooled(tool_convs[:n_tools])
+    convs = []
+    acc = 0.0
+    ratio = len(tool_convs) / len(base)
+    for b in base:
+        convs.append(b)
+        acc += ratio
+        while acc >= 1.0 and tool_convs:
+            convs.append(tool_convs.pop(0))
+            acc -= 1.0
+    return convs + tool_convs
+
+
+def build_conversations(args, tokenizer, template_vars: dict):
+    """The conversations to sample: one set per listed domain in each listed language it exists in. The sets take
+    turns in the result, so a token budget that stops early still covers all of them"""
+    # The tools domain holds every scripted tool conversation, so next to it the general set keeps none
+    tool_frac = 0 if "tools" in args.domain else args.tool_frac
+    sets = []
+    for domain in args.domain:
+        for lang in args.lang:
+            if lang not in DOMAIN_LANGS[domain]:
+                continue
+            convs = conversations_for(domain, lang, tool_frac)
+            if domain == "tools" and lang == "en":
+                convs += agentic_conversations(tokenizer, template_vars, args.max_context)
+            for conv in convs:
+                conv["domain"], conv["lang"] = domain, lang
+            sets.append(convs)
+            print(f" -- {domain}/{lang}: {len(convs)} conversations")
+    convs = [c for group in itertools.zip_longest(*sets) for c in group if c is not None]
+    # Independent resamples of the whole set (each repeat continues its own conversations)
+    return [copy.deepcopy(c) for _ in range(args.repeats) for c in convs]
 
 
 # --domain tools: besides the scripted tool conversations, real agentic sessions (the spec_decode
@@ -476,18 +662,6 @@ def agentic_conversations(tokenizer, template_vars: dict, max_context: int):
                           "turns": [(last["role"], last["content"])], "prefilled": True})
     return convs
 
-
-def conversations_for_lang(lang: str):
-    """(base conversations, tool conversations) for --lang"""
-    if lang == "en":
-        return CONVERSATIONS, TOOL_CONVERSATIONS
-    assert lang == "zh", lang
-    tool_convs = []
-    for (tools, seed, fus), seed_zh, fu_zh in zip(TOOL_CONVERSATIONS, TOOL_SEEDS_ZH, TOOL_USER_FOLLOWUPS_ZH):
-        fus_zh = [(kind, fu_zh if kind == "user" else content) for kind, content in fus]
-        assert all(c is not None for _, c in fus_zh)
-        tool_convs.append((tools, seed_zh, fus_zh))
-    return CONVERSATIONS_ZH, tool_convs
 
 # Response substrings that indicate the model actually invoked a tool (family-specific markup,
 # checked on the special-token decode). If none match, scripted tool results are not injected
@@ -587,10 +761,13 @@ def sample_local(generator, config, tokenizer, args, convs, template_vars):
             )
             generator.enqueue(job)
             chunks = []
+            stop_token = None
             total_temp = total_out
             text_temp = ""
             while generator.num_remaining_jobs():
                 for result in generator.iterate():
+                    if result.get("eos_reason") == "stop_token":
+                        stop_token = result["eos_triggering_token_id"]
                     if result["stage"] == "streaming" and "token_ids" in result:
                         chunks.append(result["token_ids"])
                         total_temp += result["token_ids"].shape[-1]
@@ -608,15 +785,20 @@ def sample_local(generator, config, tokenizer, args, convs, template_vars):
             if response_ids.numel() == 0:
                 messages.pop()
                 continue
+            # The generator ends on the end-of-turn token without returning it. The model sampled it like any other
+            # token, so it belongs to the scored response, but not to the text that goes back into the context
+            sampled_ids = response_ids.tolist() + ([stop_token] if stop_token is not None else [])
             rows.append({
                 "conversation": c_idx,
                 "turn": t_idx,
+                "domain": conv["domain"],
+                "lang": conv["lang"],
                 "tools": conv["tools"] is not None,
                 "input_ids": input_ids[0].tolist(),
-                "response_ids": response_ids.tolist(),
+                "response_ids": sampled_ids,
             })
             total_in += input_ids.shape[-1]
-            total_out += response_ids.numel()
+            total_out += len(sampled_ids)
             pb.update(min(total_out, args.min_tokens))
             # Keep tool-call markup in context: cleaned only of reasoning segments, so a
             # scripted tool-role turn can follow it the way a deployed loop's transcript would
@@ -681,7 +863,7 @@ def sample_api(api, args, tokenizer, convs, template_vars):
     histories: "messages" is what the template renders, tool calls structured and reasoning dropped the way the
     local path drops it, and "wire" is what the API gets, with its tool call turns sent back as it returned them."""
     rows = []
-    total_in = total_out = 0
+    total_in = total_out = num_cut = 0
     for conv in convs:
         conv["wire"] = wire_messages(conv["messages"])
         conv["next_turn"] = 0
@@ -728,13 +910,16 @@ def sample_api(api, args, tokenizer, convs, template_vars):
                         if not (r["content"] or r["reasoning"] or r["tool_calls"]):
                             raise ValueError("empty response")
                         assistant = assistant_message(r["content"], r["reasoning"], r["tool_calls"])
-                        ids = response_token_ids(tokenizer, conv["messages"], assistant, template_kwargs)
+                        cut = r["finish_reason"] == "length"
+                        ids = response_token_ids(tokenizer, conv["messages"], assistant, template_kwargs, truncated = cut)
                     except Exception as e:
                         print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}failed{col_default} ({str(e)[:120]})")
                         continue
                     wave_rows.append({
                         "conversation": c_idx,
                         "turn": t_idx,
+                        "domain": conv["domain"],
+                        "lang": conv["lang"],
                         "tools": conv["tools"] is not None,
                         "input_ids": input_ids[0].tolist(),
                         "response_ids": ids,
@@ -744,6 +929,10 @@ def sample_api(api, args, tokenizer, convs, template_vars):
                     pb.update(min(total_out, args.min_tokens))
                     print(f"    conv {c_idx:3} turn {t_idx}: {col_yellow}{len(ids):5}{col_default} tokens "
                           f"({r['finish_reason']}, reasoning {len(r['reasoning'] or '')} chars)")
+                    num_cut += cut
+                    if cut and not r["content"].strip() and not r["tool_calls"]:
+                        # The token limit fell inside the reasoning: there is no answer for a follow-up to refer to
+                        continue
                     conv["messages"].append({k: v for k, v in assistant.items() if k in ("role", "content", "tool_calls")})
                     conv["wire"].append(r["message"] if r["tool_calls"] else {"role": "assistant", "content": r["content"]})
                     active.append(c_idx)
@@ -751,6 +940,9 @@ def sample_api(api, args, tokenizer, convs, template_vars):
             rows += sorted(wave_rows, key = lambda row: row["conversation"])
             active.sort()
 
+    if num_cut:
+        print(f" !! {num_cut} of {len(rows)} responses ran into --max_new_tokens ({args.max_new_tokens}) before the model "
+              f"finished, reasoning included; raise it for complete responses")
     if total_out < args.min_tokens:
         print(f" !! Collected only {total_out:,} of {args.min_tokens:,} response tokens; "
               f"consider a higher --repeats or --max_new_tokens")
@@ -789,41 +981,7 @@ def main(args):
     if api is not None:
         api.request_reasoning(TEMPLATE_VARS)
 
-    # Base conversations plus an optional tool-calling portion (~args.tool_frac of the total),
-    # interleaved evenly so a small token budget that stops early still samples both kinds
-    CONVS, TOOL_CONVS = conversations_for_domain(args.domain, args.lang)
-    base = [{"tools": None, "messages": [],
-             "turns": [("user", seed)] + [("user", fu) for fu in fus]}
-            for seed, fus in CONVS]
-    convs = []
-    if not TOOL_CONVS:
-        convs = base
-    elif args.domain == "tools" or args.tool_frac >= 1.0:
-        # Tools only
-        convs = [{"tools": tools, "messages": [],
-                  "turns": [("user", seed)] + list(fus)}
-                 for tools, seed, fus in TOOL_CONVS]
-    elif args.tool_frac > 0:
-        n_tools = min(len(TOOL_CONVS),
-                      max(1, round(args.tool_frac / (1 - args.tool_frac) * len(CONVS))))
-        tool_convs = [{"tools": tools, "messages": [],
-                       "turns": [("user", seed)] + list(fus)}
-                      for tools, seed, fus in TOOL_CONVS[:n_tools]]
-        acc = 0.0
-        ratio = len(tool_convs) / len(base)
-        for b in base:
-            convs.append(b)
-            acc += ratio
-            while acc >= 1.0 and tool_convs:
-                convs.append(tool_convs.pop(0))
-                acc -= 1.0
-        convs += tool_convs
-    else:
-        convs = base
-    if args.domain == "tools":
-        convs += agentic_conversations(tokenizer, TEMPLATE_VARS, args.max_context)
-    # Independent resamples of the whole set (each repeat continues its own conversations)
-    convs = [copy.deepcopy(c) for _ in range(args.repeats) for c in convs]
+    convs = build_conversations(args, tokenizer, TEMPLATE_VARS)
 
     if api is not None:
         rows, total_in, total_out = sample_api(api, args, tokenizer, convs, TEMPLATE_VARS)
@@ -836,7 +994,8 @@ def main(args):
         "vocab_size": tokenizer.actual_vocab_size,
         "template_vars": TEMPLATE_VARS,
         "tool_frac": args.tool_frac,
-        "lang": args.lang,
+        "domain": ",".join(args.domain),
+        "lang": ",".join(args.lang),
         "meta": {"rows": len(rows), "input_tokens": total_in, "output_tokens": total_out},
         "rows": rows,
     }
@@ -847,6 +1006,16 @@ def main(args):
     print(f" -- {len(rows)} rows, {total_in:,} input + {total_out:,} output tokens -> {args.output}")
 
 
+def name_list(choices: list):
+    """argparse type: one name or a comma-separated list out of choices, or "all" for every one"""
+    def parse(s):
+        names = choices if s == "all" else [n.strip() for n in s.split(",")]
+        if not all(n in choices for n in names):
+            raise argparse.ArgumentTypeError(f"expected names out of {', '.join(choices)}, comma-separated, or all")
+        return list(dict.fromkeys(names))
+    return parse
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, default_cache_size = 32768, add_draft_model_args = True)
@@ -855,9 +1024,20 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 4096, help = "Per-turn generation cap")
     parser.add_argument("--tool_frac", type = float, default = 0.3, help = "Approximate fraction of conversations that define tools and elicit tool calls, default: 0.3; 0 disables")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
-    parser.add_argument("--domain", type = str, default = "general", choices = ["general", "literature", "longctx", "tools"], help = "Conversation set: general (default; mixed reasoning tasks plus --tool_frac tool calls), literature (poetry and literary criticism, no tools), longctx (questions over long documents, no tools), tools (scripted tool conversations plus agentic-session cut points up to --max_context)")
+    parser.add_argument("--domain", type = name_list(DOMAINS), default = ["general"],
+                        help = "Conversation sets, one or a comma-separated list, or all: general (default; mixed reasoning tasks plus --tool_frac tool "
+                               "calls), literature (poetry and literary criticism, no tools), longctx (questions over long documents, no tools), tools "
+                               "(scripted tool conversations plus agentic-session cut points up to --max_context). With tools in the list, the general "
+                               "set leaves the tool conversations to it")
     parser.add_argument("--max_context", type = int, default = 12288, help = "--domain tools: longest templated context of an agentic cut point, default: 12288")
     parser.add_argument("--repeats", type = int, default = 1, help = "Sample the whole conversation set this many times (independent samples per repeat), default: 1")
-    parser.add_argument("--lang", type = str, default = "en", choices = ["en", "zh"], help = "Language of the user turns: en (default) or zh (same conversations in Chinese; tool specs/results stay English)")
+    parser.add_argument("--lang", type = name_list(LANGS), default = ["en"],
+                        help = "Languages of the user turns, one or a comma-separated list, or all: en (default), zh, fr. The same conversations in each; "
+                               "tool specs/results stay English. The general and tools domains exist in every language (agentic sessions in English "
+                               "only), literature and longctx in English only, so a list that includes en covers every domain")
     add_api_args(parser)
-    main(parser.parse_args())
+    args = parser.parse_args()
+    for domain in args.domain:
+        if not set(args.lang) & set(DOMAIN_LANGS[domain]):
+            parser.error(f"--domain {domain} exists only in {', '.join(DOMAIN_LANGS[domain])}, which --lang must then include")
+    main(args)
