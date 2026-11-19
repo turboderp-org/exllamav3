@@ -1,0 +1,250 @@
+"""Opt-in, per-layer residual projection for Qwen4Exp inference."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+from typing_extensions import override
+import hashlib
+import json
+import math
+import re
+
+from safetensors import safe_open
+import torch
+import triton
+import triton.language as tl
+
+from ..module import Module
+from ..hyperconnections import GatedResidual, hc_flush
+from ...util.tensor import g_tensor_cache
+
+if TYPE_CHECKING:
+    from ...model.config import Config
+
+
+@triton.jit
+def _project_rows(X, V, W, XW, WIDTH: tl.constexpr, SCALE: tl.constexpr,
+                  STREAMS: tl.constexpr, WEIGHTED: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    value = tl.load(X + row * WIDTH + col, col < WIDTH, other = 0).to(tl.float32)
+    direction = tl.load(V + col, col < WIDTH, other = 0).to(tl.float32)
+    dot = tl.sum(value * direction, axis = 0)
+    projected = value - (SCALE * dot) * direction
+    tl.store(X + row * WIDTH + col, projected, col < WIDTH)
+    if WEIGHTED:
+        weight = tl.load(W + (row % STREAMS) * WIDTH + col, col < WIDTH, other = 0).to(tl.float32)
+        tl.store(XW + row * WIDTH + col, projected * weight, col < WIDTH)
+
+
+@dataclass(frozen = True)
+class Qwen4ExpControlVector:
+    """A model-lifetime projection, loaded before constructing the model.
+
+    Directions are stored as immutable F32 bytes. Each model gets its own tensors;
+    changing the source file or retaining this object cannot mutate a live model.
+    Supports Qwen4Exp's FP32 hyperconnection streams only.
+    """
+    hidden_size: int
+    num_hidden_layers: int
+    hc_count: int
+    # (zero-based decoder index, normalized F32 direction, effective F32 strength)
+    directions: tuple[tuple[int, bytes, float], ...]
+    fingerprint: str = field(init = False)
+
+    def __post_init__(self):
+        shape = (self.hidden_size, self.num_hidden_layers, self.hc_count)
+        if any(type(v) is not int or v <= 0 for v in shape):
+            raise ValueError("Invalid control-vector model dimensions")
+        directions = []
+        previous = None
+        for i, data, strength in self.directions:
+            if type(i) is not int or not 0 <= i < self.num_hidden_layers or \
+                    (previous is not None and i != previous + 1):
+                raise ValueError("Control-vector layers must be contiguous, ordered and unique")
+            if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) != 4 * self.hidden_size:
+                raise ValueError(f"Invalid control-vector direction at layer {i}")
+            data = bytes(data)
+            value = torch.frombuffer(bytearray(data), dtype = torch.float32)
+            if not torch.isfinite(value).all() or abs(value.double().norm().item() - 1.0) > 1e-5:
+                raise ValueError(f"Control-vector direction must be finite and normalized at layer {i}")
+            strength = torch.tensor(float(strength), dtype = torch.float32).item()
+            if not math.isfinite(strength) or strength <= 0:
+                raise ValueError(f"Invalid control-vector strength at layer {i}")
+            directions.append((i, data, strength))
+            previous = i
+        if not directions:
+            raise ValueError("Control vector contains no directions")
+        # Own immutable data even when constructed directly with mutable inputs.
+        object.__setattr__(self, "directions", tuple(directions))
+        # Hash effective math, not the pathname or caller-provided identity.
+        digest = hashlib.sha256(json.dumps(["qwen4_exp.project.v1", *shape]).encode())
+        for i, data, strength in directions:
+            digest.update(json.dumps([i, strength]).encode())
+            digest.update(data)
+        object.__setattr__(self, "fingerprint", digest.hexdigest())
+
+    @classmethod
+    def from_file(cls, config: Config, path, *, scale: float = 1.0,
+                  layer_range: tuple[int, int] | None = None) -> Qwen4ExpControlVector | None:
+        """Load direction.N tensors; layer_range is zero-based and inclusive.
+
+        None selects the entire contiguous range present in the file. Zero scale
+        returns None after validation, preserving the unmodified model graph/cache.
+        Scaling and normalization match llama.cpp's per-layer projection variant:
+        scale the raw F32 vector, normalize using an FP64 norm, then store the unit
+        direction and effective norm as F32.
+        """
+        if getattr(config, "architecture", None) != "Qwen4ExpForConditionalGeneration":
+            raise ValueError("Control-vector projection currently supports Qwen4Exp only")
+        scale = float(scale)
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError("Control-vector scale must be finite and nonnegative")
+        shape = (config.hidden_size, config.num_hidden_layers, config.hc_mult)
+        if any(type(v) is not int or v <= 0 for v in shape):
+            raise ValueError("Invalid control-vector model dimensions")
+        tensors = {}
+        with safe_open(str(path), framework = "pt", device = "cpu") as reader:
+            expected = {
+                "source_architecture": "qwen4_exp", "operation": "project",
+                "hidden_size": str(shape[0]), "num_hidden_layers": str(shape[1]),
+                "hc_count": str(shape[2]),
+            }
+            metadata = reader.metadata() or {}
+            if any(metadata.get(k) != v for k, v in expected.items()):
+                raise ValueError("Control-vector metadata does not match the model")
+            for name in reader.keys():
+                match = re.fullmatch(r"direction\.(0|[1-9][0-9]*)", name)
+                if match is None or not 0 <= int(match[1]) < shape[1]:
+                    raise ValueError(f"Invalid control-vector tensor name: {name}")
+                value = reader.get_tensor(name)
+                if value.shape != (shape[0],) or value.dtype != torch.float32 \
+                        or not torch.isfinite(value).all():
+                    raise ValueError(f"Invalid control-vector tensor: {name}")
+                tensors[int(match[1])] = value
+        if not tensors:
+            raise ValueError("Control-vector file contains no directions")
+        if layer_range is not None and (not isinstance(layer_range, (tuple, list)) or len(layer_range) != 2):
+            raise ValueError("Control-vector range must contain two decoder indices")
+        first, last = layer_range if layer_range is not None else (min(tensors), max(tensors))
+        if type(first) is not int or type(last) is not int or not 0 <= first <= last < shape[1]:
+            raise ValueError("Control-vector range must contain valid zero-based decoder indices")
+        if any(i not in tensors for i in range(first, last + 1)):
+            raise ValueError("Control-vector file is missing a selected layer")
+        if scale == 0:
+            return None
+        directions = []
+        for i in range(first, last + 1):
+            weighted = tensors[i] * scale
+            norm = weighted.double().norm().item()
+            strength = torch.tensor(norm, dtype = torch.float32).item()
+            if not math.isfinite(norm) or norm == 0 or not math.isfinite(strength):
+                raise ValueError(f"Invalid control-vector norm at layer {i}")
+            direction = (weighted.double() / norm).float().contiguous()
+            directions.append((i, direction.numpy().tobytes(), strength))
+        return cls(*shape, tuple(directions))
+
+    def validate(self, config: Config):
+        if getattr(config, "architecture", None) != "Qwen4ExpForConditionalGeneration" \
+                or (config.hidden_size, config.num_hidden_layers, config.hc_mult) != \
+                   (self.hidden_size, self.num_hidden_layers, self.hc_count):
+            raise ValueError("Control vector was loaded for a different model architecture or shape")
+        if getattr(config, "layer_map", None) or getattr(config, "layer_map_str", None):
+            raise ValueError("Control-vector projection does not support layer remapping")
+
+    def modules(self, config: Config, key_prefix: str) -> dict[int, Qwen4ExpResidualProjection]:
+        self.validate(config)
+        return {
+            i: Qwen4ExpResidualProjection(
+                config, f"{key_prefix}.layers.{i}.control_vector",
+                torch.frombuffer(bytearray(data), dtype = torch.float32), strength, i,
+            ) for i, data, strength in self.directions
+        }
+
+
+class Qwen4ExpResidualProjection(Module):
+    """Project each FP32 residual stream independently after a decoder block."""
+
+    def __init__(self, config: Config, key: str, direction: torch.Tensor, scale: float, steered_layer_idx: int):
+        super().__init__(config, key, None)
+        self.direction_cpu = direction.clone()
+        self.direction = None
+        self.scale = scale
+        self.steered_layer_idx = steered_layer_idx
+        self.width = config.hidden_size
+        self.streams = config.hc_mult
+        self.next_site = None
+        # layer_idx stays None: this module owns no attention or recurrent cache.
+
+    @staticmethod
+    def link_sites(modules: list[Module]):
+        """Link the immediately following residual mix; PLE and other intervening modules break the handoff."""
+        for i, module in enumerate(modules):
+            if not isinstance(module, Qwen4ExpResidualProjection):
+                continue
+            nxt = modules[i + 1] if i + 1 < len(modules) else None
+            site = nxt if isinstance(nxt, GatedResidual) else getattr(nxt, "attn_hc", None)
+            module.next_site = site if isinstance(site, GatedResidual) else None
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.direction = self.direction_cpu.to(device = device, dtype = torch.float32)
+
+    @override
+    def unload(self):
+        self.direction = None
+        super().unload()
+
+    @override
+    def weights_numel(self):
+        return self.direction_cpu.numel()
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+    @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
+    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[-2:] != (self.streams, self.width) or x.dtype != torch.float32:
+            raise ValueError("Expected FP32 [batch, tokens, streams, hidden_size] residual")
+        if out_dtype not in (None, torch.float32):
+            raise ValueError("Projection must preserve FP32 residual streams")
+        if "capture" in params or "quant_preserve" in params:
+            raise ValueError("Control-vector projection is inference-only")
+        hc_flush(params)
+        # Inserting this module breaks GatedResidual.link_sites' weighted-copy
+        # handoff. Also invalidate any copy a caller might have relinked manually.
+        params.pop("gr_weighted", None)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if self.direction is None or self.direction.device != x.device:
+            raise RuntimeError("Projection vector is not loaded on the residual device")
+        if x.numel() == 0:
+            return x
+        if x.is_cuda:
+            nxt = self.next_site
+            xw = None
+            # Prepare the successor's weighted streams in this launch, using the same
+            # shared scratch as GatedResidual.apply_. Prefill mixes apply their own weight.
+            if nxt is not None and x.shape[0] * x.shape[1] <= GatedResidual.FUSED_MAX_R \
+                    and nxt.w_h is not None and nxt.w_h.device == x.device:
+                xw = g_tensor_cache.get_bucketed(x.device, x.numel(), torch.float, "gr_apply_xw")
+                xw = xw.view(-1, self.streams, self.width)
+            _project_rows[(x.numel() // self.width,)](
+                x, self.direction, nxt.w_h if xw is not None else None, xw,
+                WIDTH = self.width, SCALE = self.scale, STREAMS = self.streams, WEIGHTED = xw is not None,
+                BLOCK = triton.next_power_of_2(self.width), num_warps = 4, enable_fp_fusion = False,
+            )
+            if xw is not None:
+                params["gr_weighted"] = (nxt, x.data_ptr(), xw)
+        else:
+            dots = (x * self.direction).sum(dim = -1, keepdim = True)
+            x.sub_((self.scale * dots) * self.direction)
+        return x

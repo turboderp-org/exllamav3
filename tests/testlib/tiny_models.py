@@ -3,6 +3,9 @@ Tiny random-weight checkpoints written in an architecture's native format, for m
 that need a whole model but no real weights. Each builder writes config.json plus model.safetensors into a
 directory and returns it.
 
+Qwen4Exp (QWEN4_TINY, make_qwen4_checkpoint): four decoder blocks with GDN, QSA, hyperconnections, a small PLE table
+and a byte-level tokenizer, for cached inference tests without downloaded weights.
+
 DeepSeek-V4 (DSV4_TINY, make_dsv4_checkpoint): DeepSeek's native tensor namespace (the naming of the real
 V4-Flash release), exercising all three attention layer types (sliding / CSA / HCA), hash + sqrtsoftplus MoE
 routing, mHC, sinks, partial rope with the yarn compress table and the output de-rotation.
@@ -13,6 +16,118 @@ import os
 
 import torch
 from safetensors.torch import save_file
+
+
+QWEN4_TINY = dict(
+    hidden_size = 256,
+    num_hidden_layers = 4,
+    vocab_size = 512,
+    num_attention_heads = 4,
+    num_key_value_heads = 2,
+    head_dim = 64,
+    full_attention_interval = 2,
+    linear_num_key_heads = 2,
+    linear_num_value_heads = 4,
+    linear_key_head_dim = 64,
+    linear_value_head_dim = 64,
+    linear_conv_kernel_dim = 4,
+    moe_intermediate_size = 128,
+    shared_expert_intermediate_size = 128,
+    num_experts = 4,
+    num_experts_per_tok = 2,
+    rms_norm_eps = 1e-6,
+    hc_count = 4,
+    indexer_n_heads = 3,
+    indexer_head_dim = 64,
+    indexer_budget = 16,
+    ple_layer_ids = [2],
+    ple_embed_dim = 256,
+    ngram_size = 2,
+    heads_per_ngram = 1,
+    ple_conv_kernel_size = 4,
+    eos_token_id = 2,
+    bos_token_id = 1,
+    max_position_embeddings = 2048,
+    tie_word_embeddings = False,
+)
+
+
+def make_qwen4_checkpoint(out_dir, seed: int = 7) -> str:
+    """Four small Qwen4Exp blocks, including PLE, GDN, QSA and real hyperconnection weights."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
+    c = dict(QWEN4_TINY)
+    rng = torch.Generator().manual_seed(seed)
+    tensors = {}
+
+    def w(key, *shape, scale = 0.02):
+        tensors[key] = (torch.randn(shape, generator = rng) * scale).half()
+
+    def zero(key, *shape):
+        tensors[key] = torch.zeros(shape, dtype = torch.half)
+
+    def hc(key, combine = True):
+        zero(key + ".hc_norm.weight", 1024)
+        w(key + ".input_mix_weight_down.weight", 64, 1024)
+        w(key + ".input_mix_weight_up.weight", 1024, 64)
+        if combine: w(key + ".block_inject_weight.weight", 4, 1024)
+
+    prefix = "model.language_model"
+    w(prefix + ".embed_tokens.weight", 512, 256)
+    w("lm_head.weight", 512, 256)
+    hc(prefix + ".hyper_connection_mixer", False)
+    for i in range(4):
+        block = f"{prefix}.layers.{i}"
+        hc(block + ".attn_hyper_connection")
+        hc(block + ".mlp_hyper_connection")
+        if i % 2 == 0:
+            attn = block + ".linear_attn"
+            for name, rows in [("in_proj_qkv", 512), ("in_proj_z", 256), ("in_proj_b", 4), ("in_proj_a", 4)]:
+                w(f"{attn}.{name}.weight", rows, 256)
+            w(attn + ".out_proj.weight", 256, 256)
+            w(attn + ".conv1d.weight", 512, 1, 4, scale = 0.2)
+            tensors[attn + ".A_log"] = torch.zeros(4, dtype = torch.float)
+            tensors[attn + ".dt_bias"] = torch.full((4,), -2.0, dtype = torch.bfloat16)
+            tensors[attn + ".norm.weight"] = torch.ones(64, dtype = torch.bfloat16)
+        else:
+            attn = block + ".self_attn"
+            for name, rows in [("q_proj", 512), ("k_proj", 128), ("v_proj", 128), ("o_proj", 256)]:
+                w(f"{attn}.{name}.weight", rows, 256)
+            zero(attn + ".q_norm.weight", 64)
+            zero(attn + ".k_norm.weight", 64)
+            w(attn + ".indexer.index_qk_proj.weight", 256, 256)
+            zero(attn + ".indexer.q_layernorm.weight", 64)
+            zero(attn + ".indexer.k_layernorm.weight", 64)
+        w(block + ".mlp.gate.weight", 4, 256)
+        w(block + ".mlp.shared_expert_gate.weight", 1, 256)
+        for expert in [f"experts.{e}" for e in range(4)] + ["shared_expert"]:
+            for name, shape in [("up_proj", (128, 256)), ("gate_proj", (128, 256)), ("down_proj", (256, 128))]:
+                w(f"{block}.mlp.{expert}.{name}.weight", *shape)
+    ple = prefix + ".layers.1.ple"
+    w(ple + ".ple_embedding.ngram_embedding.weight", 257, 256)
+    tensors[ple + ".ple_embedding.ngram_heads_offsets"] = torch.tensor([0])
+    tensors[ple + ".ple_embedding.ngram_heads_vocab_sizes"] = torch.tensor([257])
+    tensors[ple + ".ple_embedding.layer_multipliers"] = torch.tensor([1, 31])
+    w(ple + ".key_proj.weight", 1024, 256)
+    w(ple + ".value_proj.weight", 256, 256)
+    for name in ["norm_key", "norm_query", "norm_conv"]: zero(f"{ple}.{name}.weight", 4, 256)
+    w(ple + ".conv1d.weight", 1024, 1, 4)
+
+    os.makedirs(out_dir, exist_ok = True)
+    save_file(tensors, os.path.join(out_dir, "model.safetensors"))
+    with open(os.path.join(out_dir, "config.json"), "w") as fp:
+        json.dump({"architectures": ["Qwen4ExpForConditionalGeneration"], "text_config": c}, fp)
+    vocab = {"<unk>": 0, "<s>": 1, "</s>": 2}
+    vocab.update({token: i + 3 for i, token in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))})
+    vocab.update({f"<unused{i}>": i for i in range(len(vocab), 512)})
+    tok = Tokenizer(models.BPE(vocab, [], unk_token = "<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space = False)
+    tok.decoder = decoders.ByteLevel()
+    tok.add_special_tokens(["<unk>", "<s>", "</s>"])
+    tok.save(os.path.join(out_dir, "tokenizer.json"))
+    with open(os.path.join(out_dir, "tokenizer_config.json"), "w") as fp:
+        json.dump({"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>"}, fp)
+    return str(out_dir)
 
 DSV4_TINY = dict(
     hidden_size = 256,

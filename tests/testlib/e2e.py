@@ -117,7 +117,7 @@ def forward_logits(lm: LoadedModel, ids: torch.Tensor) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def prefill_decode_logits(lm: LoadedModel, ids: torch.Tensor | list[torch.Tensor], decode_steps: int):
+def prefill_decode_logits(lm: LoadedModel, ids: torch.Tensor | list[torch.Tensor], decode_steps: int, **generator_kwargs):
     """Teacher-forced logits through the generator's cached path: prefill ids[:, :-decode_steps], then feed the
     remaining tokens one at a time (single-token decode). Returns (decode_steps + 1, vocab) fp32 logits on the
     CPU: the prefill's last position followed by each decode step. A list of sequences runs as concurrent jobs
@@ -126,7 +126,7 @@ def prefill_decode_logits(lm: LoadedModel, ids: torch.Tensor | list[torch.Tensor
     from exllamav3.generator.sampler import ArgmaxSampler
 
     seqs = ids if isinstance(ids, list) else [ids]
-    gen = lm.generator()
+    gen = lm.generator(**generator_kwargs)
     jobs = []
     for i, seq in enumerate(seqs):
         prompt = seq[:, :seq.shape[-1] - decode_steps]
@@ -146,14 +146,18 @@ def prefill_decode_logits(lm: LoadedModel, ids: torch.Tensor | list[torch.Tensor
 
 
 @torch.inference_mode()
-def greedy(gen, ids: torch.Tensor, new_tokens: int, return_logits: bool = False, **job_kwargs):
+def greedy(gen, ids: torch.Tensor, new_tokens: int, return_logits: bool = False,
+           forced_tokens: torch.Tensor | None = None, **job_kwargs):
     """Greedy generation of exactly new_tokens through gen. Returns (tokens, logits or None, events) where events
-    are the job's "started" and final ("eos") result dicts"""
+    are the job's "started" and final ("eos") result dicts. forced_tokens fixes the continuation for comparisons
+    between cached paths that may otherwise diverge on near-ties"""
     from exllamav3 import Job
     from exllamav3.generator.sampler import ArgmaxSampler
     job = Job(input_ids = ids, max_new_tokens = new_tokens, sampler = ArgmaxSampler(), stop_conditions = [],
               return_logits = return_logits, **job_kwargs)
     gen.enqueue(job)
+    if forced_tokens is not None:
+        job.constrain_output_now(forced_tokens)
     tokens, logits, events = [], [], {}
     while gen.num_remaining_jobs():
         for r in gen.iterate():
