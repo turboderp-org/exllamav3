@@ -1,7 +1,13 @@
-"""Text-only SenseNova Loop inference; shared physical layers use layer_map."""
+"""SenseNova Loop inference; shared physical layers use layer_map.
+
+The text path is the Loop forward below.  The optional vision tower is the stock Qwen3.5 one
+(Qwen3VLVisionModel); it is only loaded when vision_config is present in config.json."""
+import json
 import math
+import os
 import torch
 from .qwen3_5 import Qwen3_5VLBaseConfig, Qwen3_5BaseModel
+from .qwen3_vl import Qwen3VLVisionModel
 from ..modules.transformer import TransformerBlock
 from ..modules.gated_delta_net import GatedDeltaNet
 from ..modules.loop_router import LoopRouter, merge
@@ -39,7 +45,14 @@ class SenseNovaLoopConfig(Qwen3_5VLBaseConfig):
     arch_string = "SenseNovaLoopForConditionalGeneration"
 
     def __init__(self, directory, **kwargs):
-        super().__init__(directory, "text_config", SenseNovaLoopModel, None, **kwargs)
+        # Text-only checkpoints (no vision_config or preprocessor_config.json) skip the vision component.
+        with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
+            has_vision = isinstance(json.load(f).get("vision_config"), dict) \
+                and os.path.isfile(os.path.join(directory, "preprocessor_config.json"))
+        # No MTP head in Loop checkpoints
+        super().__init__(
+            directory, "text_config", SenseNovaLoopModel, Qwen3VLVisionModel if has_vision else None, None, **kwargs
+        )
         plan = loop_plan(self.config_dict)
         if self.layer_map_str is not None or (self.layer_map is not None and self.layer_map != plan):
             raise ValueError("Custom layer maps are not supported for SenseNova Loop")

@@ -135,8 +135,9 @@ def read_qwen3_vl_pp_config(config_dict: dict):
     pp.rescale_factor = 1 / 255
     pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
     pp.max_pixels = pp.size["longest_edge"]
-    assert pp.image_processor_type == "Qwen2VLImageProcessorFast", \
-        "Expected image_processor_type to be 'Qwen2VLImageProcessorFast'"
+    # The slow and fast HF processors share the resize/normalize/patchify definition (SenseNova Loop ships the slow one)
+    assert pp.image_processor_type in ("Qwen2VLImageProcessorFast", "Qwen2VLImageProcessor"), \
+        "Expected image_processor_type to be 'Qwen2VLImageProcessorFast' or 'Qwen2VLImageProcessor'"
     return pp
 
 

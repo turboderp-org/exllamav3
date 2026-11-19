@@ -127,3 +127,65 @@ def test_block_boundaries_and_export():
         torch.testing.assert_close(actual, expected, rtol = 0, atol = 0)
         torch.testing.assert_close(params["export_states"][0], streams.mean(-2).half(), rtol = 0, atol = 0)
         x = actual
+
+
+# --- Vision tower: config-level contracts (JSON reading only, no weights) ---
+
+import json
+import os
+import shutil
+
+STAGED = "/mnt/local-ai-shared/local-ai-experiments/models/loop9b-release/8.0bpw"
+SOURCE = "/home/lasse/Work/storage-models/SenseNova-Loop-9B"
+CONFIG_FILES = ("config.json", "preprocessor_config.json")
+
+
+def _loop_dir(tmp_path, src, drop_vision = False, drop_preprocessor = False):
+    from testlib.checkpoint import write_tensors
+    for name in CONFIG_FILES:
+        if name == "preprocessor_config.json" and drop_preprocessor:
+            continue
+        shutil.copy(os.path.join(src, name), tmp_path / name)
+    if drop_vision:
+        raw = json.loads((tmp_path / "config.json").read_text())
+        del raw["vision_config"]
+        (tmp_path / "config.json").write_text(json.dumps(raw))
+    write_tensors({"dummy": torch.zeros(1)}, str(tmp_path))
+    return str(tmp_path)
+
+
+@pytest.mark.skipif(not os.path.isfile(os.path.join(STAGED, "config.json")), reason = "staged 8.0 dir not present")
+def test_vision_component_exposed(tmp_path):
+    from exllamav3 import Config
+    from exllamav3.architecture.sensenova_loop import SenseNovaLoopModel
+    from exllamav3.architecture.qwen3_vl import Qwen3VLVisionModel
+    config = Config.from_directory(_loop_dir(tmp_path, STAGED))
+    assert config.model_classes["text"] is SenseNovaLoopModel
+    assert config.model_classes["vision"] is Qwen3VLVisionModel
+    assert "mtp" not in config.model_classes
+    v = config.vision
+    assert (v.depth, v.hidden_size, v.out_hidden_size, v.patch_size) == (27, 1152, 4096, 16)
+    assert (v.spatial_merge_size, v.temporal_patch_size, v.deepstack_visual_indexes) == (2, 2, [])
+    assert config.vision_pp.patch_size == 16 and config.vision_start_token_id == 248053
+    assert config.layer_map == loop_plan(config.config_dict)
+
+
+@pytest.mark.skipif(not os.path.isfile(os.path.join(STAGED, "config.json")), reason = "staged 8.0 dir not present")
+def test_vision_model_ignores_layer_map(tmp_path):
+    from exllamav3 import Config, Model
+    config = Config.from_directory(_loop_dir(tmp_path, STAGED))
+    vision = Model.from_config(config, "vision")
+    assert len(vision.modules) == 2 + 27 + 1      # patch embed, pos embed, blocks, merger
+    assert [m for m, _, _ in vision.fwd_modules] == vision.modules
+    text = Model.from_config(config)
+    assert len(text.fwd_modules) == 59            # 1 embed + 56 visits + norm + head
+
+
+@pytest.mark.skipif(not os.path.isfile(os.path.join(STAGED, "config.json")), reason = "staged 8.0 dir not present")
+@pytest.mark.parametrize("drop_vision,drop_preprocessor", [(True, False), (False, True)])
+def test_text_only_without_vision_config(tmp_path, drop_vision, drop_preprocessor):
+    from exllamav3 import Config
+    config = Config.from_directory(_loop_dir(tmp_path, STAGED, drop_vision, drop_preprocessor))
+    assert config.vision is None and config.vision_pp is None
+    assert set(config.model_classes) == {"text"}
+    assert len(config.layer_map) == 56
