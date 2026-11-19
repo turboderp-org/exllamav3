@@ -1491,8 +1491,9 @@ class DiskPageCache:
     def _build_order(self):
         """
         Eviction order over the mirror: orphaned states (anchor page in no tier), orphaned page chains, then
-        rooted trees least recently used root first, each pruned leaf-first. Same policy as the CPU tier, over
-        last_access instead of the page table's serial.
+        rooted trees, each pruned leaf-first. With aging_lfu on the attached page table, leaves are ordered by
+        effective weight rather than raw last_access, so hot prefixes survive while cold tails are pruned first.
+        Without it, the heap key falls back to last_access.
         """
         pages = self.pages
         children = {h: [] for h in pages}
@@ -1513,31 +1514,33 @@ class DiskPageCache:
             if h not in pages and not self._rooted_elsewhere(h):
                 order.append(("state", h, True))
 
-        def prune(root, orphaned):
+        pt = self.pagetable
+        def weight(h):
+            return pt.effective_weight_hash(h) if pt is not None else 0.0
+
+        def prune(roots, orphaned):
             remaining = {}
             heap = []
-            stack = [root]
-            while stack:
-                h = stack.pop()
-                n = len(children[h])
-                remaining[h] = n
-                if n == 0:
-                    heapq.heappush(heap, (pages[h]["last_access"], h))
-                stack.extend(children[h])
+            for root in roots:
+                stack = [root]
+                while stack:
+                    h = stack.pop()
+                    n = len(children[h])
+                    remaining[h] = n
+                    if n == 0:
+                        heapq.heappush(heap, (weight(h), pages[h]["last_access"], h))
+                    stack.extend(children[h])
             while heap:
-                _, h = heapq.heappop(heap)
+                _, _, h = heapq.heappop(heap)
                 order.append(("page", h, orphaned))
                 ph = pages[h]["prev_hash"]
                 if ph is not None and ph in remaining:
                     remaining[ph] -= 1
                     if remaining[ph] == 0:
-                        heapq.heappush(heap, (pages[ph]["last_access"], ph))
+                        heapq.heappush(heap, (weight(ph), pages[ph]["last_access"], ph))
 
-        access = lambda h: pages[h]["last_access"]
-        for root in sorted(orphan_roots, key = access):
-            prune(root, True)
-        for root in sorted(roots, key = access):
-            prune(root, False)
+        prune(orphan_roots, True)
+        prune(roots, False)
         # Checkpoints whose page is on disk went with their page above; those anchored on a page still in a
         # higher tier only (not on disk) are the last resort, least recently used first
         anchored = [h for h in self.states if h not in pages and self._rooted_elsewhere(h)]
