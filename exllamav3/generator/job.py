@@ -1304,6 +1304,8 @@ class Job:
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
+            # An MTP job requeues one token past the boundary and reserves it (rq_margin, rq_headroom below)
+            mtp_lag = 1 if self.generator.mtp_draft else 0
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
@@ -1312,8 +1314,9 @@ class Job:
                 # The final segment: a budget aligned to the end of the cache leaves no room for the
                 # speculative window past it, and no requeue can follow it anyway, so it is cut to what
                 # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
-                # 31-token draft window could not be enqueued at all)
-                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
+                # 31-token draft window could not be enqueued at all). The cut makes room for everything
+                # reserved past the budget (rq_headroom), so for an MTP job the token past the window too
+                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens - mtp_lag)
                 self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
@@ -1323,7 +1326,6 @@ class Job:
             # MTP keeps the last two tokens of a prompt out of the page cache (max_cached_pages below), so an MTP job
             # requeues one token past the boundary: the next segment then finds the boundary page cached and resumes
             # from the checkpoint there, instead of replaying the whole interval before it
-            mtp_lag = 1 if self.generator.mtp_draft else 0
             self.rq_margin = -mtp_lag
             self.rq_headroom = self.generator.max_draft_tokens + mtp_lag
         else:
