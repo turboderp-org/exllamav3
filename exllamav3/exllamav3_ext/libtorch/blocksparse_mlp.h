@@ -21,6 +21,21 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     const py::dict& params
 );
 
+#if defined(USE_ROCM)
+// Torch-facing entry for the fused shared-expert gate tail kernel (rocm/quant/
+// exl3_gate_fused_rdna.cu), bound for tests: dst = routed + sigmoid(y @ w) * sh, with
+// y/w absent skipping the gate dot and sh absent skipping the add. The route's own
+// layout checks (run_bszN_rdna) are the product contract; this wrapper mirrors them so
+// the test exercises the kernel's accepted domain, nothing else.
+void moe_gate_fused_rdna(
+    const c10::optional<at::Tensor>& y,
+    const c10::optional<at::Tensor>& w,
+    const at::Tensor& routed,
+    const c10::optional<at::Tensor>& sh,
+    at::Tensor& dst
+);
+#endif
+
 struct BC_BlockSparseMLP
 {
     at::Tensor yh2;

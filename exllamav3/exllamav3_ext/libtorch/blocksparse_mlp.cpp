@@ -114,6 +114,12 @@ void BC_BlockSparseMLP::run_bszN
 // RDNA route of run_bszN: four launches through exl3_rocm_moe_decode into out_d2, then the shared expert (its
 // own multi-row graph, merged through the sigmoid gate when there is one, as the fused kernels do) and the copy
 // into out_bszn. Returns false, having launched nothing, when the call is outside the op's bounds
+extern "C" void exl3_moe_gate_fused_rdna(const void* y, const void* w, const void* routed, const void* sh, void* dst, int H, int W, int bsz, void* stream);
+extern "C" void exl3_moe_gate_fused_rdna_f32(const void* y, const void* w, const void* routed, const void* sh, void* dst, int H, int W, int bsz, void* stream);
+// Reports whether the fused tail may be used (EXL3_RDNA_GATE_FUSED=0 clears it; the host
+// then runs the eager chain). ROCm-only symbol; the sole caller is under USE_ROCM.
+extern "C" int exl3_moe_gate_fused_rdna_enabled(void);
+
 bool BC_BlockSparseMLP::run_bszN_rdna
 (
     const at::Tensor& y,
@@ -145,24 +151,141 @@ bool BC_BlockSparseMLP::run_bszN_rdna
     const int H = (int) out_bszn.size(-1);
     at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
     at::Tensor dst = out_bszn.slice(0, 0, bsz);
+    // The shared-expert rows (the buffer is filled further down, the view is static)
+    c10::optional<at::Tensor> sh_o;
     if (shared_experts && out_d_sh)
+        sh_o = out_d_sh.value().slice(1, 0, bsz).view({bsz, -1}).slice(1, 0, H);
+    if (shared_experts && !sh_o)
+    {
+        // No shared-expert output buffer: as before, the shared expert is skipped and
+        // out_bszn takes the routed sum alone
+        dst.copy_(routed);
+        return true;
+    }
+    // The tail -- copy of the routed sum, plus the shared expert merged through the sigmoid
+    // gate when there is one -- runs as one fused launch: a single kernel with one block per
+    // output row, which computes the gate dot once per row, then sweeps H (gate dot, sigmoid
+    // and the (gated) add folded into one pass; with no shared expert it degenerates to a
+    // single-pass copy). The kernel indexes every operand flat, so only fully contiguous
+    // buffers may enter it, and the gate dot reduces y across the full gate-weight width
+    // and has no bias term -- anything else (sliced rows from a padded accumulator, a gate
+    // wider than the model input, a biased gate) takes the eager tail instead of raising.
+    const bool gate_shape_ok =
+        !shared_gate || (y.scalar_type() == at::kHalf && y.is_contiguous() &&
+            (int) shared_gate->weight.numel() == (int) y.size(-1) &&
+            !shared_gate->bias.has_value() &&
+            shared_gate->weight.scalar_type() == at::kHalf &&
+            shared_gate->weight.is_contiguous());
+    const bool tail_layout_ok =
+        routed.is_contiguous() && dst.is_contiguous() &&
+        (!sh_o || sh_o->is_contiguous());
+    // The eager tail seeds dst with the routed sum first; the fused launch folds that copy in
+    const bool tail_fused = exl3_moe_gate_fused_rdna_enabled() && gate_shape_ok && tail_layout_ok;
+    if (!tail_fused)
+        dst.copy_(routed);
+    if (sh_o)
     {
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
         shared_experts->run_bszN(x_dense, out_d_sh_n);
-        at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
-        dst.copy_(routed);
-        if (shared_gate)
+        at::Tensor sh = *sh_o;
+        if (!tail_fused && shared_gate)
         {
+            // Bypass path (EXL3_RDNA_GATE_FUSED=0, or a layout that failed the checks
+            // above): the original eager chain, kept for bisecting
             at::Tensor g = at::sigmoid(at::matmul(y.to(at::kFloat), shared_gate->weight.reshape({-1, 1}).to(at::kFloat)));
             dst.addcmul_(g, sh);
         }
-        else
+        else if (!tail_fused)
+        {
             dst.add_(sh);
+        }
+        else
+        {
+            // One fused launch replaces the to(Float)/matmul/sigmoid/copy_/addcmul_ chain.
+            // On the decode route those chains are dispatched ops whose cost is dominated
+            // by launch and ATen dispatch latency, not by their tiny amount of GPU work;
+            // folding them into a kernel raised RDNA4 decode by ~20 % at batch 1. The dot
+            // runs in fp32 with a fixed thread-deposition order, which is deterministic
+            // per build but not bit-identical to a gemv reduction (numerically equivalent
+            // within fp32 rounding of the gate scalar). A null sh means there is nothing to
+            // add and the kernel becomes a plain copy; W == 0 skips the gate dot and adds
+            // the shared half unscaled.
+            // dtype is a contract (the host picks the half/float variant on it); layout and
+            // gate shape were checked up front and take the eager tail instead of raising
+            TORCH_CHECK((routed.scalar_type() == at::kHalf || routed.scalar_type() == at::kFloat) &&
+                    dst.scalar_type() == routed.scalar_type() &&
+                    sh.scalar_type() == routed.scalar_type(),
+                    "exl3_moe_gate_fused_rdna: dtype assumption violated");
+            const bool f32 = routed.scalar_type() == at::kFloat;
+            auto fn = f32 ? exl3_moe_gate_fused_rdna_f32 : exl3_moe_gate_fused_rdna;
+            fn(shared_gate ? y.data_ptr() : nullptr,
+                shared_gate ? shared_gate->weight.data_ptr() : nullptr,
+                routed.data_ptr(),
+                sh.data_ptr(),
+                dst.data_ptr(), H,
+                shared_gate ? (int) shared_gate->weight.numel() : 0, bsz,
+                at::cuda::getCurrentCUDAStream().stream());
+        }
+    }
+    else if (tail_fused)
+    {
+        // No shared expert: the gate has nothing to gate, so this is a plain copy and the
+        // kernel runs with the dot and the add both skipped (single pass over routed).
+        // Layout was gated above; only the dtype pair remains a contract.
+        TORCH_CHECK((routed.scalar_type() == at::kHalf || routed.scalar_type() == at::kFloat) &&
+                dst.scalar_type() == routed.scalar_type(),
+                "exl3_moe_gate_fused_rdna: dtype assumption violated");
+        (routed.scalar_type() == at::kFloat ? exl3_moe_gate_fused_rdna_f32 : exl3_moe_gate_fused_rdna)
+            (nullptr, nullptr, routed.data_ptr(), nullptr,
+                dst.data_ptr(), H, 0, bsz,
+                at::cuda::getCurrentCUDAStream().stream());
     }
     else
         dst.copy_(routed);
     return true;
+}
+
+// Test/inspection entry for the fused tail kernel, same kernel the route launches.
+// Contract mirrors run_bszN_rdna's checks: routed/dst (and sh when given) equal dtype
+// (half or float) and contiguous, (bsz, H); with a gate, y is a contiguous (bsz, W) half
+// row block and w a contiguous (W,) half vector; without one, both are absent and the
+// shared half is added unscaled. An empty sh (std::nullopt) makes the kernel a plain copy.
+void moe_gate_fused_rdna
+(
+    const c10::optional<at::Tensor>& y,
+    const c10::optional<at::Tensor>& w,
+    const at::Tensor& routed,
+    const c10::optional<at::Tensor>& sh,
+    at::Tensor& dst
+)
+{
+    c10::cuda::CUDAGuard device_guard(routed.device());
+    const bool gated = y.has_value() || w.has_value();
+    TORCH_CHECK(gated == (y.has_value() && w.has_value()), "moe_gate_fused_rdna: y and w come as a pair");
+    TORCH_CHECK((routed.scalar_type() == at::kHalf || routed.scalar_type() == at::kFloat) &&
+            dst.scalar_type() == routed.scalar_type() &&
+            (!sh || sh->scalar_type() == routed.scalar_type()),
+            "moe_gate_fused_rdna: routed, sh and dst share one dtype, half or float");
+    TORCH_CHECK(routed.is_contiguous() && dst.is_contiguous() && (!sh || sh->is_contiguous()),
+            "moe_gate_fused_rdna: routed, sh and dst must be contiguous");
+    TORCH_CHECK(dst.sizes().equals(routed.sizes()) && (!sh || sh->sizes().equals(routed.sizes())),
+            "moe_gate_fused_rdna: routed, sh and dst are the same shape");
+    if (gated)
+    {
+        TORCH_CHECK(y->scalar_type() == at::kHalf && y->is_contiguous() && y->dim() == 2 &&
+                w->scalar_type() == at::kHalf && w->is_contiguous() && w->dim() == 1 &&
+                y->size(1) == w->size(0) && y->size(0) == routed.size(0),
+                "moe_gate_fused_rdna: y must be (bsz, W) half and w (W,) half, contiguous");
+    }
+    const int bsz = routed.size(0);
+    const int H = routed.size(-1);
+    const int W = gated ? (int) w->numel() : 0;
+    const bool f32 = routed.scalar_type() == at::kFloat;
+    auto fn = f32 ? exl3_moe_gate_fused_rdna_f32 : exl3_moe_gate_fused_rdna;
+    fn(gated ? y->data_ptr() : nullptr, gated ? w->data_ptr() : nullptr,
+        routed.data_ptr(), sh ? sh->data_ptr() : nullptr, dst.data_ptr(),
+        H, W, bsz, at::cuda::getCurrentCUDAStream().stream());
 }
 #endif
 

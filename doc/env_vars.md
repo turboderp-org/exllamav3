@@ -324,6 +324,16 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+### `EXL3_RDNA_GATE_FUSED` (ROCm; default: `1`)
+
+The RDNA block-sparse MLP decode route ends its tail (copy of the routed sum, plus the shared
+expert merged through the sigmoid gate when there is one) in one fused kernel instead of the
+eager to(Float)/matmul/sigmoid/copy_/addcmul_ chain, whose dispatched ops cost mostly launch
+and ATen dispatch time at batch 1 (~20% decode throughput on RDNA4). Set `0` to run the eager
+chain instead, for bisecting; the fused kernel also covers the no-gate merge and the plain
+copy. A gate is only fused when it spans the full model width and has no bias; those cases
+always take the eager tail.
+
 ### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
 
 Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels

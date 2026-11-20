@@ -588,7 +588,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # second entry under the same name would silently double memory forever)
         bszn_rows = MAX_BSZN * numex
 
-        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        # temp_hidden holds the rotated gate/up input pair the RDNA fused decode route
+        # (run_bszN_rdna) reads per pick, so yh2 -- the whole buffer -- needs 2 rows per slot:
+        # 2 * MAX_BSZN * numex. A row-short yh2 fails the route's fit check and drops whole
+        # verify steps (spec decode, bsz > 1) back to the eager path. The yh view keeps the
+        # first bszn_rows rows, one rotated input per pick, as in the fused-coop path.
+        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
         temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
         temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
