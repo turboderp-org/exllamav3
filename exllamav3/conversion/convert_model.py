@@ -1453,6 +1453,9 @@ def main(args, job_state):
     # table; resumable and skipped when already complete
     from .ngram import prepare_ngram_table_for_conversion
     prepare_ngram_table_for_conversion(args, config, model)
+    # Hy4-flash: one Engram table per Engram layer, each quantized into its own file
+    from .hy4_engram import prepare_engram_tables_for_conversion
+    prepare_engram_tables_for_conversion(args, config, model)
 
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
