@@ -207,6 +207,7 @@ python examples/chat.py -h
 | **GPT-OSS**                                       | `GptOssForCausalLM`                                                           |            |                       |
 | **HyperCLOVAX**                                   | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM`                          |     ✓     |                       |
 | **Hy3**                                           | `HYV3ForCausalLM`                                                             |            |                       |
+| **Hy4 flash**                                     | `HYV4FlashForConditionalGeneration`                                           |            | Conversion only       |
 | **IQuest-Coder**                                  | `IQuestCoderForCausalLM`                                                      |            |                       |
 | **Kimi Linear**                                   | `KimiLinearForCausalLM`                                                       |            |                       |
 | **Ling 3.x**                                      | `BailingMoeV3ForCausalLM`                                                     |            |                       |

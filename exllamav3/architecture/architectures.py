@@ -28,6 +28,7 @@ from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
+from .hy_v4_flash import HyV4FlashModel
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
@@ -108,6 +109,7 @@ ARCHITECTURES = {
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
+        HyV4FlashModel,
         HyperClovaxModel,
         IQuestCoderModel,
         LagunaModel,
