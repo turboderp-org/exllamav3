@@ -37,6 +37,14 @@ fp_quantize_tiles_kernel quantize_tiles_kernel_k5_cb2_l160(bool optimized = fals
 fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb2_l160(bool optimized = false);
 fp_quantize_tiles_kernel quantize_tiles_kernel_k7_cb2_l160(bool optimized = false);
 fp_quantize_tiles_kernel quantize_tiles_kernel_k8_cb2_l160(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k1_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k2_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k3_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k4_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k5_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k7_cb2_l96(bool optimized = false);
+fp_quantize_tiles_kernel quantize_tiles_kernel_k8_cb2_l96(bool optimized = false);
 
 
 // Fractional-rate instances (mul1 codebook only): quantize_tiles_frac_kernel<KA, MASK>, rate KA + popcount(MASK)/16
