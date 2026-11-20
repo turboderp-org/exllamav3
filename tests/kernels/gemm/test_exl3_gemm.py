@@ -120,3 +120,23 @@ def test_empty_gemm(device, c_dtype, m, k, n):
             ext.exl3_gemm(A, w["trellis"], torch.empty((m - 1, n), dtype = c_dtype, device = device), w["suh"],
                           torch.empty_like(A), w["svh"], 0, False, True, 0)
     _device_still_works(device)
+
+
+@torch.inference_mode()
+def test_strided_b_rejected(device):
+    """The kernel takes B's row pitch from its shape, so a column slice of a wider B (which passes the shape checks)
+    would read the wrong tiles. It is rejected; the same slice made contiguous matches the sliced reference"""
+    k, n, m, n_out = 512, 1024, 4, 256
+    gen = generator(5)
+    w = rand_linear(k, n, 4, gen, device)
+    A = (torch.randn((m, k), generator = gen) * 0.5).half().to(device)
+    B = w["trellis"][:, : n_out // 16]
+    svh = w["svh"][:n_out]
+    C = torch.empty((m, n_out), dtype = torch.half, device = device)
+    with pytest.raises(RuntimeError, match = "exl3_gemm: B must be contiguous"):
+        ext.exl3_gemm(A, B, C, w["suh"], torch.empty_like(A), svh, 0, False, True, 0)
+    ext.exl3_gemm(A, B.contiguous(), C, w["suh"], torch.empty_like(A), svh, 0, False, True, 0)
+    ref = linear_ref(A, w["trellis"], w["suh"], w["svh"], 4, "mul1")[:, :n_out]
+    rel = ((C.float() - ref.float()).square().mean().sqrt() / ref.float().square().mean().sqrt()).item()
+    assert rel < 0.02, f"relative RMS error {rel:.4f}"
+    _device_still_works(device)
