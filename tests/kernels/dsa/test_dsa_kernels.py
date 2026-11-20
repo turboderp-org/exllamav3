@@ -250,6 +250,55 @@ def test_attn_nc_chunk(device, monkeypatch, i, case, derot, groups, bits):
                tol = 1.2e-2 if bits else 6e-3, nc_chunk = True)
 
 
+# gfx1151 HIP prefill kernel (EXL3_DSA_PF): gathered prefill at the V4 Flash shape, with de-rotation, sinks and
+# group-major output.
+# Prefill-sized rows (>= 256) at compress rates 4, 2 and 1 (page_size stays PAGE_SIZE here: the kernel takes it
+# as an argument), plus a start-of-sequence case where the window floor and short pools bite
+PF_CASES = [
+    ((256, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8),   # V4 Flash CSA, group-major
+    ((512, 64, 448, 64, 4096, 512, 128, True, False, 2), True, 8),
+    ((256, 64, 448, 64, 1024, 512, 128, True, False, 1), True, 8),
+    ((256, 64, 448, 64, 300, 512, 128, True, False, 1), True, 8),    # topk > keys, -1 padding
+    ((256, 64, 448, 64, 64, 512, 128, True, False, 4), True, 8),     # q_pos0 = 0: window floor
+]
+
+
+def _count_pf(monkeypatch):
+    calls = []
+    real = ext.dsa_prefill_rdna
+    def counted(*args):
+        calls.append(args[0].shape[0])
+        return real(*args)
+    monkeypatch.setattr(ext, "dsa_prefill_rdna", counted)
+    return calls
+
+
+@pytest.mark.rocm_only
+@pytest.mark.skipif(not getattr(ext, "HAS_DSA_PREFILL_RDNA", False), reason = "built without dsa_prefill_rdna")
+@pytest.mark.parametrize("i,case,derot,groups",
+                         [pytest.param(i, c, d, g, id = _id(c, d, g)) for i, (c, d, g) in enumerate(PF_CASES)])
+def test_attn_prefill_rdna(device, monkeypatch, i, case, derot, groups):
+    if not dsa_triton._dsa_pf_ok(torch.device(device)):
+        pytest.skip("dsa_prefill_rdna runs on gfx1151 only")
+    monkeypatch.setattr(dsa_triton, "_dsa_pf", True)
+    calls = _count_pf(monkeypatch)
+    check_attn(device, monkeypatch, *case, seed = 700 + i, derot = derot, groups = groups)
+    # check_attn's single-split run takes the kernel; its 8-split run takes the split path before the branch
+    assert calls == [case[0]], f"HIP prefill kernel calls {calls}"
+
+
+@pytest.mark.rocm_only
+@pytest.mark.skipif(not getattr(ext, "HAS_DSA_PREFILL_RDNA", False), reason = "built without dsa_prefill_rdna")
+@pytest.mark.parametrize("flag,R,qc_bits,groups", [(False, 256, 0, 8), (True, 255, 0, 8), (True, 256, 8, 8), (True, 256, 0, 1)])
+def test_attn_prefill_rdna_not_taken(device, monkeypatch, flag, R, qc_bits, groups):
+    """Flag off, rows under _dsa_pf_min_r, packed (quantized) pools and token-major output stay on the Triton kernels"""
+    monkeypatch.setattr(dsa_triton, "_dsa_pf", flag)
+    calls = _count_pf(monkeypatch)
+    check_attn(device, monkeypatch, R, 64, 448, 64, 2048, 512, 128, True, False, 4, seed = 800 + R,
+               derot = True, groups = groups, qc_bits = qc_bits, single_bt = bool(qc_bits))
+    assert calls == [], f"HIP prefill kernel calls {calls}"
+
+
 # Packed-pool prefill staging (single-row block table, R >= 64, pool_len = context): the staged fp16 path and the
 # online path must both match the reference
 STAGE_CASES = [

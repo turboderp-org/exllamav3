@@ -169,6 +169,15 @@ way in the top-k regime: six to eight GEMV launches collapse into two. A/B switc
 eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
 Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
 
+### `EXL3_DSA_PF` (default: `0`)
+
+Set to `1` to run DSA gathered (top-k) prefill on gfx1151 through the HIP kernel in
+`exllamav3_ext/rocm/attn/dsa_prefill_rdna.cu` instead of the Triton MQA prefill kernel (1.2-1.4x
+faster per call on a Radeon 8060S). Only calls with 256 or more query rows at the V4 Flash shape
+(64 heads, 448 + 64 latent) with a window, sinks, fused de-rotation and an fp16 pool take it;
+decode, draft verification, dense-pool (HCA) layers and quantized pools stay on Triton. Not
+bitwise identical to the Triton kernel (different accumulation order). Ignored on other devices.
+
 ### `EXL3_QC_STAGING` (default: `1`)
 
 How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only
