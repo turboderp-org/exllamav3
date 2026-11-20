@@ -662,10 +662,10 @@ side stream, and once the copy has landed the placement map sends later routes t
 least-used resident that was not routed goes the other way into the worker slot the promotion
 freed, so the resident set follows the conversation token by token instead of once per sweep, and
 no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
-process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
-promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
-start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
-step's bookkeeping cost every 128 steps.
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to
+`EXL3_MOE_CPU_PROMOTE_BUDGET` promotions per step over all layers (one per layer), and as many
+demotions; the spares' own experts start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the
+transfer counts, the hit rate and the step's bookkeeping cost every 128 steps.
 
 Both dynamic modes save each layer's decayed expert selection counts to
 `~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
@@ -674,6 +674,15 @@ model permutes the experts hottest first from that profile, so the GPU slice sta
 experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
 what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
 (an explicit stats file in the same per-layer format) takes precedence.
+
+### `EXL3_MOE_CPU_PROMOTE_BUDGET` (default: `3`)
+
+Promotions promote-on-miss may issue per decode step over all layers, at most one per layer (and
+as many demotions). A step routes far more experts to the worker than a small budget can move, so
+the budget bounds how fast the resident set follows a change of topic or the start of a session. The
+default is small because on Windows (WDDM) streams run in submission order, so every transfer delays
+the next draft forward. Elsewhere the transfers run on a side stream beside the forward pass, and a
+larger budget (e.g. `24`) lets the resident set follow the misses. `0` issues no transfers.
 
 ### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
 

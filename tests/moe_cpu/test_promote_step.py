@@ -126,6 +126,51 @@ def test_promote_snapshot_is_one_copy_per_device(device):
         assert torch.allclose(m._split_hist, before[i] * bsc._PROMOTE_DECAY)
 
 
+def _missing_module(ip, device, host, layer):
+    """A split module with free GPU slots whose hit counts the test sets before a decide"""
+    m = _split_module(ip, device)
+    slot = SimpleNamespace(inner = None)
+    m.cpu_host, m.cpu_layer_idx, m.gated = host, layer, False
+    m.ups = m.downs = [slot] * m.num_experts
+    m._split_free_gpu = [2, 3]
+    return m
+
+
+@pytest.mark.parametrize("budget, issued", [(0, 0), (2, 2), (24, 6)])
+def test_budget_caps_promotions_per_pass(device, monkeypatch, budget, issued):
+    """Every layer routes one expert its worker holds: a pass promotes at most the budget, one per layer"""
+    monkeypatch.setattr(bsc, "_PROMOTE_BUDGET", budget)
+    promoted = []
+    def promote_expert(layer, c, linears):
+        promoted.append((layer, c))
+        ev = torch.cuda.Event()
+        ev.record()
+        return ev
+    stream = torch.cuda.Stream(device)
+    host = SimpleNamespace(
+        stream_min_rows = 32, promote_ready = lambda layer, c: True, promo_stream = lambda dev: stream,
+        promote_expert = promote_expert,
+    )
+    ip = SimpleNamespace()
+    modules = [_missing_module(ip, device, host, i) for i in range(6)]
+    with torch.inference_mode(), torch.cuda.device(device):
+        ps = bsc._split_promote_land(ip, modules)
+        bsc._split_promote_decide(ps, 1)                    # first snapshot goes out: nothing to rank yet
+        assert promoted == []
+        for m in modules:
+            m._split_hist[5] = 10.0                         # expert 5 lives in worker slot 1
+        bsc._split_promote_decide(ps, 1)                    # snapshot of the counts above goes out
+        bsc._split_promote_decide(ps, 1)                    # and is ranked here
+        torch.cuda.synchronize(device)
+
+    assert len(promoted) == issued
+    assert len({layer for layer, _ in promoted}) == issued
+    assert all(c == 1 for _, c in promoted)
+    for m in modules:
+        took = m.cpu_layer_idx in {layer for layer, _ in promoted}
+        assert len(m._split_pending) == took and len(m._split_free_gpu) == 2 - took
+
+
 def _landed(kind, r, gpu, cpu):
     ev = torch.cuda.Event()
     ev.record()
