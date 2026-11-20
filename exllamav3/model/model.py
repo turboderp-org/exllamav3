@@ -645,8 +645,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             # interpreter, torch, the checkpoint index) overlaps the first modules' loading
             # instead of holding up the first offloaded layer. It idles if no layer ends up
             # offloaded; unload shuts it down either way
-            ip = self.config.infer_params
-            if int(getattr(ip, "moe_cpu_split", 0) or 0) or int(getattr(ip, "moe_cpu_offload", 0) or 0):
+            from ..modules.block_sparse_mlp_cpu import cpu_budget
+            cpu_layers, cpu_split = cpu_budget(self.config.infer_params)
+            if cpu_layers or cpu_split:
                 from .moe_cpu_host import MoeCpuHost
                 MoeCpuHost.for_config(self.config)._spawn()
 
@@ -734,12 +735,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                     # stages modules on the CPU and the workers rebuild them from the export, so a
                     # requested offload would be dropped without notice and every expert would land
                     # in VRAM
-                    ip = self.config.infer_params
                     cpu_modes = [name for name, value in (
-                        ("moe_cpu_split", getattr(ip, "moe_cpu_split", 0)),
-                        ("moe_cpu_offload", getattr(ip, "moe_cpu_offload", 0)
-                            if getattr(self, "component", "text") == "text"
-                            else getattr(ip, "draft_moe_cpu_offload", 0)),
+                        ("moe_cpu_split", cpu_split),
+                        ("moe_cpu_offload", cpu_layers),
                     ) if value]
                     if cpu_modes:
                         raise NotImplementedError(

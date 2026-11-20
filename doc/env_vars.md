@@ -372,6 +372,12 @@ additionally stream their weights to the GPU and run there (via the fused kernel
 dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
 thread configuration, and the knobs below for tuning the split.
 
+`-mcs`/`--moe_cpu_split` (main model) and `-dmcs`/`--draft_moe_cpu_split` (draft model or MTP
+head) instead run the tail N routed experts of every eligible layer on the CPU. Each component
+takes one mode or the other, and N counts against that component's own number of routed experts
+per layer. A draft model or MTP head stays entirely on the GPU unless it is given a setting of
+its own.
+
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
 `TUNING` singleton before constructing a model instead of setting env vars. Layout policy is an

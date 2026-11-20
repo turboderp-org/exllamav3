@@ -91,10 +91,13 @@ GROUP_COLORS = [
     "#d92a72",  # 3: hot pink
     "#4685c7",  # 4: mid blue
     "#ab472d",  # 5: terracotta
-    "#1820e8",  # 6: deep blue
+    "#2840e8",  # 6: deep blue
     "#fc4f1f",  # 7: orange red
     "#96f97b",  # 8: light green
     "#c79fef",  # 9: lavender
+    "#d3c2cd",  # 10: lilac gray
+    "#d17089",  # 11: dusty berry
+    "#782c0a",  # 12: coffee
 ]
 
 def make_palette(groups):

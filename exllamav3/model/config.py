@@ -48,9 +48,12 @@ class InferParams:
         self.moe_cpu_offload_assigned = {}
         # Experimental: per-layer expert split — run the TAIL N routed experts of every
         # eligible block-sparse MoE layer on the CPU worker instead of whole layers, so the
-        # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
-        # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
+        # CPU GEMMs overlap each layer's own GPU expert compute. Per component like the whole-layer
+        # budgets, and a component takes one or the other: a draft component sharing this config
+        # stays on the GPU unless it is given a split of its own, sized for its own expert count.
+        # Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        self.draft_moe_cpu_split = 0
         # Pinned expert arena for the CPU worker: the worker's expert weights live in
         # shared chunks the parent maps and page-locks, so streamed prefill DMAs expert blocks
         # straight out of the arena and the per-layer split can promote experts into spare GPU
