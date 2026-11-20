@@ -36,6 +36,14 @@ static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_kernel_insta
 };
 #undef __
 
+// 96-length rows (Hy4-flash Engram vectors), mul1 codebook only
+#define __(i) quantize_tiles_kernel_k##i##_cb2_l96()
+static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_kernel_instances_l96
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 // Keep original instances for architectures outside the sm_120 tuning target.
 #define __(i, cb) quantize_tiles_kernel_k##i##_cb##cb(true)
 static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_optimized_instances
@@ -49,6 +57,14 @@ static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_optimized_i
 // 160-length rows (n-gram embedding vectors), mul1 codebook only
 #define __(i) quantize_tiles_kernel_k##i##_cb2_l160(true)
 static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_optimized_instances_l160
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
+// 96-length rows (Hy4-flash Engram vectors), mul1 codebook only
+#define __(i) quantize_tiles_kernel_k##i##_cb2_l96(true)
+static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_optimized_instances_l96
 {
     __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
 };
@@ -134,7 +150,8 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
         + (optimized && QT_OPTIMIZED_COSTS_ONLY ? 0 : L * sizeof(half) + 64 + 128);
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
-    auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
+    const auto& instances_l96 = optimized ? quantize_tiles_optimized_instances_l96 : quantize_tiles_kernel_instances_l96;
+    auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : L == 160 ? instances_l160[K - 1] : instances_l96[K - 1];
 #if defined(USE_ROCM)
     // Fail with a usable message rather than the attribute call's generic CUDA error
     TORCH_CHECK(shmem <= (int) props->sharedMemPerBlock,
@@ -155,7 +172,7 @@ std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bo
 {
     const c10::cuda::CUDAGuard device_guard(device);
     TORCH_CHECK(K >= 1 && K <= 8, "quantize_tiles_scratch: K must be 1..8");
-    TORCH_CHECK(L == 256 || (L == 160 && mul1), "quantize_tiles_scratch: length 160 requires the mul1 codebook");
+    TORCH_CHECK(L == 256 || ((L == 160 || L == 96) && mul1), "quantize_tiles_scratch: lengths 160 and 96 require the mul1 codebook");
     auto launch = qt_launch(device, K, mul1 ? 2 : mcg ? 1 : 0, L);
     return {launch.optimized, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
 }
@@ -178,7 +195,7 @@ void quantize_tiles
 
     TORCH_CHECK_DIM(input_tiles, 2);
     const int L = input_tiles.size(1);
-    TORCH_CHECK(L == 256 || L == 160, "quantize_tiles tile length must be 256 or 160");
+    TORCH_CHECK(L == 256 || L == 160 || L == 96, "quantize_tiles tile length must be 256, 160 or 96");
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_tiles);
     TORCH_CHECK_DTYPE(input_tiles, kFloat);
@@ -198,7 +215,7 @@ void quantize_tiles
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
-    TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
+    TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles lengths 160 and 96 require the mul1 codebook");
 
     // No tiles: nothing to quantize, no scratch needed
     if (!num_tiles) return;
