@@ -28,10 +28,11 @@ def routed_ref(ex, y, sel, w):
 
 
 def launch(y, out, layout_args, bufs, tabs, num_active = -1, scratch = None, base = None, lo = 1, hi = CAP,
-           m_tile = 16):
+           m_tile = 16, codebook = "mul1"):
     expert_count, token_sorted, weight_sorted = layout_args
+    mcg, mul1 = codebook == "mcg", codebook == "mul1"
     ext.exl3_moe(y, out, expert_count, token_sorted, weight_sorted, *bufs, 0, K, K, K,
-                 *tabs["g"], *tabs["u"], *tabs["d"], False, True, False, True, False, True, 0.0, num_active,
+                 *tabs["g"], *tabs["u"], *tabs["d"], mcg, mul1, mcg, mul1, mcg, mul1, 0.0, num_active,
                  scratch, base, lo, hi, m_tile)
 
 
@@ -73,8 +74,9 @@ def test_fused_det_matches_atomic_and_reference(device, seed):
     assert (a - ref).abs().max().item() <= 3e-3 * scale, "atomic vs reference"
 
 
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 @pytest.mark.parametrize("dims", [(256, 128), (512, 256)])   # N = 128 and N = 256 shapes
-def test_fused_row_tiles_match_single_launch(device, dims):
+def test_fused_row_tiles_match_single_launch(device, dims, codebook):
     """The 32 / 64-row tile instances, launched per expert range, produce the same per-slot outputs as one 16-row
     launch over every expert: the arithmetic per row is unchanged, only the B dequant is shared across row
     fragments"""
@@ -94,7 +96,7 @@ def test_fused_row_tiles_match_single_launch(device, dims):
 
     def run(lo, hi, m_tile, n_active, scratch):
         out = torch.zeros((A, Hd), dtype = torch.float, device = device)
-        launch(y, out, lay, bufs, tabs, n_active, scratch, base, lo, hi, m_tile)
+        launch(y, out, lay, bufs, tabs, n_active, scratch, base, lo, hi, m_tile, codebook)
 
     # Same group geometry for every launch (num_active -1: fixed group width): the k-slice split, and so the fp32
     # reduction order, is then identical and the tiles must match bit for bit
