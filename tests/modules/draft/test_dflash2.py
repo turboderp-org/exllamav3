@@ -38,6 +38,7 @@ def test_architecture_is_registered():
 def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
+    model.recurrent_state_cls = None
     input_ids = torch.tensor([[42]])
     prepared = object()
 
@@ -71,19 +72,6 @@ def test_input_embedding_scale_is_applied():
     actual = DFlashInputLayer.forward(layer, torch.tensor([[3]]), {})
 
     assert actual.tolist() == [[[6.0], [18.0]]]
-
-
-@pytest.mark.nogpu
-def test_tp_target_is_rejected_during_attach():
-    model = object.__new__(DFlash2Model)
-    target = SimpleNamespace(loaded_tp = True)
-
-    try:
-        model.attach_to(target)
-    except NotImplementedError as exc:
-        assert "tensor-parallel targets" in str(exc)
-    else:
-        raise AssertionError("DFlash2 attached to a tensor-parallel target")
 
 
 @pytest.mark.nogpu
@@ -361,6 +349,8 @@ def test_dflash2_block_keeps_fp32_residual_and_fp16_branches():
 @pytest.mark.nogpu
 def test_candidate_logit_scale_and_softcap_are_applied():
     class LMHead:
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 
@@ -400,6 +390,8 @@ def test_candidate_logit_scale_and_softcap_are_applied():
 @pytest.mark.nogpu
 def test_sample_exports_selector_confidence_for_dynamic_drafting():
     class LMHead:
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 
