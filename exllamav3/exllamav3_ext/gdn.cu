@@ -9,6 +9,7 @@
 #include "graph.cuh"
 #include "gdn.cuh"
 #include <cmath>
+#include <type_traits>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -446,9 +447,9 @@ void mamba2_dt_op
 #define SCAN_SPEC 1
 #define SCAN_REPLAY 2
 
-// Recurrent-state storage element: fp32, or fp16 for a half-size pool. The scan computes in fp32
-// (each thread's slice lives in registers for the whole pass) and converts on the one load and the
-// one store per pass, so fp16 storage rounds once per pass, not once per token
+// Recurrent-state storage element: fp32, fp16 for a half-size pool, or int8 with an fp16 scale per
+// 32-wide k slice. The scan holds its slice in registers across the pass, so the pool is read once
+// (dequantized for int8) and written once (quantized for int8)
 template <typename TS> __device__ __forceinline__ float state_ld(const TS* p) { return *p; }
 template <> __device__ __forceinline__ float state_ld<__half>(const __half* p) { return __half2float(*p); }
 template <typename TS> __device__ __forceinline__ void state_st(TS* p, float v) { *p = v; }
@@ -456,6 +457,16 @@ template <> __device__ __forceinline__ void state_st<__half>(__half* p, float v)
 
 #define REPLAY_MAX_JOBS 48
 struct ScanReplayJobBatch { ScanReplayJob jobs[REPLAY_MAX_JOBS]; int num_jobs; };
+
+// The recurrent-state pool the scan reads and writes: the payload rows (state) and, for an int8
+// pool, their scales. slot_size / slot_scale_size are the elements per row
+struct StatePool
+{
+    void* state;
+    size_t slot_size;
+    const __half* scales;
+    size_t slot_scale_size;
+};
 
 // Per-block operands of one scan: the batch row's inputs, the state rows and the output
 struct ScanOperands
@@ -465,6 +476,8 @@ struct ScanOperands
     const bfloat16* beta;
     void* read_state;       // state read by the first token (TS elements, see state_ld)
     void* final_state;      // state written by every token and read by all but the first
+    const __half* read_scales;    // int8 pool: fp16 scales, one per 32-wide k slice, read by the first token
+    const __half* final_scales;   // int8 pool: scales written by every token and read by all but the first
     bfloat16* out;          // nullptr: discard the attention output (replay)
     const float* D;
     int steps;
@@ -478,7 +491,6 @@ __device__ __forceinline__ bool resolve_scan_operands
     const bfloat16* __restrict__ mixed_qkv,
     const float* __restrict__ g,
     const bfloat16* __restrict__ beta,
-    void* __restrict__ recurrent_state,
     bfloat16* __restrict__ core_attn_out,
     const int seqlen,
     const size_t qkv_row,       // elements per token
@@ -487,9 +499,9 @@ __device__ __forceinline__ bool resolve_scan_operands
     const size_t out_row,
     const int* __restrict__ slots,
     const int* __restrict__ slots_in,
-    const size_t slot_size,
     const float* __restrict__ D,
-    const ScanReplayJobBatch* __restrict__ jobs
+    const ScanReplayJobBatch* __restrict__ jobs,
+    const StatePool pool
 )
 {
     int bi = blockIdx.x;
@@ -502,6 +514,8 @@ __device__ __forceinline__ bool resolve_scan_operands
         op.beta = (const bfloat16*) j.beta;
         op.read_state = (void*) j.base;
         op.final_state = (void*) j.scratch;
+        op.read_scales = (const __half*) j.base_scales;
+        op.final_scales = (const __half*) j.scratch_scales;
         op.out = nullptr;
         op.D = (const float*) j.D;
         op.steps = j.prefix;
@@ -512,8 +526,12 @@ __device__ __forceinline__ bool resolve_scan_operands
     op.g = g + (size_t) bi * seqlen * g_row;
     op.beta = beta + (size_t) bi * seqlen * beta_row;
     int state_slot = slots ? slots[bi] : bi;
-    op.final_state = (TS*) recurrent_state + (size_t) state_slot * slot_size;
-    op.read_state = (MODE == SCAN_SPEC) ? (TS*) recurrent_state + (size_t) slots_in[bi] * slot_size : op.final_state;
+    op.final_state = (TS*) pool.state + (size_t) state_slot * pool.slot_size;
+    op.read_state = (MODE == SCAN_SPEC) ? (TS*) pool.state + (size_t) slots_in[bi] * pool.slot_size : op.final_state;
+    op.final_scales = pool.scales ? pool.scales + (size_t) state_slot * pool.slot_scale_size : nullptr;
+    op.read_scales = (MODE == SCAN_SPEC)
+        ? (pool.scales ? pool.scales + (size_t) slots_in[bi] * pool.slot_scale_size : nullptr)
+        : op.final_scales;
     op.out = core_attn_out + (size_t) bi * seqlen * out_row;
     op.D = D;
     op.steps = seqlen;
@@ -737,6 +755,22 @@ __device__ __forceinline__ void scan_body
     }
 }
 
+// Warp-local Sylvester H32: block row = lane, normalized
+__device__ __forceinline__ void had32_warp(float& x, int lane)
+{
+    #pragma unroll
+    for (int d = 16; d >= 1; d /= 2)
+    {
+        float y = __shfl_xor_sync(0xffffffff, x, d);
+        float lo = x + y;
+        float hi = x - y;
+        x = (lane & d) ? hi : lo;
+    }
+    // The stages alone emit D.H with D[i] = (-1)^popcount(i); undo the row signs to get H exactly
+    if (__builtin_popcount(lane) & 1) x = -x;
+    x *= 0.17677669529663687f;   // 1/sqrt(32)
+}
+
 template <int V_SPLIT, bool CHANNELWISE, typename TS>
 __device__ __forceinline__ void scan_body_128
 (
@@ -750,6 +784,8 @@ __device__ __forceinline__ void scan_body_128
     constexpr int V_CHUNK_DIM = HEAD_DIM / V_SPLIT;
     constexpr int BTS = HEAD_DIM / SUBK;
     constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+    constexpr size_t HEAD_SCALE_SIZE = HEAD_DIM * SUBK;   // scales per head: (v_head_dim, SUBK)
+    static_assert(HEAD_DIM / SUBK == 32, "one warp must own exactly one 32-wide rotation slice");
 
     int group = num_v_heads / num_k_heads;
     const bfloat16* mixed_qkv = op.qkv;
@@ -781,9 +817,21 @@ __device__ __forceinline__ void scan_body_128
     const size_t st_offset = head * HEAD_STATE_SIZE + v_start + t + bt * BTS * HEAD_DIM;
     if (t < V_CHUNK_DIM)
     {
-        const TS* rs = (const TS*) op.read_state + st_offset;
-        #pragma unroll
-        for (int e = 0; e < BTS; ++e) st[e] = state_ld(rs + e * HEAD_DIM);
+        if constexpr (std::is_same_v<TS, char>)
+        {
+            // int8: dequantize the slice through its scale; the pool already holds the rotated basis
+            const __half* rsc = op.read_scales + head * HEAD_SCALE_SIZE + (v_start + t) * SUBK + bt;
+            const float sc = __half2float(rsc[0]) * (1.0f / 127.0f);
+            const char* rs = (const TS*) op.read_state + st_offset;
+            #pragma unroll
+            for (int e = 0; e < BTS; ++e) st[e] = (float) rs[e * HEAD_DIM] * sc;
+        }
+        else
+        {
+            const TS* rs = (const TS*) op.read_state + st_offset;
+            #pragma unroll
+            for (int e = 0; e < BTS; ++e) st[e] = state_ld(rs + e * HEAD_DIM);
+        }
     }
 
     for (int s = 0; s < op.steps; ++s)
@@ -821,8 +869,22 @@ __device__ __forceinline__ void scan_body_128
 
         q = q * rsqrtf(sumq + 1e-6f);
         k = k * rsqrtf(sumk + 1e-6f);
-        sh_k[t] = k;
-        sh_q[t] = q;
+        if constexpr (std::is_same_v<TS, char>)
+        {
+            // int8: rotate q/k into the pool's basis; one bt row suffices for the shared sh_q/sh_k slots
+            if (bt == 0)
+            {
+                had32_warp(q, lane);
+                had32_warp(k, lane);
+                sh_k[t] = k;
+                sh_q[t] = q;
+            }
+        }
+        else
+        {
+            sh_k[t] = k;
+            sh_q[t] = q;
+        }
         if constexpr (CHANNELWISE)
             sh_g[t] = __expf(g[head * HEAD_DIM + t]);
 
@@ -890,9 +952,25 @@ __device__ __forceinline__ void scan_body_128
 
     if (t < V_CHUNK_DIM && op.steps > 0)
     {
-        TS* rs = (TS*) op.final_state + st_offset;
-        #pragma unroll
-        for (int e = 0; e < BTS; ++e) state_st(rs + e * HEAD_DIM, st[e]);
+        if constexpr (std::is_same_v<TS, char>)
+        {
+            // int8: quantize through the slice's absmax; the pool holds the rotated basis already
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < BTS; ++e) amax = fmaxf(amax, fabsf(st[e]));
+            float inv = amax > 0.0f ? 127.0f / amax : 0.0f;   // a zeroed row's first store has amax == 0
+            __half* fsc = (__half*) op.final_scales + head * HEAD_SCALE_SIZE + (v_start + t) * SUBK + bt;
+            fsc[0] = __float2half_rn(amax);
+            char* rs = (TS*) op.final_state + st_offset;
+            #pragma unroll
+            for (int e = 0; e < BTS; ++e) rs[e * HEAD_DIM] = (char) __float2int_rn(st[e] * inv);
+        }
+        else
+        {
+            TS* rs = (TS*) op.final_state + st_offset;
+            #pragma unroll
+            for (int e = 0; e < BTS; ++e) state_st(rs + e * HEAD_DIM, st[e]);
+        }
     }
 }
 
@@ -920,16 +998,19 @@ void cuda_recurrent_gated_delta_rule_kernel
     const int* __restrict__ slots,              // [bsz], state row written (and read after the first token)
     const int history_stride,
     const float* __restrict__ D,                // [num_v_heads], MAMBA2 only, else nullptr
-    const int* __restrict__ slots_in            // [bsz], SCAN_SPEC: state row read by the first token
+    const int* __restrict__ slots_in,           // [bsz], SCAN_SPEC: state row read by the first token
+    const __half* __restrict__ recurrent_scales // [num_rows, 1, num_v_heads, v_head_dim, SUBK], int8 only
 )
 {
     int group = num_v_heads / num_k_heads;
     const size_t state_size = group * num_k_heads * k_head_dim * v_head_dim;
     ScanOperands op;
+    StatePool pool = { recurrent_state, (size_t) history_stride * state_size, recurrent_scales,
+                       (size_t) history_stride * num_v_heads * v_head_dim * SUBK };
     resolve_scan_operands<MODE, TS>(
-        op, mixed_qkv, g, beta, recurrent_state, core_attn_out, seqlen,
+        op, mixed_qkv, g, beta, core_attn_out, seqlen,
         2 * k_head_dim * num_k_heads + v_head_dim * num_v_heads, num_v_heads, num_v_heads,
-        num_v_heads * v_head_dim, slots, slots_in, (size_t) history_stride * state_size, D, nullptr);
+        num_v_heads * v_head_dim, slots, slots_in, D, nullptr, pool);
     scan_body<MAX_HEAD_DIM, V_SPLIT, MAMBA2, TS>(op, num_k_heads, num_v_heads, k_head_dim, v_head_dim, scale);
 }
 
@@ -955,18 +1036,21 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     const int* __restrict__ slots,              // [bsz]
     const int history_stride,
     const float* __restrict__ D,                // unused, matches the generic kernel signature
-    const int* __restrict__ slots_in            // [bsz], SCAN_SPEC only
+    const int* __restrict__ slots_in,           // [bsz], SCAN_SPEC only
+    const __half* __restrict__ recurrent_scales // [num_rows, 1, num_v_heads, 128, SUBK], int8 only
 )
 {
     constexpr int HEAD_DIM = 128;
     int group = num_v_heads / num_k_heads;
     const size_t state_size = (size_t) group * num_k_heads * HEAD_DIM * HEAD_DIM;
     ScanOperands op;
+    StatePool pool = { recurrent_state, (size_t) history_stride * state_size, recurrent_scales,
+                       (size_t) history_stride * num_v_heads * HEAD_DIM * SUBK };
     resolve_scan_operands<MODE, TS>(
-        op, mixed_qkv, g, beta, recurrent_state, core_attn_out, seqlen,
+        op, mixed_qkv, g, beta, core_attn_out, seqlen,
         3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads),
         (size_t) num_v_heads * (CHANNELWISE ? HEAD_DIM : 1), num_v_heads,
-        (size_t) num_v_heads * HEAD_DIM, slots, slots_in, (size_t) history_stride * state_size, D, nullptr);
+        (size_t) num_v_heads * HEAD_DIM, slots, slots_in, D, nullptr, pool);
     scan_body_128<V_SPLIT, CHANNELWISE, TS>(op, num_k_heads, num_v_heads, scale);
 }
 
@@ -985,8 +1069,8 @@ void scan_replay_kernel
 )
 {
     ScanOperands op;
-    if (!resolve_scan_operands<SCAN_REPLAY, TS>(op, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
-                                                nullptr, nullptr, 0, nullptr, &batch)) return;
+    if (!resolve_scan_operands<SCAN_REPLAY, TS>(op, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+                                                nullptr, nullptr, nullptr, &batch, StatePool{})) return;
     scan_body<MAX_HEAD_DIM, V_SPLIT, MAMBA2, TS>(op, num_k_heads, num_v_heads, k_head_dim, v_head_dim, scale);
 }
 
@@ -1001,8 +1085,8 @@ void scan_replay_kernel_128
 )
 {
     ScanOperands op;
-    if (!resolve_scan_operands<SCAN_REPLAY, TS>(op, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
-                                                nullptr, nullptr, 0, nullptr, &batch)) return;
+    if (!resolve_scan_operands<SCAN_REPLAY, TS>(op, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+                                                nullptr, nullptr, nullptr, &batch, StatePool{})) return;
     scan_body_128<V_SPLIT, CHANNELWISE, TS>(op, num_k_heads, num_v_heads, scale);
 }
 
@@ -1020,7 +1104,8 @@ void cuda_recurrent_gated_delta_rule_gr
     const c10::optional<at::Tensor>& slots,
     bool history,
     const c10::optional<at::Tensor>& slots_in,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& recurrent_scales
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
@@ -1075,9 +1160,19 @@ void cuda_recurrent_gated_delta_rule_gr
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
-    TORCH_CHECK(recurrent_state.scalar_type() == at::kFloat || recurrent_state.scalar_type() == at::kHalf,
-                "recurrent_state must be float32 or float16");
-    const bool state_half = recurrent_state.scalar_type() == at::kHalf;
+    // The pool's element type as the dispatch index (see state_format_of)
+    const int state_format = state_format_of(recurrent_state);
+    TORCH_CHECK(state_format >= 0, "recurrent_state must be float32, float16 or int8");
+    if (state_format == STATE_INT8)
+    {
+        TORCH_CHECK(recurrent_scales.has_value(), "int8 recurrent state requires recurrent_scales");
+        TORCH_CHECK(k_head_dim == 128 && v_head_dim == 128, "int8 recurrent state requires 128x128 head dims");
+        TORCH_CHECK(!channelwise, "int8 recurrent state is not supported for channelwise decay (KDA)");
+    }
+    else
+    {
+        TORCH_CHECK(!recurrent_scales.has_value(), "recurrent_scales is only used with the int8 recurrent state");
+    }
     TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
     TORCH_CHECK_DTYPE_OPT(slots, kInt);
     TORCH_CHECK_DTYPE_OPT(slots_in, kInt);
@@ -1100,6 +1195,21 @@ void cuda_recurrent_gated_delta_rule_gr
     {
         TORCH_CHECK(slots_in.value().dim() == 1 && slots_in.value().size(0) == bsz, "slots_in must be [bsz]");
         TORCH_CHECK(slots_in.value().device() == mixed_qkv.device(), "slots_in must be on the same device as mixed_qkv");
+    }
+    const __half* recurrent_scales_ptr = (const __half*) OPTPTR(recurrent_scales);
+    if (recurrent_scales_ptr)
+    {
+        TORCH_CHECK_DTYPE_OPT(recurrent_scales, kHalf);
+        TORCH_CHECK(recurrent_scales.value().is_contiguous(), "recurrent_scales must be contiguous");
+        TORCH_CHECK(recurrent_scales.value().device() == recurrent_state.device(),
+                    "recurrent_scales must be on the same device as recurrent_state");
+        TORCH_CHECK(recurrent_scales.value().dim() == 5 &&
+                    recurrent_scales.value().size(0) >= (slots.has_value() ? 1 : bsz) &&
+                    recurrent_scales.value().size(1) >= 1 &&
+                    recurrent_scales.value().size(2) == num_v_heads &&
+                    recurrent_scales.value().size(3) == v_head_dim &&
+                    recurrent_scales.value().size(4) == SUBK,
+                    "recurrent_scales must be [num_rows, 1, num_v_heads, v_head_dim, SUBK]");
     }
 
     int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
@@ -1130,11 +1240,12 @@ void cuda_recurrent_gated_delta_rule_gr
         slots_ptr,                              \
         history_stride,                         \
         nullptr,                                \
-        slots_in_ptr
+        slots_in_ptr,                           \
+        recurrent_scales_ptr
 
-    // recurrent_state is kernel param 3, slots is param 12 and slots_in is param 15, patched when
-    // running in a graph (slots_in only on speculative-pass slots, where it is recorded)
-    // LAUNCH_RULE(kernel, template args...): the state element type is appended from state_half
+    // The args list must list the patched parameters in the same order as the record_param calls:
+    // state 3, slots 12, slots_in 15 (speculative pass only), int8 scales 16.
+    // LAUNCH_RULE_FP (fp32/fp16) covers KDA and the generic kernels; LAUNCH_RULE adds char at 128x128 GDN
     #define LAUNCH_RULE_T(TS, K, ...)                                                     \
     {                                                                                     \
         K<__VA_ARGS__, TS><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                  \
@@ -1144,26 +1255,33 @@ void cuda_recurrent_gated_delta_rule_gr
             graph->record_param((void*) &K<__VA_ARGS__, TS>, GP_gdn_rule_slots, 12);      \
             if (history)                                                                  \
                 graph->record_param((void*) &K<__VA_ARGS__, TS>, GP_gdn_rule_slots_in, 15); \
+            graph->record_param((void*) &K<__VA_ARGS__, TS>, GP_gdn_rule_scales, 16);     \
             graph->record_param((void*) &K<__VA_ARGS__, TS>, GP_end, 0);                  \
         }                                                                                 \
     }
+    #define LAUNCH_RULE_FP(K, ...)                                                        \
+    {                                                                                     \
+        if (state_format == STATE_FP16) LAUNCH_RULE_T(__half, K, __VA_ARGS__)             \
+        else                            LAUNCH_RULE_T(float, K, __VA_ARGS__)              \
+    }
     #define LAUNCH_RULE(K, ...)                                                           \
     {                                                                                     \
-        if (state_half) LAUNCH_RULE_T(__half, K, __VA_ARGS__)                             \
-        else            LAUNCH_RULE_T(float, K, __VA_ARGS__)                              \
+        if (state_format == STATE_INT8)      LAUNCH_RULE_T(char, K, __VA_ARGS__)          \
+        else if (state_format == STATE_FP16) LAUNCH_RULE_T(__half, K, __VA_ARGS__)        \
+        else                                 LAUNCH_RULE_T(float, K, __VA_ARGS__)         \
     }
 
     if (channelwise)
     {
         if (!history)
         {
-            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_INPLACE, 4, true)
-            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_INPLACE, 1, true)
+            if (v_split == 4) LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_INPLACE, 4, true)
+            else              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_INPLACE, 1, true)
         }
         else
         {
-            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_SPEC, 4, true)
-            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_SPEC, 1, true)
+            if (v_split == 4) LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_SPEC, 4, true)
+            else              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel_128, SCAN_SPEC, 1, true)
         }
     }
     else if (!history)
@@ -1175,11 +1293,11 @@ void cuda_recurrent_gated_delta_rule_gr
         }
         else if (threads.x <= 128)
         {
-            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_INPLACE, 4, false)
-            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_INPLACE, 1, false)
+            if (v_split == 4) LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_INPLACE, 4, false)
+            else              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_INPLACE, 1, false)
         }
         else if (threads.x <= 256)
-                              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 256, SCAN_INPLACE, 1, false)
+                              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 256, SCAN_INPLACE, 1, false)
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     else
@@ -1191,14 +1309,15 @@ void cuda_recurrent_gated_delta_rule_gr
         }
         else if (threads.x <= 128)
         {
-            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_SPEC, 4, false)
-            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_SPEC, 1, false)
+            if (v_split == 4) LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_SPEC, 4, false)
+            else              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 128, SCAN_SPEC, 1, false)
         }
         else if (threads.x <= 256)
-                              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel, 256, SCAN_SPEC, 1, false)
+                              LAUNCH_RULE_FP(cuda_recurrent_gated_delta_rule_kernel, 256, SCAN_SPEC, 1, false)
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     #undef LAUNCH_RULE
+    #undef LAUNCH_RULE_FP
     #undef LAUNCH_RULE_T
     #undef KERNEL_ARGS
 
@@ -1218,12 +1337,13 @@ void cuda_recurrent_gated_delta_rule
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
-    const c10::optional<at::Tensor>& slots_in
+    const c10::optional<at::Tensor>& slots_in,
+    const c10::optional<at::Tensor>& recurrent_scales
 )
 {
     cuda_recurrent_gated_delta_rule_gr(
         mixed_qkv, g, beta, recurrent_state, core_attn_out,
-        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, slots_in, nullptr);
+        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, slots_in, nullptr, recurrent_scales);
 }
 
 // Mamba2 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float, row
@@ -1466,7 +1586,8 @@ void cuda_recurrent_mamba2_gr
         slots_ptr,                              \
         history_stride,                         \
         (const float*) D.data_ptr(),            \
-        slots_in_ptr
+        slots_in_ptr,                           \
+        nullptr
 
     // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
     // LAUNCH_RULE(kernel, template args...): the state element type is appended from state_half
@@ -2355,7 +2476,7 @@ void batched_scan_replay
     int num_v_heads,
     int k_head_dim,
     int v_head_dim,
-    bool state_half
+    int state_format
 )
 {
     if (jobs.empty()) return;
@@ -2367,6 +2488,9 @@ void batched_scan_replay
                 "batched_scan_replay: bad head dims");
     TORCH_CHECK(kind != 2 || (k_head_dim == 128 && v_head_dim == 128),
                 "batched_scan_replay: channelwise decay (KDA) requires 128x128 head dims");
+    TORCH_CHECK(state_format >= STATE_FP32 && state_format <= STATE_INT8, "batched_scan_replay: bad state format");
+    TORCH_CHECK(state_format != STATE_INT8 || (kind == 0 && k_head_dim == 128 && v_head_dim == 128),
+                "batched_scan_replay: int8 state requires the gated delta rule kernel at 128x128 head dims");
     bool mamba2 = kind == 1;
     bool channelwise = kind == 2;
     float scale = 1.0f / sqrtf(k_head_dim);
@@ -2390,20 +2514,32 @@ void batched_scan_replay
         }
         dim3 blocks(n, num_v_heads, v_split);
 
+        // The generic kernel and the KDA replay site are fp32/fp16 only; the 128 GDN replay site
+        // also takes the int8 char kernel
+        #define LAUNCH_REPLAY_TS(TS, ...)                                                                                   \
+            scan_replay_kernel<__VA_ARGS__, TS><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, k_head_dim, v_head_dim, scale);
+        #define LAUNCH_REPLAY_128_TS(TS, ...)                                                                               \
+            scan_replay_kernel_128<__VA_ARGS__, TS><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, scale);
         #define LAUNCH_REPLAY(...)                                                                                          \
         {                                                                                                                   \
-            if (state_half) scan_replay_kernel<__VA_ARGS__, __half><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, k_head_dim, v_head_dim, scale); \
-            else            scan_replay_kernel<__VA_ARGS__, float><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, k_head_dim, v_head_dim, scale);  \
+            if (state_format == STATE_FP16) LAUNCH_REPLAY_TS(__half, __VA_ARGS__)                                           \
+            else                            LAUNCH_REPLAY_TS(float, __VA_ARGS__)                                            \
+        }
+        #define LAUNCH_REPLAY_128_FP(...)                                                                                   \
+        {                                                                                                                   \
+            if (state_format == STATE_FP16) LAUNCH_REPLAY_128_TS(__half, __VA_ARGS__)                                       \
+            else                            LAUNCH_REPLAY_128_TS(float, __VA_ARGS__)                                        \
         }
         #define LAUNCH_REPLAY_128(...)                                                                                      \
         {                                                                                                                   \
-            if (state_half) scan_replay_kernel_128<__VA_ARGS__, __half><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, scale); \
-            else            scan_replay_kernel_128<__VA_ARGS__, float><<<blocks, threads, 0, stream>>>(batch, num_k_heads, num_v_heads, scale);  \
+            if (state_format == STATE_INT8)      LAUNCH_REPLAY_128_TS(char, __VA_ARGS__)                                    \
+            else if (state_format == STATE_FP16) LAUNCH_REPLAY_128_TS(__half, __VA_ARGS__)                                  \
+            else                                 LAUNCH_REPLAY_128_TS(float, __VA_ARGS__)                                   \
         }
         if (channelwise)
         {
-            if (v_split == 4) LAUNCH_REPLAY_128(4, true)
-            else              LAUNCH_REPLAY_128(1, true)
+            if (v_split == 4) LAUNCH_REPLAY_128_FP(4, true)
+            else              LAUNCH_REPLAY_128_FP(1, true)
         }
         else if (mamba2)
         {
@@ -2425,6 +2561,9 @@ void batched_scan_replay
         else TORCH_CHECK(false, "Max head dim exceeded");
         #undef LAUNCH_REPLAY
         #undef LAUNCH_REPLAY_128
+        #undef LAUNCH_REPLAY_128_FP
+        #undef LAUNCH_REPLAY_TS
+        #undef LAUNCH_REPLAY_128_TS
         cuda_check(cudaPeekAtLastError());
     }
 }

@@ -2,9 +2,41 @@ import os
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
+from ...util.hadamard import get_hadamard_dt
 
-# The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
-# they are imported on first use rather than with the library
+# The vendored fla chunk kernels (exllamav3.vendor.fla) are imported on first use rather than with
+# the library: they query the devices and Triton at import
+
+# Rotation block of the int8 pool: 32-wide k slices, each stored rotated through the Sylvester H32.
+# gdn.cu reads and writes the row in that basis; the chunked path converts it in and out
+_ROT_BLOCK = 32
+
+
+def _gdn_h32(device):
+    """The normalized fp32 Sylvester H32 the kernel's butterfly emits"""
+    return get_hadamard_dt(32, device, torch.float, 32 ** -0.5)
+
+
+def unpack_state_row(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """(h, k, v) int8 and (h, v, k // 32) fp16 in the pool's basis -> (h, k, v) fp32 in the model's basis"""
+    h, k, v = values.shape
+    subk = k // _ROT_BLOCK
+    x = values.float().view(h, subk, _ROT_BLOCK, v) * scales.float().permute(0, 2, 1).unsqueeze(2) / 127.0
+    x = torch.matmul(x.transpose(2, 3), _gdn_h32(str(values.device))).transpose(2, 3)
+    return x.reshape(h, k, v)
+
+
+def pack_state_row(state: torch.Tensor, values: torch.Tensor, scales: torch.Tensor):
+    """(h, k, v) fp32 in the model's basis -> (h, k, v) int8 and (h, v, k // 32) fp16 in the pool's basis, written in place"""
+    h, k, v = state.shape
+    subk = k // _ROT_BLOCK
+    x = state.reshape(h, subk, _ROT_BLOCK, v)
+    x = torch.matmul(x.transpose(2, 3), _gdn_h32(str(state.device))).transpose(2, 3)
+    amax = x.abs().amax(dim = 2)
+    inv = torch.where(amax > 0, 127.0 / amax, 0.0)
+    scales.copy_(amax.permute(0, 2, 1).half())
+    values.copy_((x * inv.unsqueeze(2)).round().to(torch.int8).reshape(h, k, v))
+
 
 def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
@@ -135,7 +167,11 @@ def gated_delta_rule_fn(
     params: dict = None,
     channelwise_g: bool = False,
     slots_in: torch.Tensor | None = None,
+    recurrent_scales: torch.Tensor | None = None,
 ):
+    # recurrent_scales: the int8 pool's fp16 scales (one per 32-wide k slice), None for an fp32 or fp16
+    # pool. With scales, the chunked branch unpacks each rotated row into the model's basis and repacks
+    # it on the store; the CUDA scan reads and writes the rotated basis itself
     if params is None:
         params = {}
 
@@ -203,6 +239,7 @@ def gated_delta_rule_fn(
             recurrent_slots,
             history,
             slots_in,
+            recurrent_scales,
         )
         return core_attn_out
 
@@ -219,13 +256,21 @@ def gated_delta_rule_fn(
         rows_out, rows_in = chunked_rows()
         core_attn_out = []
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
+            if recurrent_state is None:
+                state = None
+            elif recurrent_scales is not None:
+                state = unpack_state_row(recurrent_state[si, 0], recurrent_scales[si, 0]).unsqueeze(0)
+            else:
+                state = recurrent_state[si, 0].float().unsqueeze(0)
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                 state, save_state,
             )
             if save_state and state is not None:
-                recurrent_state[so, 0].copy_(new_state.squeeze(0))
+                if recurrent_scales is not None:
+                    pack_state_row(new_state.squeeze(0), recurrent_state[so, 0], recurrent_scales[so, 0])
+                else:
+                    recurrent_state[so, 0].copy_(new_state.squeeze(0))
             core_attn_out.append(core_attn)
 
         core_attn_out = torch.cat(core_attn_out, dim = 0)
@@ -258,6 +303,7 @@ def gated_delta_rule_fn(
             recurrent_slots,
             history,
             slots_in,
+            recurrent_scales,
         )
 
     return core_attn_out

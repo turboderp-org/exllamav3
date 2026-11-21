@@ -50,6 +50,11 @@ def unload_model(model):
     torch.cuda.empty_cache()
 
 
+def has_int8_pool(cache) -> bool:
+    """Whether any recurrent layer of the cache carries an int8 pool"""
+    return any(getattr(l, "recurrent_scales", None) is not None for l in cache.recurrent_layers.values())
+
+
 def generate_with_logits(model, cache, tokenizer, prompts: list[str], max_new_tokens: int,
                          max_batch_size: int = 4) -> list[tuple[list[int], list[torch.Tensor]]]:
     """Greedy decode of all prompts as concurrent jobs; per job (tokens, [per-step logits before sampling]), at

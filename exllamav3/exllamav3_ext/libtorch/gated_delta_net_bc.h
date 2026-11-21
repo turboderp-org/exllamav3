@@ -168,7 +168,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
 )
 .def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN,
     py::arg("x"), py::arg("y"), py::arg("conv_state"), py::arg("recurrent_state"), py::arg("slots"),
-    py::arg("slots_scan"), py::arg("history"), py::arg("slots_in") = py::none())
+    py::arg("slots_scan"), py::arg("history"), py::arg("slots_in") = py::none(),
+    py::arg("recurrent_scales") = py::none())
 .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
     py::arg("ptrs_trellis"),
     py::arg("ptrs_suh"),

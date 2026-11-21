@@ -41,6 +41,15 @@ from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 from ..cache.recurrent import host_copy
 
+# The pool's dtype as the scan kernel's dispatch index (the int state_format of gdn.cuh's
+# batched_scan_replay): 0 fp32, 1 fp16, 2 int8 (rotated, with scales)
+_STATE_FORMAT = {torch.float: 0, torch.half: 1, torch.int8: 2}
+
+
+class Int8PoolUnsupported(ValueError):
+    """The layer cannot carry an int8 recurrent-state pool: KDA and Mamba2 layers never go int8, and
+    the scan kernel's int8 path takes 128x128 heads only"""
+
 
 def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
                    spec_row: int | None, spec_shape: tuple | None, base_row: int, scratch_row: int):
@@ -80,8 +89,8 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
             l.rewind(slot, last_history, num_tokens)
     for device_index, jobs in conv_by_device.items():
         ext.batched_conv_rewind(jobs, device_index)
-    for (device_index, kind, nk, nv, dk, dv, state_half), jobs in replay_by_key.items():
-        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv, state_half)
+    for (device_index, kind, nk, nv, dk, dv, state_format), jobs in replay_by_key.items():
+        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv, state_format)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens,
@@ -284,19 +293,20 @@ class GDNLayerState:
         state_dtype: torch.dtype = torch.float,
     ):
         self.module = module
+        self.device = None
+        # The scan kernels compute in fp32 (each thread's slice lives in registers for the whole
+        # pass), so the pool dtype sets the storage alone: fp16 halves it, fp32 doubles it, and an
+        # int8 payload adds one fp16 scale per 32-wide k slice. The chunked prefill kernels take
+        # and return fp32
+        self.recurrent_state = torch.empty(
+            (2 * max_batch_size, 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
+            dtype = torch.float,
+            device = "meta"
+        )
+        self.set_state_dtype(state_dtype)
         self.conv_state = torch.empty(
             (max_batch_size, module.fdim_qkv, module.conv_kernel_size + max_history),
             dtype = torch.bfloat16,
-            device = "meta"
-        )
-        # The recurrent state is stored in fp16 (the cache's default for GDN and KDA layers) or in
-        # fp32 (Cache(recurrent_dtype = torch.float); Mamba2 layers always). The scan kernels
-        # compute in fp32 either way and round once per pass on the store; the chunked prefill
-        # kernels take and return fp32
-        assert state_dtype in (torch.float, torch.half), "recurrent state dtype must be float32 or float16"
-        self.recurrent_state = torch.empty(
-            (2 * max_batch_size, 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = state_dtype,
             device = "meta"
         )
         # Staged scan inputs, flat rows. A pass of (bsz, seqlen) stages row-major: the first
@@ -313,28 +323,66 @@ class GDNLayerState:
         self.spec_g = torch.empty((rows, self.g_width), dtype = torch.float, device = "meta")
         # (bsz, tokens, token stride) of the pass the staging buffers currently hold
         self.spec_shape = None
-        self.device = None
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
 
 
+    def _check_state_dtype(self, dtype: torch.dtype):
+        m = self.module
+        key = getattr(m, "key", None) or type(m).__name__
+        if dtype not in (torch.float, torch.half, torch.int8):
+            raise ValueError(f"recurrent state dtype must be fp16, fp32 or int8, got {dtype}")
+        if dtype == torch.int8:
+            if getattr(m, "kda", False):
+                raise Int8PoolUnsupported(f"int8 recurrent state is not supported for KDA layers, layer {key}")
+            if getattr(m, "mamba2", False):
+                raise Int8PoolUnsupported(f"int8 recurrent state is not supported for Mamba2 layers, layer {key}")
+            if m.k_head_dim != 128 or m.v_head_dim != 128:
+                raise Int8PoolUnsupported(
+                    f"int8 recurrent state requires 128x128 heads, layer {key} is {m.k_head_dim}x{m.v_head_dim}")
+
+
+    def _scales_shape(self):
+        # One absmax per 32-wide k slice (the rotation block), one scale row per pool row
+        rows = self.recurrent_state.shape[0]
+        return (rows, 1, self.module.num_v_heads, self.module.v_head_dim, self.module.k_head_dim // 32)
+
+
+    @property
+    def quantized(self) -> bool:
+        """Whether the pool is an int8 payload with a companion fp16 scales tensor"""
+        return self.recurrent_scales is not None
+
+
     def set_state_dtype(self, dtype: torch.dtype):
         """Storage dtype of the recurrent-state pool, settable until the state is allocated"""
         assert self.device is None, "recurrent state dtype must be set before the state is allocated"
-        assert dtype in (torch.float, torch.half), "recurrent state dtype must be float32 or float16"
+        self._check_state_dtype(dtype)
         self.recurrent_state = torch.empty_like(self.recurrent_state, dtype = dtype)
-
-
-    def get_checkpoint_size(self):
-        return (
-            self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
-            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * self.recurrent_state.element_size()
+        self.recurrent_scales = (
+            torch.empty(self._scales_shape(), dtype = torch.half, device = "meta")
+            if dtype == torch.int8 else None
         )
 
 
+    def get_checkpoint_size(self):
+        size = (
+            self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
+            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim *
+                self.recurrent_state.element_size()
+        )
+        if self.recurrent_scales is not None:
+            # One scale row, like the state row above
+            size += self.recurrent_scales[0].numel() * self.recurrent_scales.element_size()
+        return size
+
+
     def _tensors(self):
-        return [self.conv_state, self.recurrent_state, self.spec_conv, self.spec_beta, self.spec_g]
+        tensors = [self.conv_state, self.recurrent_state]
+        if self.quantized:
+            tensors.append(self.recurrent_scales)
+        return tensors + [self.spec_conv, self.spec_beta, self.spec_g]
 
 
     def storage_size(self):
@@ -344,11 +392,15 @@ class GDNLayerState:
     def alloc(self, device):
         self.conv_state = torch.empty_like(self.conv_state, device = device)
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
+        if self.quantized:
+            self.recurrent_scales = torch.empty_like(self.recurrent_scales, device = device)
         self.spec_conv = torch.empty_like(self.spec_conv, device = device)
         self.spec_beta = torch.empty_like(self.spec_beta, device = device)
         self.spec_g = torch.empty_like(self.spec_g, device = device)
         self.conv_state.zero_()
         self.recurrent_state.zero_()
+        if self.quantized:
+            self.recurrent_scales.zero_()
         self.spec_shape = None
         self.device = device
 
@@ -356,6 +408,8 @@ class GDNLayerState:
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+        if self.quantized:
+            self.recurrent_scales = torch.empty_like(self.recurrent_scales, device = "meta")
         self.spec_conv = torch.empty_like(self.spec_conv, device = "meta")
         self.spec_beta = torch.empty_like(self.spec_beta, device = "meta")
         self.spec_g = torch.empty_like(self.spec_g, device = "meta")
@@ -367,6 +421,8 @@ class GDNLayerState:
         if self.device is not None:
             self.conv_state[idx].zero_()
             self.recurrent_state[2 * idx : 2 * idx + 2].zero_()
+            if self.quantized:
+                self.recurrent_scales[2 * idx : 2 * idx + 2].zero_()
 
 
     def get_state_tensors(self):
@@ -411,11 +467,12 @@ class GDNLayerState:
 
 
     def scan_geometry(self):
-        """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half): the replay
+        """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_format): the replay
         kernel's selection; every job of one batched_scan_replay launch shares it"""
         m = self.module
         kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
-        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, self.recurrent_state.dtype == torch.half
+        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, \
+            _STATE_FORMAT[self.recurrent_state.dtype]
 
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
@@ -454,6 +511,10 @@ class GDNLayerState:
         r0 = spec_row * seqlen if tstride == 1 else spec_row
         rs = self.recurrent_state
         row_bytes = rs.stride(0) * rs.element_size()
+        # The int8 pool's scales have their own row stride (a different element type)
+        recurrent_scales = self.recurrent_scales
+        scale_row_bytes = recurrent_scales.stride(0) * recurrent_scales.element_size() if self.quantized else 0
+        scale_ptr = recurrent_scales.data_ptr() if self.quantized else 0
         m = self.module
         D = getattr(m, "d_skip_f", None)
         return ext.ScanReplayJob(
@@ -465,49 +526,60 @@ class GDNLayerState:
             D.data_ptr() if D is not None else 0,
             prefix,
             tstride,
+            scale_ptr + base_row * scale_row_bytes,
+            scale_ptr + scratch_row * scale_row_bytes,
         )
 
 
     def stash(self, slot, position: int = 0, parity: int = 0):
+        """(state, conv), or (state, scales, conv) for an int8 pool"""
         cdim = self.module.conv_kernel_size
         row = 2 * slot + parity
-        return (
-            host_copy(self.recurrent_state[row : row + 1]),
-            host_copy(self.conv_state[slot, :, :cdim])
-        )
+        state = host_copy(self.recurrent_state[row : row + 1])
+        conv = host_copy(self.conv_state[slot, :, :cdim])
+        if self.quantized:
+            return state, host_copy(self.recurrent_scales[row : row + 1]), conv
+        return state, conv
 
 
     def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
+        """Inverse of stash: (state, conv), or (state, scales, conv) for an int8 pool"""
         cdim = self.module.conv_kernel_size
-        s, c = stashed
         row = 2 * slot + parity
-        self.recurrent_state[row : row + 1].copy_(s)
-        self.conv_state[slot, :, :cdim].copy_(c)
+        if self.quantized:
+            state, scales, conv = stashed
+            self.recurrent_scales[row : row + 1].copy_(scales)
+        else:
+            state, conv = stashed
+        self.recurrent_state[row : row + 1].copy_(state)
+        self.conv_state[slot, :, :cdim].copy_(conv)
 
 
     def tp_stash_pieces(self):
         """
-        How this rank's stash maps into the layout-independent checkpoint the disk tier stores, one entry per
-        stashed tensor: the split dimension, its full size, and (local start, local end, canonical start)
-        pieces. The recurrent state is split by v head; the conv state's channels are the q, k and v
-        projections' rows in sequence, each split by its own head range. None for a tensor that is not split.
+        How this rank's stash maps into the layout-independent checkpoint, one entry per stashed tensor (the
+        arity of stash()): the split dimension, its full size, and (local start, local end, canonical start)
+        pieces. The recurrent state (and, for int8, its scales) splits by v head; the conv state's channels
+        split by head range. None for a tensor that is not split.
         """
         m = self.module
         first = getattr(m, "tp_kv_first", None)
         if first is None:
-            return [None, None]
+            return [None, None, None] if self.quantized else [None, None]
         nk, nv, kd, vd = m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim
         gk = m.tp_k_heads_total
         G = nv // nk
         assert m.fdim_qkv == 2 * nk * kd + nv * vd, "conv channel layout differs from q|k|v, cannot map the stash"
-        return [
-            {"dim": 2, "total": gk * G, "pieces": [(0, nv, first * G)]},
-            {"dim": 0, "total": 2 * gk * kd + gk * G * vd, "pieces": [
-                (0, nk * kd, first * kd),
-                (nk * kd, 2 * nk * kd, (gk + first) * kd),
-                (2 * nk * kd, 2 * nk * kd + nv * vd, 2 * gk * kd + first * G * vd),
-            ]},
-        ]
+        vspec = {"dim": 2, "total": gk * G, "pieces": [(0, nv, first * G)]}
+        pieces = [vspec]
+        if self.quantized:
+            pieces.append(vspec)   # scales
+        pieces.append({"dim": 0, "total": 2 * gk * kd + gk * G * vd, "pieces": [
+            (0, nk * kd, first * kd),
+            (nk * kd, 2 * nk * kd, (gk + first) * kd),
+            (2 * nk * kd, 2 * nk * kd + nv * vd, 2 * gk * kd + first * G * vd),
+        ]})
+        return pieces
 
 
     def tp_export(self, plan):
@@ -1270,11 +1342,12 @@ class GatedDeltaNet(Module):
             else:
                 rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, recurrent_state = rsl.get_state_tensors()
+            recurrent_scales = rsl.recurrent_scales
             save_state = True
         else:
             recurrent_slots = slots_scan = slots_scan_in = None
             rsl = None
-            conv_state, recurrent_state = None, None
+            conv_state, recurrent_state, recurrent_scales = None, None, None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
             scan_history = False
@@ -1326,7 +1399,8 @@ class GatedDeltaNet(Module):
             if save_history:
                 stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan, save_history, slots_scan_in)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan, save_history, slots_scan_in,
+                             recurrent_scales)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1470,6 +1544,7 @@ class GatedDeltaNet(Module):
             v_head_dim = self.v_head_dim,
             params = params,
             channelwise_g = self.kda,
+            recurrent_scales = recurrent_scales,
         )
         del mixed_qkv, beta, g
 

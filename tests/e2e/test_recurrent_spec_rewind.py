@@ -11,7 +11,8 @@ pass without history that is then position-corrected. Runs over every registry m
 import pytest
 import torch
 
-from testlib.graph import load_with_caches, unload_model
+from exllamav3.modules.gated_delta_net import Int8PoolUnsupported
+from testlib.graph import has_int8_pool, load_with_caches, unload_model
 
 MAX_HISTORY = 64
 PROMPT = "The committee reviewed the proposal in detail and concluded that"
@@ -36,27 +37,39 @@ def loaded(model_id, model_registry, request):
     if not entry.available:
         pytest.skip(f"test model '{model_id}' not available")
     device = torch.device(request.config.getoption("--device"))
-    # Two caches: the default fp16-stored recurrent state (rounds on each store) and the fp32 one
-    _, model, caches, tok = load_with_caches(entry.path, device, [
-        {"max_history": MAX_HISTORY},
-        {"max_history": MAX_HISTORY, "recurrent_dtype": torch.float},
-    ])
+    # the int8 cache only builds on a model with a 128x128 GDN layer (KDA never goes int8, so the cache is
+    # rejected there)
+    base = [{"max_history": MAX_HISTORY},
+            {"max_history": MAX_HISTORY, "recurrent_dtype": torch.float}]
+    try:
+        _, model, caches, tok = load_with_caches(entry.path, device,
+                                                 base + [{"max_history": MAX_HISTORY,
+                                                          "recurrent_dtype": torch.int8}])
+    except Int8PoolUnsupported:
+        _, model, caches, tok = load_with_caches(entry.path, device, base)
+    if len(caches) == 3 and not has_int8_pool(caches[2]):
+        caches = caches[:2]  # a Mamba2-only model: the int8 cache came out all-fp32
     ids = tok.encode(PROMPT, add_bos = True)
     gen = torch.Generator().manual_seed(1)
     cont = torch.randint(100, 2000, (1, MAX_HISTORY + 2), generator = gen)
-    yield model, dict(zip(("fp16_state", "fp32_state"), caches)), ids, cont
+    caches_by_name = {"fp16_state": caches[0], "fp32_state": caches[1]}
+    if len(caches) > 2:
+        caches_by_name["int8_state"] = caches[2]
+    yield model, caches_by_name, ids, cont
     unload_model(model)
 
 
 @pytest.mark.models("recurrent")
 @torch.inference_mode()
-@pytest.mark.parametrize("state", ["fp16_state", "fp32_state"])
+@pytest.mark.parametrize("state", ["fp16_state", "fp32_state", "int8_state"])
 @pytest.mark.parametrize("pass_len, rejected", [
     (5, 0), (5, 1), (5, 4),
     (MAX_HISTORY + 1, 0), (MAX_HISTORY + 1, 1), (MAX_HISTORY + 1, 30), (MAX_HISTORY + 1, MAX_HISTORY),
 ])
 def test_spec_pass_rewind_matches_plain(model_id, loaded, pass_len, rejected, state):
     model, caches, ids, cont = loaded
+    if state == "int8_state" and "int8_state" not in caches:
+        pytest.skip(f"{model_id}: no layer carries an int8 pool")
     cache = caches[state]
     spec = cont[:, :pass_len]
     accepted = pass_len - rejected

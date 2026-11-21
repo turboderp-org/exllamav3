@@ -187,54 +187,62 @@ def test_non_tp_page_restores_into_tp_ranks(device, tmp_path):
 
 GK, KD, G, VD = 4, 2, 2, 2          # k heads, k head dim, v heads per k head, v head dim
 FDIM = 2 * GK * KD + GK * G * VD    # canonical conv channels: q | k | v
+SUBK = 4                            # scale depth per v row, fake geometry
 
 
 class FakeRecurrentLayer:
-    """Rank-local state of a GDN-like layer for k heads [first, last)"""
+    """Rank-local state of a GDN-like layer for k heads [first, last); int8 adds the scales, split by v head"""
 
-    def __init__(self, first, last):
+    def __init__(self, first, last, int8 = False):
         self.nk = last - first
         self.nv = self.nk * G
         self.first = first
+        self.int8 = int8
         self.module = SimpleNamespace(key = "layer0")
 
     def tp_stash_pieces(self):
         nk, nv, first = self.nk, self.nv, self.first
-        return [
-            {"dim": 2, "total": GK * G, "pieces": [(0, nv, first * G)]},
-            {"dim": 0, "total": FDIM, "pieces": [
-                (0, nk * KD, first * KD),
-                (nk * KD, 2 * nk * KD, (GK + first) * KD),
-                (2 * nk * KD, 2 * nk * KD + nv * VD, 2 * GK * KD + first * G * VD),
-            ]},
-        ]
+        vspec = {"dim": 2, "total": GK * G, "pieces": [(0, nv, first * G)]}
+        pieces = [vspec]
+        if self.int8:
+            pieces.append(vspec)   # scales
+        pieces.append({"dim": 0, "total": FDIM, "pieces": [
+            (0, nk * KD, first * KD),
+            (nk * KD, 2 * nk * KD, (GK + first) * KD),
+            (2 * nk * KD, 2 * nk * KD + nv * VD, 2 * GK * KD + first * G * VD),
+        ]})
+        return pieces
 
 
-def local_stash(full_rec, full_conv, first, last):
-    """What a rank with k heads [first, last) would stash: its slice of the canonical tensors"""
+def local_stash(full_rec, full_conv, first, last, full_scales = None):
+    """What a rank with k heads [first, last) would stash: its slice of the canonical tensors; with
+    full_scales, an int8 stash (rec, scales, conv)"""
     nk = last - first
     rec = full_rec[:, :, first * G : last * G].contiguous()
+    scales = full_scales[:, :, first * G : last * G].contiguous() if full_scales is not None else None
     conv = torch.cat([
         full_conv[first * KD : last * KD],
         full_conv[(GK + first) * KD : (GK + last) * KD],
         full_conv[2 * GK * KD + first * G * VD : 2 * GK * KD + last * G * VD],
     ]).contiguous()
     assert conv.shape[0] == 2 * nk * KD + nk * G * VD
-    return (rec, conv)
+    return (rec, scales, conv) if full_scales is not None else (rec, conv)
 
 
-def build_tp_states(full_k, full_v, split, root, handle = None, stash = None):
+def build_tp_states(full_k, full_v, split, root, handle = None, stash = None, int8 = False):
     """TP page tier plus recurrent modules on the ranks; with handle/stash, every rank holds its slice of
     `stash` (full canonical tensors) in its recurrent cache under handle"""
     ranks, tier, disk = build_tp(full_k, full_v, split, root)
     model = disk.cpu_tier.tp_groups[0][0]
     cache_id = disk.cpu_tier.tp_groups[0][1][0]
     for r, (first, last) in zip(ranks, split):
-        layer = FakeRecurrentLayer(first, last)
+        layer = FakeRecurrentLayer(first, last, int8 = int8)
         r["recurrent_modules"] = [SimpleNamespace(key = "layer0", tp_recurrent_lookup = {cache_id: layer})]
         r["recurrent_cache"] = {}
         if stash is not None:
-            r["recurrent_cache"][handle] = [local_stash(*stash, first, last)]
+            rec, conv = stash[0], stash[-1]
+            scales = stash[1] if len(stash) == 3 else None
+            r["recurrent_cache"][handle] = [local_stash(rec, conv, first, last, full_scales = scales)]
     main_cache = SimpleNamespace(get_all_recurrent_layers = lambda: {("layer0", 0): SimpleNamespace(module = SimpleNamespace(key = "layer0"))})
     # id(cache) the ranks key by must be the one the describe/read dispatches carry
     disk.recurrent_sides = {"target": (model, SimpleNamespace(_id = cache_id, get_all_recurrent_layers = main_cache.get_all_recurrent_layers))}
@@ -302,3 +310,40 @@ def test_tp_checkpoint_round_trips_across_splits_and_configurations(device, tmp_
         e_rec, e_conv = local_stash(full_rec, full_conv, first, last)
         assert torch.equal(rec, e_rec) and torch.equal(conv, e_conv)
     disk4.close(); tier4.close()
+
+
+def test_tp_int8_checkpoint_round_trips_three_specs_across_splits(device, tmp_path, monkeypatch):
+    g = torch.Generator(device = "cpu").manual_seed(3)
+    full_k = torch.randn((NUM_PAGES, PAGE_SIZE, HEADS, HEAD_DIM), generator = g).half().to(device)
+    full_v = torch.randn((NUM_PAGES, PAGE_SIZE, HEADS, HEAD_DIM), generator = g).half().to(device)
+    full_rec = torch.randint(-128, 127, (1, 1, GK * G, KD, VD), generator = g).to(torch.int8)
+    full_scales = torch.randn((1, 1, GK * G, VD, SUBK), generator = g).half()
+    full_conv = torch.randn((FDIM, 3), generator = g).bfloat16()
+    key = phash(5)
+    stashed_ints = {"position": 512, "window_beg": 256,
+                    "checkpoint_size": full_rec.numel() + full_scales.numel() * 2 + full_conv.numel() * 2}
+
+    import exllamav3.generator.disk_cache as dc
+    monkeypatch.setattr(dc, "id", lambda o: o._id if hasattr(o, "_id") else id(o), raising = False)
+
+    # Written by ranks under a 2 + 2 k-head split, three stashed tensors (values, scales, conv)
+    ranks, tier, disk = build_tp_states(full_k, full_v, [(0, 2), (2, 4)], tmp_path,
+                                        handle = 7, stash = (full_rec, full_scales, full_conv), int8 = True)
+    stashed = {**stashed_ints, "target": {**stashed_ints, "tp_handle": 7}}
+    assert disk.write_state(key, stashed)
+    disk.flush()
+    assert disk.has_state(key) and disk.metrics["state_writes"] == 1
+    disk.close(); tier.close()
+
+    # Read by ranks under a 1 + 3 split: each rank's stash is its slice of the canonical 3-tuple
+    ranks2, tier2, disk2 = build_tp_states(full_k, full_v, [(0, 1), (1, 4)], tmp_path, int8 = True)
+    back = disk2.read_state(key)
+    assert back is not None and back["position"] == 512
+    h = back["target"]["tp_handle"]
+    for r, (first, last) in zip(ranks2, [(0, 1), (1, 4)]):
+        rec, scales, conv = r["recurrent_cache"][h][0]
+        e_rec, e_scales, e_conv = local_stash(full_rec, full_conv, first, last, full_scales = full_scales)
+        assert rec.dtype == torch.int8 and torch.equal(rec, e_rec), f"int8 values slice {first}:{last} differs"
+        assert scales.dtype == torch.float16 and torch.equal(scales, e_scales), f"scales slice {first}:{last} differs"
+        assert torch.equal(conv, e_conv), f"conv slice {first}:{last} differs"
+    disk2.close(); tier2.close()

@@ -205,6 +205,39 @@ def test_state_round_trip_and_deferred_release(device, tmp_path):
     tier2.close()
 
 
+def test_int8_state_round_trips_values_and_scales_bit_exact(device, tmp_path):
+    tier, disk, tensor = build(4, device, tmp_path)
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    values = torch.randint(-128, 127, (1, 1, 4, 8, 8), generator = g).to(torch.int8)
+    scales = torch.randn((1, 1, 4, 8, 4), generator = g).half()
+    conv = torch.randn((32, 4), generator = g).bfloat16()
+    stashed = {
+        "position": 2048,
+        "checkpoint_size": 4096,
+        "layer.a": (values, scales, conv),
+    }
+    key = phash(7)
+    disk.write_state(key, stashed)
+    disk.flush()
+    assert disk.has_state(key)
+    disk.close()
+    tier.close()
+
+    tier2, disk2, _ = build(4, device, tmp_path)
+    back = disk2.read_state(key)
+    assert back is not None and back["position"] == 2048
+    b_vals, b_scales, b_conv = back["layer.a"]
+    assert b_vals.dtype == torch.int8 and b_scales.dtype == torch.float16 and b_conv.dtype == torch.bfloat16
+    assert b_vals.shape == values.shape and b_scales.shape == scales.shape and b_conv.shape == conv.shape
+    # the int8 values and the fp16 scales survive the round trip bit-exact
+    assert torch.equal(b_vals, values)
+    assert torch.equal(b_scales, scales)
+    assert torch.equal(b_conv, conv)
+    host_pool.give(back)
+    disk2.close()
+    tier2.close()
+
+
 def test_fingerprint_selects_the_directory(device, tmp_path):
     tier, disk, _ = build(4, device, tmp_path, fingerprint = "aaaa")
     tier2, disk2, _ = build(4, device, tmp_path, fingerprint = "bbbb")

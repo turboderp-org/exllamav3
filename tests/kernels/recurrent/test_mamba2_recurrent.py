@@ -273,7 +273,7 @@ def test_recurrent_mamba2_replay_matches_steps(device, dv, state_dtype):
         jobs = [ext.ScanReplayJob(xbc[b].data_ptr(), g[b].data_ptr(), dt[b].data_ptr(),
                                   replayed.data_ptr() + (2 * b + 1) * rb, replayed.data_ptr() + 2 * b * rb,
                                   D.data_ptr(), n) for b in range(bsz)]
-        ext.batched_scan_replay(jobs, torch.device(device).index, 1, nk, nv, dk, dv, state_dtype == torch.half)
+        ext.batched_scan_replay(jobs, torch.device(device).index, 1, nk, nv, dk, dv, 1 if state_dtype == torch.half else 0)
         torch.cuda.synchronize(device)
         assert torch.equal(replayed, part)
 

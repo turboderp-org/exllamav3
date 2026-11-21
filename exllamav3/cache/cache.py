@@ -129,11 +129,14 @@ class Cache:
 
         :param recurrent_dtype:
             Storage dtype of the recurrent state of GatedDeltaNet and KDA layers: torch.half (default), or
-            torch.float for twice the state pool and checkpoint size. The scans compute in fp32 either way and
-            round once per pass on the store; on these layers fp16 storage moves next-token distributions no more
-            than regrouping a prefill does. Mamba2 layers keep fp32 regardless: their state spans a far wider
-            dynamic range (a quarter of it below fp16's normal range), and the per-step rounding accumulates over
-            a long generation. bf16 is not offered, its 8-bit mantissa is far worse than fp16 here
+            torch.float for twice the state pool and checkpoint size, or torch.int8, a quantized payload with
+            a companion fp16 scales tensor (one scale per 32 consecutive k values) that requires a 128x128
+            GDN layer: a model with a KDA layer or a non-128x128 GDN layer raises Int8PoolUnsupported at
+            cache construction. The scans compute in fp32 regardless and touch the pool once per pass; on
+            these layers fp16 storage moves next-token distributions no more than regrouping a prefill does.
+            Mamba2 layers keep fp32 regardless: their state spans a far wider dynamic range (a quarter of it
+            below fp16's normal range), and the per-step rounding accumulates over a long generation. bf16 is
+            not offered, its 8-bit mantissa is far worse than fp16 here
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 

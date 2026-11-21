@@ -254,7 +254,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
-          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none());
+          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none(), py::arg("recurrent_scales") = py::none());
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
@@ -275,12 +275,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
     py::class_<ScanReplayJob>(m, "ScanReplayJob")
-        .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>(),
-             py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg("prefix"), py::arg("tstride") = 1);
+        .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int, uintptr_t, uintptr_t>(),
+             py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg("prefix"), py::arg("tstride") = 1,
+             py::arg("base_scales") = 0, py::arg("scratch_scales") = 0);
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_scan_replay", &batched_scan_replay, py::arg("jobs"), py::arg("device_index"), py::arg("kind"),
           py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
-          py::arg("state_half") = false);
+          py::arg("state_format") = STATE_FP32);
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
