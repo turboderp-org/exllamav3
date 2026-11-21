@@ -180,10 +180,13 @@ def register_split_module(infer_params, module):
 
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-# Promotions issued per step over all layers (and as many demotions), EXL3_MOE_CPU_PROMOTE_BUDGET. Small by default:
-# WDDM runs streams in submission order, so each transfer's copies queue ahead of the next draft forward. Where the
-# promotion stream runs beside the compute stream, a larger budget lets the resident set follow the misses
-_PROMOTE_BUDGET = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 3)))
+# The GPU is driven through WDDM: Windows, or WSL2 (whose GPU paravirtualization shows up as /dev/dxg)
+_WDDM = os.name == "nt" or os.path.exists("/dev/dxg")
+# Promotions issued per step over all layers (and as many demotions), EXL3_MOE_CPU_PROMOTE_BUDGET. A transfer costs
+# host time and copies on the promotion stream, and pays off in worker experts later steps no longer route, so the
+# best value grows with the cost of a worker expert. Lower under WDDM, which runs streams in submission order: each
+# transfer's copies queue ahead of the next draft forward
+_PROMOTE_BUDGET = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 3 if _WDDM else 6)))
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 

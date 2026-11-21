@@ -681,14 +681,18 @@ experts instead of the checkpoint's arbitrary head. A profile from a different w
 what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
 (an explicit stats file in the same per-layer format) takes precedence.
 
-### `EXL3_MOE_CPU_PROMOTE_BUDGET` (default: `3`)
+### `EXL3_MOE_CPU_PROMOTE_BUDGET` (default: `6`; `3` on Windows and WSL2)
 
 Promotions promote-on-miss may issue per decode step over all layers, at most one per layer (and
-as many demotions). A step routes far more experts to the worker than a small budget can move, so
-the budget bounds how fast the resident set follows a change of topic or the start of a session. The
-default is small because on Windows (WDDM) streams run in submission order, so every transfer delays
-the next draft forward. Elsewhere the transfers run on a side stream beside the forward pass, and a
-larger budget (e.g. `24`) lets the resident set follow the misses. `0` issues no transfers.
+as many demotions). A step routes far more experts to the worker than the budget can move, so the
+budget bounds how fast the resident set follows a change of topic or the start of a session, and it
+is normally spent on every step. Each transfer also costs host time and copies on a side stream, so
+the best value depends on the machine: where worker experts are expensive (fewer cores, no AVX-512)
+a larger budget (e.g. `12` to `24`) raises the hit rate and decode speed, most visibly with MTP
+drafting, while a CPU fast enough to hide its experts behind the GPU's own work gains nothing from
+the extra transfers and can come out slightly slower. The default is lower where the GPU is driven through
+WDDM (Windows, and WSL2, detected by `/dev/dxg`): streams run in submission order there, so every
+transfer delays the next draft forward. `0` issues no transfers.
 
 ### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
 
