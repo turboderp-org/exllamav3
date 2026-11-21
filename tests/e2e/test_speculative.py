@@ -15,7 +15,7 @@ verification pass goes through the recurrent-state replay on the recurrent model
 import pytest
 import torch
 
-from testlib.e2e import REFERENCE_TEXT, assert_greedy_equivalent, greedy, load_model
+from testlib.e2e import REFERENCE_TEXT, assert_greedy_equivalent, gpu_split, greedy, load_model
 
 pytestmark = [pytest.mark.model(), pytest.mark.slow]
 
@@ -87,6 +87,43 @@ def test_drafting_is_lossless(case, model_registry, device):
     if hybrid:
         assert hybrid_rounds > 0, f"{case}: no hybrid draft round fired"
     assert_greedy_equivalent(ref_tokens, ref_logits, tokens, NEAR_TIE, tag = case)
+
+
+@pytest.mark.tp
+@pytest.mark.multi_gpu(2)
+@pytest.mark.parametrize("case", ["gemma4-assistant", "gemma4-assistant-swa-full"])
+@torch.inference_mode()
+def test_shared_cache_drafting_tensor_parallel(case, model_registry, devices):
+    """
+    A drafter that reads its target's cache in place, against a tensor-parallel target, whose cache is otherwise
+    split across the devices: the load keeps the layers the drafter reads whole on the output device and puts
+    the drafter there, and drafting is then as lossless as against a layer split
+    """
+    role, draft_args, text = DRAFT_CASES[case]
+    entry = model_registry.get(role)
+    if not entry.available:
+        pytest.skip(f"test model '{role}' not available")
+    dirs = {entry.draft: model_registry.get(entry.draft).path}
+    if not model_registry.get(entry.draft).available:
+        pytest.skip(f"draft model '{entry.draft}' not available")
+
+    with load_model(entry.path, None, *draft_args(dirs), "-tp", "-gs", gpu_split(devices[:2])) as lm:
+        model = lm.model
+        assert model.loaded_tp
+        for key in lm.draft_model.target_source_keys():
+            for d in model.active_devices:
+                first, last, _ = model.plan[d][key]
+                assert (last > first) == (d == model.tp_output_device), f"{key} is not whole on the output device"
+        ids = lm.tokenizer.encode(text, add_bos = True)[:, :PROMPT_TOKENS]
+        plain = lm.generator(draft_model = None, draft_cache = None)
+        ref_tokens, ref_logits, _ = greedy(plain, ids, NEW_TOKENS, return_logits = True)
+        del plain
+        tokens, _, events = greedy(lm.generator(), ids, NEW_TOKENS)
+
+    final = events.get("eos")
+    assert final is not None and final.get("accepted_draft_tokens", 0) > 0, \
+        f"{case}: no drafted tokens were accepted ({final and final.get('rejected_draft_tokens')} rejected)"
+    assert_greedy_equivalent(ref_tokens, ref_logits, tokens, NEAR_TIE, tag = f"{case}-tp")
 
 
 @pytest.mark.parametrize("case", ["mtp", "dflash", "dflash2-swa-full", "gemma4-assistant"])

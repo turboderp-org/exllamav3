@@ -68,6 +68,7 @@ class TPAllocator:
         num_tokens: int,
         output_num_tokens: int,
         dev_limits: dict = None,
+        pinned: dict | None = None,
     ):
         """
         Estimate and plan a tensor-parallel split across devices with uneven capacity.
@@ -77,6 +78,9 @@ class TPAllocator:
         the devices, so larger GPUs or less-loaded GPUs receive more channels while smaller devices can receive
         fewer or zero. The allocator tracks persistent storage as a sum and temporary overhead as a per-device max,
         allowing irregular splits when model shards and runtime buffers do not scale uniformly.
+
+        pinned maps component keys to the one device that takes the whole component, for a module something else
+        on that device reads in place.
         """
         self.components = components
         self.current_split = None
@@ -84,6 +88,7 @@ class TPAllocator:
         self.num_tokens = num_tokens
         self.output_num_tokens = output_num_tokens
         self.dev_limits = dev_limits or {}
+        self.pinned = pinned or {}
         self.estimate_total = None
         self.estimate_storage = None
         self.estimate_overhead = None
@@ -119,10 +124,10 @@ class TPAllocator:
             dev_limit = self.dev_limits.get(c.limit_key) if c.limit_key else None
             if c.max_devices is not None:
                 dev_limit = c.max_devices if dev_limit is None else min(dev_limit, c.max_devices)
-            if c.affinity_key is not None and c.affinity_key in affinity_dev:
-                # Pinned to the group leader's device, whatever the memory picture (the estimate
-                # then overshoots there and the load's headroom checks catch a real shortfall)
-                d = affinity_dev[c.affinity_key]
+            if c.key in self.pinned or (c.affinity_key is not None and c.affinity_key in affinity_dev):
+                # Pinned to a given device or to the group leader's, whatever the memory picture (the
+                # estimate then overshoots there and the load's headroom checks catch a real shortfall)
+                d = self.pinned[c.key] if c.key in self.pinned else affinity_dev[c.affinity_key]
                 rem_mem_s = [max(r, 1) if i == d else 0 for i, r in enumerate(rem_mem_s)]
             elif dev_limit is not None:
                 dev_limit = min(dev_limit, len(active_devices))

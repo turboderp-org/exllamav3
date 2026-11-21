@@ -369,6 +369,14 @@ class Model_TPMixin:
             self.tp_worker_result(device)
 
 
+    def tp_output_rank_modules(self) -> list:
+        """
+        The output device's shards of this model's modules, in module order. That rank runs in this process, so
+        its modules and what they hold (weights, cache layers) can be used here directly, between forward passes.
+        """
+        return self.mp_parent_conn[self.tp_output_device].local_context["modules"]
+
+
     def tp_dispatch_master(self, func, args):
         """
         Run a worker function only on the TP output device and return its result.
@@ -538,7 +546,14 @@ class Model_TPMixin:
         tp_backend: str,
         verbose: bool,
         tp_options: dict,
+        attached_modules: list | None = None,
+        whole_on_output: set | None = None,
     ):
+        """
+        attached_modules are another model's modules (a drafter placed by this model's loader, see Model.load_gen)
+        that load on the output device, in this process. whole_on_output names the components (by allocation key)
+        that run whole on the output device instead of being split: what those modules read in place.
+        """
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
 
@@ -565,6 +580,14 @@ class Model_TPMixin:
             del w
         torch.cuda.set_device(current)
 
+        # Attached modules go first, so that the split is planned around what they take
+        attached_bytes = 0
+        if attached_modules:
+            out = torch.device("cuda", self.tp_output_device)
+            before = torch.cuda.memory_allocated(out)
+            self._load_attached(attached_modules, out)
+            attached_bytes = torch.cuda.memory_allocated(out) - before
+
         # Create TP context
         self.active_devices = active_devices
         self.create_tp_context(tp_backend)
@@ -578,7 +601,8 @@ class Model_TPMixin:
             if reserve_per_device is not None:
                 free -= reserve_per_device[device]
             if use_per_device is not None:
-                free = use_per_device[device]
+                # A set budget covers the attached modules too; measured free memory already leaves them out
+                free = use_per_device[device] - (attached_bytes if device == self.tp_output_device else 0)
             max_mem[device] = free
 
         # Define TP split
@@ -590,6 +614,7 @@ class Model_TPMixin:
             num_tokens = max_chunk_size,
             output_num_tokens = max_output_size,
             dev_limits = dev_limits,
+            pinned = {key: self.tp_output_device for key in whole_on_output or ()},
         )
         allocator.initial_split(max_mem)
         if verbose:

@@ -596,9 +596,11 @@ class Model(Model_TPMixin, Model_LSMixin):
             (optional) Draft model that will verify against this model. Loaded first, except when its caps say
             load_with_target: such a drafter (the Gemma4 assistant) reads this model's cache layers in place and
             cannot load on its own; its modules are loaded here, each on the device of the layer it reads (see
-            its modules_with_target), within the same budget. When the drafter taps hidden states of this model
-            (DFlash), the copies of the tapped layers' states stay resident on their devices for the whole
-            forward, and the split budgets for them.
+            its modules_with_target), within the same budget. In a tensor-parallel load it goes on the output
+            device, and the layers it reads (its target_source_keys) run whole there instead of being split,
+            since the other devices' shares would be out of its reach. When the drafter taps hidden states of
+            this model (DFlash), the copies of the tapped layers' states stay resident on their devices for the
+            whole forward, and the split budgets for them.
 
         :param attn_device:
             (optional, split load) Device for the modules the architecture pins together (caps["attn_device"]:
@@ -614,14 +616,11 @@ class Model(Model_TPMixin, Model_LSMixin):
                 f"load() instead of loading it on its own"
             )
         attached = None
-        if draft_model is not None and draft_model.caps.get("load_with_target"):
-            if tensor_p:
-                raise NotImplementedError(
-                    f"{draft_model.config.architecture} drafting is not currently implemented for tensor-parallel "
-                    f"targets: the drafter reads the target's K/V cache layers, which a TP load shards across devices"
-                )
+        with_draft = draft_model is not None and draft_model.caps.get("load_with_target")
+        if with_draft:
             draft_model.attach_to(self)
-            attached = draft_model.modules_with_target(self)
+            if not tensor_p:
+                attached = draft_model.modules_with_target(self)
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
         # allocated on any device yet (the usual first load) there is none, and a full collection
@@ -771,8 +770,13 @@ class Model(Model_TPMixin, Model_LSMixin):
                         tp_backend,
                         verbose,
                         tp_options,
+                        draft_model.modules if with_draft else None,
+                        draft_model.target_source_keys() if with_draft else None,
                     )
                     self.output_device = tp_output_device
+                    # The drafter binds to the output device's shards, which exist now
+                    if with_draft:
+                        draft_model.attach_to(self)
 
             free_mem()
 
@@ -782,7 +786,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             # Mark every attached cache usable.
             self._mark_caches_initialized()
             # A drafter loaded alongside: finished the way its own load would have
-            if attached is not None:
+            if with_draft:
                 draft_model.output_device = draft_model.modules[-1].device
                 draft_model._mark_caches_initialized()
         finally:
