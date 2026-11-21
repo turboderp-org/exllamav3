@@ -1300,30 +1300,18 @@ class Job:
         # the limit when none is given, and the cap on one that is, so a chunked job that writes
         # its way to the end of the cache ends with max_new_tokens instead of asserting at the
         # requeue that finds no pages left (the cap holds for the requeued rounds too, whose prompt
-        # is the sequence so far). A prompt with no room at all keeps its limit and fails the page
-        # check below, which is the message the caller expects for that
+        # is the sequence so far). A prompt with no room at all is held to a single token: it fails
+        # the page check below, which is the message the caller expects for that, unless that one
+        # token still fits, and then the job ends after it rather than asking for a requeue
         room = self.generator.max_total_tokens - max(len(s.input_ids) for s in self.sequences) \
                - 1 - self.generator.max_draft_tokens
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, room)
-        elif room >= 1:
-            self.max_new_tokens = min(self.max_new_tokens, room)
+        else:
+            self.max_new_tokens = min(self.max_new_tokens, max(1, room))
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
-            # An MTP job requeues one token past the boundary and reserves it, so the final cut leaves room for it too
-            mtp_lag = 1 if self.generator.mtp_draft else 0
-            if len(self.sequences) == 1:
-                boundary = self.generator.recurrent_checkpoint_interval \
-                    if self.generator.recurrent_cache is not None else PAGE_SIZE
-                x = len(self.sequences[0].input_ids)
-                y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
-                # The final segment: a budget aligned to the end of the cache leaves no room for the
-                # speculative window past it, and no requeue can follow it anyway, so it is cut to what
-                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
-                # 31-token draft window could not be enqueued at all)
-                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens - mtp_lag)
-                self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
@@ -1332,8 +1320,22 @@ class Job:
             # MTP keeps the last two tokens of a prompt out of the page cache (max_cached_pages below), so an MTP job
             # requeues one token past the boundary: the next segment then finds the boundary page cached and resumes
             # from the checkpoint there, instead of replaying the whole interval before it
+            mtp_lag = 1 if self.generator.mtp_draft else 0
             self.rq_margin = -mtp_lag
             self.rq_headroom = self.generator.max_draft_tokens + mtp_lag
+            if len(self.sequences) == 1:
+                boundary = self.generator.recurrent_checkpoint_interval \
+                    if self.generator.recurrent_cache is not None else PAGE_SIZE
+                x = len(self.sequences[0].input_ids)
+                # A requeued MTP job's prompt ends one token past the boundary it stopped at, and its budget counts
+                # from that boundary (from the token itself, aligning up would add a whole interval to the segment)
+                y = (x - 1 - mtp_lag + self.max_rq_tokens + boundary - 1) // boundary * boundary
+                # The final segment: a budget aligned to the end of the cache leaves no room for what is
+                # reserved past it (rq_headroom), and no requeue can follow it anyway, so it is cut to what
+                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
+                # 31-token draft window could not be enqueued at all)
+                y = min(y, self.generator.max_total_tokens - self.rq_headroom)
+                self.max_rq_tokens = max(1, y - x)
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
