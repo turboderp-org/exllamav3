@@ -4,10 +4,9 @@ import math
 import os
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
-from ....util.memory import free_mem, list_gpu_tensors
+from ....util.memory import free_mem
 from ....util.hadamard import get_hadamard_dt
 from .hessian_packed import unpack
-from ....util import cuda_sync_active
 from ....util.tensor import save_tensor_image
 from functools import lru_cache
 
@@ -1657,7 +1656,6 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         H_err.diagonal().sub_(d_off)
     else:
         H_err = H
-    W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
     k, n = weight_q.shape

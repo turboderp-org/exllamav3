@@ -200,7 +200,7 @@ def save_tensor(tensor, filename: str, args):
         }, path)
     else:
         save_file({
-            f"tensor": tensor
+            "tensor": tensor
         }, path)
 
 
@@ -347,7 +347,7 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args["embed_bits"] != 16 and not 1 <= in_args["embed_bits"] <= 8:
         return None, None, False, f"--embed_bits must be an integer 1-8, or 16, got {in_args['embed_bits']}"
     if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
-        return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
+        return None, None, False, "Recipe uses half-integer bitrates, which need the mul1 codebook"
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
     if recipe_tensors is not None and "recipe_strategy" not in in_args:
@@ -366,9 +366,9 @@ def prepare(args) -> (dict, dict, bool, str):
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
-        print(f" -- Resuming existing job")
+        print(" -- Resuming existing job")
     else:
-        print(f" -- Creating new job")
+        print(" -- Creating new job")
         job_state = {
             "next_module_idx": 0,
             "q_strategy": None,
@@ -386,7 +386,7 @@ def prepare(args) -> (dict, dict, bool, str):
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     if in_args.get("recipe_strategy"):
         print(f"    Recipe: {in_args.get('recipe')} ({len(in_args['recipe_strategy'])} tensors)")
-    print(f"    Output scales: " + (
+    print("    Output scales: " + (
         "yaqa" if in_args["out_scales_hessian"] else
         {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]]
     ))
@@ -413,22 +413,22 @@ def get_base_model(args):
     # Block-scaled fp4/fp8 checkpoint tensors stay packed in VRAM and dequantize per use (the capture and
     # advance forwards run one projection at a time anyway); lossless, see LinearFP16Packed
     config.infer_params.packed_fp16_source = True
-    print(f" -- Loaded model config")
+    print(" -- Loaded model config")
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
     use_reference_state = not model.caps.get("uncalibrated_quantize", False)
     assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
-    print(f" -- Created model instance:")
+    print(" -- Created model instance:")
     print(model.get_layout_tree(4))
     mtp_model = model.from_config(config, component = "mtp") if "mtp" in config.model_classes else None
     if mtp_model:
-        print(f" -- Created MTP model instance:")
+        print(" -- Created MTP model instance:")
         print(mtp_model.get_layout_tree(4))
     vision_bits = args.get("vision_bits", 0)
     assert vision_bits in (0, 16) or 1 <= vision_bits <= 8, \
-        f" ## --vision_bits must be 1-8, or 16 to store the vision model unquantized"
+        " ## --vision_bits must be 1-8, or 16 to store the vision model unquantized"
     if vision_bits not in (0, 16) and "vision" not in config.model_classes:
-        print(f" !! Warning, --vision_bits given but model has no vision component, ignoring")
+        print(" !! Warning, --vision_bits given but model has no vision component, ignoring")
         vision_bits = 16
     vision_model = model.from_config(config, component = "vision") \
         if vision_bits != 16 and "vision" in config.model_classes else None
@@ -445,7 +445,7 @@ def get_base_model(args):
         print(vision_model.get_layout_tree(4))
     if use_reference_state:
         tokenizer = Tokenizer.from_config(config)
-        print(f" -- Loaded tokenizer")
+        print(" -- Loaded tokenizer")
         print(f"    Vocab size: {tokenizer.actual_vocab_size}")
     else:
         tokenizer = None
@@ -453,14 +453,14 @@ def get_base_model(args):
         if config.rope_settings:
             config.rope_settings.print()
         else:
-            print(f" -- No RoPE settings")
+            print(" -- No RoPE settings")
     return config, model, mtp_model, vision_model, tokenizer, use_reference_state
 
 
 def prepare_state(args, job_state, config, model, tokenizer):
     idx = job_state["next_module_idx"]
     if idx == 0:
-        print(f" -- Preparing input state")
+        print(" -- Preparing input state")
         if args.get("cal_data"):
             print(f"    Calibration data: {args['cal_data']}")
             state = get_file_calibration(args, tokenizer)
@@ -848,7 +848,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             while any(t.is_alive() for t in threads) and not errors:
                 progress.update(curr_progress)
                 time.sleep(0.1)
-    except KeyboardInterrupt as e:
+    except KeyboardInterrupt:
         from signal import pthread_kill, SIGTSTP, SIGKILL
         for t in threads:
             pthread_kill(t.ident, SIGTSTP)
@@ -859,7 +859,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     if errors:
         # Abort immediately (the other workers' remaining groups are wasted work); the traceback
         # of the failing worker is what the user needs to see
-        print(f" !! Quantization worker failed, aborting job")
+        print(" !! Quantization worker failed, aborting job")
         raise errors[0]
 
     for t in threads:
@@ -1305,7 +1305,7 @@ def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, m
     if state:
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else "  no_weights") +
             (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  cos: {cos_error:.6f}"
             f"  sqnr: {sqnr_:.6f}"
@@ -1316,7 +1316,7 @@ def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, m
     else:
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else "  no_weights") +
             f"  [{module_time:.2f} s]" +
             host_rss_str(),
             flush = True
@@ -1368,7 +1368,7 @@ def main(args, job_state):
     no_swap = bool(args.get("no_swap")) or all(is_integrated_device(d) for d in devices)
     exl3_quantize.NO_SWAP = no_swap
     if no_swap:
-        print(f" -- Swapping to system memory disabled (" + ("--no_swap" if args.get("no_swap") else "integrated GPU") + ")")
+        print(" -- Swapping to system memory disabled (" + ("--no_swap" if args.get("no_swap") else "integrated GPU") + ")")
     if args.get("device_ratios"):
         device_ratios = [int(d) for d in args["device_ratios"].split(",")]
         assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
@@ -1657,9 +1657,9 @@ def main(args, job_state):
                     if len(capture_H):
                         hfb_keys = [re.sub(r'\d+', '*', k) for k in capture_H.keys()]
                         hfb_keys = sorted(list(set(hfb_keys)))
-                        print(f" -- Hessians: " + ", ".join(hfb_keys))
+                        print(" -- Hessians: " + ", ".join(hfb_keys))
                     else:
-                        print(f" !! Hessians: None")
+                        print(" !! Hessians: None")
 
                     # Check for infs or NaNs in H
                     for k, v in capture_H.items():
@@ -1829,7 +1829,7 @@ def main(args, job_state):
         if can_resume_quant and \
             time.time() > last_checkpoint_time + args["checkpoint_interval"] and \
             (args.get("last_checkpoint_index", -1) < 0 or idx <= args["last_checkpoint_index"]):
-            print(f" -- Saving checkpoint")
+            print(" -- Saving checkpoint")
             ckpt_dir = os.path.join(args["work_dir"], "ckpt")
             ckpt_dir_old = os.path.join(args["work_dir"], "ckpt_old")
             ckpt_dir_new = os.path.join(args["work_dir"], "ckpt_new")
