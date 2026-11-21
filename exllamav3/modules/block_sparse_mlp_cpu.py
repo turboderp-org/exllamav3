@@ -177,8 +177,10 @@ def register_split_module(infer_params, module):
 
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-_PROMOTE_BUDGET = 3         # promotions issued per step over all layers (and as many demotions); each transfer's
-                            # copies queue ahead of the next draft forward (WDDM runs streams in submission order)
+# Promotions issued per step over all layers (and as many demotions), EXL3_MOE_CPU_PROMOTE_BUDGET. Small by default:
+# WDDM runs streams in submission order, so each transfer's copies queue ahead of the next draft forward. Where the
+# promotion stream runs beside the compute stream, a larger budget lets the resident set follow the misses
+_PROMOTE_BUDGET = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 3)))
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 
