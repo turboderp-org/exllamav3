@@ -95,3 +95,13 @@ def test_non_mtp_requeue_lands_on_the_boundary():
     seq_len = _first_requeue(job)
     assert seq_len - 1 == 2048
     assert _reserved(job) >= seq_len - 1 + generator.max_draft_tokens
+
+
+@pytest.mark.parametrize("mtp_draft", [False, True])
+def test_final_segment_fits_the_cache(mtp_draft):
+    """The final segment plus everything reserved past it (draft window, MTP token) ends exactly at the end of the
+    cache, and never asks for a requeue there"""
+    job, generator = _queued_job(mtp_draft, prompt_len = 65536 - 1000)
+    assert _reserved(job) == generator.max_total_tokens
+    job.new_tokens = job.max_new_tokens
+    assert not job.requeue_due()
