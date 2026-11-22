@@ -5,3 +5,4 @@ fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb0(bool optimized) { return o
 fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb1(bool optimized) { return optimized ? quantize_tiles_optimized_kernel<6, 1> : quantize_tiles_kernel<6, 1>; }
 fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb2(bool optimized) { return optimized ? quantize_tiles_optimized_kernel<6, 2> : quantize_tiles_kernel<6, 2>; }
 fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb2_l160(bool optimized) { return optimized ? quantize_tiles_optimized_kernel<6, 2, 160> : quantize_tiles_kernel<6, 2, 160>; }
+fp_quantize_tiles_kernel quantize_tiles_kernel_k6_cb2_l96(bool optimized) { return optimized ? quantize_tiles_optimized_kernel<6, 2, 96> : quantize_tiles_kernel<6, 2, 96>; }

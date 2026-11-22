@@ -156,7 +156,7 @@ def quantize_tiles(tiles, quant_args: dict):
     if frac_k(quant_args["K"]) is not None:
         return quantize_tiles_frac(tiles, quant_args)
     tiles = tiles.contiguous()
-    assert tiles.shape[1] in (256, 160)
+    assert tiles.shape[1] in (256, 160, 96)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
