@@ -903,6 +903,43 @@ class PromptFormat_hy3(PromptFormat):
         return "<think:opensource>", "</think:opensource>"
 
 
+class PromptFormat_hy4(PromptFormat):
+    description = "Hy4 flash"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        s, m, e = "<｜hy_start:opensource｜>", "<｜hy_middle:opensource｜>", "<｜hy_end:opensource｜>"
+        # The system turn is always present: it carries the reasoning mode after the prompt
+        context = f"{s}system{m}{system_prompt or ''}"
+        context += "<｜reasoning_mode:opensource｜>reasoning_effort:"
+        context += "high" if think else "no_think"
+        context += e
+        for (u, a) in messages:
+            context += f"{s}user{m}{u}{e}"
+            context += f"{s}assistant{m}<think:opensource>"
+            if a is not None:
+                context += f"</think:opensource>{a}{e}"
+            elif not think:
+                context += "</think:opensource>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think:opensource>", "</think:opensource>"
+
+
 class PromptFormat_gptoss(PromptFormat):
     description = "GPT-OSS"
 
@@ -1283,6 +1320,7 @@ prompt_formats = {
     "minimax": PromptFormat_minimax,
     "gptoss": PromptFormat_gptoss,
     "hy3": PromptFormat_hy3,
+    "hy4": PromptFormat_hy4,
     "laguna": PromptFormat_laguna,
     "kimi": PromptFormat_kimi,
     "deepseek": PromptFormat_deepseek,

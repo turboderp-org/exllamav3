@@ -1090,3 +1090,15 @@ class PageTable:
             torch.cuda.synchronize()
             elapsed = time.time() - time_begin
             print(f"Defrag latency: {elapsed:.5f} s")
+
+
+def prev_ids(seqs: list, positions: list, n: int) -> torch.Tensor:
+    """(len(seqs), n) ids ending right before each sequence's position, -1 where the sequence has
+    fewer: the context a forward from that position hashes its first tokens with (Model caps
+    "prev_ids")"""
+    out = torch.full((len(seqs), n), -1, dtype = torch.long)
+    for i, (seq, pos) in enumerate(zip(seqs, positions)):
+        a = max(0, pos - n)
+        if pos > a:
+            out[i, n - (pos - a):] = seq.sequence_ids.torch_slice(a, pos).view(-1)
+    return out

@@ -270,6 +270,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         vocab = self.config.vocab_size
         recurrent = len(self.get_recurrent_layers()) > 0
+        # Models that hash each token with the ids before it (caps "prev_ids") take those from the caller
+        n_prev = self.caps.get("prev_ids", 0)
         rng = random.Random(0)
         def ids(b, n):
             return torch.tensor([[rng.randrange(vocab) for _ in range(n)] for _ in range(b)], dtype = torch.long)
@@ -315,6 +317,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             for label, bsz, seq_cap, steps in families:
                 states = None
                 pos = 0
+                prev = torch.full((bsz, n_prev), -1, dtype = torch.long)
                 # Take the family's recurrent-state slots up front (all or nothing) so a shortage
                 # never strands a slot: prepare_for_recurrence creates them one by one and would
                 # leak the ones it took before running out
@@ -347,10 +350,15 @@ class Model(Model_TPMixin, Model_LSMixin):
                     if q > 16:
                         params["last_tokens_only"] = 1
                     step_label = f"{label}, {q} token(s) at {pos}" if cache is not None else label
+                    step_ids = ids(bsz, q)
+                    if n_prev:
+                        params["prev_ids"] = prev
                     try:
-                        self.forward(ids(bsz, q), params)
+                        self.forward(step_ids, params)
                         states = params.get("recurrent_states")
                         pos += q
+                        if n_prev:
+                            prev = torch.cat((prev, step_ids), dim = 1)[:, -n_prev:]
                     except Exception as e:
                         failures.append(step_label)
                         print(f" !! Warmup pass failed ({step_label}): {e!r}")

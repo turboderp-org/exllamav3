@@ -20,6 +20,7 @@ from .draft_confidence import DraftConfidenceCalibrator
 from ..model.moe_cpu_host import set_moe_cpu_hot
 from ..modules.block_sparse_mlp_cpu import promote_tick
 from .job import Job
+from .pagetable import prev_ids
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -393,6 +394,9 @@ class Generator:
         # both sides checkpoint together into this one pool (see PairedState)
         self.recurrent_cache_size = recurrent_cache_size
         self.target_recurrent = bool(self.model.caps.get("recurrent_states"))
+        # Models that hash each token with its predecessors (n-gram layers without recurrent state)
+        # take the ids before every forward's input from the caller
+        self.prev_ids = self.model.caps.get("prev_ids", 0)
         self.draft_recurrent = bool(draft_model is not None and draft_model.caps.get("recurrent_states"))
         if self.target_recurrent:
             if self.max_draft_tokens > cache.max_history:
@@ -1845,6 +1849,8 @@ class Generator:
             "pinned_staging": True,
         }
         self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
+        if self.prev_ids:
+            params["prev_ids"] = prev_ids([seq for job in batch_jobs for seq in job.sequences], seq_kvp, self.prev_ids)
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(

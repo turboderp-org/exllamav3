@@ -12,6 +12,7 @@
 #include "../hgemm.cuh"
 #include "../add.cuh"
 #include "../dsa_topk.cuh"
+#include "../activation.cuh"
 
 BC_MLAttention::BC_MLAttention
 (
@@ -121,6 +122,31 @@ void BC_MLAttention::set_indexer
     idx_gate_w = std::move(gate_w);
     idx_kpool_ape = std::move(kpool_ape);
     cache_kpool = std::move(kpool_plane);
+}
+
+void BC_MLAttention::set_gathered
+(
+    c10::optional<at::Tensor> _sinks,
+    std::shared_ptr<BC_LinearEXL3> _out_gate
+)
+{
+    if (_sinks)
+    {
+        TORCH_CHECK_DTYPE(_sinks.value(), kFloat);
+        TORCH_CHECK(_sinks->is_contiguous() && _sinks->numel() == num_q_heads, "BC_MLAttention: sinks must be (H,) fp32");
+    }
+    sinks = std::move(_sinks);
+    out_gate = std::move(_out_gate);
+}
+
+void BC_MLAttention::configure_slot_gate(int bsz, int q_len, int regime, at::Tensor gate)
+{
+    Slot& s = slot(bsz, q_len, regime);
+    TORCH_CHECK(s.configured, "BC_MLAttention: configure_slot before configure_slot_gate");
+    TORCH_CHECK_DTYPE(gate, kHalf);
+    TORCH_CHECK(gate.is_contiguous() && gate.dim() == 2 && gate.size(0) == bsz * q_len &&
+                gate.size(1) == num_q_heads * v_head_dim, "BC_MLAttention: bad gate static");
+    s.gate = std::move(gate);
 }
 
 bool BC_MLAttention::needs_configure(int bsz, int q_len, int regime)
@@ -319,6 +345,7 @@ void BC_MLAttention::run_gr
     int regime,
     int64_t t_total,
     const c10::optional<at::Tensor>& ext_indices,
+    int ext_k_len,
     Graph* graph
 )
 {
@@ -689,6 +716,9 @@ void BC_MLAttention::run_gr
             // producing layer's tensor for shared ones)
             at::Tensor idx_t = ext_indices ? ext_indices.value() : s.indices;
             int k_pad = (int) idx_t.size(1);
+            // An external selection may fill only its leading columns (a window or prefix still
+            // shorter than the stride); the live width is patched per call
+            int k_len = (ext_indices && ext_k_len > 0) ? MIN(ext_k_len, k_pad) : k_pad;
             std::vector<void*> args =
             {
                 (void*) s.q_lat.data_ptr(),
@@ -700,7 +730,7 @@ void BC_MLAttention::run_gr
                 (void*) idx_t.data_ptr(),
                 (void*) s.dsa_ws_ml.data_ptr(),
                 (void*) s.dsa_ws_acc.data_ptr(),
-                (void*) (uintptr_t) (uint32_t) k_pad,
+                (void*) (uintptr_t) (uint32_t) k_len,
                 (void*) (uintptr_t) (uint32_t) 0,   // win_len
                 (void*) (uintptr_t) (uint32_t) 0,   // pool_len (gathered mode)
                 // MULTIROW: one block-table row per job; else a single shared row
@@ -720,6 +750,8 @@ void BC_MLAttention::run_gr
             {
                 graph->record_param(s.k_dsa_split->handle(), GP_attn_block_table, 5);
                 graph->record_param(s.k_dsa_split->handle(), GP_dsa_indices, 6);
+                if (idx_mode == 2)
+                    graph->record_param(s.k_dsa_split->handle(), GP_dsa_k_len, 9, 4);
                 if (multirow)
                     graph->record_param(s.k_dsa_split->handle(), GP_attn_num_pages, 12, 4);
                 graph->record_param(s.k_dsa_split->handle(), GP_end, 0);
@@ -732,7 +764,8 @@ void BC_MLAttention::run_gr
             {
                 (void*) s.dsa_ws_ml.data_ptr(),
                 (void*) s.dsa_ws_acc.data_ptr(),
-                (void*) s.dsa_ws_ml.data_ptr(),  // sinks (unused, HAS_SINKS = False)
+                // sinks (the slot compiles HAS_SINKS to match; a dummy pointer otherwise)
+                (void*) (sinks ? sinks.value().data_ptr() : s.dsa_ws_ml.data_ptr()),
                 (void*) s.dsa_ws_ml.data_ptr(),  // derot_inv_freq (unused)
                 (void*) s.o_lat.data_ptr(),
                 (void*) (uintptr_t) (uint32_t) (int) position,
@@ -817,6 +850,15 @@ void BC_MLAttention::run_gr
     }
     dbg("unfold");
 
+    // Elementwise output gate from the block input: o *= sigmoid(out_gate(x))
+    if (out_gate)
+    {
+        at::Tensor xh_x = xh_flat.narrow(0, 0, (int64_t) R * hidden_size).view({R, hidden_size});
+        exl3_gemm_gr(x2, out_gate->trellis, s.gate, out_gate->suh, xh_x, out_gate->svh, -1, out_gate->mcg, out_gate->mul1, 0, graph);
+        mul_sigmoid__gr(s.o, s.gate, graph);
+        dbg("out_gate");
+    }
+
     // Output projection
     at::Tensor y2 = y.view({R, hidden_size});
     at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * v_head_dim).view({R, num_q_heads * v_head_dim});
@@ -837,7 +879,8 @@ void BC_MLAttention::run
     const c10::optional<at::Tensor>& position_ids,
     int regime,
     int64_t t_total,
-    const c10::optional<at::Tensor>& ext_indices
+    const c10::optional<at::Tensor>& ext_indices,
+    int ext_k_len
 )
 {
     py::gil_scoped_release release;
@@ -851,13 +894,16 @@ void BC_MLAttention::run
     TORCH_CHECK(idx_mode != 2 || regime == 0 || ext_indices,
                 "BC_MLAttention: shared-indexer sparse step requires external indices");
     TORCH_CHECK(!index_kpool || bsz == 1, "BC_MLAttention: kpool indexer requires bsz 1");
+    TORCH_CHECK(!(sinks || out_gate) || (regime == 1 && idx_mode == 2 && ext_indices),
+                "BC_MLAttention: sinks and the output gate run on an external selection");
+    TORCH_CHECK(!out_gate || s.gate.defined(), "BC_MLAttention: output gate static missing");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched.
     // A disabled graph runs the same C++ path eagerly every time
     if (s.runs == 0 || s.graph->disabled)
     {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, nullptr);
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, ext_k_len, nullptr);
         s.runs = 1;
         return;
     }
@@ -865,7 +911,7 @@ void BC_MLAttention::run
     if (!s.graph->ready)
     {
         GraphCapture capture(*s.graph);
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, s.graph.get());
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, ext_k_len, s.graph.get());
         capture.finish();
         s.runs = 2;
     }
@@ -976,6 +1022,12 @@ void BC_MLAttention::run
         at::Tensor idx_t = ext_indices ? ext_indices.value() : s.indices;
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
         params.emplace_back(GP_dsa_indices, (void*) idx_t.data_ptr());
+        if (idx_mode == 2)
+        {
+            int k_pad = (int) idx_t.size(1);
+            int k_len = (ext_indices && ext_k_len > 0) ? MIN(ext_k_len, k_pad) : k_pad;
+            params.emplace_back(GP_dsa_k_len, (void*) (uintptr_t) (uint32_t) k_len);
+        }
         if (multirow)
             params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);   // gather
     }
@@ -989,6 +1041,14 @@ void BC_MLAttention::run
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
+    }
+
+    // Output gate: reads x; its own output site is restated so the o_proj entry below lands on
+    // o_proj's (the patcher takes the next site of each id in order)
+    if (out_gate)
+    {
+        params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_gemm_C, (void*) s.gate.data_ptr());
     }
 
     // Output projection

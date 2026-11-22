@@ -1,14 +1,15 @@
 """
 Trellis quantization of hashed n-gram embedding tables (Qwen3.8-Flash-Next ple_embedding and kin).
 
-Each 160-D embedding row is quantized as a single tail-biting trellis ring (mul1 codebook, the
-length-160 instances of quantize_tiles), after subtracting a per-hash-head bias vector and applying
-a per-row scale. Storage per row is 16 + 160*K bits, packed as (1 + 10*K) little-endian uint16
-words: word 0 holds the fp16 row scale, the rest hold the ring bitstream where stream bits
-[i*K, (i+1)*K) are the low K bits of position i's 16-bit trellis state.
+Each embedding row (160-D in Qwen3.8-Flash-Next, 96-D in Hy4 flash) is quantized as a single
+tail-biting trellis ring (mul1 codebook, the row instances of quantize_tiles), after subtracting a
+per-hash-head bias vector and applying a per-row scale. Storage per row is 16 + dim*K bits, packed
+as (1 + dim*K/16) little-endian uint16 words: word 0 holds the fp16 row scale, the rest hold the
+ring bitstream where stream bits [i*K, (i+1)*K) are the low K bits of position i's 16-bit trellis
+state.
 
 Reconstruction: row[i] = decode_mul1(state_i) * scale + head_bias[head], where state_i is read as
-the 16 ring bits ending at stream bit (i+1)*K - 1 (mod 160*K).
+the 16 ring bits ending at stream bit (i+1)*K - 1 (mod dim*K).
 
 The file produced by quantize_ngram_table() / util/convert_ngram.py is a regular safetensors file
 holding the packed table plus the bias vectors and the source model's hashing buffers, with the
@@ -59,8 +60,8 @@ def quantize_rows(
     cs_search: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    rows: (N, 160) source rows, or (N, 256) rotated groups (any float dtype) on a CUDA device
-    bias: (N, 160) per-row bias to subtract (gathered per head), fp16 values, or None
+    rows: (N, dim) source rows, or (N, 256) rotated groups (any float dtype) on a CUDA device
+    bias: (N, dim) per-row bias to subtract (gathered per head), fp16 values, or None
     cs: fixed codebook-scale multiplier, or None for the per-row heuristic (default)
     cs_search: number of encodes per row; > 1 sweeps cs in steps of CS_SEARCH_STEP centered on the
         heuristic/fixed value and keeps the lowest-error encode per row (decode-invisible)
@@ -237,41 +238,72 @@ class StreamingSafetensorsWriter:
 
 
 class NgramSource:
-    """Row-addressable view of the source table: the concatenation of the ngram_embedding shards."""
+    """
+    Row-addressable view of one source table: the {prefix}.shard_N.weight tensors back to back, or a
+    single {prefix}.weight. The hash layout comes from the caller (models that derive it from their
+    config) or from the checkpoint's buffers next to the table.
+    """
 
-    def __init__(self, model_dir: str):
+    def __init__(
+        self,
+        model_dir: str | None = None,
+        file_map: dict | None = None,
+        prefix: str | None = None,
+        row_dim: int = ROW_DIM,
+        head_vocab_sizes: list | None = None,
+        layer_multipliers: list | None = None,
+        row_filter = None,
+    ):
+        """
+        model_dir: read the tensor locations from its model.safetensors.index.json; or
+        file_map: tensor name -> file path. prefix: the embedding module's key, found by its shard
+        tensors when omitted. row_filter: applied to source rows (on the device, source dtype) before
+        they are encoded, for tables the model reads through a transform
+        """
         self.model_dir = model_dir
-        with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
-            weight_map = json.load(f)["weight_map"]
+        if file_map is None:
+            with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+                weight_map = json.load(f)["weight_map"]
+            file_map = {k: os.path.join(model_dir, v) for k, v in weight_map.items()}
 
         def find(suffix):
-            keys = [k for k in weight_map if k.endswith(suffix)]
+            keys = [k for k in file_map if k.endswith(suffix)]
             assert len(keys) == 1, f"expected exactly one *{suffix} tensor, found {len(keys)}"
             return keys[0]
 
-        num_shards = len([k for k in weight_map if ".ngram_embedding.shard_" in k])
-        assert num_shards > 0, "no ngram_embedding shards found in model"
-        self.shard_keys = [find(f".ngram_embedding.shard_{s}.weight") for s in range(num_shards)]
-        # model-scoped key prefix of the embedding module, e.g.
-        # "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-        self.prefix = self.shard_keys[0].rsplit(".shard_", 1)[0]
-        self.shard_files = [os.path.join(model_dir, weight_map[k]) for k in self.shard_keys]
+        if prefix is None:
+            # model-scoped key prefix of the embedding module, e.g.
+            # "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+            assert any(".ngram_embedding.shard_" in k for k in file_map), "no ngram_embedding shards found in model"
+            prefix = find(".ngram_embedding.shard_0.weight").rsplit(".shard_", 1)[0]
+        self.prefix = prefix
+        num_shards = len([k for k in file_map if k.startswith(prefix + ".shard_") and k.endswith(".weight")])
+        self.sharded = num_shards > 0
+        self.shard_keys = [f"{prefix}.shard_{s}.weight" for s in range(num_shards)] if self.sharded else [f"{prefix}.weight"]
+        self.shard_files = [file_map[k] for k in self.shard_keys]
+        self.row_filter = row_filter
         self._local = threading.local()
 
         from safetensors import safe_open
         with safe_open(self.shard_files[0], framework = "pt") as f:
             shape = f.get_slice(self.shard_keys[0]).get_shape()
         self.rows_per_shard = shape[0]
-        assert shape[1] == ROW_DIM
-        self.num_rows = self.rows_per_shard * num_shards
+        self.row_dim = row_dim
+        assert shape[1] == row_dim, f"{prefix}: rows are {shape[1]} wide, expected {row_dim}"
+        self.num_rows = self.rows_per_shard * len(self.shard_keys)
 
-        def load_aux(suffix):
-            key = find(suffix)
-            with safe_open(os.path.join(model_dir, weight_map[key]), framework = "pt") as f:
-                return f.get_tensor(key)
-        self.head_offsets = load_aux(".ngram_heads_offsets")
-        self.head_vocab_sizes = load_aux(".ngram_heads_vocab_sizes")
-        self.layer_multipliers = load_aux(".layer_multipliers")
+        if head_vocab_sizes is not None:
+            self.head_vocab_sizes = torch.tensor(head_vocab_sizes, dtype = torch.long)
+            self.head_offsets = self.head_vocab_sizes.cumsum(0) - self.head_vocab_sizes
+            self.layer_multipliers = torch.tensor(layer_multipliers, dtype = torch.long)
+        else:
+            def load_aux(suffix):
+                key = find(suffix)
+                with safe_open(file_map[key], framework = "pt") as f:
+                    return f.get_tensor(key)
+            self.head_offsets = load_aux(".ngram_heads_offsets")
+            self.head_vocab_sizes = load_aux(".ngram_heads_vocab_sizes")
+            self.layer_multipliers = load_aux(".layer_multipliers")
         self.num_heads = self.head_offsets.shape[0]
 
     def _handles(self):
@@ -294,10 +326,32 @@ class NgramSource:
             start += hi - lo
         return parts[0] if len(parts) == 1 else torch.cat(parts)
 
+    def rows_on(self, start: int, end: int, device) -> torch.Tensor:
+        """The rows as the model reads them, float on the device"""
+        rows = self.read_rows(start, end).to(device)
+        if self.row_filter is not None:
+            rows = self.row_filter(rows)
+        return rows.float()
+
     def head_of_rows(self, start: int, end: int, device) -> torch.Tensor:
         idx = torch.arange(start, end, device = device)
         h = torch.searchsorted(self.head_offsets.to(device), idx, right = True) - 1
         return h.clamp(0, self.num_heads - 1)
+
+    def stream_tensors(self, K: int, total_rows: int | None = None) -> list:
+        """(name, shape) of the packed tensors this table is written as: one per source shard (so
+        consumers can keep them as separate tensors in RAM instead of one concatenated table), or one
+        for an unsharded table"""
+        total_rows = self.num_rows if total_rows is None else total_rows
+        words = words_per_row(K, self.row_dim)
+        if not self.sharded:
+            return [(f"{self.prefix}.trellis", (total_rows, words))]
+        out, r0 = [], 0
+        while r0 < total_rows:
+            r1 = min(r0 + self.rows_per_shard, total_rows)
+            out.append((f"{self.prefix}.shard_{len(out)}.trellis", (r1 - r0, words)))
+            r0 = r1
+        return out
 
 
 def copy_tensors_streamed(stc, names: list[str], out_path: str, chunk: int = 256 << 20):
@@ -352,18 +406,18 @@ def read_table_tensor(path: str, name: str, dtype: torch.dtype) -> torch.Tensor 
 
 
 def compute_head_bias(source: NgramSource, device, rows_per_head: int = 131072, verbose: bool = False) -> torch.Tensor:
-    """Per-head channel mean over sampled stripes, returned as (num_heads, 160) float16."""
-    bias = torch.zeros(source.num_heads, ROW_DIM, dtype = torch.float64)
+    """Per-head channel mean over sampled stripes, returned as (num_heads, row_dim) float16."""
+    bias = torch.zeros(source.num_heads, source.row_dim, dtype = torch.float64)
     stripe = 8192
     for h in range(source.num_heads):
         off = source.head_offsets[h].item()
         size = source.head_vocab_sizes[h].item()
         num_stripes = max(1, rows_per_head // stripe)
-        acc = torch.zeros(ROW_DIM, dtype = torch.float64, device = device)
+        acc = torch.zeros(source.row_dim, dtype = torch.float64, device = device)
         n = 0
         for j in range(num_stripes):
-            lo = off + (size - stripe) * j // max(1, num_stripes - 1)
-            rows = source.read_rows(lo, lo + stripe).to(device)
+            lo = off + max(0, size - stripe) * j // max(1, num_stripes - 1)
+            rows = source.rows_on(lo, min(lo + stripe, off + size), device)
             acc += rows.double().sum(dim = 0)
             n += rows.shape[0]
         bias[h] = (acc / n).cpu()
@@ -377,6 +431,20 @@ def quantize_ngram_table(
     out_path: str,
     K: int,
     devices: list[int],
+    **kwargs,
+) -> dict:
+    """
+    Quantize the n-gram embedding table of the model at model_dir (found by its shard tensors) into
+    out_path. util/convert_ngram.py is the CLI wrapper.
+    """
+    return quantize_ngram_tables([NgramSource(model_dir)], out_path, K, devices, **kwargs)
+
+
+def quantize_ngram_tables(
+    sources: list[NgramSource],
+    out_path: str,
+    K: int,
+    devices: list[int],
     cs: float | None = None,
     cs_search: int = 1,
     chunk_rows: int = 131072,
@@ -386,14 +454,17 @@ def quantize_ngram_table(
     verbose: bool = True,
 ) -> dict:
     """
-    Quantize the full n-gram embedding table of the model at model_dir into out_path. Returns a
-    stats dict. cs = None (default) selects the per-row heuristic; a float fixes the multiplier.
-    Reusable from convert_model.py; util/convert_ngram.py is the CLI wrapper.
+    Quantize the given tables into one file, back to back. Returns a stats dict. cs = None (default)
+    selects the per-row heuristic; a float fixes the multiplier. limit_rows caps every table.
     """
     assert 1 <= K <= 8
     assert cs_search >= 1
-    source = NgramSource(model_dir)
-    total_rows = source.num_rows if limit_rows is None else min(limit_rows, source.num_rows)
+    row_dim = sources[0].row_dim
+    assert all(s.row_dim == row_dim for s in sources), "tables of one file must share a row width"
+    assert row_dim * K % 16 == 0, f"{row_dim}-D rows at K = {K} do not pack into whole words"
+    rows_of = [s.num_rows if limit_rows is None else min(limit_rows, s.num_rows) for s in sources]
+    starts = [sum(rows_of[:i]) for i in range(len(sources))]
+    total_rows = sum(rows_of)
 
     if cs is None:
         gamma, cs_hi = CS_HEURISTIC[K]
@@ -403,50 +474,47 @@ def quantize_ngram_table(
     if cs_search > 1:
         cs_desc += f" x{cs_search} search"
     if verbose:
-        print(f" -- source table: {source.num_rows} rows x {ROW_DIM} in {len(source.shard_files)} shards, "
-              f"quantizing {total_rows} rows at K = {K} (cs = {cs_desc}) on devices {devices}")
+        for s, n in zip(sources, rows_of):
+            print(f" -- source table {s.prefix}: {s.num_rows} rows x {row_dim} in {len(s.shard_files)} tensor(s), "
+                  f"quantizing {n} rows at K = {K} (cs = {cs_desc}) on devices {devices}")
 
     # On resume, reuse the interrupted run's bias vectors (already in the partial file) so all rows
     # of the finished table share one bias; the writer's header-equality check then guarantees the
     # remaining parameters match too
-    bias = read_table_tensor(out_path, f"{source.prefix}.head_bias", torch.float16) if resume else None
-    if bias is None:
-        if verbose:
-            print(f" -- computing per-head bias ({bias_sample_rows} sampled rows/head)")
-        bias = compute_head_bias(source, f"cuda:{devices[0]}", bias_sample_rows, verbose = False)
+    biases = []
+    for s in sources:
+        bias = read_table_tensor(out_path, f"{s.prefix}.head_bias", torch.float16) if resume else None
+        if bias is None:
+            if verbose:
+                print(f" -- computing per-head bias for {s.prefix} ({bias_sample_rows} sampled rows/head)")
+            bias = compute_head_bias(s, f"cuda:{devices[0]}", bias_sample_rows, verbose = False)
+        biases.append(bias)
 
-    # The table is written as individual shard tensors (mirroring the source's shard row count)
-    # laid out consecutively, so consumers can keep it as separate tensors in RAM instead of one
-    # concatenated table, while the byte stream remains a single contiguous row array
-    shard_rows = source.rows_per_shard
-    stream_tensors = []
-    r0 = 0
-    while r0 < total_rows:
-        r1 = min(r0 + shard_rows, total_rows)
-        stream_tensors.append(
-            (f"{source.prefix}.shard_{len(stream_tensors)}.trellis", (r1 - r0, words_per_row(K))))
-        r0 = r1
+    stream_tensors, small_tensors = [], {}
+    for s, n, bias in zip(sources, rows_of, biases):
+        stream_tensors += s.stream_tensors(K, n)
+        small_tensors.update({
+            f"{s.prefix}.head_bias": bias,
+            f"{s.prefix}.head_offsets": s.head_offsets,
+            f"{s.prefix}.head_vocab_sizes": s.head_vocab_sizes,
+            f"{s.prefix}.layer_multipliers": s.layer_multipliers,
+        })
 
     writer = StreamingSafetensorsWriter(
         out_path,
         stream_tensors = stream_tensors,
         stream_dtype_str = "I16",
-        small_tensors = {
-            f"{source.prefix}.head_bias": bias,
-            f"{source.prefix}.head_offsets": source.head_offsets,
-            f"{source.prefix}.head_vocab_sizes": source.head_vocab_sizes,
-            f"{source.prefix}.layer_multipliers": source.layer_multipliers,
-        },
+        small_tensors = small_tensors,
         metadata = {
             "format": "exl3_ngram_trellis",
             "version": str(NGRAM_FORMAT_VERSION),
             "K": str(K),
             "codebook": "mul1",
             "codebook_scale": cs_desc,  # informational only; the chosen cs is folded into row scales
-            "row_dim": str(ROW_DIM),
+            "row_dim": str(row_dim),
             "rows": str(total_rows),
-            "shard_rows": str(shard_rows),
-            "source": os.path.abspath(model_dir),
+            "shard_rows": str(sources[0].rows_per_shard),
+            "source": os.path.abspath(sources[0].model_dir) if sources[0].model_dir else "",
         },
         resume = resume,
         chunk_rows = chunk_rows,
@@ -454,6 +522,16 @@ def quantize_ngram_table(
     start_row = writer.resume_rows
     if verbose and start_row:
         print(f" -- resuming at row {start_row} of {total_rows} ({start_row / total_rows * 100:.1f}% done)")
+
+    def parts_of(lo, hi):
+        """A chunk of the file's row space as (table, first row, last row) pieces: tables are stored
+        back to back and a chunk may cross from one into the next"""
+        out = []
+        for t, (s0, n) in enumerate(zip(starts, rows_of)):
+            a, b = max(lo, s0), min(hi, s0 + n)
+            if a < b:
+                out.append((t, a - s0, b - s0))
+        return out
 
     chunks = [(i, lo, min(lo + chunk_rows, total_rows))
               for i, lo in enumerate(range(start_row, total_rows, chunk_rows))]
@@ -473,7 +551,7 @@ def quantize_ngram_table(
     def worker(dev_idx):
         dev = f"cuda:{dev_idx}"
         try:
-            bias_d = bias.to(dev)
+            biases_d = [b.to(dev) for b in biases]
             while True:
                 try:
                     chunk_i, lo, hi = work.get_nowait()
@@ -483,13 +561,16 @@ def quantize_ngram_table(
                     cv.wait_for(lambda: len(results) < max_pending or state["error"])
                     if state["error"]:
                         return
-                rows = source.read_rows(lo, hi).to(dev)
-                heads = source.head_of_rows(lo, hi, dev)
-                with torch.cuda.device(dev):
-                    packed, deq = quantize_rows(rows, bias_d[heads], K, cs, cs_search)
-                e = (deq - rows.float()).square().sum().double().item()
-                s = rows.float().square().sum().double().item()
-                packed_cpu = packed.cpu()
+                packed_parts, e, s = [], 0.0, 0.0
+                for t, a, b in parts_of(lo, hi):
+                    rows = sources[t].rows_on(a, b, dev)
+                    heads = sources[t].head_of_rows(a, b, dev)
+                    with torch.cuda.device(dev):
+                        packed, deq = quantize_rows(rows, biases_d[t][heads], K, cs, cs_search)
+                    e += (deq - rows).square().sum().double().item()
+                    s += rows.square().sum().double().item()
+                    packed_parts.append(packed.cpu())
+                packed_cpu = packed_parts[0] if len(packed_parts) == 1 else torch.cat(packed_parts)
                 with cv:
                     acc["err_sq"] += e
                     acc["src_sq"] += s
@@ -536,7 +617,7 @@ def quantize_ngram_table(
     }
     if verbose:
         print(f" -- done: {processed} rows in {elapsed:.0f} s "
-              f"({processed * ROW_DIM / max(elapsed, 1e-9) / 1e6:.1f}M weights/s), "
+              f"({processed * row_dim / max(elapsed, 1e-9) / 1e6:.1f}M weights/s), "
               f"rfn {rfn:.5f}{' (resumed portion)' if start_row else ''}, "
               f"{stats['bytes'] / 1024**3:.2f} GB -> {out_path}")
         for d in devices:
@@ -546,12 +627,12 @@ def quantize_ngram_table(
 
 class NgramTableReader:
     """
-    On-demand reader for a quantized n-gram table file: parses the safetensors header once, keeps
-    file offsets and the small tensors, and serves arbitrary row indices with pread + GPU decode.
-    This is the deferred-load backing store for the model's n-gram embedding module.
+    On-demand reader for one table of a quantized n-gram table file: parses the safetensors header
+    once, keeps file offsets and the small tensors, and serves arbitrary row indices with pread + GPU
+    decode. prefix names the table in a file that holds several.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, prefix: str | None = None):
         self.path = path
         with open(path, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
@@ -559,8 +640,11 @@ class NgramTableReader:
         self.metadata = header.pop("__metadata__", {})
         assert self.metadata.get("format") == "exl3_ngram_trellis", "not an exl3 ngram table file"
         self.K = int(self.metadata["K"])
+        self.row_dim = int(self.metadata.get("row_dim", ROW_DIM))
         self.cs = self.metadata.get("codebook_scale")  # informational string, not needed for decode
         self.data_base = 8 + hlen
+        if prefix is not None:
+            header = {k: v for k, v in header.items() if k.startswith(prefix + ".")}
         self.tensors = header
 
         def resolve(suffix):
@@ -577,14 +661,13 @@ class NgramTableReader:
                 raw = f.read(info["data_offsets"][1] - info["data_offsets"][0])
             return torch.frombuffer(bytearray(raw), dtype = dtype).view(*info["shape"])
 
-        self.head_bias = load_small("ngram_embedding.head_bias", torch.float16)
-        self.head_offsets = load_small("ngram_embedding.head_offsets", torch.int64)
-        self.head_vocab_sizes = load_small("ngram_embedding.head_vocab_sizes", torch.int64)
-        self.layer_multipliers = load_small("ngram_embedding.layer_multipliers", torch.int64)
+        self.head_bias = load_small(".head_bias", torch.float16)
+        self.head_offsets = load_small(".head_offsets", torch.int64)
+        self.head_vocab_sizes = load_small(".head_vocab_sizes", torch.int64)
+        self.layer_multipliers = load_small(".layer_multipliers", torch.int64)
 
-        # Table data: sharded shard_N.trellis tensors (current converter output) or a single
-        # .trellis tensor (older files). Shards are laid out consecutively, so either way the
-        # data is one contiguous row array
+        # Table data: sharded shard_N.trellis tensors or a single .trellis tensor. Shards are laid
+        # out consecutively, so either way the data is one contiguous row array
         shard_keys = [k for k in header if k.endswith(".trellis") and ".shard_" in k]
         if shard_keys:
             shard_keys.sort(key = lambda k: int(k.rsplit(".shard_", 1)[1].split(".")[0]))
@@ -596,9 +679,9 @@ class NgramTableReader:
             self.row_words = infos[0]["shape"][1]
             info0 = infos[0]
         else:
-            info0 = header[resolve("ngram_embedding.trellis")]
+            info0 = header[resolve(".trellis")]
             self.num_rows, self.row_words = info0["shape"]
-        assert self.row_words == words_per_row(self.K)
+        assert self.row_words == words_per_row(self.K, self.row_dim)
         self.row_bytes = self.row_words * 2
         self.trellis_offset = self.data_base + info0["data_offsets"][0]
         self.fd = os.open(path, os.O_RDONLY)
@@ -625,7 +708,7 @@ class NgramTableReader:
         return self._codebooks[device]
 
     def dequant(self, indices: torch.Tensor, device, out_dtype = torch.half) -> torch.Tensor:
-        """Gather + decode rows: returns (N, 160) on device."""
+        """Gather + decode rows: returns (N, row_dim) on device."""
         packed = self.read_rows_packed(indices).to(device)
         idx = indices.to(device, torch.int64)
         heads = (torch.searchsorted(self.head_offsets.to(device), idx, right = True) - 1) \
@@ -636,7 +719,7 @@ class NgramTableReader:
 
 def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
     """
-    First conversion step for models with a hashed n-gram embedding table: produce the quantized
+    First conversion step for models with hashed n-gram embedding tables: produce the quantized
     table file in the output directory (resumable), or copy a pre-quantized file given via
     --ngram_file, then add it to the model's tensor collection so the table modules pick up the
     .trellis format for the calibration forward pass. Returns the table file path, or None when
@@ -653,11 +736,15 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
 
     ngram_file = args.get("ngram_file")
     stc = config.stc
-    fixed = [m.key for m in ngram_modules
-             if not stc.has_tensor(f"{m.key}.shard_0.weight") and stc.has_tensor(f"{m.key}.weight")]
+
+    def source_dtype(m):
+        name = f"{m.key}.shard_0.weight" if stc.has_tensor(f"{m.key}.shard_0.weight") else f"{m.key}.weight"
+        return stc.file_headers[stc.tensor_file_map[name]][name]["dtype"]
+
+    fixed = [m.key for m in ngram_modules if source_dtype(m) in ("F8_E4M3", "F8_E5M2")]
     if not ngram_file and fixed:
-        # Fixed-width tables stored as one (fp8 + E8M0 scale) tensor each (DeepSeek-V4.1's Engram layers)
-        # have no trellis codec yet: they go into the output as they are, streamed file to file
+        # Tables stored as one (fp8 + E8M0 scale) tensor each (DeepSeek-V4.1's Engram layers) have no
+        # trellis codec yet: they go into the output as they are, streamed file to file
         assert len(fixed) == len(ngram_modules), "mixed n-gram table formats are not supported"
         if args.get("ngram_bits"):
             print(f" !! --ngram_bits ignored: {', '.join(fixed)} are fixed-width tables and are copied unquantized")
@@ -667,14 +754,13 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
         copy_tensors_streamed(stc, names, out_path)
         config.stc.add_tensor_files(out_path, warn_if_override = False)
         return out_path
-    assert len(ngram_modules) == 1, "multiple n-gram tables not supported by the conversion step yet"
-    prefix = ngram_modules[0].key
     if ngram_file:
         with open(ngram_file, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(hlen))
-        assert f"{prefix}.trellis" in header or f"{prefix}.shard_0.trellis" in header, \
-            f"--ngram_file does not contain {prefix}[.shard_0].trellis (run util/rekey_ngram.py on older files)"
+        for m in ngram_modules:
+            assert f"{m.key}.trellis" in header or f"{m.key}.shard_0.trellis" in header, \
+                f"--ngram_file does not contain {m.key}[.shard_0].trellis (run util/rekey_ngram.py on older files)"
         if os.path.abspath(ngram_file) != os.path.abspath(out_path):
             if not os.path.exists(out_path) or os.path.getsize(out_path) != os.path.getsize(ngram_file):
                 print(f" -- Copying pre-quantized n-gram table: {ngram_file}")
@@ -685,9 +771,9 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
     else:
         K = args.get("ngram_bits") or max(1, min(8, round(args["bits"])))
         devices = [int(d) for d in args["devices"].split(",")]
-        print(f" -- Quantizing n-gram embedding table at K = {K}")
-        quantize_ngram_table(
-            model_dir = args["in_dir"],
+        print(f" -- Quantizing n-gram embedding table{'s' if len(ngram_modules) > 1 else ''} at K = {K}")
+        quantize_ngram_tables(
+            [ngram_source_for(m, stc) for m in ngram_modules],
             out_path = out_path,
             K = K,
             devices = devices,
@@ -695,6 +781,19 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
         )
 
     # calibration forwards must see the quantized table: the modules detect .trellis over the
-    # source .shard_N.weight tensors automatically
+    # source weight tensors automatically
     config.stc.add_tensor_files(out_path, warn_if_override = False)
     return out_path
+
+
+def ngram_source_for(module, stc) -> NgramSource:
+    """The source table of an NGramEmbedding module, with the module's own hash layout and row transform"""
+    sizes, mult = module.hash_params
+    return NgramSource(
+        file_map = stc.tensor_file_map,
+        prefix = module.key,
+        row_dim = module.head_dim,
+        head_vocab_sizes = sizes,
+        layer_multipliers = mult,
+        row_filter = module._fp8_round_trip if module.fp8_rows else None,
+    )

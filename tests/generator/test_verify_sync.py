@@ -42,6 +42,7 @@ def _speculative_generator(monkeypatch, job):
     g.model = SimpleNamespace(caps = (), forward = lambda input_ids, params: torch.zeros(1, 3, 8))
     g.draft_model = g.cache = None
     g.target_recurrent = False
+    g.prev_ids = 0
     g.draft_sample_pinned = torch.empty((32, 8), dtype = torch.long)
     g._stage_arena = lambda rows, width, with_positions: (None, (None, None, None))
     g._upload_arena = lambda arena, rows, width, with_positions, params: None

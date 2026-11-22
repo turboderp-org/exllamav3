@@ -111,7 +111,8 @@ void quantize_tiles_frac_kernel
     uint16_t* __restrict__ output_indices_ptr,
     half* __restrict__ temp_costs_ptr,
     uint16_t* __restrict__ temp_edges_ptr,
-    const half2* __restrict__ lut
+    const half2* __restrict__ lut,
+    const int
 )
 {
     static_assert(L % 32 == 0, "the 16-position pattern must tile both halves of the ring");

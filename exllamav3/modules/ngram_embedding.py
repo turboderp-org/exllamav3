@@ -54,6 +54,8 @@ class NGramEmbedding(Module):
         qmap: str | None = None,
         head_vocab_sizes: list | None = None,
         layer_multipliers: list | None = None,
+        segment: bool = True,
+        fp8_rows: bool = False,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "NGramEmbedding quantizes via util/convert_ngram.py, not the qmap pipeline"
@@ -65,6 +67,13 @@ class NGramEmbedding(Module):
         self.ple_embed_dim = ple_embed_dim
         self.head_dim = ple_embed_dim // self.num_heads
         self.eos_token_id = eos_token_id
+        # segment False (Hy4): eos_token_id only pads the start of a sequence, an n-gram is free to span
+        # a later occurrence of it. The hash then looks for a boundary id no token carries
+        self.segment = segment
+        self.boundary_id = eos_token_id if segment else -1
+        # fp8_rows (Hy4): the model reads every row through a per-row e4m3 round trip (scale amax / 448).
+        # Applied to unquantized source rows; a quantized table encodes the rounded rows
+        self.fp8_rows = fp8_rows
         # None: defer to config.infer_params.ngram_stream_from_disk at load time (the load-time
         # option; also EXL3_NGRAM_STREAM). An explicit bool here overrides it
         self.stream_from_disk = stream_from_disk
@@ -174,9 +183,9 @@ class NGramEmbedding(Module):
     def _set_table(self, table: RowTable, quantized: bool):
         self.table = table
         self.num_rows = table.num_rows
-        self.K = (table.row_words - 1) * 16 // ROW_DIM if quantized else None
-        assert table.row_words == (words_per_row(self.K) if quantized else self.head_dim)
-        assert not quantized or self.head_dim == ROW_DIM, f"expected {ROW_DIM}-D embedding rows, got {self.head_dim}"
+        self.K = (table.row_words - 1) * 16 // self.head_dim if quantized else None
+        assert table.row_words == (words_per_row(self.K, self.head_dim) if quantized else self.head_dim), \
+            f"{self.key}: table rows do not hold {self.head_dim}-D embeddings"
 
     @override
     def unload(self):
@@ -202,7 +211,7 @@ class NGramEmbedding(Module):
 
     @override
     def weights_numel(self):
-        return self.num_rows * ROW_DIM
+        return self.num_rows * self.head_dim
 
     def tp_export(self, plan, producer):
         """
@@ -221,6 +230,8 @@ class NGramEmbedding(Module):
                 "ple_embed_dim": self.ple_embed_dim,
                 "eos_token_id": self.eos_token_id,
                 "out_dtype": self.out_dtype,
+                "segment": self.segment,
+                "fp8_rows": self.fp8_rows,
             },
             "table": self.table.export(self.config.stc),
             # DeepSeek-V4.1: FP8 rows with an E8M0 scale table beside them, streamed the same way
@@ -250,7 +261,7 @@ class NGramEmbedding(Module):
         return module
 
     def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
-        """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
+        """Unique row indices (any device) -> decoded (N, head_dim) rows on the module's device.
         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
         raw = self.table.fetch(uids.to("cpu", torch.int64)).to(self.device)
         if self.K:
@@ -259,8 +270,17 @@ class NGramEmbedding(Module):
                                         right = True) - 1).clamp(0, self.num_heads - 1)
             rows = dequant_rows(raw, self.K, self.codebook, self.head_bias.float()[heads])
         else:
-            rows = raw.float()
+            rows = self._fp8_round_trip(raw).float() if self.fp8_rows else raw.float()
         return rows.to(out_dtype)
+
+    @staticmethod
+    def _fp8_round_trip(rows: torch.Tensor) -> torch.Tensor:
+        """Per-row e4m3 round trip, in fp32: the reference runs it in the model dtype, where the
+        division and the product round a second time"""
+        rows = rows.float()
+        fmax = torch.finfo(torch.float8_e4m3fn).max
+        scale = rows.abs().amax(dim = -1, keepdim = True).clamp(min = 1e-12) / fmax
+        return (rows / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
 
     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
         # mirrors the reference implementation: n-grams never span an eos boundary; positions
@@ -269,7 +289,7 @@ class NGramEmbedding(Module):
             return token_ids
         batch_size, seq_len = token_ids.shape
         positions = torch.arange(seq_len, device = token_ids.device)
-        eos_positions = torch.where(token_ids == self.eos_token_id, positions, -1)
+        eos_positions = torch.where(token_ids == self.boundary_id, positions, -1)
         previous_eos_inclusive = torch.cummax(eos_positions, dim = 1).values
         previous_eos = torch.cat(
             [eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]], dim = 1)
@@ -308,7 +328,7 @@ class NGramEmbedding(Module):
         uids, inverse = torch.unique(flat, return_inverse = True)
         rows = self.fetch_rows(uids, out_dtype or self.out_dtype or torch.half)
         out = rows[inverse.to(self.device)]
-        return out.view(bsz, seq_len, H * ROW_DIM)
+        return out.view(bsz, seq_len, H * self.head_dim)
 
     def forward_reference(self, x: torch.Tensor, params: dict,
                           out_dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -329,20 +349,20 @@ class NGramEmbedding(Module):
         U = ext.ngram_hash_cpu(
             history, history.shape[1] - self.context_len,
             self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
-            self.heads_per_ngram, self.eos_token_id,
+            self.heads_per_ngram, self.boundary_id,
             pin.uids, pin.inverse, pin.heads)
         return pin.uids[:U], False
 
     def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
         if not self.K:
-            rows = packed.float()
+            rows = self._fp8_round_trip(packed).float() if self.fp8_rows else packed.float()
             if self.scale is not None:
                 s = self.scale.lookup(pin.uids[:U], U, lambda ids, _: (ids, True),
                                       lambda r, *_: (r.float() - 127.0).exp2(), packed.device)
                 rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
             return rows
         heads = pin.heads[:U].to(packed.device, non_blocking = True)
-        rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = packed.device)
+        rows = torch.empty((U, self.head_dim), dtype = torch.half, device = packed.device)
         ext.ngram_dequant(packed, self.K, heads, self.head_bias, rows, False)
         return rows
 

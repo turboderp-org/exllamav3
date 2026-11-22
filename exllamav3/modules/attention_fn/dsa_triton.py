@@ -925,7 +925,7 @@ def dsa_attn(
     q_split = q_pe is not None
     if q_split:
         # Split absorbed queries exclude every feature that would touch the packed layout
-        assert not (win_len and kv_chunk is not None) and sinks is None and \
+        assert not (win_len and kv_chunk is not None) and \
             derot_inv_freq is None and groups == 1 and not group_major and \
             multirow is None and not nc_block and out_latent
         H, R, D_c = q.shape

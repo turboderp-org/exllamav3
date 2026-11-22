@@ -134,9 +134,36 @@ class BCMLA:
             h32 = h32,
         )
 
+        # Layers with attention sinks or a sliding window (Hy4) run on the gathered kernels at any
+        # context length: the module hands over the selection each step (its window or visible
+        # prefix, or its own indexer's picks), so to the graph they are shared-indexer layers that
+        # are always in the selection regime. The elementwise output gate is one more projection
+        # of the block input, applied before o_proj
+        self.gathered = m.key_sinks is not None or m.window > 0
+        if self.gathered:
+            self.indexer_mode = "shared"
+            self.index_topk = m.window or m.index_topk
+            self.index_kpool = 0
+            self.cache_kidx = None
+            self.k_pad = -(-self.index_topk // 32) * 32
+            self.bc.set_indexer(
+                mode = 2, wq_b = None, wk_w = None, k_norm_w = None, k_norm_b = None,
+                weights_w = None, kidx = None,
+                n_heads = m.index_n_heads, head_dim = m.index_head_dim, topk = self.index_topk,
+            )
+            self.sinks = m.sinks.float().contiguous() if m.sinks is not None else None
+            self.bc.set_gathered(
+                sinks = self.sinks,
+                out_gate = m.out_gate.inner.bc if m.out_gate is not None else None,
+            )
+            self.slot_indices = {}
+            self.configured = set()
+            return
+
         # DSA lightning indexer (GLM-5.2). Full layers project/norm/rope/append keys every
         # step and score + select in the sparse regime; shared layers gather through an
         # externally produced index list (patched pointer). See mla_attention.h
+        self.sinks = None
         self.indexer_mode = m.indexer_mode
         self.index_topk = m.index_topk
         # kpool (GLM5.3): the key plane packs [k || gate_scores] rows and selection runs over
@@ -260,8 +287,10 @@ class BCMLA:
         target = 2 * _get_sm_count(dev)
         splits_cap = max(1, min(target // programs, 128))
 
+        # A gathered layer never runs the dense flash-decoding pair
+        dense = not self.gathered
         cache_t = "*i32" if self.quant else "*fp16"
-        k_split = _compile_kernel(dev, _mla_decode_split_kernel,
+        k_split = dense and _compile_kernel(dev, _mla_decode_split_kernel,
             {"q_lat": "*fp16", "q_pe": "*fp16", "ckv_cache": cache_t, "kpe_cache": "*fp16",
              "ckv_scales": "*fp16", "h32": "*fp16", "block_table": "*i32",
              "cache_seqlens": "*i32", "out": "*fp16", "partial_o": "*fp32",
@@ -276,16 +305,16 @@ class BCMLA:
                  D_r = D_r, scale = float(self.sm_scale), CAUSAL = True, FINAL = False,
                  BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
                  BLOCK_N = block_n),
-            n_warps, n_stages)
+            n_warps, n_stages) or None
 
-        k_combine = _compile_kernel(dev, _mla_decode_combine_kernel,
+        k_combine = dense and _compile_kernel(dev, _mla_decode_combine_kernel,
             {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
              "num_splits": "i32"}
             | {n: "constexpr" for n in (
                 "QC", "bsz", "q_len", "n_q_heads", "D_c", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
             dict(QC = self.k_bits, bsz = bsz, q_len = q_len, n_q_heads = H, D_c = D_c,
                  BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows),
-            4, 1)
+            4, 1) or None
 
         unfold_bm = min(64, triton.next_power_of_2(max(R, 16)))
         k_unfold = _compile_kernel(dev, _mla_unfold_kernel,
@@ -313,8 +342,8 @@ class BCMLA:
         q_lat = sbuf("bcm_qlat", H, R, D_c)
         o_lat = sbuf("bcm_olat", H, R, D_c)
         o = sbuf("bcm_o", R, H * D_v)
-        partial_o = sbuf("bcm_po", programs * splits_cap * block_rows * D_c, dtype = torch.float)
-        partial_ml = sbuf("bcm_ml", programs * splits_cap * block_rows * 2, dtype = torch.float)
+        partial_o = sbuf("bcm_po", programs * splits_cap * block_rows * D_c if dense else 1, dtype = torch.float)
+        partial_ml = sbuf("bcm_ml", programs * splits_cap * block_rows * 2 if dense else 1, dtype = torch.float)
         if self.quant:
             qtmp = sbuf("bcm_qtmp", R, D_c // 32 * self.k_bits, dtype = torch.int)
             stmp = sbuf("bcm_stmp", R, D_c // 32)
@@ -332,6 +361,8 @@ class BCMLA:
 
         if self.indexer_mode is not None:
             self._configure_dsa(bsz, q_len, regime)
+        if m.out_gate is not None:
+            self.bc.configure_slot_gate(bsz, q_len, regime, sbuf("bcm_gate", R, H * D_v))
 
     def _configure_dsa(self, bsz: int, q_len: int, regime: int):
         from .mla_triton import (
@@ -511,7 +542,7 @@ class BCMLA:
                 "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
                 "SEQ", "MULTIROW", "OUT_LATENT", "QC")}
             consts_c = dict(
-                H = H, D_c = D_c, D_r = D_r, HAS_SINKS = False, DEROTATE = False,
+                H = H, D_c = D_c, D_r = D_r, HAS_SINKS = self.sinks is not None, DEROTATE = False,
                 HPG = 0, BLOCK_H = BLOCK_H, BLOCK_D = 128,
                 SEQ = 1, MULTIROW = 0, OUT_LATENT = 1,
                 QC = self.k_bits if self.quant else 0,
@@ -542,7 +573,16 @@ class BCMLA:
         if self.index_kpool and bsz > 1:
             return None
 
-        if self.indexer_mode is None:
+        ext_k_len = 0
+        if self.gathered:
+            sel = params.get("mla_selection")
+            if sel is None or sel[0].shape[1] != self.k_pad:
+                return None
+            ext_indices, ext_k_len = sel
+            regime, t_total = 1, 0
+            if bsz == 1:
+                position = params["_mla_host_seqlens"][0]
+        elif self.indexer_mode is None:
             regime, t_total, ext_indices = 0, 0, None
         else:
             host_seqlens = params.get("_mla_host_seqlens")
@@ -570,7 +610,7 @@ class BCMLA:
             self.configured.add((bsz, q_len, regime))
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
-                    position_ids, regime, t_total, ext_indices)
+                    position_ids, regime, t_total, ext_indices, ext_k_len)
         if regime and self.indexer_mode == "full":
             params["dsa_topk_indices"] = self.slot_indices[(bsz, q_len)]
         return y
@@ -596,6 +636,7 @@ def build_bc_mla(module, layer):
     m = module
     H, D_c, D_r, D_v = m.num_q_heads, m.kv_lora_rank, m.qk_rope_head_dim, m.v_head_dim
     dev = torch.device(m.device)
+    gathered = m.key_sinks is not None or m.window > 0
     if not (
         bc_attn_enable and
         # NoPE models (D_r 0) compile the rope stages out, as do models whose pe slices are
@@ -621,10 +662,22 @@ def build_bc_mla(module, layer):
         # The graph runs attention straight into o_proj; a head-wise output gate (Ling 3.x)
         # sits between them and is only applied by the dispatch path
         m.head_gate is None and
+        # The elementwise output gate (Hy4) is one more graph projection of the block input, wired
+        # into the gathered form of the graph only
+        (m.out_gate is None or (
+            gathered and _proj_ok(m.out_gate, in_features = m.hidden_size, out_features = H * D_v)
+        )) and
+        # Attention sinks and sliding windows (Hy4) run on the gathered kernels through a selection
+        # of fixed stride, which takes a window or an indexer budget to bound it
+        (not gathered or (
+            (m.key_sinks is None or m.sinks is not None) and (m.window > 0 or m.indexer_mode is not None)
+        )) and
         # DSA indexer layers (GLM-5.2): full layers need the quantized wq_b, the fp16 key/
-        # weight heads, the biased key norm and the paged key plane on this cache layer
-        (m.indexer_mode is None or (
+        # weight heads, the biased key norm and the paged key plane on this cache layer. A gathered
+        # layer's indexer stays with the module, which hands the graph its selection
+        (m.indexer_mode is None or gathered or (
             _is_pow2(m.index_head_dim) and m.qk_rope_head_dim <= m.index_head_dim and
+            m.index_kpool_mode == "gate" and
             # kpool (GLM5.3): pools never straddle pages, selection counts whole pools, and
             # full layers need the gate/APE tensors and the pooled plane
             (not m.index_kpool or (
@@ -641,7 +694,7 @@ def build_bc_mla(module, layer):
                 m.idx_wk.inner.weight.dtype == torch.half and
                 getattr(m.idx_weights.inner, "weight", None) is not None and
                 m.idx_weights.inner.weight.dtype == torch.half and
-                m.idx_k_norm.weight is not None and m.idx_k_norm.bias is not None and
+                m.idx_k_norm.weight is not None and getattr(m.idx_k_norm, "bias", None) is not None and
                 layer.get_idx() is not None
             ))
         )) and

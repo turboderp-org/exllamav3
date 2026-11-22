@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash, prev_ids
 from .filter import Filter
 import random
 import time
@@ -1613,6 +1613,8 @@ class Job:
                     "mm_span_prefix": mm_span_prefix,
                 }
                 gen = self.generator
+                if gen.prev_ids:
+                    params["prev_ids"] = prev_ids([seq], [prefill_start], gen.prev_ids)
                 dm = gen.draft_model
                 if dm:
                     params.update(dm.draft_verifier_params)

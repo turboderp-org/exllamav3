@@ -150,17 +150,19 @@ def quantize_tiles(tiles, quant_args: dict):
     Quantize a batch of 16x16 tiles on the current device.
 
     tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
-    reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
-    (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
+    reconstructed float tile values and the short encoded indices used later for packing. Rows of another even
+    length (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting
+    rings.
     """
     if frac_k(quant_args["K"]) is not None:
         return quantize_tiles_frac(tiles, quant_args)
     tiles = tiles.contiguous()
-    assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
     mcg, mul1 = quant_codebook(quant_args)
+    assert tiles.shape[1] == 256 or (mul1 and tiles.shape[1] % 2 == 0), \
+        "quantize_tiles: tile length must be 256, or an even row length with the mul1 codebook"
     cb = 2 if mul1 else 1 if mcg else 0
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
@@ -825,7 +827,7 @@ def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbo
     blockwise_preapply_had_l_(Ho, had_n)
     Ho /= Ho.diagonal().mean().clamp_min(1e-30)
     Ho.diagonal().add_(quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025)))
-    L_out, Ho = block_ldl(Ho, 16, quant_args, verbose)
+    L_out, Ho = block_ldl(Ho, 16, quant_args, verbose, debug_info = {"key": f"{quant_args.get('key')}.out", "sv": sv})
     L_out.diagonal().fill_(0.0)
     return L_out.to(device), Ho.to(device)
 

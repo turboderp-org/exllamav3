@@ -21,7 +21,8 @@ class RMSNorm(Module):
         constant_scale: float = 1.0,
         span_heads: bool = False,
         unweighted: bool = False,
-        groups: int = 1
+        groups: int = 1,
+        alt_keys: list[str] | None = None,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -42,6 +43,9 @@ class RMSNorm(Module):
         assert groups == 1 or not span_heads
 
         self.tensor_key = f"{self.key}.weight" if tensor_weight_suffix else f"{self.key}"
+        # Source checkpoints that keep a grouped weight as one tensor per group: the rows are stacked at
+        # load, and the module's own tensor is the stacked one
+        self.alt_keys = alt_keys
 
     @override
     def optimizer_targets(self):
@@ -51,7 +55,14 @@ class RMSNorm(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         if not self.unweighted:
-            weight = self.config.stc.get_tensor(self.tensor_key, self.device, float2half = True, allow_bf16 = True)
+            stc = self.config.stc
+            if self.alt_keys and not stc.has_tensor(self.tensor_key):
+                weight = torch.stack([
+                    stc.get_tensor(k, self.device, float2half = True, allow_bf16 = True, no_defer = True)
+                    for k in self.alt_keys
+                ]).half().contiguous()
+            else:
+                weight = stc.get_tensor(self.tensor_key, self.device, float2half = True, allow_bf16 = True)
             self._numel = weight.numel()
             self.weight = nn.Parameter(weight, requires_grad = False)
         else:

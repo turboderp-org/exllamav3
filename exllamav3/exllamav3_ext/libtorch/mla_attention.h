@@ -113,6 +113,13 @@ struct BC_MLAttention
     c10::optional<at::Tensor> idx_kpool_ape;   // (P, D_i) fp16
     c10::optional<at::Tensor> cache_kpool;     // flat (pages * page_size / P, D_i) fp16
 
+    // Per-head attention sinks (fp32, one logit per head, folded in by the gathered combine) and an
+    // elementwise sigmoid gate on the attention output, projected from the block input (Hy4). Both
+    // live on the gathered attention path, so such a layer always runs regime 1 through an external
+    // selection (mode 2): its window or visible prefix, or its indexer's picks, made by the caller
+    c10::optional<at::Tensor> sinks;
+    std::shared_ptr<BC_LinearEXL3> out_gate;
+
     struct Slot
     {
         bool configured = false;
@@ -138,6 +145,7 @@ struct BC_MLAttention
         at::Tensor partial_o, partial_ml;
         at::Tensor qtmp, stmp;   // quant append temporaries
         at::Tensor q_pe4, kpe4;  // rope views (bsz, q_len, heads, D_r)
+        at::Tensor gate;         // (R, H * D_v) fp16, output gate logits (out_gate only)
 
         std::shared_ptr<TritonKernel> k_stage;
         std::shared_ptr<TritonKernel> k_absorb;
@@ -225,7 +233,15 @@ struct BC_MLAttention
         c10::optional<at::Tensor> kpool_plane = {}
     );
 
+    void set_gathered
+    (
+        c10::optional<at::Tensor> sinks,
+        std::shared_ptr<BC_LinearEXL3> out_gate
+    );
+
     bool needs_configure(int bsz, int q_len, int regime);
+
+    void configure_slot_gate(int bsz, int q_len, int regime, at::Tensor gate);
 
     void configure_slot
     (
@@ -304,7 +320,8 @@ struct BC_MLAttention
         const c10::optional<at::Tensor>& position_ids,
         int regime,
         int64_t t_total,
-        const c10::optional<at::Tensor>& ext_indices
+        const c10::optional<at::Tensor>& ext_indices,
+        int ext_k_len
     );
 
     void run_gr
@@ -322,6 +339,7 @@ struct BC_MLAttention
         int regime,
         int64_t t_total,
         const c10::optional<at::Tensor>& ext_indices,
+        int ext_k_len,
         Graph* graph
     );
 

@@ -19,6 +19,8 @@ mix(streams (R, H, D) fp32) -> post (R, H), comb (R, H, H), collapsed (R, D):
   comb = sinkhorn(softmax(mixv[2H:] * s2 + base[2H:]))   (iters alternating row/col norms)
   collapsed = sum_h pre[h] * streams[h]
 
+A site without a comb matrix (fn with 2H rows, hc_mix_nocomb) skips the sinkhorn and adds post_eps to post.
+
 Two launches, no grid-wide sync, deterministic (fixed reduction order, no atomics):
   K1 partials: grid (chunksA, R); each block reduces its column chunk to M + 1 partials.
   K2 finalize: grid (chunksC, R); EVERY block re-reduces the tiny partial matrix and
@@ -138,10 +140,12 @@ void hc_mix_finalize_kernel
     const float* __restrict__ pre_in,    // (R, H) carried pre weights (carry 1), may be null
     float* __restrict__ pre_out,         // (R, H) this site's own pre weights, written when non-null
     const int carry,                     // collapse with 0: own pre, 1: pre_in, 2: stream 0 (first carried site)
+    const float post_eps,
     const HcNormArgs norm = {}
 )
 {
     constexpr int M = M_;
+    constexpr bool COMB = M_ == 2 * H + H * H;
     const int r = blockIdx.y;
     const int row_len = H * D;
 
@@ -195,9 +199,9 @@ void hc_mix_finalize_kernel
     {
         if (threadIdx.x < H)
             post[(size_t) r * H + threadIdx.x] =
-                2.0f * sigmoidf_(fmaf(mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x]));
+                2.0f * sigmoidf_(fmaf(mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x])) + post_eps;
 
-        if (threadIdx.x < H * H)
+        if (COMB && threadIdx.x < H * H)
         {
             const unsigned mask = (H * H == 32) ? 0xffffffffu : ((1u << (H * H)) - 1u);
             float v = fmaf(mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x]);
@@ -865,7 +869,7 @@ void hc_apply_kernel
     }
 }
 
-// Shared launch logic. mode: fn rows M = 2H + H^2 (mix) or H (head)
+// Shared launch logic. mode: fn rows M = 2H + H^2 (mix), 2H (mix without a comb matrix) or H (head)
 
 static void hc_mix_launch
 (
@@ -885,7 +889,8 @@ static void hc_mix_launch
     const HcNormArgs* nrm = nullptr,           // fold the following RMSNorm into the finalize
     const float* pre_in = nullptr,             // carried pre weights (see hc_mix_carry)
     float* pre_out = nullptr,
-    int carry = 0
+    int carry = 0,
+    float post_eps = 0.0f
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -899,8 +904,10 @@ static void hc_mix_launch
     int row_len = H * D;
     int M = fn.size(0);
     bool head = M == H;
+    bool nocomb = M == 2 * H;
     TORCH_CHECK(H == 4, "hc_mix: H = 4 only");
-    TORCH_CHECK(head || M == 2 * H + H * H, "hc_mix: fn rows must be H or 2H + H^2");
+    TORCH_CHECK(head || nocomb || M == 2 * H + H * H, "hc_mix: fn rows must be H, 2H or 2H + H^2");
+    TORCH_CHECK(!nocomb || (!pend && !nrm && !carry), "hc_mix: no folds or carried weights without a comb matrix");
     TORCH_CHECK(fn.size(1) == row_len && D % 4 == 0, "hc_mix: dims");
     bool fn_half = fn.dtype() == at::kHalf;
     if (!fn_half) TORCH_CHECK_DTYPE(fn, kFloat);
@@ -932,7 +939,7 @@ static void hc_mix_launch
         (const float*) streams.data_ptr(), (const float*) partials.data_ptr(), \
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
-        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry
+        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry, post_eps
     if (pend || nrm)
     {
         // The pending apply runs inside the partials kernel when each stream is a whole number of
@@ -980,7 +987,7 @@ static void hc_mix_launch
                 (const float*) streams.data_ptr(), (const float*) partials.data_ptr(),
                 (const float*) base.data_ptr(), (const float*) scale.data_ptr(),
                 post_p, comb_p, collapsed.data_ptr(),
-                D, n_chunks_a, chunk_cols_c_n, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry, *nrm
+                D, n_chunks_a, chunk_cols_c_n, rms_eps, hc_eps, sinkhorn_iters, pre_in, pre_out, carry, post_eps, *nrm
             );
         }
         else
@@ -988,7 +995,20 @@ static void hc_mix_launch
         cuda_check(cudaPeekAtLastError());
         return;
     }
-    if (!head)
+    if (nocomb)
+    {
+        if (fn_half)
+            hc_mix_partials_kernel<4, 8, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
+        else
+            hc_mix_partials_kernel<4, 8, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
+        cuda_check(cudaPeekAtLastError());
+        float* post_p = (float*) post->data_ptr();
+        if (half_out)
+            hc_mix_finalize_kernel<4, 8, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, nullptr));
+        else
+            hc_mix_finalize_kernel<4, 8, false, false><<<grid_c, NUM_THREADS, 0, stream>>>(ARGS_C(post_p, nullptr));
+    }
+    else if (!head)
     {
         if (fn_half)
             hc_mix_partials_kernel<4, 24, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
@@ -1056,6 +1076,53 @@ void hc_mix
         &comb,
         collapsed,
         nullptr
+    );
+}
+
+// hc_mix for a site without a comb matrix: every stream takes post[h] * y in the residual update, and
+// post = 2 sigmoid(.) + post_eps
+void hc_mix_nocomb
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& fn,                // (2H, H * D) float or half
+    const at::Tensor& base,              // (2H) float
+    const at::Tensor& scale,             // (2) float
+    double rms_eps,
+    double hc_eps,
+    double post_eps,
+    at::Tensor partials,                 // (R, chunks, 2H + 1) float workspace
+    at::Tensor post,                     // (R, H) float out
+    at::Tensor collapsed                 // (R, D) float or half out
+)
+{
+    TORCH_CHECK(streams.dim() == 3 && fn.size(0) == 2 * streams.size(1), "hc_mix_nocomb: fn must have 2H rows");
+    TORCH_CHECK(base.numel() == fn.size(0) && scale.numel() >= 2, "hc_mix_nocomb: base and scale shapes");
+    TORCH_CHECK(partials.dim() == 3 && partials.size(0) == streams.size(0) && partials.size(2) == fn.size(0) + 1,
+                "hc_mix_nocomb: partials shape");
+    TORCH_CHECK_DTYPE(post, kFloat);
+    TORCH_CHECK(post.is_contiguous() && post.numel() == streams.size(0) * streams.size(1), "hc_mix_nocomb: post shape");
+    TORCH_CHECK(collapsed.is_contiguous() && collapsed.numel() == streams.size(0) * streams.size(2),
+                "hc_mix_nocomb: collapsed shape");
+    hc_mix_launch
+    (
+        streams,
+        fn,
+        base,
+        scale,
+        (float) rms_eps,
+        (float) hc_eps,
+        0,
+        partials,
+        &post,
+        nullptr,
+        collapsed,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        (float) post_eps
     );
 }
 

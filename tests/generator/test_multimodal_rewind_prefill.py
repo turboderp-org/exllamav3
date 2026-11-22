@@ -74,6 +74,7 @@ def make_job(prompt_length, sequence_length, replay_start, *, image = True, imag
         cache = None,
         draft_model = None,
         mtp_draft = mtp,
+        prev_ids = 0,
     )
     if atomic:
         # Gemma 4: chunks ending inside an image span are extended to cover the whole span
