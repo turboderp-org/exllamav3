@@ -75,6 +75,45 @@ def test_input_embedding_scale_is_applied():
 
 
 @pytest.mark.nogpu
+def test_tp_target_drafts_from_merged_rank_candidates():
+    # A tensor-parallel target (9cc3bd15): each rank takes the top-k of its head slice, and the selector
+    # walks the merged candidates instead of full-width logits
+    unary, cands = torch.ones(1, 2, 3), torch.zeros(1, 2, 3, dtype = torch.long)
+    calls = {}
+
+    def topk(args, k, scale, softcap):
+        calls["topk"] = (args[0].shape, k, scale, softcap)
+        return unary, cands
+
+    class Selector:
+        device = torch.device("cpu")
+        top_k = 3
+
+        def walk_candidates(self, hidden, u, c, anchor, return_confidence = False):
+            calls["walk"] = (u, c, anchor.tolist(), return_confidence)
+            return torch.tensor([[1, 2, 3]]), torch.tensor([[0.0, 1.0, 2.0]])
+
+    target = SimpleNamespace(
+        loaded_tp = True,
+        tp_producer = SimpleNamespace(send = lambda x: x),
+        tp_dispatch_lm_head_topk = topk,
+    )
+    model = object.__new__(DFlash2Model)
+    model.config = SimpleNamespace(output_multiplier = 2.0, final_logit_softcapping = None)
+    model.attached_model = lambda: target
+    model.selector = Selector()
+    params = {"dflash2_anchor_ids": torch.tensor([[7]]), "export_draft_conf": True}
+
+    ids = DFlash2Model.sample_from_state(model, torch.zeros(1, 3, 4), params)
+
+    assert ids.tolist() == [[1, 2, 3]]
+    assert calls["topk"] == (torch.Size([1, 2, 4]), 3, 2.0, 0.0)
+    assert calls["walk"][0] is unary and calls["walk"][1] is cands
+    assert calls["walk"][2:] == ([7], True)
+    assert params["draft_conf"].tolist() == [[0.0, 1.0, 2.0]]
+
+
+@pytest.mark.nogpu
 def test_target_taps_are_reordered_at_dflash_projection():
     class Projection:
         def forward(self, x, params, out_dtype = None):
