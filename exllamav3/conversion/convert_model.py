@@ -23,7 +23,7 @@ from .moe_affinity import make_store as make_affinity_store, merge_stores as mer
     combine_down as combine_affinity_down, quantize_gate_up as quantize_affinity_gate_up
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
-import os, shutil
+import os, shutil, signal
 import json
 import threading
 from pathlib import Path
@@ -840,21 +840,21 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             t = threading.Thread(target = work_thread, args = (device_idx, all_dev_groups[i]))
             t.daemon = True
             threads.append(t)
-    for t in threads:
-        t.start()
-
     try:
+        for t in threads:
+            t.start()
         with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
             while any(t.is_alive() for t in threads) and not errors:
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt:
-        from signal import pthread_kill, SIGTSTP, SIGKILL
-        for t in threads:
-            pthread_kill(t.ident, SIGTSTP)
-            pthread_kill(t.ident, SIGKILL)
-        print("Aborted.")
-        sys.exit()
+        # The workers are daemon threads, possibly inside long kernel launches; end the process without
+        # waiting for them. A signal sent to one thread acts on the whole process (SIGTSTP suspends it).
+        # Dying by SIGINT, not exiting normally, lets a calling shell loop stop too
+        print("Aborted.", flush = True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        os._exit(130)
 
     if errors:
         # Abort immediately (the other workers' remaining groups are wasted work); the traceback
@@ -957,21 +957,22 @@ def run_row_workers(title, num_rows, workers, progress_count):
                 errors.append(e)
         return inner
     threads = [threading.Thread(target = guard(w), daemon = True) for w in workers]
-    for t in threads:
-        t.start()
     try:
+        for t in threads:
+            t.start()
         with ProgressBar(title, num_rows) as progress:
             while any(t.is_alive() for t in threads):
                 progress.update(progress_count[0])
                 time.sleep(0.05)
             progress.update(progress_count[0])
     except KeyboardInterrupt:
-        from signal import pthread_kill, SIGTSTP, SIGKILL
-        for t in threads:
-            pthread_kill(t.ident, SIGTSTP)
-            pthread_kill(t.ident, SIGKILL)
-        print("Aborted.")
-        sys.exit()
+        # The workers are daemon threads, possibly inside long kernel launches; end the process without
+        # waiting for them. A signal sent to one thread acts on the whole process (SIGTSTP suspends it).
+        # Dying by SIGINT, not exiting normally, lets a calling shell loop stop too
+        print("Aborted.", flush = True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        os._exit(130)
     for t in threads:
         t.join(timeout = 0.1)
     if errors:
