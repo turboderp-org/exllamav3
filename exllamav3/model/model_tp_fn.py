@@ -510,7 +510,11 @@ class RankSlotPool:
         self.slab_size = (offset + 4095) & ~4095
         self.max_slots = max_slots
         self.slots = {}
-        self.arena = PinnedArena(max_slots * self.slab_size, "CPU page cache (TP rank)")
+        # The TP allocator splits channels by per-device memory ratios, so a rank can legitimately
+        # receive zero channels of a component; a rank with no cache tensors has an empty slab, and
+        # there is nothing to pin for it (PinnedArena(0) fails on mmap with EINVAL).
+        self.arena = PinnedArena(max_slots * self.slab_size, "CPU page cache (TP rank)") \
+            if self.slab_size else None
         # With a disk tier: slot -> events after the last stream copies into or out of its slab, which the
         # rank's disk worker waits for before it reads or overwrites the slab from a host thread
         self.record_events = False
@@ -518,6 +522,8 @@ class RankSlotPool:
 
 
     def slab(self, slot: int):
+        if self.arena is None:
+            return torch.empty(0, dtype = torch.uint8)
         base = slot * self.slab_size
         return self.arena.tensor[base : base + self.slab_size]
 
