@@ -6,7 +6,7 @@ from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
-from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib.quantize import auto_split, clear_temp_buffers
 from ..modules.quant.exl3_lib import quantize as exl3_quantize
 from ..util.memory import is_integrated_device
 from ..modules.quant.exl3_lib.hessian_packed import packed_numel
@@ -1512,7 +1512,7 @@ def main(args, job_state):
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
-        get_temp_buffers.cache_clear()
+        clear_temp_buffers()
         free_mem()
 
         start_module_time = time.time()
@@ -1733,7 +1733,7 @@ def main(args, job_state):
 
         # Reload module from memory. The quantizer's per-device workspaces are done with: release them so the
         # state-advance replicas find the room (they are rebuilt when the next module quantizes)
-        get_temp_buffers.cache_clear()
+        clear_temp_buffers()
         free_mem()
         config.stc.set_new_tensors(q_tensors)
         module.load(
@@ -1851,7 +1851,7 @@ def main(args, job_state):
 
         for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
-            get_temp_buffers.cache_clear()   # see main loop
+            clear_temp_buffers()   # see main loop
             free_mem()
             start_module_time = time.time()
 

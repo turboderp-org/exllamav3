@@ -132,6 +132,13 @@ def get_temp_buffers_frac(device, ka: int):
     return temp_costs, temp_edges
 
 
+def clear_temp_buffers():
+    """Release both memoized trellis scratch buffers (integer and half-integer bitrates). A new cached scratch
+    allocator must be cleared here too, or conversion keeps it resident across modules"""
+    get_temp_buffers.cache_clear()
+    get_temp_buffers_frac.cache_clear()
+
+
 def quantize_tiles_frac(tiles, quant_args: dict):
     """Half-integer bitrate (KA + 0.5): alternating pattern of KA / KA+1-bit steps. mul1 codebook only"""
     tiles = tiles.contiguous()

@@ -316,8 +316,7 @@ def _release_gpu_memory_between_modules():
     # quantize calls in tests leave behind
     quantize = sys.modules.get("exllamav3.modules.quant.exl3_lib.quantize")
     if quantize is not None:
-        quantize.get_temp_buffers.cache_clear()
-        quantize.get_temp_buffers_frac.cache_clear()
+        quantize.clear_temp_buffers()
     import gc
     gc.collect()
     if env.cuda_available() and torch.cuda.is_initialized():
