@@ -100,6 +100,7 @@ class Cache:
         max_batch_size: int = 16,
         max_history: int = 0,
         recurrent_dtype: torch.dtype = torch.half,
+        recurrent_bits: int = 0,
         **kwargs
     ):
         """
@@ -129,14 +130,20 @@ class Cache:
 
         :param recurrent_dtype:
             Storage dtype of the recurrent state of GatedDeltaNet and KDA layers: torch.half (default), or
-            torch.float for twice the state pool and checkpoint size, or torch.int8, a quantized payload with
-            a companion fp16 scales tensor (one scale per 32 consecutive k values) that requires a 128x128
-            GDN layer: a model with a KDA layer or a non-128x128 GDN layer raises Int8PoolUnsupported at
-            cache construction. The scans compute in fp32 regardless and touch the pool once per pass; on
-            these layers fp16 storage moves next-token distributions no more than regrouping a prefill does.
-            Mamba2 layers keep fp32 regardless: their state spans a far wider dynamic range (a quarter of it
-            below fp16's normal range), and the per-step rounding accumulates over a long generation. bf16 is
-            not offered, its 8-bit mantissa is far worse than fp16 here
+            torch.float for twice the state pool and checkpoint size, or torch.int8, a W-bit packed payload
+            (width set by recurrent_bits) with a companion fp16 scales tensor (one scale per 32 consecutive
+            k values) that requires a 128x128 GDN layer: a model with a KDA layer or a non-128x128 GDN layer
+            raises QuantPoolUnsupported at cache construction. The scans compute in fp32 regardless and touch
+            the pool once per pass; on these layers fp16 storage moves next-token distributions no more than
+            regrouping a prefill does. Mamba2 layers keep fp32 regardless: their state spans a far wider
+            dynamic range (a quarter of it below fp16's normal range), and the per-step rounding accumulates
+            over a long generation. bf16 is not offered, its 8-bit mantissa is far worse than fp16 here
+        :param recurrent_bits:
+            For a torch.int8 recurrent_dtype, the bits per recurrent-state value W. The bound is mechanical
+            at the low end (W = 1 makes the quantize bound Q = 2^(W-1) - 1 zero) and precision-capped at the
+            high end (above W = 12 the per-slice fp16 scale's ~11-bit mantissa caps recoverable precision),
+            so the accepted range is 2..12. 9-11 are the useful range (10 typical); outside it is not a
+            policy preference but a quality trade-off. 0 for torch.float / torch.half
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 
@@ -144,6 +151,16 @@ class Cache:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
         """
         self.model = model
+        # The (recurrent_dtype, recurrent_bits) pair rule lives here and only here: fp pools take
+        # bits 0, a packed int pool takes a W in 2..12
+        if recurrent_dtype in (torch.float, torch.half):
+            if recurrent_bits != 0:
+                raise ValueError("recurrent_bits is only used with a torch.int8 recurrent state")
+        elif recurrent_dtype == torch.int8:
+            if not 2 <= recurrent_bits <= 12:
+                raise ValueError("recurrent_bits of a torch.int8 recurrent state must be 2..12")
+        else:
+            raise ValueError(f"recurrent_dtype must be torch.float, torch.half or torch.int8, got {recurrent_dtype}")
         # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
         # model loader (per layer, on the layer's device), so a cache is only usable after a
         # load of the model it was attached to at load time.
@@ -183,7 +200,7 @@ class Cache:
             for instance in self.model.get_layer_instances(layer.layer_idx):
                 ls = layer.layer_state_cls(layer, max_batch_size, max_history, id(self))
                 if recurrent_dtype != torch.float and hasattr(ls, "set_state_dtype") and not getattr(layer, "mamba2", False):
-                    ls.set_state_dtype(recurrent_dtype)
+                    ls.set_state_dtype(recurrent_dtype, recurrent_bits)
                 self.recurrent_layers[instance] = ls
 
         # Attach

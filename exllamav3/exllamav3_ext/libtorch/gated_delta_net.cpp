@@ -228,7 +228,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     const c10::optional<at::Tensor>& slots_in,
     Slot& s,
     Graph* graph,
-    const c10::optional<at::Tensor>& recurrent_scales
+    const c10::optional<at::Tensor>& recurrent_scales,
+    int recurrent_bits
 )
 {
     int R = (int) (x.size(0) * x.size(1));
@@ -321,7 +322,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         history,
         slots_in,
         graph,
-        recurrent_scales
+        recurrent_scales,
+        recurrent_bits
     );
 
     norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
@@ -341,7 +343,8 @@ void BC_GatedDeltaNetSplit::run_bszN
     const at::Tensor& slots_scan,
     bool history,
     const c10::optional<at::Tensor>& slots_in,
-    const c10::optional<at::Tensor>& recurrent_scales
+    const c10::optional<at::Tensor>& recurrent_scales,
+    int recurrent_bits
 )
 {
     py::gil_scoped_release release;
@@ -359,11 +362,13 @@ void BC_GatedDeltaNetSplit::run_bszN
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr, recurrent_scales);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr,
+                    recurrent_scales, recurrent_bits);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
         s.graph_state_format = state_format;
+        s.graph_state_bits = recurrent_bits;
         return;
     }
 
@@ -372,16 +377,19 @@ void BC_GatedDeltaNetSplit::run_bszN
     // another slot's eager run against a second cache must not re-arm this slot's replay
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride ||
-        state_format != s.graph_state_format)
+        state_format != s.graph_state_format ||
+        recurrent_bits != s.graph_state_bits)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr, recurrent_scales);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr,
+                    recurrent_scales, recurrent_bits);
         return;
     }
 
     if (!s.graph->ready)
     {
         GraphCapture capture(*s.graph);
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get(), recurrent_scales);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get(),
+                    recurrent_scales, recurrent_bits);
         capture.finish();
     }
 

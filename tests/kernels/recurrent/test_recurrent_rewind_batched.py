@@ -115,7 +115,8 @@ def test_batched_conv_rewind_rejects_large_cdim(device):
 
 # GDNLayerState: the conv job against a torch reference, the replay against a kernel pass over the prefix
 
-def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None, state_dtype = torch.float):
+def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None,
+                 state_dtype = torch.float, state_bits = 0):
     from exllamav3.modules.gated_delta_net import GDNLayerState
     module = types.SimpleNamespace(
         fdim_qkv = fdim,
@@ -125,13 +126,14 @@ def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None,
         k_head_dim = dk,
         v_head_dim = dv,
     )
-    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0, state_dtype = state_dtype)
+    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0, state_dtype = state_dtype, state_bits = state_bits)
     ls.alloc(device)
     ls.conv_state.copy_(torch.randn(ls.conv_state.shape, device = device))
     if state_dtype == torch.int8:
-        # An int8 pool holds quantized values plus their scales (normal_() would leave raw noise in
-        # a 1-byte pool)
-        q, scales = pool_from_state(torch.randn(ls.recurrent_state.shape, device = device) * 0.05)
+        # An int pool holds quantized values plus their scales (normal_() would leave raw noise in
+        # a 1-byte pool); the pool is v-major, so it fills from a (rows, 1, nv, dk, dv) fp32 state
+        q, scales = pool_from_state(torch.randn((ls.recurrent_state.shape[0], 1, nv, dk, dv), device = device) * 0.05,
+                                    state_bits)
         ls.recurrent_state.copy_(q)
         ls.recurrent_scales.copy_(scales)
     else:
@@ -167,20 +169,23 @@ def test_gdn_layer_state_conv_job_matches_reference(device, max_history):
         _layer_state(device, 1, 3, 384, 4, 4, 32, 64).rewind_conv_job(0, 3, 4)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float, torch.half, torch.int8],
-                         ids = ["fp32_state", "fp16_state", "int8_state"])
+@pytest.mark.parametrize("state_dtype,state_bits",
+                         [(torch.float, 0), (torch.half, 0), (torch.int8, 8), (torch.int8, 9),
+                          (torch.int8, 10), (torch.int8, 12)],
+                         ids = ["fp32_state", "fp16_state", "int8_state", "int9_state", "int10_state", "int12_state"])
 @pytest.mark.parametrize("max_history", [3, 64])
 @pytest.mark.parametrize("bsz", [1, 3])
 @torch.inference_mode()
-def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype):
+def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype, state_bits):
     # A speculative pass of max_history + 1 tokens writes its scan inputs into the staged views; every batch row
-    # and every prefix then replays to the state a prefix-length pass from the same base row produces. int8 pools
-    # are 128x128 only (the host check), so that case carries its own geometry; pass and replay quantize alike
+    # and every prefix then replays to the state a prefix-length pass from the same base row produces. Packed int
+    # pools are 128x128 only (the host check), so that case carries its own geometry; pass and replay quantize alike
     nk, nv = 2, 4
     dk = dv = 128 if state_dtype == torch.int8 else 64
     fdim = 2 * nk * dk + nv * dv
     seqlen = max_history + 1
-    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk, state_dtype = state_dtype)
+    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk,
+                      state_dtype = state_dtype, state_bits = state_bits)
     if state_dtype == torch.int8:
         assert ls.recurrent_scales.shape == (2 * bsz, 1, nv, dv, SUBK)       # what the host validates
     conv_out, beta, g = ls.staged_views(bsz, seqlen)
@@ -200,7 +205,7 @@ def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype):
                     conv_out[row : row + 1, :prefix].contiguous(), g[row : row + 1, :prefix].contiguous(),
                     beta[row : row + 1, :prefix].contiguous(), expect, out, nk, nv, dk, dv,
                     torch.tensor([scratch], dtype = torch.int32, device = device), True,
-                    torch.tensor([base], dtype = torch.int32, device = device), expect_scales)
+                    torch.tensor([base], dtype = torch.int32, device = device), expect_scales, state_bits)
                 ls.recurrent_state.copy_(pool0)
                 if scales0 is not None:
                     ls.recurrent_scales.copy_(scales0)

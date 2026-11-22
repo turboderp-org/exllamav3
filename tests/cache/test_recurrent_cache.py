@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from exllamav3.cache import recurrent
+from exllamav3.cache.cache import Cache
 from exllamav3.cache.recurrent import HostPool, RecurrentCache, host_copy, host_pool
 from exllamav3.modules.gated_delta_net import GDNLayerState
 
@@ -184,8 +185,8 @@ def test_closed_cache_frees_memory_for_a_replacement():
 # GDNLayerState: the dtype-tagged recurrent-state pool (fp32 / fp16 / int8). int8 adds the fp16
 # scales (one absmax per 32-wide k slice, SUBK per v row); fp16 and fp32 carry none. Checked on CPU.
 
-def _gdn_layer_state(state_dtype, slots = 2, max_history = 3):
-    # 128x128 GDN geometry: the only one int8 carries
+def _gdn_layer_state(state_dtype, state_bits = 0, slots = 2, max_history = 3):
+    # 128x128 GDN geometry: the only one the packed int pool carries
     module = SimpleNamespace(
         fdim_qkv = 2 * 4 * 128 + 4 * 128,
         conv_kernel_size = 4,
@@ -194,20 +195,27 @@ def _gdn_layer_state(state_dtype, slots = 2, max_history = 3):
         k_head_dim = 128,
         v_head_dim = 128,
     )
-    return GDNLayerState(module, slots, max_history, cache_id = 0, state_dtype = state_dtype)
+    return GDNLayerState(module, slots, max_history, cache_id = 0, state_dtype = state_dtype, state_bits = state_bits)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16, torch.int8],
-                         ids = ["fp32", "fp16", "int8"])
+@pytest.mark.parametrize("state_dtype,state_bits",
+                         [(torch.float32, 0), (torch.float16, 0), (torch.int8, 8), (torch.int8, 9),
+                          (torch.int8, 10), (torch.int8, 12)],
+                         ids = ["fp32", "fp16", "int8", "int9", "int10", "int12"])
 @pytest.mark.nogpu
-def test_gdn_layer_state_pool_layout_and_accounting(state_dtype):
+def test_gdn_layer_state_pool_layout_and_accounting(state_dtype, state_bits):
     slots, max_history = 2, 3
-    ls = _gdn_layer_state(state_dtype, slots, max_history)
+    ls = _gdn_layer_state(state_dtype, state_bits, slots, max_history)
     m = ls.module
     rows = 2 * slots
     conv, state = ls.conv_state, ls.recurrent_state
     assert conv.shape == (slots, m.fdim_qkv, m.conv_kernel_size + max_history) and conv.dtype == torch.bfloat16
-    assert state.shape == (rows, 1, m.num_v_heads, m.k_head_dim, m.v_head_dim) and state.dtype == state_dtype
+    if state_dtype == torch.int8:
+        # the pool is v-major: (rows, 1, nv, dv, dk * W // 8)
+        assert state.shape == (rows, 1, m.num_v_heads, m.v_head_dim, m.k_head_dim * state_bits // 8)
+    else:
+        assert state.shape == (rows, 1, m.num_v_heads, m.k_head_dim, m.v_head_dim)
+    assert state.dtype == state_dtype
     scales = ls.recurrent_scales
     if state_dtype == torch.int8:
         assert scales.shape == (rows, 1, m.num_v_heads, m.v_head_dim, SUBK) and scales.dtype == torch.float16
@@ -220,19 +228,19 @@ def test_gdn_layer_state_pool_layout_and_accounting(state_dtype):
     conv_bytes = slots * m.fdim_qkv * (m.conv_kernel_size + max_history) * 2
     staging_rows = slots * (max_history + 1)
     staging_bytes = staging_rows * m.fdim_qkv * 2 + staging_rows * m.num_v_heads * 2 + staging_rows * m.num_v_heads * 4
-    expected_state_bytes = rows * m.num_v_heads * m.k_head_dim * m.v_head_dim * state.element_size()
+    expected_state_bytes = rows * state[0].numel() * state.element_size()
     if state_dtype == torch.int8:
-        expected_state_bytes += rows * m.num_v_heads * m.v_head_dim * SUBK * 2
+        expected_state_bytes += rows * scales[0].numel() * scales.element_size()
     assert ls.storage_size() == conv_bytes + expected_state_bytes + staging_bytes
     assert ls.get_checkpoint_size() == m.fdim_qkv * m.conv_kernel_size * 2 \
-        + m.num_v_heads * m.k_head_dim * m.v_head_dim * state.element_size() \
-        + (m.num_v_heads * m.v_head_dim * SUBK * 2 if state_dtype == torch.int8 else 0)
+        + state[0].numel() * state.element_size() \
+        + (scales[0].numel() * scales.element_size() if state_dtype == torch.int8 else 0)
 
 
 @pytest.mark.nogpu
 def test_gdn_layer_state_clear_zeroes_the_pool_and_the_scales():
-    for state_dtype in (torch.float16, torch.int8):
-        ls = _gdn_layer_state(state_dtype)
+    for state_dtype, state_bits in ((torch.float16, 0), (torch.int8, 8)):
+        ls = _gdn_layer_state(state_dtype, state_bits)
         ls.alloc(torch.device("cpu"))
         ls.recurrent_state.fill_(1)
         if ls.recurrent_scales is not None:
@@ -249,11 +257,12 @@ def test_gdn_layer_state_clear_zeroes_the_pool_and_the_scales():
 
 @pytest.mark.nogpu
 def test_gdn_layer_state_int8_stash_round_trips_values_and_scales():
-    ls = _gdn_layer_state(torch.int8)
+    ls = _gdn_layer_state(torch.int8, 8)
     ls.alloc(torch.device("cpu"))
     m = ls.module
     row = 0
-    vals = torch.full((1, 1, m.num_v_heads, m.k_head_dim, m.v_head_dim), 3, dtype = torch.int8)
+    # v-major pool: (rows, 1, nv, dv, dk * W // 8)
+    vals = torch.full((1, 1, m.num_v_heads, m.v_head_dim, m.k_head_dim * 8 // 8), 3, dtype = torch.int8)
     scales = torch.full((1, 1, m.num_v_heads, m.v_head_dim, SUBK), 0.5, dtype = torch.float16)
     ls.recurrent_state[row : row + 1].copy_(vals)
     ls.recurrent_scales[row : row + 1].copy_(scales)
@@ -287,3 +296,21 @@ def test_gdn_layer_state_int8_stash_round_trips_values_and_scales():
     fp16.alloc(torch.device("cpu"))
     assert len(fp16.stash(0, 0, 0)) == 2
     fp16.free()
+
+
+# Cache: the (recurrent_dtype, recurrent_bits) pair rule lives in the cache and only there
+
+def _empty_model():
+    return SimpleNamespace(config = None, cache_weakrefs = {}, get_cache_layers = lambda: [],
+                           get_recurrent_layers = lambda: [], recurrent_state_cls = None,
+                           get_layer_instances = lambda i: [])
+
+
+@pytest.mark.parametrize("recurrent_dtype,recurrent_bits",
+                         [(torch.int8, 1), (torch.int8, 13), (torch.float, 4), (torch.int16, 0)],
+                         ids = ["int8_w1", "int8_w13", "fp_bits", "int16"])
+@pytest.mark.nogpu
+def test_cache_rejects_ineligible_recurrent_pairs(recurrent_dtype, recurrent_bits):
+    with pytest.raises(ValueError):
+        Cache(_empty_model(), max_num_tokens = 256, recurrent_dtype = recurrent_dtype,
+              recurrent_bits = recurrent_bits)

@@ -188,6 +188,7 @@ struct BC_GatedDeltaNetSplit
         int graph_state_size = -1;
         int graph_hist_stride = -1;
         int graph_state_format = -1;   // state_format_of(recurrent_state), see gdn.cuh
+        int graph_state_bits = -1;     // the int pool's width (0 for fp), part of the snapshot
         // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
         // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
         // another cache reconfigures (and recaptures)
@@ -345,7 +346,8 @@ struct BC_GatedDeltaNetSplit
         const c10::optional<at::Tensor>& slots_in,   // pool rows a speculative pass starts from
         Slot& s,
         Graph* graph,
-        const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt   // int8 pool: fp16 scales
+        const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt,   // int pool: fp16 scales
+        int recurrent_bits = 0                       // the int pool's width (0 for fp)
     );
 
     void run_bszN
@@ -358,7 +360,8 @@ struct BC_GatedDeltaNetSplit
         const at::Tensor& slots_scan,
         bool history,
         const c10::optional<at::Tensor>& slots_in,
-        const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt
+        const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt,
+        int recurrent_bits = 0
     );
 };
 

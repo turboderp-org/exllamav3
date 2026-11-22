@@ -254,7 +254,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
-          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none(), py::arg("recurrent_scales") = py::none());
+          py::arg("slots"), py::arg("history"), py::arg("slots_in") = py::none(), py::arg("recurrent_scales") = py::none(),
+          py::arg("recurrent_bits") = 0);
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2",
           py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(),
@@ -281,7 +282,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_scan_replay", &batched_scan_replay, py::arg("jobs"), py::arg("device_index"), py::arg("kind"),
           py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
-          py::arg("state_format") = STATE_FP32);
+          py::arg("state_format") = STATE_FP32, py::arg("state_bits") = 0);
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

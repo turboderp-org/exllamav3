@@ -205,10 +205,12 @@ def test_state_round_trip_and_deferred_release(device, tmp_path):
     tier2.close()
 
 
-def test_int8_state_round_trips_values_and_scales_bit_exact(device, tmp_path):
+@pytest.mark.parametrize("bits", [8, 9, 10, 12], ids = ["w8", "w9", "w10", "w12"])
+def test_int8_state_round_trips_values_and_scales_bit_exact(device, tmp_path, bits):
     tier, disk, tensor = build(4, device, tmp_path)
     g = torch.Generator(device = "cpu").manual_seed(0)
-    values = torch.randint(-128, 127, (1, 1, 4, 8, 8), generator = g).to(torch.int8)
+    # v-major pool: (rows, 1, nv, dv, dk * W // 8), random bytes
+    values = torch.randint(0, 256, (1, 1, 4, 8, 8 * bits // 8), generator = g).to(torch.int8)
     scales = torch.randn((1, 1, 4, 8, 4), generator = g).half()
     conv = torch.randn((32, 4), generator = g).bfloat16()
     stashed = {

@@ -15,9 +15,9 @@ enabled and disabled; every generation's decode logits must match the eager run 
 import pytest
 import torch
 
-from exllamav3.modules.gated_delta_net import Int8PoolUnsupported
+from exllamav3.modules.gated_delta_net import QuantPoolUnsupported
 from testlib.env import get_test_device
-from testlib.graph import (assert_matches_eager, generate_with_logits, has_int8_pool, load_with_caches,
+from testlib.graph import (assert_matches_eager, generate_with_logits, has_int_pool, load_with_caches,
                            run_with_and_without_graphs, unload_model)
 
 NEW_TOKENS = 12
@@ -66,42 +66,43 @@ def test_graph_slots_follow_cache_geometry(model_id, model_dir, device):
 
 
 def scenario_state_dtype(model_dir: str) -> list:
-    """An fp16 and an int8 cache in one process, switching the pool dtype under the same
-    (bsz, seqlen, history) slot; [(label, tokens, step logits)] per generation. [] if the model has
-    no layer that carries an int8 pool"""
+    """An fp16 cache and two packed-int caches (W = 8 and W = 10) in one process, switching the pool
+    format under the same (bsz, seqlen, history) slot; [(label, tokens, step logits)] per generation.
+    [] if the model has no layer that carries an int pool"""
     torch.manual_seed(0)
     try:
-        _, model, (cache_fp16, cache_int8), tok = load_with_caches(
+        _, model, (cache_fp16, cache_int8, cache_int10), tok = load_with_caches(
             model_dir, get_test_device(),
             [{"max_history": 0},
-             {"max_history": 0, "recurrent_dtype": torch.int8}])
-    except Int8PoolUnsupported:
-        return []                   # no 128x128 GDN layer: KDA never goes int8, so the cache is rejected
-    if not has_int8_pool(cache_int8):
-        return []                   # the model has no layer that takes an int8 pool (Mamba2 keeps fp32)
+             {"max_history": 0, "recurrent_dtype": torch.int8, "recurrent_bits": 8},
+             {"max_history": 0, "recurrent_dtype": torch.int8, "recurrent_bits": 10}])
+    except QuantPoolUnsupported:
+        return []                   # no 128x128 GDN layer: KDA never goes int, so the cache is rejected
+    if not has_int_pool(cache_int8):
+        return []                   # the model has no layer that takes an int pool (Mamba2 keeps fp32)
     out = []
 
     def keep(label, result):
         tokens, logits = result
         out.append((label, tokens, [l.cpu() for l in logits]))
 
-    # 1) the bsz-1 decode slot under the fp16 pool (arms, then captures on its next use)
-    (f0,) = generate_with_logits(model, cache_fp16, tok, PROMPTS[:1], NEW_TOKENS)
-    keep("fp16 bsz-1 (1)", f0)
-    # 2) the same slot and format again: the graph is captured (first use armed it)
-    (f1,) = generate_with_logits(model, cache_fp16, tok, PROMPTS[:1], NEW_TOKENS)
-    keep("fp16 bsz-1 (2)", f1)
-    # 3) the int8 cache reuses that slot: its pool format differs from the snapshot, so the slot
-    #    takes the eager path instead of patching the int8 pool into the fp16 graph
+    # 1) the bsz-1 decode slot under the W = 8 pool: first use arms the slot (eager run; the
+    #    snapshot takes int, bits 8)
     (i0,) = generate_with_logits(model, cache_int8, tok, PROMPTS[:1], NEW_TOKENS)
     keep("int8 bsz-1 (1)", i0)
-    # 4) back to fp16: the captured graph is replayed
-    (f2,) = generate_with_logits(model, cache_fp16, tok, PROMPTS[:1], NEW_TOKENS)
-    keep("fp16 bsz-1 (3)", f2)
-    # 5) the int8 pool on a slot of its own: bsz-2 spans two decode steps here
-    i1, i2 = generate_with_logits(model, cache_int8, tok, PROMPTS[1:3], NEW_TOKENS)
-    keep("int8 bsz-2 (1)", i1)
-    keep("int8 bsz-2 (2)", i2)
+    # 2) the slot's geometry matches the snapshot, so the slot captures and replays the int graph
+    (i1,) = generate_with_logits(model, cache_int8, tok, PROMPTS[:1], NEW_TOKENS)
+    keep("int8 bsz-1 (2)", i1)
+    # 3) the W = 10 pool: recurrent_bits differs from the snapshot's bits, so the slot takes the
+    #    eager path; the snapshot stays int W = 8 -- no re-arm, no re-capture
+    (i2,) = generate_with_logits(model, cache_int10, tok, PROMPTS[:1], NEW_TOKENS)
+    keep("int10 bsz-1 (1)", i2)
+    # 4) back to W = 8: the snapshot matches again, so the slot replays the graph captured in step 2
+    (i3,) = generate_with_logits(model, cache_int8, tok, PROMPTS[:1], NEW_TOKENS)
+    keep("int8 bsz-1 (3)", i3)
+    # 5) the fp16 pool: the pool format differs from the snapshot, so the slot takes the eager path
+    (f0,) = generate_with_logits(model, cache_fp16, tok, PROMPTS[:1], NEW_TOKENS)
+    keep("fp16 bsz-1", f0)
     unload_model(model)
     return out
 
@@ -111,6 +112,6 @@ def test_graph_state_dtype_snapshot(model_id, model_dir, device):
     """The state element type is part of the per-slot graph snapshot"""
     graphed, eager = run_with_and_without_graphs(scenario_state_dtype, model_dir, device = device)
     if not graphed and not eager:
-        pytest.skip(f"{model_id}: no layer carries an int8 pool")
+        pytest.skip(f"{model_id}: no layer carries an int pool")
     assert_matches_eager([(f"{model_id}, {l}", t, g) for l, t, g in graphed],
                          [(f"{model_id}, {l}", t, g) for l, t, g in eager])

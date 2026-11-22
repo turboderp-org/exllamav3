@@ -50,8 +50,8 @@ def unload_model(model):
     torch.cuda.empty_cache()
 
 
-def has_int8_pool(cache) -> bool:
-    """Whether any recurrent layer of the cache carries an int8 pool"""
+def has_int_pool(cache) -> bool:
+    """Whether any recurrent layer of the cache carries a packed int pool"""
     return any(getattr(l, "recurrent_scales", None) is not None for l in cache.recurrent_layers.values())
 
 

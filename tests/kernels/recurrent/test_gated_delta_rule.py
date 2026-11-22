@@ -12,8 +12,8 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules.gated_delta_net_fn.gated_delta_rule import (
     gated_delta_rule_fn,
-    pack_state_row,
-    unpack_state_row,
+    pack_int_state_row,
+    unpack_int_state_row,
 )
 from exllamav3.util.hadamard import get_hadamard
 from testlib.gdn import pool_from_state, state_from_pool
@@ -104,6 +104,7 @@ def _run_cuda_gated_delta_rule(
     k_head_dim: int,
     v_head_dim: int,
     recurrent_scales: torch.Tensor | None = None,
+    recurrent_bits: int = 0,
 ):
     out = torch.empty(
         (mixed_qkv.shape[0], mixed_qkv.shape[1], num_v_heads, v_head_dim),
@@ -126,6 +127,7 @@ def _run_cuda_gated_delta_rule(
         history,
         slots_in,
         recurrent_scales,
+        recurrent_bits,
     )
     torch.cuda.synchronize()
     return out, state
@@ -258,7 +260,13 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         assert torch.equal(cuda_state[slots.long() + 1], recurrent_state[slots.long() + 1])   # untouched neighbours
 
 
+# Out tolerances by width: W = 8 is the old int8 pool's exact quantization math (Q = 127), kept as
+# the regression anchor, and W = 2 the loose bound (Q = 1)
+INT_W_TOL = {2: 1e-1, 8: 5e-2, 9: 1e-2, 10: 1e-2, 11: 1e-2, 12: 5e-3}
+
 @pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("recurrent_bits", [9, 10, 11, 2, 8, 12],
+                         ids = ["int9", "int10", "int11", "int2", "int8", "int12"])
 @pytest.mark.parametrize(
     "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
     [
@@ -267,9 +275,10 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
     ],
 )
 @torch.inference_mode()
-def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
+def test_cuda_recurrent_gated_delta_rule_int_matches_torch(
     device,
     history,
+    recurrent_bits,
     bsz,
     seqlen,
     num_k_heads,
@@ -277,12 +286,11 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
     k_head_dim,
     v_head_dim,
 ):
-    # The int8 pool rounds once per pass and stores the row rotated: out and the written pool rows
-    # agree with the fp32 reference to int8 precision (5e-2 on out, 1e-2 on the pool rows). The same
-    # pass over an fp16 pool holding that dequantized state rotated into the pool's basis pins that
-    # the rotation is a change of basis of the scan and not of its result: the two agree within a
-    # bf16 output quantum or two (6e-5 on these shapes), while a reference in the model basis is off
-    # by ~1.2e-2, so that comparison is held at 2e-3
+    # The packed int pool rounds once per pass and stores the row rotated: out and the written pool
+    # rows agree with the fp32 reference to the width's quantization precision. The same pass over an
+    # fp16 pool holding that dequantized state rotated into the pool's basis pins that the rotation is
+    # a change of basis of the scan and not of its result: the two agree within a bf16 output quantum
+    # or two regardless of W (fp16 rounding dominates), so that comparison is held at 2e-3
     torch.manual_seed(4321)
     qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
     num_slots = 2 * bsz + 2
@@ -290,7 +298,7 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
     g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
     beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
     state0 = torch.randn((num_slots, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device) * 0.05
-    pool, scales = pool_from_state(state0)
+    pool, scales = pool_from_state(state0, recurrent_bits)
     pool0, scales0 = pool.clone(), scales.clone()
     slots = 2 * torch.arange(bsz, dtype = torch.int32, device = device) + 1
 
@@ -298,7 +306,7 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
         mixed_qkv,
         g,
         beta,
-        state_from_pool(pool, scales),
+        state_from_pool(pool, scales, recurrent_bits),
         slots,
         history,
         num_k_heads,
@@ -319,12 +327,13 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
         k_head_dim,
         v_head_dim,
         recurrent_scales = scales,
+        recurrent_bits = recurrent_bits,
     )
     fp16_out, _ = _run_cuda_gated_delta_rule(
         mixed_qkv,
         g,
         beta,
-        _rotate_state(state_from_pool(pool, scales0)).half(),
+        _rotate_state(state_from_pool(pool, scales0, recurrent_bits)).half().contiguous(),
         slots,
         history,
         num_k_heads,
@@ -333,11 +342,19 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
         v_head_dim,
     )
 
-    deq = state_from_pool(cuda_state, scales)
-    torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
+    deq = state_from_pool(cuda_state, scales, recurrent_bits)
+    out_tol = INT_W_TOL[recurrent_bits]
+    torch.testing.assert_close(cuda_out, ref_out, rtol = out_tol, atol = out_tol)
     torch.testing.assert_close(cuda_out, fp16_out, rtol = 0.0, atol = 2e-3)
-    # The pool rows the pass wrote: one quantization step from the reference
-    torch.testing.assert_close(deq[slots.long()], ref_state[slots.long()], rtol = 1e-2, atol = 1e-2)
+    # The pool rows the pass wrote, against the written slices' own quantization step
+    # (amax / Q): the kernel's final state is the reference state re-quantized on that grid, plus
+    # the per-pass re-quantization drift. W = 2's grid is {-amax, 0, +amax}, so a step is the full
+    # slice scale and no fixed absolute bound fits every width (measured <= 1.4 steps)
+    q_bound = (1 << (recurrent_bits - 1)) - 1
+    sl = slots.long()
+    step = scales[sl].float().squeeze(1)[..., torch.arange(k_head_dim, device = device) // 32]  # (bsz, nv, dv, dk)
+    step = step.permute(0, 1, 3, 2).unsqueeze(1) / q_bound                                        # (bsz, 1, nv, dk, dv)
+    assert ((deq[sl] - ref_state[sl]).abs() <= 2 * step).all()
     # Every other row (values and scales alike) is untouched and bit-equal
     mask = torch.ones(num_slots, dtype = torch.bool, device = device)
     mask[slots.long()] = False
@@ -345,53 +362,76 @@ def test_cuda_recurrent_gated_delta_rule_int8_matches_torch(
     assert torch.equal(scales[mask], scales0[mask])
 
 
+@pytest.mark.parametrize("bits", [2, 5, 7, 9, 10, 11, 12],
+                         ids = ["w2", "w5", "w7", "w9", "w10", "w11", "w12"])
 @torch.inference_mode()
-def test_int8_state_pack_unpack_round_trip(device):
-    # The converter's pack/unpack round trip is one quantization step; the rotation is its own
-    # inverse (an already-rotated state round-trips too) and a zero state packs to zero values and scales
+def test_int_state_pack_unpack_round_trip(device, bits):
+    # The converter's pack/unpack round trip is one quantization step per pool-basis value: each
+    # slice's values round to the nearest multiple of amax / Q, so the error is at most half a
+    # step, amax / (2Q). The unpack rotates back to the model basis, where an element's error mixes
+    # up to 32 slice errors (H32 row of +1/-1): the max over 64K elements lands just above one
+    # step for some widths (measured <= 1.1x this seed), so the bound is two steps, with room for
+    # the fp16 scale rounding and the fp32 rotation. A repack of the unpacked state is byte- and
+    # scale-exact (idempotent), and a zero state packs to zero values and scales
     h, k, v = 4, 128, 128
     torch.manual_seed(31)
     state = torch.randn((h, k, v), dtype = torch.float, device = device) * 0.05
-    values = torch.empty((h, k, v), dtype = torch.int8, device = device)
+    values = torch.empty((h, v, k * bits // 8), dtype = torch.int8, device = device)
     scales = torch.empty((h, v, k // 32), dtype = torch.float16, device = device)
 
-    pack_state_row(state, values, scales)
-    back = unpack_state_row(values, scales)
-    # atol = the max slice absmax of the rotated state / 127: twice the value-rounding bound
-    # (amax / 254), with room for the fp16 scale rounding and the fp32 rotation
-    amax = _rotate_state(state).view(h, k // 32, 32, v).abs().amax(dim = 2).max().item()
-    torch.testing.assert_close(back, state, rtol = 0.0, atol = amax / 127.0)
+    pack_int_state_row(state, values, scales, bits)
+    back = unpack_int_state_row(values, scales, bits)
+    q_bound = (1 << (bits - 1)) - 1
+    max_scale = scales.float().max().item()
+    torch.testing.assert_close(back, state, rtol = 0.0, atol = 2 * max_scale / q_bound)
 
-    pack_state_row(_rotate_state(state), values, scales)
-    torch.testing.assert_close(unpack_state_row(values, scales), _rotate_state(state),
-                              rtol = 0.0, atol = amax / 127.0)
+    values2 = torch.empty_like(values)
+    scales2 = torch.empty_like(scales)
+    pack_int_state_row(back, values2, scales2, bits)
+    assert torch.equal(values2, values)
+    assert torch.equal(scales2, scales)
 
-    pack_state_row(torch.zeros_like(state), values, scales)
+    values.zero_(); scales.zero_()
+    pack_int_state_row(torch.zeros_like(state), values, scales, bits)
     assert torch.equal(values, torch.zeros_like(values))
     assert torch.equal(scales, torch.zeros_like(scales))
-    assert torch.equal(unpack_state_row(values, scales), torch.zeros_like(state))
+    assert torch.equal(unpack_int_state_row(values, scales, bits), torch.zeros_like(state))
 
 
-@pytest.mark.parametrize(
-    "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
-    [
-        (3, 9, 2, 4, 64, 64),        # generic kernel
-        (2, 17, 4, 8, 128, 128),     # 128 kernel
-        (1, 65, 2, 8, 128, 128),     # 128 kernel, a long (suffix-match class) pass
-        (2, 9, 2, 4, 256, 256),      # generic, wide
-    ],
-)
+REPLAY_SHAPES = [
+    (3, 9, 2, 4, 64, 64),        # generic kernel
+    (2, 17, 4, 8, 128, 128),     # 128 kernel
+    (1, 65, 2, 8, 128, 128),     # 128 kernel, a long (suffix-match class) pass
+    (2, 9, 2, 4, 256, 256),      # generic, wide
+]
+
+def _replay_param(shape, dtype, bits):
+    dtype_id = "fp32" if dtype == torch.float else f"int{bits}"
+    return pytest.param(dtype, bits, *shape, id = f"{dtype_id},{'x'.join(map(str, shape))}")
+
+# fp32 on every shape; the packed int pool is 128x128 only, and W = 2 (a 24-byte row slice per v column
+# at dk 128) only on the smallest 128x128 shape to keep the pool small
+REPLAY_PARAMS = []
+for _shape in REPLAY_SHAPES:
+    REPLAY_PARAMS.append(_replay_param(_shape, torch.float, 0))
+    if _shape[4] == 128 and _shape[5] == 128:
+        for _bits in (8, 9, 10, 12):
+            REPLAY_PARAMS.append(_replay_param(_shape, torch.int8, _bits))
+        if _shape == (2, 17, 4, 8, 128, 128):
+            REPLAY_PARAMS.append(_replay_param(_shape, torch.int8, 2))
+
 @pytest.mark.parametrize("layers", [1, 3, 50])
-@pytest.mark.parametrize("state_dtype", [torch.float, torch.int8], ids = ["fp32_state", "int8_state"])
+@pytest.mark.parametrize(
+    "state_dtype,state_bits,bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
+    REPLAY_PARAMS,
+)
 @torch.inference_mode()
-def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim, layers, state_dtype):
+def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim, layers, state_dtype, state_bits):
     """A speculative pass advances scratch rows from base rows; batched_scan_replay over the first p staged
     tokens of one batch row must leave the scratch row exactly as a p-token pass from the same base row does,
     for every prefix, with the jobs of several layers (own pools and inputs) in one launch. 50 layers spans
-    two launches (REPLAY_MAX_JOBS). The int8 pool replays through the char kernel: pass and replay
+    two launches (REPLAY_MAX_JOBS). The packed int pool replays through the char kernel: pass and replay
     quantize identically, so the bit-exactness carries over"""
-    if state_dtype == torch.int8 and (k_head_dim != 128 or v_head_dim != 128):
-        pytest.skip("int8 pools are 128x128 only")
     torch.manual_seed(7 + layers)
     qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
     rr = bsz - 1   # the batch row replayed: the last one
@@ -402,7 +442,7 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
         beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
         pool = torch.randn((2 * bsz, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device) * 0.05
         if state_dtype == torch.int8:
-            pool, scales = pool_from_state(pool)
+            pool, scales = pool_from_state(pool, state_bits)
         else:
             scales = None
         L.append((mixed_qkv, g, beta, pool, scales))
@@ -417,7 +457,7 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
             out = torch.empty((bsz, prefix, num_v_heads, v_head_dim), dtype = torch.bfloat16, device = device)
             ext.cuda_recurrent_gated_delta_rule(mixed_qkv[:, :prefix].contiguous(), g[:, :prefix].contiguous(),
                                                 beta[:, :prefix].contiguous(), ref, out, num_k_heads, num_v_heads,
-                                                k_head_dim, v_head_dim, slots, True, slots_in, sref)
+                                                k_head_dim, v_head_dim, slots, True, slots_in, sref, state_bits)
             expect.append((ref, sref))
         jobs = []
         pools = []
@@ -434,9 +474,9 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
                 mixed_qkv[rr].data_ptr(), g[rr].data_ptr(), beta[rr].data_ptr(),
                 p2.data_ptr() + int(slots_in[rr]) * rb, p2.data_ptr() + int(slots[rr]) * rb, 0, prefix, 1,
                 sb + int(slots_in[rr]) * srb, sb + int(slots[rr]) * srb))
-        # The pool's dispatch index: 0 fp32, 2 int8 (see GDNLayerState.scan_geometry)
+        # The pool's dispatch index: 0 fp32, 2 int (see GDNLayerState.scan_geometry)
         ext.batched_scan_replay(jobs, torch.device(device).index, 0, num_k_heads, num_v_heads, k_head_dim, v_head_dim,
-                               2 if state_dtype == torch.int8 else 0)
+                               2 if state_dtype == torch.int8 else 0, state_bits)
         torch.cuda.synchronize(device)
         for p2, s2, (ref, sref), (_, _, _, pool, scales) in zip(pools, scales2, expect, L):
             assert torch.equal(p2[int(slots[rr])], ref[int(slots[rr])]), f"prefix {prefix}: replayed row differs"
@@ -456,7 +496,8 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
         (3, 127, 2, 4, 128, 128),
     ],
 )
-@pytest.mark.parametrize("state_format", ["fp32", "int8"], ids = ["fp32_pool", "int8_pool"])
+@pytest.mark.parametrize("state_format", ["fp32", 8, 9, 10, 12],
+                         ids = ["fp32_pool", "int8_pool", "int9_pool", "int10_pool", "int12_pool"])
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_matches_torch(
     device,
@@ -480,13 +521,13 @@ def test_chunk_gated_delta_rule_matches_torch(
         device = device,
     ) * 0.05
 
-    if state_format == "int8":
-        # The chunked path with a packed int8 pool (128x128 only) must agree with the fp32 reference
+    if state_format != "fp32":
+        # The chunked path with a packed int pool (128x128 only) must agree with the fp32 reference
         # started from the same (quantized) state; a wrong-but-orthogonal converter matrix fails it
         if k_head_dim != 128 or v_head_dim != 128:
-            pytest.skip("int8 pools are 128x128 only")
-        pool, scales = pool_from_state(recurrent_state)
-        init_state = _rotate_state(state_from_pool(pool, scales))
+            pytest.skip("int pools are 128x128 only")
+        pool, scales = pool_from_state(recurrent_state, state_format)
+        init_state = _rotate_state(state_from_pool(pool, scales, state_format))
     else:
         pool, scales = None, None
         init_state = recurrent_state
@@ -504,7 +545,7 @@ def test_chunk_gated_delta_rule_matches_torch(
         v_head_dim,
     )
 
-    if state_format == "int8":
+    if state_format != "fp32":
         out = gated_delta_rule_fn(
             mixed_qkv,
             beta,
@@ -520,11 +561,12 @@ def test_chunk_gated_delta_rule_matches_torch(
             k_head_dim,
             v_head_dim,
             recurrent_scales = scales,
+            recurrent_bits = state_format,
         )
         torch.testing.assert_close(out, ref_out, rtol = 5e-2, atol = 5e-2)
         # The pass wrote the pool in place: decode the new rows back to the original basis, one
         # quantization step from the reference
-        torch.testing.assert_close(_rotate_state(state_from_pool(pool, scales)), ref_state,
+        torch.testing.assert_close(_rotate_state(state_from_pool(pool, scales, state_format)), ref_state,
                                   rtol = 1e-2, atol = 1e-2)
         return
 
@@ -645,38 +687,48 @@ def test_rejects_non_contiguous(device, which):
                                             None, False)
 
 
+@pytest.mark.parametrize("bits", [1, 13], ids = ["w1", "w13"])
 @torch.inference_mode()
-def test_int8_state_rejects_ineligible_calls(device):
-    """The int8 dispatch is 128x128 GDN only: channelwise decay (KDA) does not commute with the rotation,
-    and the generic (non-128) kernels have no char path. The scales tensor is int8-only."""
+def test_int8_state_rejects_ineligible_calls(device, bits):
+    """The packed int dispatch is 128x128 GDN only: channelwise decay (KDA) does not commute with the
+    rotation, the generic (non-128) kernels have no char path, the width must be 2..12, and the scales
+    tensor pairs with an int pool and its width only. The pool is v-major (rows, 1, nv, dv, dk * W // 8)."""
     bsz, seqlen, nk, nv, dk, dv = 1, 3, 2, 4, 128, 128
     mixed_qkv = torch.randn(bsz, seqlen, 2 * nk * dk + nv * dv, device = device).bfloat16()
     beta = torch.rand(bsz, seqlen, nv, device = device).bfloat16()
     out = torch.empty(bsz, seqlen, nv, dv, dtype = torch.bfloat16, device = device)
-    pool = torch.randint(-127, 128, (2, 1, nv, dk, dv), dtype = torch.int8, device = device)
+    pool = torch.randint(-127, 128, (2, 1, nv, dv, dk * bits // 8), dtype = torch.int8, device = device)
     scales = torch.rand((2, 1, nv, dv, dk // 32), device = device).half()
+    g = -torch.rand(bsz, seqlen, nv, device = device)
 
-    # channelwise g (KDA) with an int8 state
+    # W outside 2..12 (W = 1 would divide by Q = 0 in the kernel)
+    with pytest.raises(RuntimeError, match = "packed int recurrent state requires 2..12 bits"):
+        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool, out, nk, nv, dk, dv, None, False, None, scales, bits)
+
+    # channelwise g (KDA) with an int state
     g_kda = -torch.rand(bsz, seqlen, nv, dk, device = device)
     with pytest.raises(RuntimeError, match = "not supported for channelwise"):
-        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g_kda, beta, pool, out, nk, nv, dk, dv, None, False, None, scales)
+        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g_kda, beta, pool, out, nk, nv, dk, dv, None, False, None, scales, 8)
 
-    # int8 with non-128 head dims
+    # int with non-128 head dims
     dk2, dv2 = 64, 64
     qkv2 = torch.randn(bsz, seqlen, 2 * nk * dk2 + nv * dv2, device = device).bfloat16()
-    pool2 = torch.randint(-127, 128, (2, 1, nv, dk2, dv2), dtype = torch.int8, device = device)
+    pool2 = torch.randint(-127, 128, (2, 1, nv, dv2, dk2 * 8 // 8), dtype = torch.int8, device = device)
     scales2 = torch.rand((2, 1, nv, dv2, dk2 // 32), device = device).half()
     out2 = torch.empty(bsz, seqlen, nv, dv2, dtype = torch.bfloat16, device = device)
-    g2 = -torch.rand(bsz, seqlen, nv, device = device)
     with pytest.raises(RuntimeError, match = "requires 128x128"):
-        ext.cuda_recurrent_gated_delta_rule(qkv2, g2, beta, pool2, out2, nk, nv, dk2, dv2, None, False, None, scales2)
+        ext.cuda_recurrent_gated_delta_rule(qkv2, g, beta, pool2, out2, nk, nv, dk2, dv2, None, False, None, scales2, 8)
 
-    # an int8 pool without its per-slice scales
-    g = -torch.rand(bsz, seqlen, nv, device = device)
-    with pytest.raises(RuntimeError, match = "int8 recurrent state requires recurrent_scales"):
-        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool, out, nk, nv, dk, dv, None, False, None, None)
+    # an int pool without its per-slice scales
+    with pytest.raises(RuntimeError, match = "packed int recurrent state requires recurrent_scales"):
+        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool, out, nk, nv, dk, dv, None, False, None, None, 8)
 
-    # a scales tensor with a non-int8 pool
+    # a scales tensor with a non-int pool
     pool_fp16 = torch.zeros(2, 1, nv, dk, dv, dtype = torch.half, device = device)
-    with pytest.raises(RuntimeError, match = "recurrent_scales is only used with the int8"):
+    with pytest.raises(RuntimeError, match = "recurrent_scales is only used with the packed int recurrent state"):
         ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool_fp16, out, nk, nv, dk, dv, None, False, None, scales)
+
+    # a pool of an unsupported dtype
+    pool_i16 = torch.zeros(2, 1, nv, dv, dk * 8 // 8, dtype = torch.int16, device = device)
+    with pytest.raises(RuntimeError, match = "recurrent_state must be float32, float16 or int8"):
+        ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool_i16, out, nk, nv, dk, dv, None, False, None, scales, 8)
