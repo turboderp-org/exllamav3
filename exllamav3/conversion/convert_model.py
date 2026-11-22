@@ -208,11 +208,17 @@ def recover_checkpoint(work_dir):
     """
     Checkpoint saving swaps ckpt_new/ in with two renames (ckpt/ to ckpt_old/, then ckpt_new/ to ckpt/). An interrupt
     or crash between them leaves no ckpt/. The first rename only runs once ckpt_new/ is complete, so restore that,
-    else the previous checkpoint in ckpt_old/. Runs before prepare_env, which would recreate ckpt/ empty
+    else the previous checkpoint in ckpt_old/. Runs before prepare_env, which would recreate ckpt/ empty; an empty
+    ckpt/ left by an earlier failed resume is removed first
     """
     ckpt_dir = os.path.join(work_dir, "ckpt")
-    if os.path.exists(ckpt_dir):
+    if os.path.exists(os.path.join(ckpt_dir, "job.json")):
         return
+    if os.path.isdir(ckpt_dir):
+        try:
+            os.rmdir(ckpt_dir)
+        except OSError:
+            return  # not empty: leave it for the user to inspect
     for name in ("ckpt_new", "ckpt_old"):
         candidate = os.path.join(work_dir, name)
         if os.path.exists(os.path.join(candidate, "job.json")):

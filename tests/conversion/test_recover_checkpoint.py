@@ -43,3 +43,11 @@ def test_existing_checkpoint_is_kept(tmp_path):
     recover_checkpoint(str(tmp_path))
     assert _restored_idx(tmp_path) == 5
     assert (tmp_path / "ckpt_new").exists()
+
+
+@pytest.mark.nogpu
+def test_empty_ckpt_from_failed_resume_is_replaced(tmp_path):
+    (tmp_path / "ckpt").mkdir()  # prepare_env recreated it during an earlier failed resume
+    _ckpt(tmp_path, "ckpt_new", 5)
+    recover_checkpoint(str(tmp_path))
+    assert _restored_idx(tmp_path) == 5
