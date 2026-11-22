@@ -1610,6 +1610,9 @@ def original_H(H_data: dict, device, cache: bool = False) -> torch.Tensor:
     return H
 
 
+# Floor on the scaled Hessian's diagonal, as a share of its mean (see scaled_ldl)
+SCALED_DIAG_FLOOR = 1e-3
+
 def scaled_ldl(H_orig: torch.Tensor, su: torch.Tensor, quant_args: dict) -> torch.Tensor:
     """
     Block LDL of the Hessian in the domain LDLQ actually quantizes in. finalize_capture_H factors the
@@ -1625,9 +1628,16 @@ def scaled_ldl(H_orig: torch.Tensor, su: torch.Tensor, quant_args: dict) -> torc
     s = su.view(-1).float().to(H_orig.device)
     H = H_orig * s.unsqueeze(0)
     H *= s.unsqueeze(1)
+    # An input channel the weight barely reads (a dead unit: its scale sits orders of magnitude below the
+    # rest) takes its share of finalize_capture_H's damping down with it. Once the rotation mixes it with
+    # live channels, that falls below what fp32 resolves, and a matrix that is positive definite on paper
+    # stops factoring. Such channels are held at a diagonal floor far under the live ones; an error left in
+    # them does not reach the output either way
+    d = H.diagonal()
+    d.clamp_(min = SCALED_DIAG_FLOOR * d.mean().item())
     blockwise_preapply_had_r_(H, had_k)
     blockwise_preapply_had_l_(H, had_k)
-    L, _ = block_ldl(H, 16, quant_args, False)
+    L, _ = block_ldl(H, 16, quant_args, False, debug_info = {"key": quant_args.get("key"), "su": su})
     dr = torch.arange(L.shape[0], device = L.device)
     L[dr, dr] = 0
     return L
