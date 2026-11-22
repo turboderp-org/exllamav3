@@ -204,6 +204,23 @@ def save_tensor(tensor, filename: str, args):
         }, path)
 
 
+def recover_checkpoint(work_dir):
+    """
+    Checkpoint saving swaps ckpt_new/ in with two renames (ckpt/ to ckpt_old/, then ckpt_new/ to ckpt/). An interrupt
+    or crash between them leaves no ckpt/. The first rename only runs once ckpt_new/ is complete, so restore that,
+    else the previous checkpoint in ckpt_old/. Runs before prepare_env, which would recreate ckpt/ empty
+    """
+    ckpt_dir = os.path.join(work_dir, "ckpt")
+    if os.path.exists(ckpt_dir):
+        return
+    for name in ("ckpt_new", "ckpt_old"):
+        candidate = os.path.join(work_dir, name)
+        if os.path.exists(os.path.join(candidate, "job.json")):
+            print(f" -- Restoring checkpoint from {name}")
+            os.rename(candidate, ckpt_dir)
+            return
+
+
 def prepare_env(args):
     qtensors_dir = os.path.join(args["work_dir"], "qtensors")
     ckpt_dir = os.path.join(args["work_dir"], "ckpt")
@@ -270,6 +287,7 @@ def prepare(args) -> (dict, dict, bool, str):
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
+        recover_checkpoint(args.work_dir)
         in_args = load_dict("args.json", in_args)
         in_args["work_dir"] = args.work_dir
 
