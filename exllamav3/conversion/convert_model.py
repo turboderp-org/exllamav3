@@ -23,7 +23,7 @@ from .moe_affinity import make_store as make_affinity_store, merge_stores as mer
     combine_down as combine_affinity_down, quantize_gate_up as quantize_affinity_gate_up
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
-import os, shutil, signal
+import contextlib, os, shutil, signal
 import json
 import threading
 from pathlib import Path
@@ -734,6 +734,19 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             malloc_trim()
 
 
+def abort_workers():
+    """
+    Ctrl-C while daemon worker threads may be inside long kernel launches: end the process without waiting for them.
+    A signal sent to one thread acts on the whole process (SIGTSTP suspends it). Dying by SIGINT, not exiting
+    normally, lets a calling shell loop stop too. A second Ctrl-C or a closed stdout cannot interrupt the exit.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    with contextlib.suppress(OSError):
+        print("Aborted.", flush = True)
+    os.kill(os.getpid(), signal.SIGINT)
+    os._exit(130)
+
+
 def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state,
                               out_sens = None):
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
@@ -848,13 +861,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt:
-        # The workers are daemon threads, possibly inside long kernel launches; end the process without
-        # waiting for them. A signal sent to one thread acts on the whole process (SIGTSTP suspends it).
-        # Dying by SIGINT, not exiting normally, lets a calling shell loop stop too
-        print("Aborted.", flush = True)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGINT)
-        os._exit(130)
+        abort_workers()
 
     if errors:
         # Abort immediately (the other workers' remaining groups are wasted work); the traceback
@@ -966,13 +973,7 @@ def run_row_workers(title, num_rows, workers, progress_count):
                 time.sleep(0.05)
             progress.update(progress_count[0])
     except KeyboardInterrupt:
-        # The workers are daemon threads, possibly inside long kernel launches; end the process without
-        # waiting for them. A signal sent to one thread acts on the whole process (SIGTSTP suspends it).
-        # Dying by SIGINT, not exiting normally, lets a calling shell loop stop too
-        print("Aborted.", flush = True)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGINT)
-        os._exit(130)
+        abort_workers()
     for t in threads:
         t.join(timeout = 0.1)
     if errors:

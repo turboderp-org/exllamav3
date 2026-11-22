@@ -11,8 +11,6 @@ import sys
 
 import pytest
 
-pytest.importorskip("exllamav3.conversion.convert_model")
-
 PRELUDE = """
 import time
 from exllamav3.conversion import convert_model as cm
@@ -49,7 +47,9 @@ cm.run_row_workers(" -- Rows", 1, [busy], [0])
 @pytest.mark.parametrize("child", [QUANTIZE_PARALLEL, ROW_WORKERS], ids = ["quantize_linears_parallel", "run_row_workers"])
 def test_ctrl_c_aborts_busy_workers(child):
     proc = subprocess.Popen(
-        [sys.executable, "-c", child], stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True
+        [sys.executable, "-c", child], stdout = subprocess.PIPE, stderr = subprocess.STDOUT, text = True,
+        # A runner started with SIGINT ignored would pass that on, and the child would never see Ctrl-C
+        preexec_fn = lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)
     )
     try:
         for line in proc.stdout:
