@@ -4,12 +4,14 @@ import numpy as np
 import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeSettings, RopeStyle
+from ..util.rope import RopeSettings, RopeStyle, RoPE
 from ..modules import (
     RMSNorm, Embedding, TransformerBlock, MLAttention, GatedMLP, Linear, BlockSparseMLP, PLELayer,
 )
 from ..modules.hyperconnections import ExpandStreams, HyperConnection, HyperHead
 from ..modules.attn import prepare_for_attn
+from .hy_v4_flash_dfly import HyV4FlashDFlyModel
+from .hy_v4_flash_vision import HyV4FlashVisionModel, read_hy_v4_vision_config
 
 # Hy4 flash (HYV4FlashForConditionalGeneration, text component): gated MLA with a learned sink on
 # every layer, read through a 512-token window on three layers out of four and through a compressed
@@ -32,7 +34,7 @@ class HyV4FlashConfig(Config):
     ):
         super().__init__(
             directory,
-            {"text": HyV4FlashModel},
+            {"text": HyV4FlashModel, "mtp": HyV4FlashDFlyModel, "vision": HyV4FlashVisionModel},
             **kwargs
         )
         p = "text_config->"
@@ -66,11 +68,20 @@ class HyV4FlashConfig(Config):
         self.index_kpool = self.read_cfg(int, [p + "index_kpool", p + "compressed_indexer_compress_ratio"], 4)
 
         # RoPE: interleaved pairs over the rope slice, one base per layer type. Text positions are the same
-        # on all three M-RoPE planes, which leaves the plain one-dimensional rotation
+        # on all three M-RoPE planes, which leaves the plain one-dimensional rotation; the rows of an image
+        # take a position per plane (frame, row, column), the planes interleaved over the frequencies
         rp = self.read_cfg(dict, p + "rope_parameters", {})
         def rope(names: tuple, default_theta: float, dim: int):
-            theta = next((rp[n]["rope_theta"] for n in names if n in rp and "rope_theta" in rp[n]), default_theta)
-            return RopeSettings(head_dim = dim, rope_theta = float(theta), rope_style = RopeStyle.GPTJ)
+            params = next((rp[n] for n in names if n in rp), {})
+            return RopeSettings(
+                head_dim = dim,
+                rope_theta = float(params.get("rope_theta", default_theta)),
+                rope_style = RopeStyle.GPTJ,
+                rope_scaling = {
+                    "mrope_section": params.get("mrope_section", [12, 10, 10]),
+                    "mrope_interleaved": params.get("mrope_interleaved", True),
+                },
+            )
         self.rope_settings_indexed = rope(("indexed_attention", "deepseek_sparse_attention"), 1e7, self.qk_rope_head_dim)
         self.rope_settings_sliding = rope(("sliding_attention",), 1e4, self.swa_qk_rope_head_dim)
 
@@ -118,7 +129,49 @@ class HyV4FlashConfig(Config):
                 f"HyV4Flash: unexpected Engram head layout for layer {idx}"
 
         self.image_token_id = self.read_cfg(int, "image_token_id", None)
+        self.image_start_token_id = self.read_cfg(int, "image_start_token_id", None)
+        self.image_end_token_id = self.read_cfg(int, "image_end_token_id", None)
+
+        # Vision tower, present when the directory carries its tensors
+        self.vision = read_hy_v4_vision_config(self)
+        if self.vision is None:
+            del self.model_classes["vision"]
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+
+        # DFly2 drafter (MTP component), present when the directory carries its tensors
+        dk = "model.dfly_layers"
+        self.dfly_num_layers = self.read_cfg(int, "dfly_num_hidden_layers", 0)
+        self.dfly_kv_layers = self.read_cfg(list, "dfly_target_kv_layers", [])
+        index_layers = self.read_cfg([list, int], "dfly_target_index_layer", [])
+        self.dfly_index_layers = index_layers if isinstance(index_layers, list) else [index_layers] * self.dfly_num_layers
+        if (
+            not self.dfly_num_layers or not self.stc.has_tensor(f"{dk}.final_norm.weight") or
+            # (a model cut short of the layers the drafter shares has no use for it)
+            max(self.dfly_kv_layers + self.dfly_index_layers, default = 0) >= self.num_hidden_layers
+        ):
+            del self.model_classes["mtp"]
+            return
+        self.dfly_mask_token_id = self.read_cfg(int, "dfly_mask_token_id", no_default)
+        self.dfly_local_window = self.read_cfg(int, "dfly_context_local_window", None)
+        self.dfly_block_size = self.read_cfg(int, "speculative_config->num_speculative_tokens", 5)
+        # Acceptance predictor for the dynamic draft length, when the directory carries it
+        self.dfly_confidence_head = self.stc.has_tensor(f"{dk}.confidence_head.proj.weight")
+        self.assert_cfg(str, "dfly_mtp_fusion", "slot0", True)
+        self.assert_cfg(bool, "dfly_enable_hidden_correction", True, True)
+        self.assert_cfg(bool, "dfly_enable_ihc", False, True)
+        self.assert_cfg(str, "dfly_mlp_type", "dense", True)
+        # The MLP widths are not in the config; a projection's input side gives them, as the weight's
+        # second dimension or the length of a quantized tensor's input scales
+        def in_features(key: str, default: int) -> int:
+            for suffix, dim in ((".weight", 1), (".suh", 0), (".su", 0)):
+                meta = self.stc.get_tensor_meta(key + suffix)
+                if meta is not None:
+                    return meta[key + suffix]["shape"][dim]
+            return default
+        self.dfly_intermediate_size = self.read_cfg(int, "dfly_intermediate_size", None) or \
+            in_features(f"{dk}.0.mlp.down_proj", self.intermediate_size)
+        self.dfly_correction_size = self.read_cfg(int, "dfly_hidden_correction_intermediate_size", None) or \
+            in_features(f"{dk}.hidden_correction.down_proj", self.hidden_size)
 
     def engram_multipliers(self, idx: int, compressed_vocab_size: int) -> list:
         """The odd multipliers a layer's n-grams are mixed with: numpy's default generator seeded per layer
@@ -218,6 +271,14 @@ class HyV4FlashModel(Model):
             # The Engram layers hash each token with the ones before it; the caller supplies those
             self.caps.update({"prev_ids": config.engram_ngram_size - 1})
 
+        # Image rows take three-axis positions: the caller builds a per-token frequency table for them
+        # with the indexed layers' base, and the sliding layers rescale it to their own
+        assert config.rope_settings_sliding.rope_scaling == config.rope_settings_indexed.rope_scaling and \
+            config.rope_settings_sliding.head_dim == config.rope_settings_indexed.head_dim, \
+            "HyV4Flash: the layer types must share their M-RoPE layout"
+        self.caps.update({"mrope": True})
+        self.g_rope = RoPE("cpu", config.rope_settings_indexed)
+
     def make_attn(self, idx: int, key: str) -> MLAttention:
         config = self.config
         sliding = config.layer_types[idx] == "sliding"
@@ -232,6 +293,7 @@ class HyV4FlashModel(Model):
             qk_rope_head_dim = config.swa_qk_rope_head_dim if sliding else config.qk_rope_head_dim,
             v_head_dim = config.swa_v_head_dim if sliding else config.v_head_dim,
             rope_settings = config.rope_settings_sliding if sliding else config.rope_settings_indexed,
+            table_rope_settings = config.rope_settings_indexed if sliding else None,
             q_lora_rank = config.q_lora_rank,
             rms_norm_eps = config.rms_norm_eps,
             qmap = "block.attn",

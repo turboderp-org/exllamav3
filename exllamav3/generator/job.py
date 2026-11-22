@@ -324,8 +324,9 @@ class Job:
         self.sam = rq_state.get("sam", None)
         self.sam_match = None
 
-        # MTP state
+        # MTP state: the target's state for the last token in the cache, and any further exports for it
         self.mtp_last_hidden = None
+        self.mtp_last_aux = []
 
 
     def get_pinned_logit_mask(self):
@@ -1124,6 +1125,7 @@ class Job:
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
             self.mtp_last_hidden = None
+            self.mtp_last_aux = []
             self.checkpoint_rewound = True
             # Every deferred page held rewound tokens and was truncated above
             self.checkpoint["deferred_pages"].clear()
@@ -1620,8 +1622,12 @@ class Job:
                     params.update(dm.draft_verifier_params)
                 # MTP needs the target's post-final-norm state for every prompt token. Normal prefill stops at the
                 # last cache-writing layer, before final norm. (A drafter fed the last decoder layer's output takes
-                # the regular prefill, which runs through that layer)
-                to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
+                # the regular prefill, which runs through that layer; one that shares the target's cache but
+                # reads its final state does not)
+                to_output = gen.mtp_draft and (
+                    dm is None or not dm.caps.get("draft_uses_target_cache") or
+                    "export_state_norm_keys" in dm.draft_verifier_params
+                )
                 if to_output:
                     params["last_tokens_only"] = 1
                 then = None
@@ -1723,6 +1729,7 @@ class Job:
         elif self.generator.draft_model:
             if self.generator.mtp_draft:
                 target_hidden = params.get("export_states")[-1]
+                self.mtp_last_aux = [s[:, -1:].clone() for s in params["export_states"][:-1]]
                 carry_hidden = seq.mtp_carry_hidden
                 if carry_hidden is None:
                     carry_hidden = torch.zeros_like(target_hidden[:, :1, :])

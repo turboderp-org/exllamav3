@@ -115,6 +115,8 @@ class MLAttention(Module):
         index_kpool_mode: str = "gate",
         index_keys: dict | None = None,
         key_indexer: str = "indexer",
+        cache_layer_idx: int | None = None,
+        table_rope_settings: RopeSettings | None = None,
         submodules: dict | None = None,
         tp_affinity: str | None = None,
     ):
@@ -136,6 +138,10 @@ class MLAttention(Module):
         self.q_lora_rank = q_lora_rank
         self.rope_settings = rope_settings
         self.rope = None
+        # A caller's per-token frequency table (params["inv_freq"], M-RoPE) is built with one set of rope
+        # settings; a layer rotating with another base rescales the table by the ratio of the two
+        self.table_rope_settings = table_rope_settings
+        self.table_scale = None
         # Llama-4 position scale (Mistral-Small-4): set in load_local from the RoPE instance
         self.l4_beta = 0.0
         self.l4_original = 1
@@ -154,8 +160,10 @@ class MLAttention(Module):
 
         # DSA lightning indexer (GLM-5.2 / DeepSeek-V3.2-on-MLA). "full" layers score and select
         # index_topk tokens per query and publish the selection; "shared" layers reuse the
-        # nearest preceding full layer's selection. None = plain dense MLA
-        assert indexer_mode in (None, "full", "shared")
+        # nearest preceding full layer's selection. "external" layers take every forward's selection from
+        # the caller (params["mla_selection"]: (rows, K_pad) int32 with K_pad = index_topk rounded up to
+        # 32, -1 for unused entries, and the columns in use). None = plain dense MLA
+        assert indexer_mode in (None, "full", "shared", "external")
         self.indexer_mode = indexer_mode
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -213,6 +221,10 @@ class MLAttention(Module):
         self.idx_wk = None
         self.idx_k_norm = None
         self.idx_weights = None
+
+        # A layer of a drafter that shares its target's K/V reads and writes the target's cache layer at
+        # this index (through the target's Cache, which the caller passes) and owns none
+        self.cache_layer_idx = cache_layer_idx
 
         self.cache_layers = []
         self.tp_cache_lookup = {}
@@ -325,9 +337,10 @@ class MLAttention(Module):
                 qmap = None, out_dtype = torch.half, pad_to = 1,
             ))
 
-        self.caps.update({
-            "kv_cache": True
-        })
+        if cache_layer_idx is None:
+            self.caps.update({
+                "kv_cache": True
+            })
 
 
 
@@ -408,6 +421,8 @@ class MLAttention(Module):
 
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
+            if self.table_rope_settings is not None:
+                self.table_scale = (self.rope.inv_freq / RoPE(device, self.table_rope_settings).inv_freq).float()
             # The Llama-4 scale multiplies the FULL query post-rope (HF semantics, q only). Only
             # the q_pe/k_pe slices pass through the rope kernel here, which would miss q_nope, so
             # take the beta out of the kernel and scale the whole query in _attend instead
@@ -488,6 +503,7 @@ class MLAttention(Module):
         for cl in self.cache_layers:
             cl.free()
         self.rope = None
+        self.table_scale = None
         self.w_uk_flat = None
         self.w_uv_flat = None
         self.idx_kpool_ape = None
@@ -691,13 +707,18 @@ class MLAttention(Module):
         return indices
 
 
-    def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen):
+    def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen, inv_freq = None, shift = None):
         """
         Incrementally extend the pooled-key plane with the pools completed by this chunk's
         append. A pool's key is the (gate_scores + APE)-softmax-weighted mean of its
         index_kpool members' keys; members are read back from the packed per-token plane
         (already appended), so pools straddling chunk boundaries resolve correctly. Complete
         pools are immutable, so each is written exactly once.
+
+        A Hy4 pool key carries the rotation of its first token: read from the caller's per-token
+        frequency table (inv_freq, by slot) when there is one, otherwise the slot moved by the chunk's
+        own offset between positions and slots (shift, per row). The latter holds for the pools a chunk
+        of plain text completes, as long as the pool does not reach back into an image
         """
         P, D_i = self.index_kpool, self.index_head_dim
         plane = idx_layer.get_idx()
@@ -716,7 +737,11 @@ class MLAttention(Module):
             tok = torch.arange(first_pool * P, last_pool * P, device = plane.device)
             rows = bt[tok // epp].long() * epp + tok % epp
             if proj:
-                pool_keys = self._kpool_proj(flat[rows].view(n_new, P, D_i), first_pool)
+                table = inv_freq[b : b + 1] if inv_freq is not None and inv_freq.dim() == 3 else inv_freq
+                pool_keys = self._kpool_proj(
+                    flat[rows].view(n_new, P, D_i), first_pool, table,
+                    shift[b] if shift is not None and table is None else None,
+                )
             else:
                 members = flat[rows].view(n_new, P, 2 * D_i).float()
                 keys, gates = members[..., :D_i], members[..., D_i:]
@@ -729,11 +754,12 @@ class MLAttention(Module):
             )
 
 
-    def _kpool_proj(self, members: torch.Tensor, first_pool: int) -> torch.Tensor:
+    def _kpool_proj(self, members: torch.Tensor, first_pool: int, inv_freq = None, shift = None) -> torch.Tensor:
         """Hy4 pooled keys: members (n, P, D_i) are the normalized token keys of n complete pools
         starting at pool first_pool. The pooling runs in fp32 (a softmax over P slots; fp16 rounding
         reorders near-ties and changes which pools a query recalls), then the pooled key is
-        normalized and rotated at its pool's first position. Returns (n, D_i) fp16"""
+        normalized and rotated at its pool's first position: its slot, looked up in a per-token
+        frequency table (inv_freq) or moved by shift. Returns (n, D_i) fp16"""
         import torch.nn.functional as F
         n, P, D_i = members.shape
         m = members.float()
@@ -744,7 +770,9 @@ class MLAttention(Module):
         pooled = (pooled * self.idx_kpool_norm).half().contiguous()
         if n:
             pos = ((first_pool + torch.arange(n, device = members.device)) * P).int().view(1, n)
-            self._indexer_rope_(pooled.view(1, n, 1, D_i), 0, None, pos, None, trailing = True)
+            if shift is not None:
+                pos = pos + shift
+            self._indexer_rope_(pooled.view(1, n, 1, D_i), 0, None, pos.contiguous(), inv_freq, trailing = True)
         return pooled
 
 
@@ -886,7 +914,8 @@ class MLAttention(Module):
             base_cols = 0
             if n_pools:
                 if self.index_kpool_mode == "proj":
-                    pool_keys = self._kpool_proj(plane[: n_pools * P].view(n_pools, P, D_i), 0).float()
+                    table = inv_freq[b : b + 1] if inv_freq is not None and inv_freq.dim() == 3 else inv_freq
+                    pool_keys = self._kpool_proj(plane[: n_pools * P].view(n_pools, P, D_i), 0, table).float()
                 else:
                     keys, gates = plane[:, :D_i].float(), plane[:, D_i:].float()
                     gk = keys[: n_pools * P].view(n_pools, P, D_i)
@@ -942,6 +971,13 @@ class MLAttention(Module):
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        if inv_freq is not None and self.table_scale is not None:
+            # One rescaled table per forward for the layers of this base on this device
+            key = ("inv_freq_scaled", self.device, self.rope_settings.rope_theta)
+            scaled = params.get(key)
+            if scaled is None:
+                scaled = params[key] = (inv_freq * self.table_scale).contiguous()
+            inv_freq = scaled
         causal = params.get("causal", True)
 
         H = self.num_q_heads
@@ -951,7 +987,10 @@ class MLAttention(Module):
 
         # Sparse DSA applies once the visible context exceeds the selection budget; below that,
         # top-k selection is all-inclusive and the dense path is bit-equivalent
-        if self.indexer_mode is not None:
+        if self.indexer_mode == "external":
+            assert causal and "mla_selection" in params, "MLA layer with an external selection was given none"
+            sparse = True
+        elif self.indexer_mode is not None:
             assert causal, "DSA indexer layers are causal-only"
             assert host_seqlens is not None
             sparse = max(host_seqlens) + seqlen > self.index_topk
@@ -1099,7 +1138,12 @@ class MLAttention(Module):
         if idx_layer is not None:
             idx_layer.update_idx_direct(cache_seqlens, block_table, k_idx, seqlen)
             if self.index_kpool:
-                self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
+                # Where the rows' positions leave their cache slots (text after an image), by how much
+                if positions is not None:
+                    shift = positions.view(-1).int() - cache_seqlens.view(-1).int()
+                else:
+                    shift = position - cache_seqlens.view(-1).int()
+                self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen, inv_freq, shift)
         return k_idx
 
 
@@ -1107,8 +1151,29 @@ class MLAttention(Module):
                    position, positions, position_ids, inv_freq, cache_seqlens = None) -> tuple:
         """The positions each query row attends over, for the gathered kernels: the indexer's picks in
         the sparse regime, otherwise the window or visible prefix of a layer that always gathers
-        (_visible_indices). Returns ((bsz * seqlen, K_pad) int32, -1 padded, columns in use or 0 for
-        all). q_resid may be a callable, evaluated only when the indexer scores"""
+        (_visible_indices). Returns ((bsz * seqlen, K_pad) int32, -1 for unused entries, columns in use
+        or 0 for all). q_resid may be a callable, evaluated only when the indexer scores.
+
+        A drafter that reuses this layer's selections (params["export_mla_selection"], layer indices)
+        gets them with the exported states, as (bsz, rows, K_pad): every row of a decode step, the last
+        row of a longer chunk. Only selections made here are exported, which covers every forward of a
+        layer with sinks or a window; other layers attend without one below the selection budget, and
+        select inside the graph path above it"""
+        sel = self._select(
+            x, params, q_resid, bsz, seqlen, host_seqlens, sparse, k_idx, idx_layer, block_table,
+            position, positions, position_ids, inv_freq, cache_seqlens,
+        )
+        if self.layer_idx in params.get("export_mla_selection", ()):
+            states = params.get("export_states")
+            if states is None:
+                states = params["export_states"] = []
+            rows = sel[0].view(bsz, seqlen, -1)
+            states.append(rows if seqlen <= MAX_DECODE_QLEN else rows[:, -1:].clone())
+        return sel
+
+
+    def _select(self, x, params, q_resid, bsz, seqlen, host_seqlens, sparse, k_idx, idx_layer, block_table,
+                position, positions, position_ids, inv_freq, cache_seqlens = None) -> tuple:
         if not sparse:
             return self._visible_indices(bsz, seqlen, host_seqlens, x.device, params, cache_seqlens)
         if self.indexer_mode != "full":
@@ -1224,8 +1289,9 @@ class MLAttention(Module):
         assert params.get("non_causal_spans") is None, \
             "MLAttention does not support non-causal spans"
 
+        layer_idx = self.layer_idx if self.cache_layer_idx is None else self.cache_layer_idx
         layer = cache if not hasattr(cache, "layers") else \
-            cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+            cache.layers[layer_idx, params.get("layer_instance") or 0]
 
         # Graph-captured C++ path for the whole decode block (projections through o_proj as one
         # replayed CUDA graph). Falls back to the dispatch path for unsupported configurations,
@@ -1283,7 +1349,7 @@ class MLAttention(Module):
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
         x = x.contiguous()
-        if bcm.gathered:
+        if bcm.gathered and self.indexer_mode != "external":
             # Sinks and windows live on the gathered kernels: the selection (window, visible prefix
             # or the indexer's picks, with the indexer planes updated first) is made here and the
             # graph runs the rest of the block through it

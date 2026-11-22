@@ -672,6 +672,8 @@ def build_bc_mla(module, layer):
         (not gathered or (
             (m.key_sinks is None or m.sinks is not None) and (m.window > 0 or m.indexer_mode is not None)
         )) and
+        # A caller-made selection (a drafter reusing its target's) enters the graph the same way
+        (m.indexer_mode != "external" or gathered) and
         # DSA indexer layers (GLM-5.2): full layers need the quantized wq_b, the fp16 key/
         # weight heads, the biased key norm and the paged key plane on this cache layer. A gathered
         # layer's indexer stays with the module, which hands the graph its selection

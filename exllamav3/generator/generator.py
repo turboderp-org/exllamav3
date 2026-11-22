@@ -1276,12 +1276,19 @@ class Generator:
 
         self._draft_conf_round = None
 
+        # A block drafter takes one forward for the whole window and returns all of its columns at once. One
+        # that shares the target's cache writes its block there, at the positions the verification pass
+        # takes: as many as the job's pages are guaranteed to hold past its K/V position, whatever the
+        # window of this round
+        block = self.draft_model.caps.get("block_draft", False)
+        block_window = self.num_draft_tokens if block else window
+
         # Get shape of active batch
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + window + 1)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + block_window + 1)
             batch_size += 1
         if batch_size == 0:
             return None
@@ -1306,6 +1313,7 @@ class Generator:
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
+        mtp_aux_list = []
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
@@ -1319,9 +1327,12 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
+            mtp_aux_list.append(job.mtp_last_aux)
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+        # Whatever else the target exported for the drafter (see iterate_gen), carried the same way
+        temp_aux = [torch.cat(rows, dim = 0) for rows in zip(*mtp_aux_list)]
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
@@ -1341,11 +1352,18 @@ class Generator:
         target_kv = self.draft_model.caps.get("draft_uses_target_cache", False)
         if target_kv:
             kv_seqlens = cache_seqlens.clone()
+            # Behind an image with three-axis positions, a row's position is its K/V slot plus the job's offset
+            kv_positions = kv_seqlens
+            if "mrope" in self.model.caps:
+                offsets = [job.alt_rope_offset for job in self.active_jobs if job.is_prefill_done()]
+                if any(offsets):
+                    kv_positions = kv_seqlens + torch.tensor(offsets, dtype = kv_seqlens.dtype)
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
-        for idx in range(window):
+        for idx in range(1 if block else window):
             params = {
                 "target_hidden": temp_hidden,
+                "target_aux": temp_aux,
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
                 "cache": self.cache if target_kv else self.draft_cache,
@@ -1354,13 +1372,16 @@ class Generator:
                 "sparse_head": self._sparse_flag,
             }
             if target_kv:
-                params["positions"] = kv_seqlens
+                params["positions"] = kv_positions
                 if target_states is not None:
                     params["source_recurrent_states"] = target_states
             if cal is not None:
                 params["export_draft_conf"] = True
             if draft_emb is not None:
                 params["draft_embedding"] = draft_emb
+            if block:
+                params["draft_window"] = window
+                params["draft_block_window"] = block_window
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
@@ -1374,6 +1395,21 @@ class Generator:
             # Drafters that re-project their state for the next step hand it back through params
             temp_hidden = params["next_target_hidden"] if "next_target_hidden" in params else batch_state
             draft_conf = params.get("draft_conf")
+            if block:
+                # The block is drafted already: cut the verified part at the first position whose confidence
+                # falls below the calibrated threshold, taking the longest cut across rows, and keep the
+                # whole block with its scores for labelling (as iterate_draftmodel_dflash_gen)
+                window = new_ids.shape[-1]
+                if cal is not None and draft_conf is not None:
+                    conf = draft_conf.float().cpu()
+                    below = conf < cal.threshold()
+                    first_below = below.int().argmax(dim = 1)
+                    cuts = torch.where(below.any(dim = 1), first_below, torch.full_like(first_below, window))
+                    window = int(cuts.max().item())
+                    self._draft_conf_round = {"ids": new_ids.cpu(), "conf": conf, "window": window}
+                    if window == 0:
+                        return None
+                break
             if cal is not None and draft_conf is not None:
                 c = draft_conf.float().cpu()
                 conf_cols.append(c)
@@ -1382,7 +1418,7 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
-        self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
+        self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1)[:, :window])
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -2242,10 +2278,14 @@ class Generator:
                         },
                     )
 
-                # The next unprocessed token is paired with the preceding target hidden state.
+                # The next unprocessed token is paired with the preceding target hidden state, and with
+                # anything else the drafter had the target export for that position
                 job.mtp_last_hidden = target_hidden[
                     a_idx:b_idx, accepted_length - 1:accepted_length, :
                 ].clone()
+                job.mtp_last_aux = [
+                    s[a_idx:b_idx, accepted_length - 1:accepted_length].clone() for s in p_export_states[:-1]
+                ]
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached

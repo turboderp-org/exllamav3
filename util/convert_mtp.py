@@ -80,7 +80,8 @@ def main(args):
     # Load MTP component model
     config = Config.from_directory(args.model_dir)
     mtp_model = Model.from_config(config, component = "mtp")
-    mtp_model.load(progressbar = True)
+    if not mtp_model.caps.get("load_with_target"):
+        mtp_model.load(progressbar = True)
     q_tensors = {}
     out_path = Path(args.out_file).resolve()
 
