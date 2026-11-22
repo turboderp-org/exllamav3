@@ -108,6 +108,8 @@ Resume the job started above if it was interrupted:
 python convert.py -w /mnt/temp/exl3 -r
 ```
 
+Ctrl-C stops a job at any point, including during parallel quantization (which prints `Aborted.`). The process ends on SIGINT, so a shell loop running several conversions stops too. Resume from the latest checkpoint as above.
+
 #### Multi-GPU quant
 
 Convert a model on the first three devices:
