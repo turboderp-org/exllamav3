@@ -5,6 +5,16 @@
 
 class Graph;
 
+// Recurrent-state formats: fp32, fp16, or a packed 2..12-bit payload with fp16 scales
+constexpr int STATE_FP32 = 0, STATE_FP16 = 1, STATE_PACKED = 2;
+
+inline int state_format_of(const at::Tensor& state)
+{
+    return state.scalar_type() == at::kFloat ? STATE_FP32
+         : state.scalar_type() == at::kHalf ? STATE_FP16
+         : state.scalar_type() == at::kChar ? STATE_PACKED : -1;
+}
+
 void gated_delta_net_fused_op
 (
     const at::Tensor& mixed_qkvz,
@@ -46,7 +56,9 @@ void cuda_recurrent_gated_delta_rule
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
-    const c10::optional<at::Tensor>& slots_in = c10::nullopt
+    const c10::optional<at::Tensor>& slots_in = c10::nullopt,
+    const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt,
+    int recurrent_bits = 0
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -63,7 +75,9 @@ void cuda_recurrent_gated_delta_rule_gr
     const c10::optional<at::Tensor>& slots,
     bool history,
     const c10::optional<at::Tensor>& slots_in,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& recurrent_scales = c10::nullopt,
+    int recurrent_bits = 0
 );
 
 // Mamba2 discretization: dt = clamp(softplus(dt_raw + dt_bias), dt_min, dt_max), g = -exp(a_log) * dt
@@ -249,17 +263,21 @@ struct ScanReplayJob
     uintptr_t qkv;          // staged post-conv qkv rows of this batch row, [prefix, qkv_dim] bf16
     uintptr_t g;            // staged log decay, [prefix, heads] or [prefix, heads, dk] (KDA) fp32
     uintptr_t beta;         // staged beta / dt, [prefix, heads] bf16
-    uintptr_t base;         // state row read for the first token, fp32 or fp16 [heads, dk, dv]
-    uintptr_t scratch;      // state row written (first token from base, then in place)
+    uintptr_t base;         // fp [heads, dk, dv], packed [heads, dv, dk * bits / 8]
+    uintptr_t scratch;      // output state row
     uintptr_t D;            // Mamba2 skip scales [heads] fp32, else 0
     int prefix;
     int tstride;            // staged rows between consecutive tokens: 1 for a pass staged (row, token),
                             // the batch size for one staged token-major, one step at a time
+    uintptr_t base_scales = 0;     // packed input row scales, else 0
+    uintptr_t scratch_scales = 0;  // packed output row scales, else 0
 
     ScanReplayJob() = default;
     ScanReplayJob(uintptr_t _qkv, uintptr_t _g, uintptr_t _beta, uintptr_t _base, uintptr_t _scratch,
-                  uintptr_t _D, int _prefix, int _tstride = 1) :
-        qkv(_qkv), g(_g), beta(_beta), base(_base), scratch(_scratch), D(_D), prefix(_prefix), tstride(_tstride) {}
+                  uintptr_t _D, int _prefix, int _tstride = 1,
+                  uintptr_t _base_scales = 0, uintptr_t _scratch_scales = 0) :
+        qkv(_qkv), g(_g), beta(_beta), base(_base), scratch(_scratch), D(_D), prefix(_prefix), tstride(_tstride),
+        base_scales(_base_scales), scratch_scales(_scratch_scales) {}
 };
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
@@ -274,5 +292,6 @@ void batched_scan_replay
     int num_v_heads,
     int k_head_dim,
     int v_head_dim,
-    bool state_half = false     // the jobs' state rows hold fp16 elements (see state_ld in gdn.cu)
+    int state_format = STATE_FP32,  // the jobs' pool element type (see state_format_of)
+    int state_bits = 0      // packed width (0 for fp)
 );

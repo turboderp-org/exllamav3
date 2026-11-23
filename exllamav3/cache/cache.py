@@ -100,6 +100,7 @@ class Cache:
         max_batch_size: int = 16,
         max_history: int = 0,
         recurrent_dtype: torch.dtype = torch.half,
+        recurrent_bits: int = 0,
         **kwargs
     ):
         """
@@ -128,12 +129,12 @@ class Cache:
             two rows per batch item regardless of this value.
 
         :param recurrent_dtype:
-            Storage dtype of the recurrent state of GatedDeltaNet and KDA layers: torch.half (default), or
-            torch.float for twice the state pool and checkpoint size. The scans compute in fp32 either way and
-            round once per pass on the store; on these layers fp16 storage moves next-token distributions no more
-            than regrouping a prefill does. Mamba2 layers keep fp32 regardless: their state spans a far wider
-            dynamic range (a quarter of it below fp16's normal range), and the per-step rounding accumulates over
-            a long generation. bf16 is not offered, its 8-bit mantissa is far worse than fp16 here
+            Storage format of GatedDeltaNet and KDA recurrent states: torch.half (default), torch.float, or
+            torch.int8 for a packed quantized state with one fp16 absmax scale per 32-value k slice. Packed states require
+            128x128 GDN heads and reject KDA layers. Mamba2 states always use torch.float.
+        :param recurrent_bits:
+            Bits per value for a packed torch.int8 recurrent state, from 2 to 12. Must be 0 for torch.float
+            and torch.half.
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 
@@ -141,6 +142,14 @@ class Cache:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
         """
         self.model = model
+        if recurrent_dtype in (torch.float, torch.half):
+            if recurrent_bits != 0:
+                raise ValueError("recurrent_bits is only used with a torch.int8 recurrent state")
+        elif recurrent_dtype == torch.int8:
+            if not 2 <= recurrent_bits <= 12:
+                raise ValueError("recurrent_bits of a torch.int8 recurrent state must be 2..12")
+        else:
+            raise ValueError(f"recurrent_dtype must be torch.float, torch.half or torch.int8, got {recurrent_dtype}")
         # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
         # model loader (per layer, on the layer's device), so a cache is only usable after a
         # load of the model it was attached to at load time.
@@ -180,7 +189,7 @@ class Cache:
             for instance in self.model.get_layer_instances(layer.layer_idx):
                 ls = layer.layer_state_cls(layer, max_batch_size, max_history, id(self))
                 if recurrent_dtype != torch.float and hasattr(ls, "set_state_dtype") and not getattr(layer, "mamba2", False):
-                    ls.set_state_dtype(recurrent_dtype)
+                    ls.set_state_dtype(recurrent_dtype, recurrent_bits)
                 self.recurrent_layers[instance] = ls
 
         # Attach

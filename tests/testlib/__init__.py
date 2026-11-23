@@ -14,6 +14,7 @@ Infrastructure
 Synthetic weights and references, by subsystem
     exl3          random EXL3 linears/experts, dequantization, dense reference, MLP activations
     attention     fp32 attention reference, random paged / packed-quantized caches, quantized round trip
+    gdn           packed GDN recurrent-state quantization reference
     moe           expert pointer tables, routing layouts, swizzle, per-expert MLP reference
     moe_cpu       CPU expert-kernel ISA tiers (run_per_tier), swizzled layouts, thread/affinity fixture
     routing       router configs and tie-aware selection comparison

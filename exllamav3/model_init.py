@@ -9,6 +9,12 @@ from argparse import ArgumentParser
 import yaml
 from pathlib import Path
 
+RECURRENT_STATE_FORMATS = (
+    {"fp16": (torch.half, 0), "fp32": (torch.float, 0)}
+    | {f"int{n}": (torch.int8, n) for n in range(2, 13)}
+)
+
+
 def add_args(
     parser: ArgumentParser,
     cache: bool = True,
@@ -119,7 +125,11 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
-        parser.add_argument("-rs32", "--recurrent_state_fp32", action = "store_true", help = "Store the recurrent state of GatedDeltaNet/KDA layers in fp32 instead of the default fp16 (twice the state pool and checkpoints; the scans compute in fp32 either way). Mamba2 layers always use fp32")
+        rs = parser.add_mutually_exclusive_group()
+        rs.add_argument("-rsf", "--recurrent_state_format", type = str, choices = list(RECURRENT_STATE_FORMATS), default = "fp16",
+                    help = "GDN recurrent state format: fp16 (default), fp32, or int2..int12 for packed values with fp16 scales; packed formats require 128x128 GDN heads. Mamba2 uses fp32")
+        rs.add_argument("-rs32", "--recurrent_state_fp32", action = "store_const", const = "fp32", dest = "recurrent_state_format",
+                    help = "Alias for -rsf fp32")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
         parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
         parser.add_argument("-dcd", "--disk_cache_dir", type = str, help = "Directory for a persistent third-tier page/checkpoint cache behind the CPU tier (needs -ccs > 0), default: disabled", default = None)
@@ -305,6 +315,7 @@ def init(
         vars(args).get("hybrid_draft_tokens") or 0,
     )
     if "cache_size" in vars(args):
+        recurrent_dtype, recurrent_bits = RECURRENT_STATE_FORMATS[args.recurrent_state_format]
         if args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
             if len(split) == 1:
@@ -322,7 +333,8 @@ def init(
                 compand_a = args.cache_compand_a,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
-                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
+                recurrent_dtype = recurrent_dtype,
+                recurrent_bits = recurrent_bits,
             )
             # The draft cache gets the same speculative headroom and slot count: a recurrent drafter
             # keeps its own state pool and checkpoints alongside the target's
@@ -334,7 +346,8 @@ def init(
                 v_bits = v_bits,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
-                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
+                recurrent_dtype = recurrent_dtype,
+                recurrent_bits = recurrent_bits,
             ) if draft_model_dir else None
         else:
             cache = Cache(
@@ -343,7 +356,8 @@ def init(
                 layer_type = CacheLayer_fp16,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
-                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
+                recurrent_dtype = recurrent_dtype,
+                recurrent_bits = recurrent_bits,
             )
             draft_cache = Cache(
                 draft_model,
@@ -351,7 +365,8 @@ def init(
                 layer_type = CacheLayer_fp16,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
-                recurrent_dtype = torch.float if args.recurrent_state_fp32 else torch.half,
+                recurrent_dtype = recurrent_dtype,
+                recurrent_bits = recurrent_bits,
             ) if draft_model_dir else None
     else:
         cache = None

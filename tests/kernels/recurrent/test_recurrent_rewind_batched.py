@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
+from testlib.gdn import quantize_pool
 
 CONV1D_MAX_K = 16
 
@@ -113,7 +114,8 @@ def test_batched_conv_rewind_rejects_large_cdim(device):
 
 # GDNLayerState: the conv job against a torch reference, the replay against a kernel pass over the prefix
 
-def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None, state_dtype = torch.float):
+def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None,
+                 state_dtype = torch.float, state_bits = 0):
     from exllamav3.modules.gated_delta_net import GDNLayerState
     module = types.SimpleNamespace(
         fdim_qkv = fdim,
@@ -123,10 +125,18 @@ def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None,
         k_head_dim = dk,
         v_head_dim = dv,
     )
-    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0, state_dtype = state_dtype)
+    ls = GDNLayerState(module, num_slots, max_history, cache_id = 0, state_dtype = state_dtype, state_bits = state_bits)
     ls.alloc(device)
     ls.conv_state.copy_(torch.randn(ls.conv_state.shape, device = device))
-    ls.recurrent_state.normal_()
+    if state_dtype == torch.int8:
+        values, scales = quantize_pool(
+            torch.randn((ls.recurrent_state.shape[0], 1, nv, dk, dv), device = device) * 0.05,
+            state_bits,
+        )
+        ls.recurrent_state.copy_(values)
+        ls.recurrent_scales.copy_(scales)
+    else:
+        ls.recurrent_state.normal_()
     return ls
 
 
@@ -158,38 +168,49 @@ def test_gdn_layer_state_conv_job_matches_reference(device, max_history):
         _layer_state(device, 1, 3, 384, 4, 4, 32, 64).rewind_conv_job(0, 3, 4)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float, torch.half], ids = ["fp32_state", "fp16_state"])
+@pytest.mark.parametrize("state_dtype,state_bits",
+                         [(torch.float, 0), (torch.half, 0), (torch.int8, 9)],
+                         ids = ["fp32_state", "fp16_state", "int9_state"])
 @pytest.mark.parametrize("max_history", [3, 64])
 @pytest.mark.parametrize("bsz", [1, 3])
 @torch.inference_mode()
-def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype):
-    # A speculative pass of max_history + 1 tokens writes its scan inputs into the staged views; every batch row
-    # and every prefix then replays to the state a prefix-length pass from the same base row produces
-    nk, nv, dk, dv, fdim = 2, 4, 64, 64, 2 * 2 * 64 + 4 * 64
+def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype, state_bits):
+    # Every batch row and prefix replays to the same state as a prefix-length pass from the base row
+    nk, nv = 2, 4
+    dk = dv = 128 if state_dtype == torch.int8 else 64
+    fdim = 2 * nk * dk + nv * dv
     seqlen = max_history + 1
-    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk, state_dtype = state_dtype)
+    ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk,
+                      state_dtype = state_dtype, state_bits = state_bits)
     conv_out, beta, g = ls.staged_views(bsz, seqlen)
     conv_out.copy_((torch.randn(conv_out.shape, device = device) * 0.25).bfloat16())
     beta.copy_(torch.sigmoid(torch.randn(beta.shape, device = device)).bfloat16())
     g.copy_(torch.randn(g.shape, device = device) * 0.5 - 1.0)
     pool0 = ls.recurrent_state.clone()
+    scales0 = ls.recurrent_scales.clone() if ls.recurrent_scales is not None else None
     for row in range(bsz):
         for parity in (0, 1):
             base, scratch = 2 * row + parity, 2 * row + 1 - parity
             for prefix in sorted({1, seqlen // 2, seqlen}):
                 expect = pool0.clone()
+                expect_scales = scales0.clone() if scales0 is not None else None
                 out = torch.empty((1, prefix, nv, dv), dtype = torch.bfloat16, device = device)
                 ext.cuda_recurrent_gated_delta_rule(
                     conv_out[row : row + 1, :prefix].contiguous(), g[row : row + 1, :prefix].contiguous(),
                     beta[row : row + 1, :prefix].contiguous(), expect, out, nk, nv, dk, dv,
                     torch.tensor([scratch], dtype = torch.int32, device = device), True,
-                    torch.tensor([base], dtype = torch.int32, device = device))
+                    torch.tensor([base], dtype = torch.int32, device = device), expect_scales, state_bits)
                 ls.recurrent_state.copy_(pool0)
+                if scales0 is not None:
+                    ls.recurrent_scales.copy_(scales0)
                 ext.batched_scan_replay([ls.replay_job(row, prefix, (bsz, seqlen, 1), base, scratch)],
                                         device.index, *ls.scan_geometry())
                 torch.cuda.synchronize(device)
                 assert torch.equal(ls.recurrent_state, expect), (row, parity, prefix)
                 assert torch.equal(ls.recurrent_state[base], pool0[base])
+                if scales0 is not None:
+                    assert torch.equal(ls.recurrent_scales, expect_scales), (row, parity, prefix)
+                    assert torch.equal(ls.recurrent_scales[base], scales0[base])
     with pytest.raises(AssertionError):
         ls.replay_job(0, 1, (bsz, seqlen - 1, 1), 0, 1)   # staged shape mismatch
     with pytest.raises(AssertionError):

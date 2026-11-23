@@ -2,9 +2,99 @@ import os
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
+from ...util.hadamard import get_hadamard_dt
 
-# The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
-# they are imported on first use rather than with the library
+# Packed rows contain signed two's-complement fields at consecutive bit offsets in little-endian byte
+# order, with one fp16 absmax scale per 32-value k slice. Packed values represent recurrent state in
+# the H32-rotated domain.
+_K_SLICE_SIZE = 32
+_K_HEAD_DIM = 128
+
+
+def _hadamard_32(device):
+    """Normalized fp32 32x32 Sylvester Hadamard matrix."""
+    return get_hadamard_dt(32, device, torch.float, 32 ** -0.5)
+
+
+def _unpack_bit_codes(units: torch.Tensor, bits: int) -> torch.Tensor:
+    """Unpack unsigned 16-bit units into signed codes."""
+    k_head_dim = units.shape[2] * 16 // bits
+    unpacked = torch.zeros(*units.shape[:2], k_head_dim, dtype = torch.int64, device = units.device)
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        bit_offset = bit_base & 15
+        unit_index = bit_base >> 4
+        if bit_offset + bits > 16:
+            code = (
+                (units[:, :, unit_index] >> bit_offset)
+                | ((units[:, :, unit_index + 1] << (16 - bit_offset)) & 0xffff)
+            )
+        else:
+            code = units[:, :, unit_index] >> bit_offset
+        code = code & code_mask
+        unpacked[:, :, value_index] = torch.where(code >= (1 << (bits - 1)), code - (1 << bits), code)
+    return unpacked
+
+
+def _pack_bit_row(codes: torch.Tensor, packed_values: torch.Tensor, bits: int):
+    """Pack signed codes into a row's little-endian byte stream in place."""
+    num_v_heads, k_head_dim, v_head_dim = codes.shape
+    num_units = packed_values.shape[2] // 2
+    units = torch.zeros(num_v_heads, v_head_dim, num_units, dtype = torch.int32, device = codes.device)
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        code = codes[:, value_index, :].to(torch.int32) & code_mask
+        bit_offset = bit_base & 15
+        unit_index = bit_base >> 4
+        units[:, :, unit_index] = units[:, :, unit_index] | (code << bit_offset)
+        if bit_offset + bits > 16:
+            units[:, :, unit_index + 1] = units[:, :, unit_index + 1] | (code >> (16 - bit_offset))
+    flat_units = units.view(num_v_heads * v_head_dim, num_units)
+    low_bytes = (flat_units & 0xff).to(torch.int8)
+    high_bytes = ((flat_units >> 8) & 0xff).to(torch.int8)
+    packed_values.view(num_v_heads * v_head_dim, num_units, 2).copy_(torch.stack([low_bytes, high_bytes], dim = -1))
+
+
+def _unpack_quantized_state_row(packed_values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
+    """Dequantize a packed row and rotate out of the H32-rotated domain."""
+    num_v_heads, v_head_dim, packed_bytes = packed_values.shape
+    k_head_dim = _K_HEAD_DIM
+    assert packed_bytes == k_head_dim * bits // 8, "packed state width does not match its bit count"
+    byte_pairs = packed_values.view(num_v_heads, v_head_dim, packed_bytes // 2, 2).to(torch.int32)
+    units = (byte_pairs[:, :, :, 0] & 0xff) | ((byte_pairs[:, :, :, 1] & 0xff) << 8)
+    codes = _unpack_bit_codes(units, bits)
+    quantization_bound = (1 << (bits - 1)) - 1
+    expanded_scales = scales.float().permute(0, 2, 1).unsqueeze(2)
+    rotated_state = (
+        codes.permute(0, 2, 1).reshape(
+            num_v_heads, _K_HEAD_DIM // _K_SLICE_SIZE, _K_SLICE_SIZE, v_head_dim
+        ) * expanded_scales / quantization_bound
+    )
+    hadamard = _hadamard_32(packed_values.device)
+    return torch.matmul(rotated_state.transpose(2, 3), hadamard).transpose(2, 3).reshape(
+        num_v_heads, k_head_dim, v_head_dim
+    )
+
+
+def _pack_quantized_state_row(state: torch.Tensor, packed_values: torch.Tensor, scales: torch.Tensor, bits: int):
+    """Rotate an (nv, dk, dv) fp32 state into the H32-rotated domain and write packed values and scales in place."""
+    num_v_heads, k_head_dim, v_head_dim = state.shape
+    assert k_head_dim == _K_HEAD_DIM and packed_values.shape[2] == k_head_dim * bits // 8, \
+        "packed state width does not match its bit count"
+    hadamard = _hadamard_32(state.device)
+    quantization_bound = (1 << (bits - 1)) - 1
+    state_slices = state.reshape(num_v_heads, _K_HEAD_DIM // _K_SLICE_SIZE, _K_SLICE_SIZE, v_head_dim)
+    rotated_state = torch.matmul(state_slices.transpose(2, 3), hadamard).transpose(2, 3)
+    absmax = rotated_state.abs().amax(dim = 2)
+    quantization_scale = torch.where(absmax > 0, quantization_bound / absmax, 0.0)
+    scales.copy_(absmax.permute(0, 2, 1).half())
+    codes = (rotated_state * quantization_scale.unsqueeze(2)).round().to(torch.int16).reshape(
+        num_v_heads, k_head_dim, v_head_dim
+    )
+    _pack_bit_row(codes, packed_values, bits)
+
 
 def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
@@ -118,6 +208,7 @@ def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
     return out, state if save_state else None
 
 
+# Vendored FLA imports query devices and Triton, so load chunk kernels on first use.
 def gated_delta_rule_fn(
     mixed_qkv: torch.Tensor,
     beta: torch.Tensor,
@@ -135,6 +226,8 @@ def gated_delta_rule_fn(
     params: dict = None,
     channelwise_g: bool = False,
     slots_in: torch.Tensor | None = None,
+    recurrent_scales: torch.Tensor | None = None,
+    recurrent_bits: int = 0,
 ):
     if params is None:
         params = {}
@@ -203,6 +296,8 @@ def gated_delta_rule_fn(
             recurrent_slots,
             history,
             slots_in,
+            recurrent_scales,
+            recurrent_bits,
         )
         return core_attn_out
 
@@ -218,14 +313,27 @@ def gated_delta_rule_fn(
         # (Grouped attn supported in fla-core now)
         rows_out, rows_in = chunked_rows()
         core_attn_out = []
+        # The chunked scan uses the unrotated state.
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
+            if recurrent_state is None:
+                state = None
+            elif recurrent_scales is not None:
+                state = _unpack_quantized_state_row(
+                    recurrent_state[si, 0], recurrent_scales[si, 0], recurrent_bits
+                ).unsqueeze(0)
+            else:
+                state = recurrent_state[si, 0].float().unsqueeze(0)
             core_attn, new_state = _chunked_scan(
                 chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
                 state, save_state,
             )
             if save_state and state is not None:
-                recurrent_state[so, 0].copy_(new_state.squeeze(0))
+                if recurrent_scales is not None:
+                    _pack_quantized_state_row(
+                        new_state.squeeze(0), recurrent_state[so, 0], recurrent_scales[so, 0], recurrent_bits
+                    )
+                else:
+                    recurrent_state[so, 0].copy_(new_state.squeeze(0))
             core_attn_out.append(core_attn)
 
         core_attn_out = torch.cat(core_attn_out, dim = 0)
@@ -258,6 +366,8 @@ def gated_delta_rule_fn(
             recurrent_slots,
             history,
             slots_in,
+            recurrent_scales,
+            recurrent_bits,
         )
 
     return core_attn_out

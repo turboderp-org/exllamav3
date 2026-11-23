@@ -171,12 +171,17 @@ def test_budget_evicts_tail_first_oldest_root_first(device, tmp_path):
 
 def test_state_round_trip_and_deferred_release(device, tmp_path):
     tier, disk, tensor = build(4, device, tmp_path)
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    values = torch.randint(0, 256, (1, 1, 4, 128, 128 * 9 // 8), generator = g).to(torch.int8)
+    scales = torch.randn((1, 1, 4, 128, 4), generator = g).half()
+    conv = torch.randn((32, 4), generator = g).bfloat16()
     stashed = {
         "position": 2048,
         "checkpoint_size": 4096,
         "layer.a": (torch.arange(16, dtype = torch.float32).reshape(1, 16), torch.ones(4, 3, dtype = torch.bfloat16)),
         "layer.b": [torch.full((8,), 3.0), torch.full((2, 2), 5.0)],
         "layer.c": torch.full((5,), 9, dtype = torch.int32),
+        "layer.packed": (values, scales, conv),
     }
     key = phash(7)
     released = []
@@ -194,7 +199,8 @@ def test_state_round_trip_and_deferred_release(device, tmp_path):
     back = disk2.read_state(key)
     assert back["position"] == 2048 and back["checkpoint_size"] == 4096
     assert isinstance(back["layer.a"], tuple) and isinstance(back["layer.b"], list)
-    for k in ("layer.a", "layer.b"):
+    assert isinstance(back["layer.packed"], tuple)
+    for k in ("layer.a", "layer.b", "layer.packed"):
         for a, b in zip(stashed[k], back[k]):
             assert a.dtype == b.dtype and torch.equal(a, b)
     assert torch.equal(stashed["layer.c"], back["layer.c"])

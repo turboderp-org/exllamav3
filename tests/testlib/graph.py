@@ -50,6 +50,10 @@ def unload_model(model):
     torch.cuda.empty_cache()
 
 
+def has_quantized_state(cache) -> bool:
+    return any(getattr(layer, "quantized", False) for layer in cache.recurrent_layers.values())
+
+
 def generate_with_logits(model, cache, tokenizer, prompts: list[str], max_new_tokens: int,
                          max_batch_size: int = 4) -> list[tuple[list[int], list[torch.Tensor]]]:
     """Greedy decode of all prompts as concurrent jobs; per job (tokens, [per-step logits before sampling]), at

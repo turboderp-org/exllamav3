@@ -227,7 +227,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     bool history,
     const c10::optional<at::Tensor>& slots_in,
     Slot& s,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& recurrent_scales,
+    int recurrent_bits
 )
 {
     int R = (int) (x.size(0) * x.size(1));
@@ -319,7 +321,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         slots_scan,
         history,
         slots_in,
-        graph
+        graph,
+        recurrent_scales,
+        recurrent_bits
     );
 
     norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
@@ -338,7 +342,9 @@ void BC_GatedDeltaNetSplit::run_bszN
     const at::Tensor& slots,
     const at::Tensor& slots_scan,
     bool history,
-    const c10::optional<at::Tensor>& slots_in
+    const c10::optional<at::Tensor>& slots_in,
+    const c10::optional<at::Tensor>& recurrent_scales,
+    int recurrent_bits
 )
 {
     py::gil_scoped_release release;
@@ -352,31 +358,36 @@ void BC_GatedDeltaNetSplit::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
+    int state_format = state_format_of(recurrent_state);
+
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr,
+                    recurrent_scales, recurrent_bits);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
-        s.graph_state_half = recurrent_state.scalar_type() == at::kHalf;
+        s.graph_state_format = state_format;
+        s.graph_state_bits = recurrent_bits;
         return;
     }
 
-    // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions or state element type falls back to the eager path. The snapshot is per slot:
-    // another slot's eager run against a second cache must not re-arm this slot's replay
+    // Geometry and state format are scalar kernel args, so a mismatch falls back to eager execution
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride ||
-        (recurrent_state.scalar_type() == at::kHalf) != s.graph_state_half)
+        state_format != s.graph_state_format ||
+        recurrent_bits != s.graph_state_bits)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr,
+                    recurrent_scales, recurrent_bits);
         return;
     }
 
     if (!s.graph->ready)
     {
         GraphCapture capture(*s.graph);
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, s.graph.get(),
+                    recurrent_scales, recurrent_bits);
         capture.finish();
     }
 
@@ -417,10 +428,11 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
-    // The speculative-pass scan reads its first token's state from slots_in (recorded after the
-    // slots param, so it patches in that order)
+    // Keep patch parameters in kernel argument order, before the o_proj output
     if (history)
         args.insert(args.end() - 1, PPTR(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr()));
+    if (recurrent_scales.has_value())
+        args.insert(args.end() - 1, PPTR(GP_gdn_rule_scales, (void*) recurrent_scales.value().data_ptr()));
     // The o_proj bias add runs in place on y, which is a different tensor every call
     if (o_proj->bias)
     {
