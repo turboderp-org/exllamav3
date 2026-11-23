@@ -4,6 +4,7 @@ must go: the half-integer bitrates (1.5 / 2.5 / 3.5 bpw) keep their own scratch,
 stays allocated for the rest of the run and leaves no room to reload the module.
 """
 
+import ast
 import inspect
 from functools import lru_cache
 
@@ -43,4 +44,8 @@ def test_conversion_clears_through_the_helper():
     source = inspect.getsource(convert_model)
     assert "get_temp_buffers.cache_clear" not in source
     assert "get_temp_buffers_frac.cache_clear" not in source
-    assert source.count("clear_temp_buffers()") >= 3
+    calls = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "clear_temp_buffers"
+    ]
+    assert len(calls) >= 3
