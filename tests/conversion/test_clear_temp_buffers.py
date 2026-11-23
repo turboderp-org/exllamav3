@@ -8,6 +8,7 @@ import inspect
 from functools import lru_cache
 
 import pytest
+import torch
 
 from exllamav3.conversion import convert_model
 from exllamav3.modules.quant.exl3_lib import quantize
@@ -23,6 +24,17 @@ def test_clear_temp_buffers_releases_both_caches(monkeypatch):
     quantize.clear_temp_buffers()
     assert quantize.get_temp_buffers.cache_info().currsize == 0
     assert quantize.get_temp_buffers_frac.cache_info().currsize == 0
+
+
+def test_clear_temp_buffers_frees_the_frac_scratch_on_the_device(device):
+    # The 1.5 bpw scratch has to go back to the allocator, not just out of the cache
+    quantize.clear_temp_buffers()
+    costs, edges = quantize.get_temp_buffers_frac(device, 1)
+    size = costs.nbytes + edges.nbytes
+    del costs, edges
+    before = torch.cuda.memory_allocated(device)
+    quantize.clear_temp_buffers()
+    assert before - torch.cuda.memory_allocated(device) >= size
 
 
 @pytest.mark.nogpu
