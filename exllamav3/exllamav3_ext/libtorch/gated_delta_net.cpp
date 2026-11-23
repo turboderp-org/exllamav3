@@ -372,9 +372,7 @@ void BC_GatedDeltaNetSplit::run_bszN
         return;
     }
 
-    // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions or state element type falls back to the eager path. The snapshot is per slot:
-    // another slot's eager run against a second cache must not re-arm this slot's replay
+    // Geometry and state format are scalar kernel args, so a mismatch falls back to eager execution
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride ||
         state_format != s.graph_state_format ||
@@ -430,12 +428,11 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
-    // The insertion point must stay a subsequence of the rule kernel's record order (state, slots,
-    // slots_in, scales), so both entries land before the o_proj output
+    // Keep patch parameters in kernel argument order, before the o_proj output
     if (history)
         args.insert(args.end() - 1, PPTR(GP_gdn_rule_slots_in, (void*) slots_in.value().data_ptr()));
-    args.insert(args.end() - 1,
-                PPTR(GP_gdn_rule_scales, (void*) (recurrent_scales.has_value() ? recurrent_scales.value().data_ptr() : nullptr)));
+    if (recurrent_scales.has_value())
+        args.insert(args.end() - 1, PPTR(GP_gdn_rule_scales, (void*) recurrent_scales.value().data_ptr()));
     // The o_proj bias add runs in place on y, which is a different tensor every call
     if (o_proj->bias)
     {
@@ -615,17 +612,13 @@ void BC_Mamba2::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_Mamba2::run_bszN: slot not configured");
 
-    // Mamba2 never carries an int8 pool (the host rejects it), but an fp16 pool is accepted: its
-    // element type is part of the snapshot like the GDN slots'
-    int state_format = state_format_of(recurrent_state);
-
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
-        s.graph_state_format = state_format;
+        s.graph_state_half = recurrent_state.scalar_type() == at::kHalf;
         return;
     }
 
@@ -634,7 +627,7 @@ void BC_Mamba2::run_bszN
     // another slot's eager run against a second cache must not re-arm this slot's replay
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride ||
-        state_format != s.graph_state_format)
+        (recurrent_state.scalar_type() == at::kHalf) != s.graph_state_half)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, slots_scan, history, slots_in, s, nullptr);
         return;

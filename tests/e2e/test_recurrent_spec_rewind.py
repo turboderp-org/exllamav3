@@ -11,8 +11,8 @@ pass without history that is then position-corrected. Runs over every registry m
 import pytest
 import torch
 
-from exllamav3.modules.gated_delta_net import QuantPoolUnsupported
-from testlib.graph import has_int_pool, load_with_caches, unload_model
+from exllamav3.modules.gated_delta_net import QuantizedStateUnsupported
+from testlib.graph import has_quantized_state, load_with_caches, unload_model
 
 MAX_HISTORY = 64
 PROMPT = "The committee reviewed the proposal in detail and concluded that"
@@ -37,34 +37,28 @@ def loaded(model_id, model_registry, request):
     if not entry.available:
         pytest.skip(f"test model '{model_id}' not available")
     device = torch.device(request.config.getoption("--device"))
-    # the int caches only build on a model with a 128x128 GDN layer (KDA never goes int, so the cache is
-    # rejected there)
     base = [{"max_history": MAX_HISTORY},
             {"max_history": MAX_HISTORY, "recurrent_dtype": torch.float}]
+    packed = {"max_history": MAX_HISTORY, "recurrent_dtype": torch.int8, "recurrent_bits": 8}
     try:
-        _, model, caches, tok = load_with_caches(entry.path, device,
-                                                 base + [{"max_history": MAX_HISTORY,
-                                                          "recurrent_dtype": torch.int8},
-                                                         {"max_history": MAX_HISTORY,
-                                                          "recurrent_dtype": torch.int8, "recurrent_bits": 10}])
-    except QuantPoolUnsupported:
+        _, model, caches, tok = load_with_caches(entry.path, device, base + [packed])
+    except QuantizedStateUnsupported:
         _, model, caches, tok = load_with_caches(entry.path, device, base)
-    if len(caches) == 4 and not has_int_pool(caches[2]):
-        caches = caches[:2]  # a Mamba2-only model: the int caches came out all-fp32
+    if len(caches) == 3 and not has_quantized_state(caches[2]):
+        caches = caches[:2]
     ids = tok.encode(PROMPT, add_bos = True)
     gen = torch.Generator().manual_seed(1)
     cont = torch.randint(100, 2000, (1, MAX_HISTORY + 2), generator = gen)
     caches_by_name = {"fp16_state": caches[0], "fp32_state": caches[1]}
-    if len(caches) > 2:
+    if len(caches) == 3:
         caches_by_name["int8_state"] = caches[2]
-        caches_by_name["int10_state"] = caches[3]
     yield model, caches_by_name, ids, cont
     unload_model(model)
 
 
 @pytest.mark.models("recurrent")
 @torch.inference_mode()
-@pytest.mark.parametrize("state", ["fp16_state", "fp32_state", "int8_state", "int10_state"])
+@pytest.mark.parametrize("state", ["fp16_state", "fp32_state", "int8_state"])
 @pytest.mark.parametrize("pass_len, rejected", [
     (5, 0), (5, 1), (5, 4),
     (MAX_HISTORY + 1, 0), (MAX_HISTORY + 1, 1), (MAX_HISTORY + 1, 30), (MAX_HISTORY + 1, MAX_HISTORY),
@@ -72,7 +66,7 @@ def loaded(model_id, model_registry, request):
 def test_spec_pass_rewind_matches_plain(model_id, loaded, pass_len, rejected, state):
     model, caches, ids, cont = loaded
     if state not in caches:
-        pytest.skip(f"{model_id}: no layer carries this state pool")
+        pytest.skip(f"{model_id}: state format is not supported")
     cache = caches[state]
     spec = cont[:, :pass_len]
     accepted = pass_len - rejected

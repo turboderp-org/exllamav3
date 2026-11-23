@@ -4,111 +4,96 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
 from ...util.hadamard import get_hadamard_dt
 
-# The vendored fla chunk kernels (exllamav3.vendor.fla) are imported on first use rather than with
-# the library: they query the devices and Triton at import
+# Packed rows contain signed two's-complement fields at consecutive bit offsets in little-endian byte
+# order, with one fp16 absmax scale per 32-value k slice. Packed values represent recurrent state in
+# the H32-rotated domain.
+_K_SLICE_SIZE = 32
+_K_HEAD_DIM = 128
 
-# Rotation block of the int pool: 32-wide k slices, each stored rotated through the Sylvester H32.
-# gdn.cu reads and writes the row in that basis; the chunked path converts it in and out
-_ROT_BLOCK = 32
 
-
-def _gdn_h32(device):
-    """The normalized fp32 Sylvester H32 the kernel's butterfly emits"""
+def _hadamard_32(device):
+    """Normalized fp32 32x32 Sylvester Hadamard matrix."""
     return get_hadamard_dt(32, device, torch.float, 32 ** -0.5)
 
 
-def _vcol_units(row: torch.Tensor) -> torch.Tensor:
-    """A (nv, dv, dk * W // 8) packed pool row -> (nv, dv, dk * W // 16) little-endian uint16 units
-    (as int32), the slots the kernel assembles (sp[2i] | sp[2i+1] << 8)"""
-    r = row.view(row.shape[0], row.shape[1], row.shape[2] // 2, 2).to(torch.int32)
-    return (r[:, :, :, 0] & 0xff) | ((r[:, :, :, 1] & 0xff) << 8)
-
-
-def _unpack_bit_codes(u: torch.Tensor, bits: int) -> torch.Tensor:
-    """(nv, dv, dk * W // 16) little-endian uint16 units of one v column -> the dk signed W-bit
-    values. A value sits at bit e * W of the column's dk*W-bit stream: unit p = (e * W) >> 4 holds
-    its low bits at bit s16 = (e * W) & 15, the next unit the high bits when the value leaves p. The
-    units stay unsigned (a 64-bit shift would sign-extend a negative window)"""
-    dk = u.shape[2] * 16 // bits
-    out = torch.zeros(*u.shape[:2], dk, dtype = torch.int64, device = u.device)
-    mask = (1 << bits) - 1
-    for e in range(dk):
-        base = e * bits
-        s16 = base & 15
-        p = base >> 4
-        if s16 + bits > 16:
-            code = (u[:, :, p] >> s16) | ((u[:, :, p + 1] << (16 - s16)) & 0xffff)
+def _unpack_bit_codes(units: torch.Tensor, bits: int) -> torch.Tensor:
+    """Unpack unsigned 16-bit units into signed codes."""
+    k_head_dim = units.shape[2] * 16 // bits
+    unpacked = torch.zeros(*units.shape[:2], k_head_dim, dtype = torch.int64, device = units.device)
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        bit_offset = bit_base & 15
+        unit_index = bit_base >> 4
+        if bit_offset + bits > 16:
+            code = (
+                (units[:, :, unit_index] >> bit_offset)
+                | ((units[:, :, unit_index + 1] << (16 - bit_offset)) & 0xffff)
+            )
         else:
-            code = u[:, :, p] >> s16
-        code = code & mask
-        out[:, :, e] = torch.where(code >= (1 << (bits - 1)), code - (1 << bits), code)
-    return out
+            code = units[:, :, unit_index] >> bit_offset
+        code = code & code_mask
+        unpacked[:, :, value_index] = torch.where(code >= (1 << (bits - 1)), code - (1 << bits), code)
+    return unpacked
 
 
-def _dequant_bit_row(values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
-    """A (nv, dv, dk * W // 8) packed int pool row + (nv, dv, dk // 32) fp16 scales -> (nv, dk, dv)
-    fp32 in the pool's basis: extract each value's W bits of its v column, dequantize against the
-    slice's absmax. The CUDA scan reads this exact value (state_ld for int), so this is the kernel's
-    load, mirrored on the CPU"""
-    nv, dv, dbits = values.shape
-    dk = dbits * 8 // bits
-    q_bound = (1 << (bits - 1)) - 1
-    raw = _unpack_bit_codes(_vcol_units(values), bits)               # (nv, dv, dk)
-    sc = scales.float().permute(0, 2, 1).unsqueeze(2)                # (nv, dk//32, 1, dv)
-    return (raw.permute(0, 2, 1).reshape(nv, dk // 32, 32, dv) * sc / q_bound).reshape(nv, dk, dv)
+def _pack_bit_row(codes: torch.Tensor, packed_values: torch.Tensor, bits: int):
+    """Pack signed codes into a row's little-endian byte stream in place."""
+    num_v_heads, k_head_dim, v_head_dim = codes.shape
+    num_units = packed_values.shape[2] // 2
+    units = torch.zeros(num_v_heads, v_head_dim, num_units, dtype = torch.int32, device = codes.device)
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        code = codes[:, value_index, :].to(torch.int32) & code_mask
+        bit_offset = bit_base & 15
+        unit_index = bit_base >> 4
+        units[:, :, unit_index] = units[:, :, unit_index] | (code << bit_offset)
+        if bit_offset + bits > 16:
+            units[:, :, unit_index + 1] = units[:, :, unit_index + 1] | (code >> (16 - bit_offset))
+    flat_units = units.view(num_v_heads * v_head_dim, num_units)
+    low_bytes = (flat_units & 0xff).to(torch.int8)
+    high_bytes = ((flat_units >> 8) & 0xff).to(torch.int8)
+    packed_values.view(num_v_heads * v_head_dim, num_units, 2).copy_(torch.stack([low_bytes, high_bytes], dim = -1))
 
 
-def _pack_bit_row(q: torch.Tensor, values: torch.Tensor, bits: int):
-    """(nv, dk, dv) signed quantized values -> a (nv, dv, dk * W // 8) packed int pool row, written
-    in place. Value e of the column sits at bit e * W of the column's dk*W-bit stream: assemble its
-    W-bit two's-complement pattern into the 16-bit units holding those bits (the kernel's store,
-    mirrored; the kernel reads the units little-endian as sp[2i] | sp[2i+1] << 8)"""
-    nv, dk, dv = q.shape
-    n_units = values.shape[2] // 2
-    units = torch.zeros(nv, dv, n_units, dtype = torch.int32, device = q.device)
-    mask = (1 << bits) - 1
-    for e in range(dk):
-        base = e * bits
-        v = q[:, e, :].to(torch.int32) & mask     # the value's W-bit two's-complement pattern
-        s16 = base & 15
-        p = base >> 4
-        units[:, :, p] = units[:, :, p] | (v << s16)
-        if s16 + bits > 16:
-            units[:, :, p + 1] = units[:, :, p + 1] | (v >> (16 - s16))
-    # little-endian byte reassembly, matching the kernel's store (unit i -> sp[2i] | sp[2i+1] << 8)
-    flat = units.view(nv * dv, n_units)
-    lo = (flat & 0xff).to(torch.int8)
-    hi = ((flat >> 8) & 0xff).to(torch.int8)
-    values.view(nv * dv, n_units, 2).copy_(torch.stack([lo, hi], dim = -1))
+def _unpack_quantized_state_row(packed_values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
+    """Dequantize a packed row and rotate out of the H32-rotated domain."""
+    num_v_heads, v_head_dim, packed_bytes = packed_values.shape
+    k_head_dim = _K_HEAD_DIM
+    assert packed_bytes == k_head_dim * bits // 8, "packed state width does not match its bit count"
+    byte_pairs = packed_values.view(num_v_heads, v_head_dim, packed_bytes // 2, 2).to(torch.int32)
+    units = (byte_pairs[:, :, :, 0] & 0xff) | ((byte_pairs[:, :, :, 1] & 0xff) << 8)
+    codes = _unpack_bit_codes(units, bits)
+    quantization_bound = (1 << (bits - 1)) - 1
+    expanded_scales = scales.float().permute(0, 2, 1).unsqueeze(2)
+    rotated_state = (
+        codes.permute(0, 2, 1).reshape(
+            num_v_heads, _K_HEAD_DIM // _K_SLICE_SIZE, _K_SLICE_SIZE, v_head_dim
+        ) * expanded_scales / quantization_bound
+    )
+    hadamard = _hadamard_32(packed_values.device)
+    return torch.matmul(rotated_state.transpose(2, 3), hadamard).transpose(2, 3).reshape(
+        num_v_heads, k_head_dim, v_head_dim
+    )
 
 
-def unpack_int_state_row(values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
-    """A (nv, dv, dk * W // 8) packed int pool row and its (nv, dv, dk // 32) fp16 scales in the
-    pool's basis -> (nv, dk, dv) fp32 in the model's basis: dequantize the pool values, then rotate
-    each 32-wide k slice back to the model basis (the chunked path computes in the model basis)"""
-    assert values.shape[2] == 128 * bits // 8, "packed pool width does not match its bit count"
-    x = _dequant_bit_row(values, scales, bits)
-    h32 = _gdn_h32(str(values.device))
-    x = x.reshape(values.shape[0], 128 // 32, 32, values.shape[1])
-    return torch.matmul(x.transpose(2, 3), h32).transpose(2, 3).reshape(values.shape[0], 128, values.shape[1])
-
-
-def pack_int_state_row(state: torch.Tensor, values: torch.Tensor, scales: torch.Tensor, bits: int):
-    """(nv, dk, dv) fp32 in the model's basis -> a (nv, dv, dk * W // 8) packed int pool row and
-    (nv, dv, dk // 32) fp16 scales in the pool's basis, written in place. Rotate each 32-wide k
-    slice to the pool basis, quantize each slice against its absmax (one scale word), and assemble
-    each value's W bits into the v column's 16-bit units (the mirror of unpack's unit extraction)"""
-    assert values.shape[2] == 128 * bits // 8, "packed pool width does not match its bit count"
-    nv, dk, dv = state.shape
-    h32 = _gdn_h32(str(state.device))
-    q_bound = (1 << (bits - 1)) - 1
-    x = state.reshape(nv, dk // 32, 32, dv)
-    x = torch.matmul(x.transpose(2, 3), h32).transpose(2, 3)     # pool basis, (nv, dk, dv)
-    amax = x.abs().amax(dim = 2)                                  # (nv, dk//32, dv)
-    inv = torch.where(amax > 0, q_bound / amax, 0.0)
-    scales.copy_(amax.permute(0, 2, 1).half())
-    q = (x * inv.unsqueeze(2)).round().to(torch.int16).reshape(nv, dk, dv)
-    _pack_bit_row(q, values, bits)
+def _pack_quantized_state_row(state: torch.Tensor, packed_values: torch.Tensor, scales: torch.Tensor, bits: int):
+    """Rotate an (nv, dk, dv) fp32 state into the H32-rotated domain and write packed values and scales in place."""
+    num_v_heads, k_head_dim, v_head_dim = state.shape
+    assert k_head_dim == _K_HEAD_DIM and packed_values.shape[2] == k_head_dim * bits // 8, \
+        "packed state width does not match its bit count"
+    hadamard = _hadamard_32(state.device)
+    quantization_bound = (1 << (bits - 1)) - 1
+    state_slices = state.reshape(num_v_heads, _K_HEAD_DIM // _K_SLICE_SIZE, _K_SLICE_SIZE, v_head_dim)
+    rotated_state = torch.matmul(state_slices.transpose(2, 3), hadamard).transpose(2, 3)
+    absmax = rotated_state.abs().amax(dim = 2)
+    quantization_scale = torch.where(absmax > 0, quantization_bound / absmax, 0.0)
+    scales.copy_(absmax.permute(0, 2, 1).half())
+    codes = (rotated_state * quantization_scale.unsqueeze(2)).round().to(torch.int16).reshape(
+        num_v_heads, k_head_dim, v_head_dim
+    )
+    _pack_bit_row(codes, packed_values, bits)
 
 
 def torch_recurrent_gated_delta_rule(
@@ -223,6 +208,7 @@ def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
     return out, state if save_state else None
 
 
+# Vendored FLA imports query devices and Triton, so load chunk kernels on first use.
 def gated_delta_rule_fn(
     mixed_qkv: torch.Tensor,
     beta: torch.Tensor,
@@ -243,10 +229,6 @@ def gated_delta_rule_fn(
     recurrent_scales: torch.Tensor | None = None,
     recurrent_bits: int = 0,
 ):
-    # recurrent_scales: the int pool's fp16 scales (one per 32-wide k slice), None for an fp32 or fp16
-    # pool. With scales, the chunked branch unpacks each rotated row into the model's basis and repacks
-    # it on the store; the CUDA scan reads and writes the rotated basis itself. recurrent_bits is the
-    # packed pool's width W (0 for an fp pool)
     if params is None:
         params = {}
 
@@ -331,11 +313,14 @@ def gated_delta_rule_fn(
         # (Grouped attn supported in fla-core now)
         rows_out, rows_in = chunked_rows()
         core_attn_out = []
+        # The chunked scan uses the unrotated state.
         for i, (so, si) in enumerate(zip(rows_out, rows_in)):
             if recurrent_state is None:
                 state = None
             elif recurrent_scales is not None:
-                state = unpack_int_state_row(recurrent_state[si, 0], recurrent_scales[si, 0], recurrent_bits).unsqueeze(0)
+                state = _unpack_quantized_state_row(
+                    recurrent_state[si, 0], recurrent_scales[si, 0], recurrent_bits
+                ).unsqueeze(0)
             else:
                 state = recurrent_state[si, 0].float().unsqueeze(0)
             core_attn, new_state = _chunked_scan(
@@ -344,7 +329,9 @@ def gated_delta_rule_fn(
             )
             if save_state and state is not None:
                 if recurrent_scales is not None:
-                    pack_int_state_row(new_state.squeeze(0), recurrent_state[so, 0], recurrent_scales[so, 0], recurrent_bits)
+                    _pack_quantized_state_row(
+                        new_state.squeeze(0), recurrent_state[so, 0], recurrent_scales[so, 0], recurrent_bits
+                    )
                 else:
                     recurrent_state[so, 0].copy_(new_state.squeeze(0))
             core_attn_out.append(core_attn)

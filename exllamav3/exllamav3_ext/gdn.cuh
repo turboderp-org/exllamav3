@@ -5,17 +5,14 @@
 
 class Graph;
 
-// The recurrent-state pool's element type as the scan kernel's dispatch index: fp32, fp16 (a
-// half-size pool) or char (a W-bit packed payload in a rotated basis, with a per-32-wide-k-slice
-// fp16 scale; W travels with the pool as the bits arg, 0 for fp). The packed pool takes 2..12
-// (the bound is enforced in Cache)
-constexpr int STATE_FP32 = 0, STATE_FP16 = 1, STATE_INT = 2;
+// Recurrent-state formats: fp32, fp16, or a packed 2..12-bit payload with fp16 scales
+constexpr int STATE_FP32 = 0, STATE_FP16 = 1, STATE_PACKED = 2;
 
 inline int state_format_of(const at::Tensor& state)
 {
     return state.scalar_type() == at::kFloat ? STATE_FP32
          : state.scalar_type() == at::kHalf ? STATE_FP16
-         : state.scalar_type() == at::kChar ? STATE_INT : -1;
+         : state.scalar_type() == at::kChar ? STATE_PACKED : -1;
 }
 
 void gated_delta_net_fused_op
@@ -266,14 +263,14 @@ struct ScanReplayJob
     uintptr_t qkv;          // staged post-conv qkv rows of this batch row, [prefix, qkv_dim] bf16
     uintptr_t g;            // staged log decay, [prefix, heads] or [prefix, heads, dk] (KDA) fp32
     uintptr_t beta;         // staged beta / dt, [prefix, heads] bf16
-    uintptr_t base;         // state row read for the first token, fp32, fp16 or W-bit packed [heads, dk, dv]
-    uintptr_t scratch;      // state row written (first token from base, then in place)
+    uintptr_t base;         // fp [heads, dk, dv], packed [heads, dv, dk * bits / 8]
+    uintptr_t scratch;      // output state row
     uintptr_t D;            // Mamba2 skip scales [heads] fp32, else 0
     int prefix;
     int tstride;            // staged rows between consecutive tokens: 1 for a pass staged (row, token),
                             // the batch size for one staged token-major, one step at a time
-    uintptr_t base_scales = 0;     // int pools: the base row's fp16 scales, else 0
-    uintptr_t scratch_scales = 0;  // int pools: the scratch row's fp16 scales, else 0
+    uintptr_t base_scales = 0;     // packed input row scales, else 0
+    uintptr_t scratch_scales = 0;  // packed output row scales, else 0
 
     ScanReplayJob() = default;
     ScanReplayJob(uintptr_t _qkv, uintptr_t _g, uintptr_t _beta, uintptr_t _base, uintptr_t _scratch,
@@ -296,5 +293,5 @@ void batched_scan_replay
     int k_head_dim,
     int v_head_dim,
     int state_format = STATE_FP32,  // the jobs' pool element type (see state_format_of)
-    int state_bits = 0      // the int pool's width (0 for fp)
+    int state_bits = 0      // packed width (0 for fp)
 );

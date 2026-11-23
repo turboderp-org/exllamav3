@@ -129,21 +129,12 @@ class Cache:
             two rows per batch item regardless of this value.
 
         :param recurrent_dtype:
-            Storage dtype of the recurrent state of GatedDeltaNet and KDA layers: torch.half (default), or
-            torch.float for twice the state pool and checkpoint size, or torch.int8, a W-bit packed payload
-            (width set by recurrent_bits) with a companion fp16 scales tensor (one scale per 32 consecutive
-            k values) that requires a 128x128 GDN layer: a model with a KDA layer or a non-128x128 GDN layer
-            raises QuantPoolUnsupported at cache construction. The scans compute in fp32 regardless and touch
-            the pool once per pass; on these layers fp16 storage moves next-token distributions no more than
-            regrouping a prefill does. Mamba2 layers keep fp32 regardless: their state spans a far wider
-            dynamic range (a quarter of it below fp16's normal range), and the per-step rounding accumulates
-            over a long generation. bf16 is not offered, its 8-bit mantissa is far worse than fp16 here
+            Storage format of GatedDeltaNet and KDA recurrent states: torch.half (default), torch.float, or
+            torch.int8 for a packed quantized state with one fp16 absmax scale per 32-value k slice. Packed states require
+            128x128 GDN heads and reject KDA layers. Mamba2 states always use torch.float.
         :param recurrent_bits:
-            For a torch.int8 recurrent_dtype, the bits per recurrent-state value W. The bound is mechanical
-            at the low end (W = 1 makes the quantize bound Q = 2^(W-1) - 1 zero) and precision-capped at the
-            high end (above W = 12 the per-slice fp16 scale's ~11-bit mantissa caps recoverable precision),
-            so the accepted range is 2..12. 9-11 are the useful range (10 typical); outside it is not a
-            policy preference but a quality trade-off. 0 for torch.float / torch.half
+            Bits per value for a packed torch.int8 recurrent state, from 2 to 12. Must be 0 for torch.float
+            and torch.half.
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 
@@ -151,8 +142,6 @@ class Cache:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
         """
         self.model = model
-        # The (recurrent_dtype, recurrent_bits) pair rule lives here and only here: fp pools take
-        # bits 0, a packed int pool takes a W in 2..12
         if recurrent_dtype in (torch.float, torch.half):
             if recurrent_bits != 0:
                 raise ValueError("recurrent_bits is only used with a torch.int8 recurrent state")

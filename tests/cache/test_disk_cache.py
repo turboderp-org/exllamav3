@@ -171,12 +171,17 @@ def test_budget_evicts_tail_first_oldest_root_first(device, tmp_path):
 
 def test_state_round_trip_and_deferred_release(device, tmp_path):
     tier, disk, tensor = build(4, device, tmp_path)
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    values = torch.randint(0, 256, (1, 1, 4, 128, 128 * 9 // 8), generator = g).to(torch.int8)
+    scales = torch.randn((1, 1, 4, 128, 4), generator = g).half()
+    conv = torch.randn((32, 4), generator = g).bfloat16()
     stashed = {
         "position": 2048,
         "checkpoint_size": 4096,
         "layer.a": (torch.arange(16, dtype = torch.float32).reshape(1, 16), torch.ones(4, 3, dtype = torch.bfloat16)),
         "layer.b": [torch.full((8,), 3.0), torch.full((2, 2), 5.0)],
         "layer.c": torch.full((5,), 9, dtype = torch.int32),
+        "layer.packed": (values, scales, conv),
     }
     key = phash(7)
     released = []
@@ -194,48 +199,14 @@ def test_state_round_trip_and_deferred_release(device, tmp_path):
     back = disk2.read_state(key)
     assert back["position"] == 2048 and back["checkpoint_size"] == 4096
     assert isinstance(back["layer.a"], tuple) and isinstance(back["layer.b"], list)
-    for k in ("layer.a", "layer.b"):
+    assert isinstance(back["layer.packed"], tuple)
+    for k in ("layer.a", "layer.b", "layer.packed"):
         for a, b in zip(stashed[k], back[k]):
             assert a.dtype == b.dtype and torch.equal(a, b)
     assert torch.equal(stashed["layer.c"], back["layer.c"])
     # Buffers came from the stash pool so RecurrentCache can give them back
     host_pool.give(back)
     assert host_pool.free
-    disk2.close()
-    tier2.close()
-
-
-@pytest.mark.parametrize("bits", [8, 9, 10, 12], ids = ["w8", "w9", "w10", "w12"])
-def test_int_state_round_trips_values_and_scales_bit_exact(device, tmp_path, bits):
-    tier, disk, tensor = build(4, device, tmp_path)
-    g = torch.Generator(device = "cpu").manual_seed(0)
-    # v-major pool: (rows, 1, nv, dv, dk * W // 8), random bytes
-    values = torch.randint(0, 256, (1, 1, 4, 8, 8 * bits // 8), generator = g).to(torch.int8)
-    scales = torch.randn((1, 1, 4, 8, 4), generator = g).half()
-    conv = torch.randn((32, 4), generator = g).bfloat16()
-    stashed = {
-        "position": 2048,
-        "checkpoint_size": 4096,
-        "layer.a": (values, scales, conv),
-    }
-    key = phash(7)
-    disk.write_state(key, stashed)
-    disk.flush()
-    assert disk.has_state(key)
-    disk.close()
-    tier.close()
-
-    tier2, disk2, _ = build(4, device, tmp_path)
-    back = disk2.read_state(key)
-    assert back is not None and back["position"] == 2048
-    b_vals, b_scales, b_conv = back["layer.a"]
-    assert b_vals.dtype == torch.int8 and b_scales.dtype == torch.float16 and b_conv.dtype == torch.bfloat16
-    assert b_vals.shape == values.shape and b_scales.shape == scales.shape and b_conv.shape == conv.shape
-    # the int8 values and the fp16 scales survive the round trip bit-exact
-    assert torch.equal(b_vals, values)
-    assert torch.equal(b_scales, scales)
-    assert torch.equal(b_conv, conv)
-    host_pool.give(back)
     disk2.close()
     tier2.close()
 

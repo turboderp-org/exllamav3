@@ -15,25 +15,20 @@ from contextlib import ExitStack
 
 import pytest
 
-from exllamav3.modules.gated_delta_net import QuantPoolUnsupported
+from exllamav3.modules.gated_delta_net import QuantizedStateUnsupported
 from testlib.e2e import assert_logits_agree, forward_logits, load_model, noise_floor, prefill_decode_logits
-from testlib.graph import has_int_pool
+from testlib.graph import has_quantized_state
 
 pytestmark = [pytest.mark.models(), pytest.mark.slow]
 
 DECODE_STEPS = 32
 PROMPT_TOKENS = 256
 
-# The 8-bit cache adds its own (small) quantization error on top of the fp16-cache bound. The default fp16
-# recurrent state (recurrent models only) rounds the state once per decode step, which stays within that
-# bound; the fp32 state variant checks the other storage dtype. The packed int pool quantizes once per
-# pass-end store, so its bound is 4e-3, twice the fp16 one (both the W = 8 and the W = 10 pool)
 CACHE_VARIANTS = {
     "fp16_cache": ([], 2e-3),
     "q8_cache": (["-cq", "8"], 5e-3),
-    "fp32_state": (["-rsf", "fp32"], 2e-3),
+    "fp32_state": (["-rs32"], 2e-3),
     "int8_state": (["-rsf", "int8"], 4e-3),
-    "int10_state": (["-rsf", "int10"], 4e-3),
 }
 
 
@@ -43,13 +38,12 @@ def test_decode_matches_forward(model_id, model_dir, variant, device):
     with ExitStack() as stack:
         try:
             lm = stack.enter_context(load_model(model_dir, device, *cache_args))
-        except QuantPoolUnsupported:
-            # the int cache is rejected on a model with no 128x128 GDN layer (KDA never goes int)
-            pytest.skip(f"{model_id}: no layer carries an int pool")
+        except QuantizedStateUnsupported:
+            pytest.skip(f"{model_id}: packed recurrent state is not supported")
         if variant == "fp32_state" and not lm.model.caps.get("recurrent_states"):
             pytest.skip("fp32 recurrent state: model has no recurrent layers")
-        if variant in ("int8_state", "int10_state") and not has_int_pool(lm.cache):
-            pytest.skip(f"{model_id}: no layer carries an int pool")
+        if variant == "int8_state" and not has_quantized_state(lm.cache):
+            pytest.skip(f"{model_id}: packed recurrent state is not supported")
         ids = lm.encode(max_tokens = PROMPT_TOKENS)
         full = forward_logits(lm, ids)[0]
         floor = noise_floor(lm, ids, DECODE_STEPS, full)

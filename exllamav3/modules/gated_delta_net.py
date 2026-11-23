@@ -41,14 +41,11 @@ from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 from ..cache.recurrent import host_copy
 
-# The pool's dtype as the scan kernel's dispatch index (the int state_format of gdn.cuh's
-# batched_scan_replay): 0 fp32, 1 fp16, 2 packed int (rotated, with scales)
-_STATE_FORMAT = {torch.float: 0, torch.half: 1, torch.int8: 2}
+_STATE_FORMAT = {torch.float: ext.STATE_FP32, torch.half: ext.STATE_FP16, torch.int8: ext.STATE_PACKED}
 
 
-class QuantPoolUnsupported(ValueError):
-    """The layer cannot carry a quantized recurrent-state pool: KDA and Mamba2 layers never go
-    quantized, and the scan kernel's int path takes 128x128 heads only"""
+class QuantizedStateUnsupported(ValueError):
+    pass
 
 
 def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
@@ -82,15 +79,15 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
             if cj is not None:
                 conv_by_device.setdefault(device_index, []).append(cj)
             if replay:
-                key = (device_index,) + l.scan_geometry()
+                key = (device_index, l.scan_geometry())
                 replay_by_key.setdefault(key, []).append(
                     l.replay_job(spec_row, prefix, spec_shape, base_row, scratch_row))
         else:
             l.rewind(slot, last_history, num_tokens)
     for device_index, jobs in conv_by_device.items():
         ext.batched_conv_rewind(jobs, device_index)
-    for (device_index, kind, nk, nv, dk, dv, state_format, state_bits), jobs in replay_by_key.items():
-        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv, state_format, state_bits)
+    for (device_index, scan_config), jobs in replay_by_key.items():
+        ext.batched_scan_replay(jobs, device_index, *scan_config)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens,
@@ -298,15 +295,6 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
-        # The scan kernels compute in fp32 (each thread's slice lives in registers for the whole
-        # pass), so the pool dtype sets the storage alone: fp16 halves it, fp32 doubles it, and
-        # a W-bit packed payload adds one fp16 scale per 32-wide k slice. The chunked prefill
-        # kernels take and return fp32
-        self.recurrent_state = torch.empty(
-            (2 * max_batch_size, 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = torch.float,
-            device = "meta"
-        )
         self.set_state_dtype(state_dtype, state_bits)
         self.conv_state = torch.empty(
             (max_batch_size, module.fdim_qkv, module.conv_kernel_size + max_history),
@@ -329,26 +317,22 @@ class GDNLayerState:
         self.spec_shape = None
 
 
-    def _check_state_dtype(self, dtype: torch.dtype):
-        """Eligibility of the layer for a quantized pool (no per-layer width bounds: the cache
-        owns the (dtype, bits) pair rule)"""
+    def _validate_state_dtype(self, dtype: torch.dtype):
         m = self.module
         key = getattr(m, "key", None) or type(m).__name__
         if dtype not in (torch.float, torch.half, torch.int8):
-            raise ValueError(f"recurrent state dtype must be fp16, fp32 or int8 (packed int pool), got {dtype}")
+            raise ValueError(f"recurrent state dtype must be fp16, fp32 or int8 (packed state), got {dtype}")
         if dtype == torch.int8:
             if getattr(m, "kda", False):
-                raise QuantPoolUnsupported(f"quantized recurrent state is not supported for KDA layers, layer {key}")
+                raise QuantizedStateUnsupported(f"quantized recurrent state is not supported for KDA layers, layer {key}")
             if getattr(m, "mamba2", False):
-                raise QuantPoolUnsupported(f"quantized recurrent state is not supported for Mamba2 layers, layer {key}")
+                raise QuantizedStateUnsupported(f"quantized recurrent state is not supported for Mamba2 layers, layer {key}")
             if m.k_head_dim != 128 or m.v_head_dim != 128:
-                raise QuantPoolUnsupported(
+                raise QuantizedStateUnsupported(
                     f"quantized recurrent state requires 128x128 heads, layer {key} is {m.k_head_dim}x{m.v_head_dim}")
 
 
-    def _pool_shape(self, dtype: torch.dtype, bits: int):
-        """One pool row: fp is k-major (k_head_dim, v_head_dim), the packed int pool is v-major
-        (v_head_dim, k_head_dim * W / 8)"""
+    def _state_pool_shape(self, dtype: torch.dtype, bits: int):
         rows = 2 * self.max_batch_size
         m = self.module
         if dtype == torch.int8:
@@ -357,24 +341,21 @@ class GDNLayerState:
 
 
     def _scales_shape(self):
-        # One absmax per 32-wide k slice (the rotation block), one scale row per pool row
-        rows = self.recurrent_state.shape[0]
+        rows = 2 * self.max_batch_size
         return (rows, 1, self.module.num_v_heads, self.module.v_head_dim, self.module.k_head_dim // 32)
 
 
     @property
     def quantized(self) -> bool:
-        """Whether the pool is a W-bit packed payload with a companion fp16 scales tensor"""
         return self.recurrent_scales is not None
 
 
     def set_state_dtype(self, dtype: torch.dtype, bits: int):
-        """Storage dtype (and, for a packed int pool, its width) of the recurrent-state pool,
-        settable until the state is allocated"""
+        """Set the storage dtype and packed width before allocating the state."""
         assert self.device is None, "recurrent state dtype must be set before the state is allocated"
-        self._check_state_dtype(dtype)
+        self._validate_state_dtype(dtype)
         self.recurrent_bits = bits
-        self.recurrent_state = torch.empty(self._pool_shape(dtype, bits), dtype = dtype, device = "meta")
+        self.recurrent_state = torch.empty(self._state_pool_shape(dtype, bits), dtype = dtype, device = "meta")
         self.recurrent_scales = (
             torch.empty(self._scales_shape(), dtype = torch.half, device = "meta")
             if dtype == torch.int8 else None
@@ -386,8 +367,7 @@ class GDNLayerState:
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
             self.recurrent_state[0].numel() * self.recurrent_state.element_size()
         )
-        if self.recurrent_scales is not None:
-            # One scale row, like the state row above
+        if self.quantized:
             size += self.recurrent_scales[0].numel() * self.recurrent_scales.element_size()
         return size
 
@@ -525,7 +505,6 @@ class GDNLayerState:
         r0 = spec_row * seqlen if tstride == 1 else spec_row
         rs = self.recurrent_state
         row_bytes = rs.stride(0) * rs.element_size()
-        # The int8 pool's scales have their own row stride (a different element type)
         recurrent_scales = self.recurrent_scales
         scale_row_bytes = recurrent_scales.stride(0) * recurrent_scales.element_size() if self.quantized else 0
         scale_ptr = recurrent_scales.data_ptr() if self.quantized else 0
@@ -546,7 +525,7 @@ class GDNLayerState:
 
 
     def stash(self, slot, position: int = 0, parity: int = 0):
-        """(state, conv), or (state, scales, conv) for an int8 pool"""
+        """Return (state, conv), or (state, scales, conv) for a packed state."""
         cdim = self.module.conv_kernel_size
         row = 2 * slot + parity
         state = host_copy(self.recurrent_state[row : row + 1])
@@ -557,7 +536,7 @@ class GDNLayerState:
 
 
     def unstash(self, slot, stashed, position: int = 0, parity: int = 0):
-        """Inverse of stash: (state, conv), or (state, scales, conv) for an int8 pool"""
+        """Restore a tuple returned by stash()."""
         cdim = self.module.conv_kernel_size
         row = 2 * slot + parity
         if self.quantized:
@@ -570,12 +549,8 @@ class GDNLayerState:
 
 
     def tp_stash_pieces(self):
-        """
-        How this rank's stash maps into the layout-independent checkpoint, one entry per stashed tensor (the
-        arity of stash()): the split dimension, its full size, and (local start, local end, canonical start)
-        pieces. The recurrent state (and, for int8, its scales) splits by v head; the conv state's channels
-        split by head range. None for a tensor that is not split.
-        """
+        """Map stashed tensors into the canonical checkpoint. Values and scales split by v head;
+        conv channels split by q, k and v head range."""
         m = self.module
         first = getattr(m, "tp_kv_first", None)
         if first is None:
@@ -584,10 +559,10 @@ class GDNLayerState:
         gk = m.tp_k_heads_total
         G = nv // nk
         assert m.fdim_qkv == 2 * nk * kd + nv * vd, "conv channel layout differs from q|k|v, cannot map the stash"
-        vspec = {"dim": 2, "total": gk * G, "pieces": [(0, nv, first * G)]}
-        pieces = [vspec]
+        v_head_mapping = {"dim": 2, "total": gk * G, "pieces": [(0, nv, first * G)]}
+        pieces = [v_head_mapping]
         if self.quantized:
-            pieces.append(vspec)   # scales
+            pieces.append(v_head_mapping)
         pieces.append({"dim": 0, "total": 2 * gk * kd + gk * G * vd, "pieces": [
             (0, nk * kd, first * kd),
             (nk * kd, 2 * nk * kd, (gk + first) * kd),
@@ -604,6 +579,7 @@ class GDNLayerState:
                 "max_history": self.max_history,
                 "max_batch_size": self.max_batch_size,
                 "state_dtype": self.recurrent_state.dtype,
+                "state_bits": self.recurrent_bits,
             }
         }
 

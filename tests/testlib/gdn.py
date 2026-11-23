@@ -1,86 +1,78 @@
-"""
-An independent bit-layout reference for the GDN packed recurrent-state pool used by the state
-kernel tests: a torch.int8 (char) payload of W-bit values (2 <= W <= 12), v-major
-(rows, 1, nv, dv, dk * W // 8), plus fp16 scales, one absmax per 32-wide k slice. The k-th value
-of a v column sits at bit k * W of the column's byte stream (little-endian). This module implements
-that layout on its own (64-bit windows on the pack side, 16-bit units on the unpack side), so it
-shares no code with the kernel-mirroring converters it is tested against.
+"""Independent bit-layout reference for packed GDN recurrent states.
 
-These helpers work in the model's basis, i.e. on a state as the rule computes it (the scan kernel
-dequantizes the pool values and uses them directly, rotating q/k warp-locally).
+Packed rows contain signed two's-complement fields at consecutive bit offsets in little-endian byte order,
+with one fp16 absmax scale per 32-value k slice. Packed values represent recurrent state in the H32-rotated
+domain; these helpers remain in that domain and do not rotate.
 """
 
 import torch
 
 
-def pool_from_state(state: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """(rows, 1, nv, dk, dv) fp32 in the model's basis -> packed int pool (rows, 1, nv, dv,
-    dk * bits // 8) + fp16 scales (rows, 1, nv, dv, dk // 32): one absmax per 32-wide k slice,
-    value = round(state * Q / amax) where Q = 2^(bits-1) - 1"""
-    rows, _, nv, dk, dv = state.shape
-    b = bits
-    subk = dk // 32
-    q_bound = (1 << (b - 1)) - 1
-    m = state.float()
-    amax = m.view(rows, 1, nv, subk, 32, dv).abs().amax(dim = 4)      # (rows, 1, nv, subk, dv)
-    inv = torch.where(amax > 0, q_bound / amax, 0.0)
-    scales = amax.squeeze(1).permute(0, 1, 3, 2).contiguous().to(torch.float16)     # (rows, nv, dv, subk)
-    q = torch.round(m.view(rows, 1, nv, subk, 32, dv) * inv.unsqueeze(4)).view(rows, 1, nv, dk, dv).to(torch.int16)
-    values = _pack_row(q.view(rows, nv, dk, dv), b)
-    return values.view(rows, 1, nv, dv, dk * b // 8), scales.view(rows, 1, nv, dv, subk)
+def quantize_pool(state: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a (rows, 1, nv, dk, dv) state in the H32-rotated domain and return packed values and scales."""
+    rows, _, num_v_heads, k_head_dim, v_head_dim = state.shape
+    num_k_slices = k_head_dim // 32
+    quantization_bound = (1 << (bits - 1)) - 1
+    rotated_state = state.float()
+    absmax = rotated_state.view(rows, 1, num_v_heads, num_k_slices, 32, v_head_dim).abs().amax(dim = 4)
+    quantization_scale = torch.where(absmax > 0, quantization_bound / absmax, 0.0)
+    scales = absmax.squeeze(1).permute(0, 1, 3, 2).contiguous().to(torch.float16)
+    codes = torch.round(
+        rotated_state.view(rows, 1, num_v_heads, num_k_slices, 32, v_head_dim) * quantization_scale.unsqueeze(4)
+    ).view(rows, 1, num_v_heads, k_head_dim, v_head_dim).to(torch.int16)
+    packed_values = _pack_row(codes.view(rows, num_v_heads, k_head_dim, v_head_dim), bits)
+    return packed_values.view(rows, 1, num_v_heads, v_head_dim, k_head_dim * bits // 8), \
+        scales.view(rows, 1, num_v_heads, v_head_dim, num_k_slices)
 
 
-def state_from_pool(values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
-    """packed int pool (rows, 1, nv, dv, dk * bits // 8) + scales (rows, 1, nv, dv, dk // 32) ->
-    fp32 state in the model's basis. The stored scale is the slice's absmax, the step is amax / Q"""
-    rows, _, nv, dv, dbits = values.shape
-    b = bits
-    dk = dbits * 8 // b
-    subk = dk // 32
-    q_bound = (1 << (b - 1)) - 1
-    q = _unpack_row(values.view(rows, nv, dv, dbits), b)              # (rows, nv, dk, dv)
-    s = scales.float().squeeze(1).permute(0, 1, 3, 2)                        # (rows, nv, subk, dv)
-    q = q.view(rows, nv, subk, 32, dv) * s.unsqueeze(3) / q_bound
-    return q.view(rows, 1, nv, dk, dv)
+def dequantize_pool(packed_values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
+    """Dequantize packed values and scales to a (rows, 1, nv, dk, dv) fp32 state in the H32-rotated domain."""
+    rows, _, num_v_heads, v_head_dim, packed_bytes = packed_values.shape
+    k_head_dim = packed_bytes * 8 // bits
+    num_k_slices = k_head_dim // 32
+    quantization_bound = (1 << (bits - 1)) - 1
+    codes = _unpack_row(packed_values.view(rows, num_v_heads, v_head_dim, packed_bytes), bits)
+    expanded_scales = scales.float().squeeze(1).permute(0, 1, 3, 2)
+    state = codes.view(rows, num_v_heads, num_k_slices, 32, v_head_dim) \
+        * expanded_scales.unsqueeze(3) / quantization_bound
+    return state.view(rows, 1, num_v_heads, k_head_dim, v_head_dim)
 
 
-def _pack_row(q: torch.Tensor, b: int) -> torch.Tensor:
-    """(rows, nv, dk, dv) signed quantized values -> (rows, nv, dv, dk * b // 8) packed bytes.
-    Value e of the column at bit e * b; each value's b-bit two's-complement pattern ORs into the
-    64-bit window holding that offset (and the next window when it straddles a 64-bit boundary)"""
-    rows, nv, dk, dv = q.shape
-    win = torch.zeros(rows, nv, dv, 2 * b, dtype = torch.int64, device = q.device)
-    mask = (1 << b) - 1
-    for e in range(dk):
-        base = e * b
-        v = q[:, :, e, :].to(torch.int64) & mask
-        lo = base // 64
-        sh = base % 64
-        win[:, :, :, lo] = win[:, :, :, lo] | (v << sh)
-        if sh + b > 64:
-            win[:, :, :, lo + 1] = win[:, :, :, lo + 1] | (v >> (64 - sh))
-    return win.view(torch.int8)
+def _pack_row(codes: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack signed codes into 64-bit windows."""
+    rows, num_v_heads, k_head_dim, v_head_dim = codes.shape
+    windows = torch.zeros(rows, num_v_heads, v_head_dim, 2 * bits, dtype = torch.int64, device = codes.device)
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        code = codes[:, :, value_index, :].to(torch.int64) & code_mask
+        window_index = bit_base // 64
+        bit_offset = bit_base % 64
+        windows[:, :, :, window_index] = windows[:, :, :, window_index] | (code << bit_offset)
+        if bit_offset + bits > 64:
+            windows[:, :, :, window_index + 1] = windows[:, :, :, window_index + 1] | (code >> (64 - bit_offset))
+    return windows.view(torch.int8)
 
 
-def _unpack_row(values: torch.Tensor, b: int) -> torch.Tensor:
-    """(rows, nv, dv, dk * b // 8) packed bytes -> (rows, nv, dk, dv) signed values. The mirror of
-    _pack_row: value e sits at bit e * b of the column's stream; the 16-bit unit p = (e * b) >> 4
-    holds its low bits at bit s16 = (e * b) & 15, the next unit the high bits when the value leaves
-    p (the units stay unsigned, a 64-bit shift would sign-extend a negative window)"""
-    rows, nv, dv, dbits = values.shape
-    dk = dbits * 8 // b
-    r = values.view(rows, nv, dv, dbits // 2, 2).to(torch.int32)
-    u = (r[:, :, :, :, 0] & 0xff) | ((r[:, :, :, :, 1] & 0xff) << 8)    # (rows, nv, dv, dbits // 2)
-    out = torch.zeros(rows, nv, dk, dv, dtype = torch.int64, device = values.device)
-    mask = (1 << b) - 1
-    for e in range(dk):
-        base = e * b
-        s16 = base & 15
-        p = base >> 4
-        if s16 + b > 16:
-            code = (u[:, :, :, p] >> s16) | ((u[:, :, :, p + 1] << (16 - s16)) & 0xffff)
+def _unpack_row(packed_values: torch.Tensor, bits: int) -> torch.Tensor:
+    """Unpack little-endian bytes into signed codes."""
+    rows, num_v_heads, v_head_dim, packed_bytes = packed_values.shape
+    k_head_dim = packed_bytes * 8 // bits
+    byte_pairs = packed_values.view(rows, num_v_heads, v_head_dim, packed_bytes // 2, 2).to(torch.int32)
+    units = (byte_pairs[..., 0] & 0xff) | ((byte_pairs[..., 1] & 0xff) << 8)
+    unpacked = torch.zeros(
+        rows, num_v_heads, k_head_dim, v_head_dim, dtype = torch.int64, device = packed_values.device
+    )
+    code_mask = (1 << bits) - 1
+    for value_index in range(k_head_dim):
+        bit_base = value_index * bits
+        bit_offset = bit_base & 15
+        unit_index = bit_base >> 4
+        if bit_offset + bits > 16:
+            code = (units[:, :, :, unit_index] >> bit_offset) | \
+                ((units[:, :, :, unit_index + 1] << (16 - bit_offset)) & 0xffff)
         else:
-            code = u[:, :, :, p] >> s16
-        code = code & mask
-        out[:, :, e, :] = torch.where(code >= (1 << (b - 1)), code - (1 << b), code)
-    return out
+            code = units[:, :, :, unit_index] >> bit_offset
+        code = code & code_mask
+        unpacked[:, :, value_index, :] = torch.where(code >= (1 << (bits - 1)), code - (1 << bits), code)
+    return unpacked

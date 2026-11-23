@@ -9,9 +9,7 @@ from argparse import ArgumentParser
 import yaml
 from pathlib import Path
 
-# --recurrent_state_format name -> (pool dtype, bits) Cache takes (see Cache.recurrent_dtype /
-# recurrent_bits): fp pools carry bits 0, the packed int pool its width W
-RECURRENT_STATE = (
+RECURRENT_STATE_FORMATS = (
     {"fp16": (torch.half, 0), "fp32": (torch.float, 0)}
     | {f"int{n}": (torch.int8, n) for n in range(2, 13)}
 )
@@ -128,8 +126,8 @@ def add_args(
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
         rs = parser.add_mutually_exclusive_group()
-        rs.add_argument("-rsf", "--recurrent_state_format", type = str, choices = list(RECURRENT_STATE), default = "fp16",
-                    help = "Storage of the GDN recurrent state: fp16 (default), fp32, or int W (2..12): packed W-bit values (8 values per W bytes), per-slice fp16 scales, 128x128 GDN layers only. 9-11 are the useful range (10 typical); above 12 the fp16 scale caps recoverable precision. Mamba2 layers always use fp32. -rs32 is an alias for -rsf fp32")
+        rs.add_argument("-rsf", "--recurrent_state_format", type = str, choices = list(RECURRENT_STATE_FORMATS), default = "fp16",
+                    help = "GDN recurrent state format: fp16 (default), fp32, or int2..int12 for packed values with fp16 scales; packed formats require 128x128 GDN heads. Mamba2 uses fp32")
         rs.add_argument("-rs32", "--recurrent_state_fp32", action = "store_const", const = "fp32", dest = "recurrent_state_format",
                     help = "Alias for -rsf fp32")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
@@ -317,7 +315,7 @@ def init(
         vars(args).get("hybrid_draft_tokens") or 0,
     )
     if "cache_size" in vars(args):
-        recurrent_dtype, recurrent_bits = RECURRENT_STATE[args.recurrent_state_format]
+        recurrent_dtype, recurrent_bits = RECURRENT_STATE_FORMATS[args.recurrent_state_format]
         if args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
             if len(split) == 1:

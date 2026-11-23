@@ -50,9 +50,8 @@ def unload_model(model):
     torch.cuda.empty_cache()
 
 
-def has_int_pool(cache) -> bool:
-    """Whether any recurrent layer of the cache carries a packed int pool"""
-    return any(getattr(l, "recurrent_scales", None) is not None for l in cache.recurrent_layers.values())
+def has_quantized_state(cache) -> bool:
+    return any(getattr(layer, "quantized", False) for layer in cache.recurrent_layers.values())
 
 
 def generate_with_logits(model, cache, tokenizer, prompts: list[str], max_new_tokens: int,

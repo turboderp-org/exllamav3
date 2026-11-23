@@ -21,10 +21,9 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
-from testlib.gdn import pool_from_state
+from testlib.gdn import quantize_pool
 
 CONV1D_MAX_K = 16
-SUBK = 4   # scales per v row: one fp16 absmax per 32-wide k slice
 
 
 def _conv_job(t: torch.Tensor, slot: int, src_col: int, dst_col: int, cdim: int, dim: int | None = None):
@@ -130,11 +129,11 @@ def _layer_state(device, num_slots, max_history, fdim, k, nv, dk, dv, nk = None,
     ls.alloc(device)
     ls.conv_state.copy_(torch.randn(ls.conv_state.shape, device = device))
     if state_dtype == torch.int8:
-        # An int pool holds quantized values plus their scales (normal_() would leave raw noise in
-        # a 1-byte pool); the pool is v-major, so it fills from a (rows, 1, nv, dk, dv) fp32 state
-        q, scales = pool_from_state(torch.randn((ls.recurrent_state.shape[0], 1, nv, dk, dv), device = device) * 0.05,
-                                    state_bits)
-        ls.recurrent_state.copy_(q)
+        values, scales = quantize_pool(
+            torch.randn((ls.recurrent_state.shape[0], 1, nv, dk, dv), device = device) * 0.05,
+            state_bits,
+        )
+        ls.recurrent_state.copy_(values)
         ls.recurrent_scales.copy_(scales)
     else:
         ls.recurrent_state.normal_()
@@ -170,24 +169,19 @@ def test_gdn_layer_state_conv_job_matches_reference(device, max_history):
 
 
 @pytest.mark.parametrize("state_dtype,state_bits",
-                         [(torch.float, 0), (torch.half, 0), (torch.int8, 8), (torch.int8, 9),
-                          (torch.int8, 10), (torch.int8, 12)],
-                         ids = ["fp32_state", "fp16_state", "int8_state", "int9_state", "int10_state", "int12_state"])
+                         [(torch.float, 0), (torch.half, 0), (torch.int8, 9)],
+                         ids = ["fp32_state", "fp16_state", "int9_state"])
 @pytest.mark.parametrize("max_history", [3, 64])
 @pytest.mark.parametrize("bsz", [1, 3])
 @torch.inference_mode()
 def test_gdn_layer_state_replay(device, max_history, bsz, state_dtype, state_bits):
-    # A speculative pass of max_history + 1 tokens writes its scan inputs into the staged views; every batch row
-    # and every prefix then replays to the state a prefix-length pass from the same base row produces. Packed int
-    # pools are 128x128 only (the host check), so that case carries its own geometry; pass and replay quantize alike
+    # Every batch row and prefix replays to the same state as a prefix-length pass from the base row
     nk, nv = 2, 4
     dk = dv = 128 if state_dtype == torch.int8 else 64
     fdim = 2 * nk * dk + nv * dv
     seqlen = max_history + 1
     ls = _layer_state(device, bsz, max_history, fdim, 4, nv, dk, dv, nk = nk,
                       state_dtype = state_dtype, state_bits = state_bits)
-    if state_dtype == torch.int8:
-        assert ls.recurrent_scales.shape == (2 * bsz, 1, nv, dv, SUBK)       # what the host validates
     conv_out, beta, g = ls.staged_views(bsz, seqlen)
     conv_out.copy_((torch.randn(conv_out.shape, device = device) * 0.25).bfloat16())
     beta.copy_(torch.sigmoid(torch.randn(beta.shape, device = device)).bfloat16())

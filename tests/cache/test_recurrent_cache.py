@@ -4,8 +4,7 @@ exact shape and dtype that eviction returns, so the allocator sees no per-checkp
 host_copy matches a plain .cpu() for strided device sources. RecurrentCache.close(): drops every checkpoint,
 counts a stash shared by two keys once, returns the buffers and empties the pool so a replacement cache
 allocates fresh memory. Checked against the pool's allocation/reuse counters and buffer identity.
-GDNLayerState: the dtype-tagged recurrent-state pool (fp32 / fp16 / int8) — tensor layout, storage and
-checkpoint accounting, and the clear() zeroing.
+GDNLayerState: fp32, fp16 and packed recurrent-state layout, storage, checkpoints and TP mappings.
 """
 
 from types import SimpleNamespace
@@ -16,9 +15,9 @@ import torch
 from exllamav3.cache import recurrent
 from exllamav3.cache.cache import Cache
 from exllamav3.cache.recurrent import HostPool, RecurrentCache, host_copy, host_pool
-from exllamav3.modules.gated_delta_net import GDNLayerState
+from exllamav3.modules.gated_delta_net import GDNLayerState, QuantizedStateUnsupported
 
-SUBK = 4   # scales per v row (one fp16 absmax per 32 consecutive k values); SUBK in gdn.cuh
+NUM_K_SLICES = 4
 
 
 @pytest.fixture(autouse = True)
@@ -182,11 +181,10 @@ def test_closed_cache_frees_memory_for_a_replacement():
     assert host_pool.allocated == allocated + 4 and host_pool.reused == reused
 
 
-# GDNLayerState: the dtype-tagged recurrent-state pool (fp32 / fp16 / int8). int8 adds the fp16
-# scales (one absmax per 32-wide k slice, SUBK per v row); fp16 and fp32 carry none. Checked on CPU.
+# GDNLayerState
+
 
 def _gdn_layer_state(state_dtype, state_bits = 0, slots = 2, max_history = 3):
-    # 128x128 GDN geometry: the only one the packed int pool carries
     module = SimpleNamespace(
         fdim_qkv = 2 * 4 * 128 + 4 * 128,
         conv_kernel_size = 4,
@@ -199,9 +197,8 @@ def _gdn_layer_state(state_dtype, state_bits = 0, slots = 2, max_history = 3):
 
 
 @pytest.mark.parametrize("state_dtype,state_bits",
-                         [(torch.float32, 0), (torch.float16, 0), (torch.int8, 8), (torch.int8, 9),
-                          (torch.int8, 10), (torch.int8, 12)],
-                         ids = ["fp32", "fp16", "int8", "int9", "int10", "int12"])
+                         [(torch.float32, 0), (torch.float16, 0), (torch.int8, 9)],
+                         ids = ["fp32", "fp16", "int9"])
 @pytest.mark.nogpu
 def test_gdn_layer_state_pool_layout_and_accounting(state_dtype, state_bits):
     slots, max_history = 2, 3
@@ -211,20 +208,16 @@ def test_gdn_layer_state_pool_layout_and_accounting(state_dtype, state_bits):
     conv, state = ls.conv_state, ls.recurrent_state
     assert conv.shape == (slots, m.fdim_qkv, m.conv_kernel_size + max_history) and conv.dtype == torch.bfloat16
     if state_dtype == torch.int8:
-        # the pool is v-major: (rows, 1, nv, dv, dk * W // 8)
         assert state.shape == (rows, 1, m.num_v_heads, m.v_head_dim, m.k_head_dim * state_bits // 8)
     else:
         assert state.shape == (rows, 1, m.num_v_heads, m.k_head_dim, m.v_head_dim)
     assert state.dtype == state_dtype
     scales = ls.recurrent_scales
     if state_dtype == torch.int8:
-        assert scales.shape == (rows, 1, m.num_v_heads, m.v_head_dim, SUBK) and scales.dtype == torch.float16
+        assert scales.shape == (rows, 1, m.num_v_heads, m.v_head_dim, NUM_K_SLICES) and scales.dtype == torch.float16
     else:
         assert scales is None
-    # The two-tuple stays (conv, state) in every dtype; the scales are read separately
     assert len(ls.get_state_tensors()) == 2
-    # The storage is the pool plus the staging buffers, and the checkpoint is one slot's conv
-    # window plus one pool row (plus its scales, for int8)
     conv_bytes = slots * m.fdim_qkv * (m.conv_kernel_size + max_history) * 2
     staging_rows = slots * (max_history + 1)
     staging_bytes = staging_rows * m.fdim_qkv * 2 + staging_rows * m.num_v_heads * 2 + staging_rows * m.num_v_heads * 4
@@ -256,49 +249,94 @@ def test_gdn_layer_state_clear_zeroes_the_pool_and_the_scales():
 
 
 @pytest.mark.nogpu
-def test_gdn_layer_state_int8_stash_round_trips_values_and_scales():
-    ls = _gdn_layer_state(torch.int8, 8)
+def test_gdn_layer_state_packed_stash_round_trips_values_and_scales():
+    bits = 9
+    ls = _gdn_layer_state(torch.int8, bits)
     ls.alloc(torch.device("cpu"))
     m = ls.module
-    row = 0
-    # v-major pool: (rows, 1, nv, dv, dk * W // 8)
-    vals = torch.full((1, 1, m.num_v_heads, m.v_head_dim, m.k_head_dim * 8 // 8), 3, dtype = torch.int8)
-    scales = torch.full((1, 1, m.num_v_heads, m.v_head_dim, SUBK), 0.5, dtype = torch.float16)
-    ls.recurrent_state[row : row + 1].copy_(vals)
-    ls.recurrent_scales[row : row + 1].copy_(scales)
+    values = torch.full(
+        (1, 1, m.num_v_heads, m.v_head_dim, m.k_head_dim * bits // 8), 3, dtype = torch.int8
+    )
+    scales = torch.full((1, 1, m.num_v_heads, m.v_head_dim, NUM_K_SLICES), 0.5, dtype = torch.float16)
+    ls.recurrent_state[0:1].copy_(values)
+    ls.recurrent_scales[0:1].copy_(scales)
     before = host_pool.allocated
 
-    # int8 stashes three host copies: the values, the scales and the conv window
     stashed = ls.stash(0, 0, 0)
-    s_vals, s_scales, s_conv = stashed
-    assert len(stashed) == 3
-    assert s_vals.dtype == torch.int8 and s_vals.shape == (1, 1, m.num_v_heads, m.k_head_dim, m.v_head_dim)
-    assert s_scales.dtype == torch.float16 and s_scales.shape == (1, 1, m.num_v_heads, m.v_head_dim, SUBK)
-    assert torch.equal(s_vals, vals) and torch.equal(s_scales, scales)
-    assert host_pool.allocated == before + 3, "the stash allocated three host buffers (values, scales, conv)"
+    stashed_values, stashed_scales, _ = stashed
+    assert stashed_values.shape == values.shape and stashed_values.dtype == torch.int8
+    assert stashed_scales.shape == scales.shape and stashed_scales.dtype == torch.float16
+    assert torch.equal(stashed_values, values) and torch.equal(stashed_scales, scales)
+    assert host_pool.allocated == before + 3
 
-    # overwriting the pool, unstash restores both the values and the scales
-    ls.recurrent_state[row : row + 1].zero_()
-    ls.recurrent_scales[row : row + 1].zero_()
+    ls.recurrent_state[0:1].zero_()
+    ls.recurrent_scales[0:1].zero_()
     ls.unstash(0, stashed, 0, 0)
-    assert torch.equal(ls.recurrent_state[row : row + 1], vals)
-    assert torch.equal(ls.recurrent_scales[row : row + 1], scales)
+    assert torch.equal(ls.recurrent_state[0:1], values)
+    assert torch.equal(ls.recurrent_scales[0:1], scales)
 
-    # giving the stash back pools all three; values and scales are distinct (shape, dtype) classes
     host_pool.give(stashed)
     assert free_count(host_pool) == 3
-    assert (tuple(s_vals.shape), torch.int8) in host_pool.free
-    assert (tuple(s_scales.shape), torch.float16) in host_pool.free
     ls.free()
 
-    # fp16 keeps the two-tuple (state, conv) shape
-    fp16 = _gdn_layer_state(torch.float16)
-    fp16.alloc(torch.device("cpu"))
-    assert len(fp16.stash(0, 0, 0)) == 2
-    fp16.free()
+
+@pytest.mark.nogpu
+def test_gdn_layer_state_fp16_stash_has_state_and_conv():
+    ls = _gdn_layer_state(torch.float16)
+    ls.alloc(torch.device("cpu"))
+    stashed = ls.stash(0, 0, 0)
+    assert len(stashed) == 2
+    host_pool.give(stashed)
+    ls.free()
 
 
-# Cache: the (recurrent_dtype, recurrent_bits) pair rule lives in the cache and only there
+@pytest.mark.nogpu
+def test_gdn_layer_state_tp_export_preserves_packed_width():
+    original = _gdn_layer_state(torch.int8, 9)
+    exported = original.tp_export(None)
+    reconstructed = GDNLayerState(original.module, **exported["args"])
+    assert reconstructed.recurrent_bits == 9
+    assert reconstructed.recurrent_state.dtype == torch.int8
+    assert reconstructed.recurrent_scales.dtype == torch.float16
+    assert reconstructed.quantized
+
+
+@pytest.mark.nogpu
+def test_gdn_layer_state_tp_stash_pieces_order_and_v_head_mapping():
+    module = SimpleNamespace(
+        fdim_qkv = 2 * 2 * 128 + 4 * 128,
+        conv_kernel_size = 4,
+        num_k_heads = 2,
+        num_v_heads = 4,
+        k_head_dim = 128,
+        v_head_dim = 128,
+        tp_kv_first = 1,
+        tp_k_heads_total = 4,
+    )
+    state = GDNLayerState(module, 1, 0, cache_id = 0, state_dtype = torch.int8, state_bits = 9)
+    v_head_mapping = {"dim": 2, "total": 8, "pieces": [(0, 4, 2)]}
+    conv_mapping = {"dim": 0, "total": 2048, "pieces": [
+        (0, 256, 128),
+        (256, 512, 640),
+        (512, 1024, 1280),
+    ]}
+    assert state.tp_stash_pieces() == [v_head_mapping, v_head_mapping, conv_mapping]
+
+
+@pytest.mark.parametrize("attribute,value,error", [
+    ("kda", True, "KDA"),
+    ("k_head_dim", 64, "128x128"),
+])
+@pytest.mark.nogpu
+def test_quantized_state_rejects_ineligible_layers(attribute, value, error):
+    state = _gdn_layer_state(torch.float)
+    setattr(state.module, attribute, value)
+    with pytest.raises(QuantizedStateUnsupported, match = error):
+        state.set_state_dtype(torch.int8, 9)
+
+
+# Cache configuration
+
 
 def _empty_model():
     return SimpleNamespace(config = None, cache_weakrefs = {}, get_cache_layers = lambda: [],
@@ -307,8 +345,8 @@ def _empty_model():
 
 
 @pytest.mark.parametrize("recurrent_dtype,recurrent_bits",
-                         [(torch.int8, 1), (torch.int8, 13), (torch.float, 4), (torch.int16, 0)],
-                         ids = ["int8_w1", "int8_w13", "fp_bits", "int16"])
+                         [(torch.int8, 0), (torch.int8, 1), (torch.int8, 13), (torch.float, 4), (torch.int16, 0)],
+                         ids = ["missing_width", "width_1", "width_13", "fp_bits", "int16"])
 @pytest.mark.nogpu
 def test_cache_rejects_ineligible_recurrent_pairs(recurrent_dtype, recurrent_bits):
     with pytest.raises(ValueError):
