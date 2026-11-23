@@ -335,7 +335,7 @@ class GDNLayerState:
         m = self.module
         key = getattr(m, "key", None) or type(m).__name__
         if dtype not in (torch.float, torch.half, torch.int8):
-            raise ValueError(f"recurrent state dtype must be fp16, fp32 or int8, got {dtype}")
+            raise ValueError(f"recurrent state dtype must be fp16, fp32 or int8 (packed int pool), got {dtype}")
         if dtype == torch.int8:
             if getattr(m, "kda", False):
                 raise QuantPoolUnsupported(f"quantized recurrent state is not supported for KDA layers, layer {key}")
@@ -368,7 +368,7 @@ class GDNLayerState:
         return self.recurrent_scales is not None
 
 
-    def set_state_dtype(self, dtype: torch.dtype, bits: int = 0):
+    def set_state_dtype(self, dtype: torch.dtype, bits: int):
         """Storage dtype (and, for a packed int pool, its width) of the recurrent-state pool,
         settable until the state is allocated"""
         assert self.device is None, "recurrent state dtype must be set before the state is allocated"

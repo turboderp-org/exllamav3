@@ -18,30 +18,30 @@ def _gdn_h32(device):
 
 
 def _vcol_units(row: torch.Tensor) -> torch.Tensor:
-    """A (nv, dv, 16W) packed pool row -> (nv, dv, 8W) little-endian uint16 units (as int32), the
-    slots the kernel assembles (sp[2i] | sp[2i+1] << 8)"""
+    """A (nv, dv, dk * W // 8) packed pool row -> (nv, dv, dk * W // 16) little-endian uint16 units
+    (as int32), the slots the kernel assembles (sp[2i] | sp[2i+1] << 8)"""
     r = row.view(row.shape[0], row.shape[1], row.shape[2] // 2, 2).to(torch.int32)
     return (r[:, :, :, 0] & 0xff) | ((r[:, :, :, 1] & 0xff) << 8)
 
 
 def _unpack_bit_codes(u: torch.Tensor, bits: int) -> torch.Tensor:
-    """(nv, dv, 8W) little-endian uint16 units of one v column -> the 128 signed W-bit values. A
-    value sits at bit e * W of the column's 128W-bit stream: unit p = (e * W) >> 4 holds its low
-    bits at bit s16 = (e * W) & 15, the next unit the high bits when the value leaves p. The units
-    stay unsigned (a 64-bit shift would sign-extend a negative window)"""
-    b = bits
-    out = torch.zeros(*u.shape[:2], 128, dtype = torch.int64, device = u.device)
-    mask = (1 << b) - 1
-    for e in range(128):
-        base = e * b
+    """(nv, dv, dk * W // 16) little-endian uint16 units of one v column -> the dk signed W-bit
+    values. A value sits at bit e * W of the column's dk*W-bit stream: unit p = (e * W) >> 4 holds
+    its low bits at bit s16 = (e * W) & 15, the next unit the high bits when the value leaves p. The
+    units stay unsigned (a 64-bit shift would sign-extend a negative window)"""
+    dk = u.shape[2] * 16 // bits
+    out = torch.zeros(*u.shape[:2], dk, dtype = torch.int64, device = u.device)
+    mask = (1 << bits) - 1
+    for e in range(dk):
+        base = e * bits
         s16 = base & 15
         p = base >> 4
-        if s16 + b > 16:
+        if s16 + bits > 16:
             code = (u[:, :, p] >> s16) | ((u[:, :, p + 1] << (16 - s16)) & 0xffff)
         else:
             code = u[:, :, p] >> s16
         code = code & mask
-        out[:, :, e] = torch.where(code >= (1 << (b - 1)), code - (1 << b), code)
+        out[:, :, e] = torch.where(code >= (1 << (bits - 1)), code - (1 << bits), code)
     return out
 
 
@@ -51,34 +51,35 @@ def _dequant_bit_row(values: torch.Tensor, scales: torch.Tensor, bits: int) -> t
     slice's absmax. The CUDA scan reads this exact value (state_ld for int), so this is the kernel's
     load, mirrored on the CPU"""
     nv, dv, dbits = values.shape
+    dk = dbits * 8 // bits
     q_bound = (1 << (bits - 1)) - 1
-    raw = _unpack_bit_codes(_vcol_units(values), bits)                # (nv, dv, 128)
+    raw = _unpack_bit_codes(_vcol_units(values), bits)               # (nv, dv, dk)
     sc = scales.float().permute(0, 2, 1).unsqueeze(2)                # (nv, dk//32, 1, dv)
-    return (raw.permute(0, 2, 1).reshape(nv, 128 // 32, 32, dv) * sc / q_bound).reshape(nv, 128, dv)
+    return (raw.permute(0, 2, 1).reshape(nv, dk // 32, 32, dv) * sc / q_bound).reshape(nv, dk, dv)
 
 
 def _pack_bit_row(q: torch.Tensor, values: torch.Tensor, bits: int):
     """(nv, dk, dv) signed quantized values -> a (nv, dv, dk * W // 8) packed int pool row, written
-    in place. Value e of the column sits at bit e * W of the column's 128W-bit stream: assemble its
+    in place. Value e of the column sits at bit e * W of the column's dk*W-bit stream: assemble its
     W-bit two's-complement pattern into the 16-bit units holding those bits (the kernel's store,
     mirrored; the kernel reads the units little-endian as sp[2i] | sp[2i+1] << 8)"""
     nv, dk, dv = q.shape
-    b = bits
-    units = torch.zeros(nv, dv, 8 * b, dtype = torch.int32, device = q.device)   # 128W bits = 8W 16-bit units
-    mask = (1 << b) - 1
-    for e in range(128):
-        base = e * b
+    n_units = values.shape[2] // 2
+    units = torch.zeros(nv, dv, n_units, dtype = torch.int32, device = q.device)
+    mask = (1 << bits) - 1
+    for e in range(dk):
+        base = e * bits
         v = q[:, e, :].to(torch.int32) & mask     # the value's W-bit two's-complement pattern
         s16 = base & 15
         p = base >> 4
         units[:, :, p] = units[:, :, p] | (v << s16)
-        if s16 + b > 16:
+        if s16 + bits > 16:
             units[:, :, p + 1] = units[:, :, p + 1] | (v >> (16 - s16))
     # little-endian byte reassembly, matching the kernel's store (unit i -> sp[2i] | sp[2i+1] << 8)
-    flat = units.view(nv * dv, 8 * b)
+    flat = units.view(nv * dv, n_units)
     lo = (flat & 0xff).to(torch.int8)
     hi = ((flat >> 8) & 0xff).to(torch.int8)
-    values.view(nv * dv, 8 * b, 2).copy_(torch.stack([lo, hi], dim = -1))
+    values.view(nv * dv, n_units, 2).copy_(torch.stack([lo, hi], dim = -1))
 
 
 def unpack_int_state_row(values: torch.Tensor, scales: torch.Tensor, bits: int) -> torch.Tensor:
@@ -99,16 +100,15 @@ def pack_int_state_row(state: torch.Tensor, values: torch.Tensor, scales: torch.
     each value's W bits into the v column's 16-bit units (the mirror of unpack's unit extraction)"""
     assert values.shape[2] == 128 * bits // 8, "packed pool width does not match its bit count"
     nv, dk, dv = state.shape
-    b = bits
     h32 = _gdn_h32(str(state.device))
-    q_bound = (1 << (b - 1)) - 1
+    q_bound = (1 << (bits - 1)) - 1
     x = state.reshape(nv, dk // 32, 32, dv)
     x = torch.matmul(x.transpose(2, 3), h32).transpose(2, 3)     # pool basis, (nv, dk, dv)
     amax = x.abs().amax(dim = 2)                                  # (nv, dk//32, dv)
     inv = torch.where(amax > 0, q_bound / amax, 0.0)
     scales.copy_(amax.permute(0, 2, 1).half())
     q = (x * inv.unsqueeze(2)).round().to(torch.int16).reshape(nv, dk, dv)
-    _pack_bit_row(q, values, b)
+    _pack_bit_row(q, values, bits)
 
 
 def torch_recurrent_gated_delta_rule(

@@ -1001,10 +1001,12 @@ __device__ __forceinline__ void scan_body_128
                 const int16_t q = (int16_t) __float2int_rn(st[e] * inv);
                 const int s16 = (e * state_bits) & 15;
                 const int p = (e * state_bits) >> 4;
-                w[p] = (w[p] & ~(m << s16)) | ((uint32_t) q << s16);
+                // pat holds only the value's W low bits (the int16 cast sign-extends otherwise), so the
+                // ORs write each field exactly once: the units are zeroed and the fields are disjoint
+                const uint32_t pat = (uint32_t) q & m;
+                w[p] |= pat << s16;
                 if (s16 + state_bits > 16)
-                    w[p + 1] = (w[p + 1] & ~(m << (32 - (s16 + state_bits))))
-                        | ((uint32_t) q >> (16 - s16));
+                    w[p + 1] |= pat >> (16 - s16);
             }
             #pragma unroll
             for (int i = 0; i < MAX_UNITS; ++i)
@@ -1203,7 +1205,7 @@ void cuda_recurrent_gated_delta_rule_gr
                 "beta must be [bsz, seqlen, num_v_heads]");
     // The pool's element type as the dispatch index (see state_format_of)
     const int state_format = state_format_of(recurrent_state);
-    TORCH_CHECK(state_format >= 0, "recurrent_state must be float32, float16 or int8");
+    TORCH_CHECK(state_format >= 0, "recurrent_state must be float32, float16 or int8 (packed int pool)");
     if (state_format == STATE_INT)
     {
         TORCH_CHECK(recurrent_bits >= 2 && recurrent_bits <= 12,

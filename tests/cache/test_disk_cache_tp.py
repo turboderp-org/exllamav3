@@ -313,7 +313,7 @@ def test_tp_checkpoint_round_trips_across_splits_and_configurations(device, tmp_
 
 
 @pytest.mark.parametrize("bits", [8, 9, 10, 12], ids = ["w8", "w9", "w10", "w12"])
-def test_tp_int8_checkpoint_round_trips_three_specs_across_splits(device, tmp_path, monkeypatch, bits):
+def test_tp_int_pool_checkpoint_round_trips_three_specs_across_splits(device, tmp_path, monkeypatch, bits):
     g = torch.Generator(device = "cpu").manual_seed(3)
     full_k = torch.randn((NUM_PAGES, PAGE_SIZE, HEADS, HEAD_DIM), generator = g).half().to(device)
     full_v = torch.randn((NUM_PAGES, PAGE_SIZE, HEADS, HEAD_DIM), generator = g).half().to(device)

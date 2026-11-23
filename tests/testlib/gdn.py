@@ -1,10 +1,10 @@
 """
-The GDN packed recurrent-state pool for the state kernel tests: a torch.int8 (char) payload of
-W-bit values (2 <= W <= 12), v-major (rows, 1, nv, dv, dk * W // 8), plus fp16 scales, one absmax
-per 32-wide k slice. The k-th value of a v column sits at bit k * W of the column's byte stream
-(little-endian), mirroring gdn.cu's int load (16-bit slot extract) and store (per-value bit
-scatter) -- the kernel reads the column as a stream of 32-value slices and dequantizes each against
-its scale.
+An independent bit-layout reference for the GDN packed recurrent-state pool used by the state
+kernel tests: a torch.int8 (char) payload of W-bit values (2 <= W <= 12), v-major
+(rows, 1, nv, dv, dk * W // 8), plus fp16 scales, one absmax per 32-wide k slice. The k-th value
+of a v column sits at bit k * W of the column's byte stream (little-endian). This module implements
+that layout on its own (64-bit windows on the pack side, 16-bit units on the unpack side), so it
+shares no code with the kernel-mirroring converters it is tested against.
 
 These helpers work in the model's basis, i.e. on a state as the rule computes it (the scan kernel
 dequantizes the pool values and uses them directly, rotating q/k warp-locally).

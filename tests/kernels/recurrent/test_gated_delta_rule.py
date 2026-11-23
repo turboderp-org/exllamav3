@@ -689,7 +689,7 @@ def test_rejects_non_contiguous(device, which):
 
 @pytest.mark.parametrize("bits", [1, 13], ids = ["w1", "w13"])
 @torch.inference_mode()
-def test_int8_state_rejects_ineligible_calls(device, bits):
+def test_int_state_rejects_ineligible_calls(device, bits):
     """The packed int dispatch is 128x128 GDN only: channelwise decay (KDA) does not commute with the
     rotation, the generic (non-128) kernels have no char path, the width must be 2..12, and the scales
     tensor pairs with an int pool and its width only. The pool is v-major (rows, 1, nv, dv, dk * W // 8)."""
@@ -730,5 +730,5 @@ def test_int8_state_rejects_ineligible_calls(device, bits):
 
     # a pool of an unsupported dtype
     pool_i16 = torch.zeros(2, 1, nv, dv, dk * 8 // 8, dtype = torch.int16, device = device)
-    with pytest.raises(RuntimeError, match = "recurrent_state must be float32, float16 or int8"):
+    with pytest.raises(RuntimeError, match = r"recurrent_state must be float32, float16 or int8 \(packed int pool\)"):
         ext.cuda_recurrent_gated_delta_rule(mixed_qkv, g, beta, pool_i16, out, nk, nv, dk, dv, None, False, None, scales, 8)
