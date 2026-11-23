@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from exllamav3.modules.quant.exl3_lib.quantize import get_temp_buffers, get_temp_buffers_frac
+from exllamav3.modules.quant.exl3_lib.quantize import clear_temp_buffers
 
 
 @pytest.fixture(autouse = True)
@@ -10,6 +10,5 @@ def release_quant_scratch():
     edge histories run to GBs at low K (4 GiB at K = 1). Conversion clears the cache per layer; the tests sweep K and
     codebooks, so they drop it after every test or the cached buffers fill a 24 GB card"""
     yield
-    get_temp_buffers.cache_clear()
-    get_temp_buffers_frac.cache_clear()
+    clear_temp_buffers()
     torch.cuda.empty_cache()
