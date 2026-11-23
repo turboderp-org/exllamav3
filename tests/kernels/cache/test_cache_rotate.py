@@ -47,6 +47,11 @@ def test_cache_rotate_pages(device, cache_dim, cache_dtype, full):
     torch.manual_seed(0)
 
     num_pages = cache_dim[0]
+    # The cache and its reference clone must fit together (8 GiB for the largest fp32 case)
+    shape, dtype = (cache_dim[:-1], torch.uint8) if cache_dim[-1] == "u8" else (cache_dim, cache_dtype)
+    need = 2 * math.prod(shape) * dtype.itemsize
+    if need > torch.cuda.mem_get_info(device)[0]:
+        pytest.skip(f"needs {need / 2**30:.1f} GiB free on {device}")
     if cache_dim[-1] == "u8":
         cache = torch.randint(0, 256, cache_dim[:-1], device = device, dtype = torch.uint8)
     else:

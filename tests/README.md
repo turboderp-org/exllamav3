@@ -27,7 +27,7 @@ against references; higher levels compose them.
 | `tokenizer/`, `loader/`, `model_setup/` | Tokenization, checkpoint loading, config parsing, warmup | |
 | `moe_cpu/`    | CPU expert offload: ISA tiers, arena, host affinity, thread pool, streaming | CPU, some GPU |
 | `tp/`         | Tensor-parallel export/import, collectives plumbing, worker lifecycle | |
-| `conversion/` | Quantizer and conversion pipeline pieces | GPU |
+| `conversion/` | Quantizer and conversion pipeline pieces | GPU, some CPU |
 | `e2e/`        | Feature tests over the canonical model set (generation, CPU offload modes, TP, drafting, prompt caching) | models |
 | `parity/`     | Per-architecture parity against HF transformers or the reference implementation | models, transformers |
 | `examples/`   | Helpers of the example scripts | |

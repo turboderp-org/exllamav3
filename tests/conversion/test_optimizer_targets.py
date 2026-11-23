@@ -76,10 +76,12 @@ def _qwen38_layer_types() -> list[str]:
 
 
 def _gdn_probe_class() -> type:
-    return _optimizer_probe_class(
+    probe = _optimizer_probe_class(
         "exllamav3/modules/gated_delta_net.py",
         "GatedDeltaNet",
     )
+    probe.kda_direct = False
+    return probe
 
 
 def _linear(key: str) -> SimpleNamespace:
