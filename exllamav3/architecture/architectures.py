@@ -62,6 +62,7 @@ from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
 from .qwen3_vl_moe import Qwen3VLMoeModel
+from .sensenova_loop import SenseNovaLoopModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
@@ -75,6 +76,7 @@ ARCHITECTURES = {
         "config_class": m.config_class,
         "model_class": m,
     } for m in [
+        SenseNovaLoopModel,
         ArceeModel,
         AfmoeModel,
         ApertusModel,

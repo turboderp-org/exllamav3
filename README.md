@@ -233,6 +233,7 @@ python examples/chat.py -h
 | **Qwen 3.5**                                      | `Qwen3_5ForConditionalGeneration`                                             |     ✓     |                       |
 | **Qwen 3.5 MoE**                                  | `Qwen3_5MoeForConditionalGeneration`                                          |     ✓     |                       |
 | **Qwen 3.8-Flash-Next**                           | `Qwen4ExpForConditionalGeneration`                                            |     ✓     |                       |
+| **SenseNova Loop** (text only)                    | `SenseNovaLoopForConditionalGeneration`                                       |     ✓     |                       |
 | **Seed-OSS**                                      | `SeedOssForCausalLM`                                                          |            |                       |
 | **SmolLM**                                        | `SmolLM3ForCausalLM`                                                          |            |                       |
 | **SolarOpen**                                     | `SolarOpenForCausalLM`                                                        |            |                       |

@@ -130,3 +130,5 @@ python convert.py -i /mnt/models/qwen3.5-35b-a3b \
                   -hq \
                   -d 2,0,1
 ```
+
+SenseNova Loop conversion collects calibration statistics from both visits to each shared layer and replays the quantized region before continuing. It requires a single GPU and online calibration.

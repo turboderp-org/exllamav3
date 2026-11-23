@@ -108,6 +108,25 @@ def get_file_calibration(args, tokenizer):
     lengths present a row keeps its own (shorter) length, so a chat example is never cut mid-turn
     and never continued into the padding. Files without lengths are read as full-width rows.
     """
+    if args["cal_data"].endswith(".jsonl"):
+        import json
+        out = []
+        with open(args["cal_data"], encoding = "utf8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)["input_ids"]
+                if not isinstance(row, list) or not row or any(type(t) is not int or not 0 <= t < tokenizer.actual_vocab_size for t in row):
+                    raise ValueError(f"Invalid input_ids in {args['cal_data']}, row {len(out)}")
+                out.append(torch.tensor([row[:args["cal_cols"]]], dtype = torch.long))
+                if len(out) >= args["cal_rows"]:
+                    break
+        if not out:
+            raise ValueError(f"Empty calibration file: {args['cal_data']}")
+        if len(out) < args["cal_rows"]:
+            print(f" !! Calibration file contains {len(out)} rows, less than cal_rows ({args['cal_rows']})")
+            args["cal_rows"] = len(out)
+        return out
     from safetensors.torch import load_file
     data = load_file(args["cal_data"])
     packed = data["input_ids"]

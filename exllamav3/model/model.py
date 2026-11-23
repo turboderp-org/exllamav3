@@ -119,6 +119,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         Prepare list of (module, instance_num, original_idx) for mapped layers
         """
 
+        # The layer map describes the text model; other components (vision) run their layers once
+        if getattr(self, "component", "text") != "text":
+            self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+            self.last_kv_module_idx_instance = (self.last_kv_module_idx, 0)
+            return
+
         # Parse layer map string
         if self.config.layer_map is None and self.config.layer_map_str:
             self.config.layer_map = parse_int_list(
