@@ -190,8 +190,14 @@ python examples/chat.py -m <olala_exl3_dir> --mode olala
 
 Olala chat uses the checkpoint's template and defaults to medium reasoning. Pass
 `--no_think` to disable reasoning. Olala supports up to 32K total context and uses FP32
-recurrent state. On gfx1100, EXL3 decode can replay batches of up to eight sequences with an FP16 KV
+recurrent state.
+On gfx1100, EXL3 decode can replay batches of up to eight sequences with an FP16 KV
 cache or a quantized KV cache that supports direct attention.
+
+For a sensitivity-calibrated (SC) Olala quant, follow the
+[SC workflow](doc/optimize.md). Generate the calibration trace from the original
+Olala checkpoint and pass `--template_vars '{"reasoning_effort":"medium"}'` to
+`sc_trace.py`. Use the resulting trace with both `sc_measure.py` and `convert.py`.
 
 ## Architecture support
 

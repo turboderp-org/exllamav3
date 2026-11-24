@@ -153,7 +153,8 @@ def estimate_resident_bytes(modules, rows, length, vocab_size, shaped, h_rows, s
                                + 16 * max(qmaps.values()) ** 2)
     weights = max(weights, linear_weights)  # account for padded/repeated linear modules
     states = 2 * length * width * (rows * (len(modules) + 2) + (h_rows if shaped else 0))
-    logits = 2 * length * vocab_size + 16 * min(length, 256) * vocab_size
+    # One live device row of up to FP32 logits plus chunked KL workspace.
+    logits = 4 * length * vocab_size + 16 * min(length, 256) * vocab_size
     workspace = largest_weight + (hessian_peak if shaped else 0) + 3 * 1024 ** 3
     return math.ceil(1.15 * (weights + states + logits + workspace))
 
@@ -383,7 +384,7 @@ def main(args):
 
     @torch.inference_mode()
     def ref_pass():
-        """Full reference pass, caching the input state to every module and the final logits"""
+        """Cache module inputs and final logits, preserving their dtype for the replay control."""
         boundary = [[] for _ in range(num_mods)]
         logits = []
         if streaming:
@@ -393,7 +394,7 @@ def main(args):
                 with runner.loaded(i) as mod:
                     states = runner.rows(
                         mod, states, ids = rows,
-                        consume=(lambda r, x: logits.append(x.half().to("cpu", copy=True)))
+                        consume=(lambda r, x: logits.append(x.to("cpu", copy=True)))
                         if i == num_mods - 1 else None,
                     )
             return boundary, logits
@@ -407,7 +408,7 @@ def main(args):
                 # cloned or all mid-stream experiments run on corrupted inputs
                 boundary[i].append(x.clone() if x.is_floating_point() else x)
                 x = mod.forward(x, params)
-            logits.append(x.half().cpu())
+            logits.append(x.cpu())
         return boundary, logits
 
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
