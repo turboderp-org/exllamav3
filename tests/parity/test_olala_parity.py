@@ -249,3 +249,71 @@ def test_olala_exl3_prefill_and_decode(model_dir, device):
         if generator is not None:
             generator.close()
         model.unload()
+
+
+@pytest.mark.rocm_only
+@pytest.mark.slow
+@pytest.mark.model("olala-exl3")
+@pytest.mark.parametrize("batch_size, quant_cache", [(1, False), (2, False), (2, True)])
+def test_olala_decode_graph_replays_slots_and_page_tables(model_dir, device, monkeypatch, batch_size, quant_cache):
+    from exllamav3 import Cache, Config, Model, Tokenizer
+    from exllamav3.constants import PAGE_SIZE
+    from exllamav3.util.backend import gfx_arch
+
+    if gfx_arch(device) != "gfx1100":
+        pytest.skip("Olala decode graphs are enabled on gfx1100")
+    config = Config.from_directory(model_dir)
+    model = Model.from_config(config)
+    tokenizer = Tokenizer.from_config(config)
+    from exllamav3.cache import CacheLayer_quant
+    cache_kwargs = dict(layer_type = CacheLayer_quant, k_bits = 8, v_bits = 8) if quant_cache else {}
+    eager_cache = Cache(model, max_num_tokens = 8 * PAGE_SIZE, max_batch_size = 2, **cache_kwargs)
+    graph_cache = Cache(model, max_num_tokens = 8 * PAGE_SIZE, max_batch_size = 2, **cache_kwargs)
+    model.load(device)
+    prefixes = [
+        tokenizer.encode(text * 50, add_bos = False)[:, :PAGE_SIZE + 4].contiguous()
+        for text in ("A lighthouse on the coast. ", "Une forêt au bord de la mer. ")
+    ]
+    page_tables = (torch.tensor([[3, 1]], dtype = torch.int32), torch.tensor([[4, 6]], dtype = torch.int32))
+
+    def run(cache):
+        states = [cache.get_new_state() for _ in prefixes]
+
+        def params(rows, positions):
+            pages = max(positions) // PAGE_SIZE + 1
+            return {
+                "attn_mode": "flash_attn", "cache": cache,
+                "cache_seqlens": torch.tensor(positions, dtype = torch.int32),
+                "block_table": torch.cat([page_tables[i][:, :pages] for i in rows]),
+                "recurrent_states": [states[i] for i in rows],
+            }
+
+        starts = [PAGE_SIZE - 2, PAGE_SIZE - 3]
+        try:
+            for i, ids in enumerate(prefixes):
+                model.prefill(ids[:, :starts[i]], params([i], [0]))
+            outputs = []
+            for step in range(6):
+                order = [1, 0] if step % 2 else [0, 1]
+                for offset in range(0, len(order), batch_size):
+                    rows = order[offset:offset + batch_size]
+                    positions = [starts[i] + step for i in rows]
+                    tokens = torch.cat([prefixes[i][:, pos:pos + 1] for i, pos in zip(rows, positions)])
+                    outputs.append(model.forward(tokens, params(rows, positions)))
+            assert [state.position for state in states] == [start + 6 for start in starts]
+            return outputs
+        finally:
+            for state in states:
+                state.free()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(model._decode_graph, "forward", lambda *args: None)
+            expected = run(eager_cache)
+        actual = run(graph_cache)
+        assert len(model._decode_graph._entries) == 2
+        assert all(entry.graph is not None for entry in model._decode_graph._entries.values())
+        for got, ref in zip(actual, expected, strict = True):
+            torch.testing.assert_close(got, ref, atol = 0.05, rtol = 0.02)
+    finally:
+        model.unload()

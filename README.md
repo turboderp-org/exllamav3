@@ -181,6 +181,9 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -h
 ```
 
+On gfx1100, Olala EXL3 decode can replay batches of up to eight sequences with an FP16 KV
+cache or a quantized KV cache that supports direct attention.
+
 ## Architecture support
 
 | Model family                                      | HF architecture                                                               | Multimodal | Notes                 |

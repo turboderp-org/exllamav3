@@ -228,6 +228,7 @@ class GTensorCache:
 
     def __init__(self):
         self.cache = {}
+        self.generation = 0
 
     def make_key(self, device, shape, dtype, x):
         device = torch.device(device)
@@ -271,5 +272,6 @@ class GTensorCache:
 
     def drop_all(self):
         self.cache.clear()
+        self.generation += 1
 
 g_tensor_cache = GTensorCache()

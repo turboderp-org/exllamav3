@@ -4,13 +4,26 @@ import torch
 import torch.nn.functional as F
 from typing_extensions import override
 
+from ..cache.fp16 import CacheLayer_fp16
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..model.config import Config, no_default
+from ..model.decode_graph import DecodeGraph
 from ..model.model import Model
 from ..modules import Embedding, Linear
 from ..modules.arch_specific.olala import OlalaBlock
 from ..modules.attn import prepare_for_attn
+from ..modules.attention_fn.dispatch import supports_direct_quant_cache
+from ..modules.block_sparse_mlp import MAX_BSZN
 from ..modules.recurrent import CommittedRecurrentState
+from ..util.backend import gfx_arch
+
+
+_DECODE_GRAPH_PARAMS = frozenset((
+    "attn_mode", "batch_shape", "block_table", "cache", "cache_seqlens", "dev_cache",
+    "indexed_embeddings", "last_tokens_only", "past_len", "pinned_staging", "position",
+    "position_ids", "positions", "recurrent_history", "recurrent_slots", "recurrent_slots_scan",
+    "recurrent_states",
+))
 
 
 class OlalaConfig(Config):
@@ -118,6 +131,7 @@ class OlalaModel(Model):
         ))
         self.calibration_all_experts = True
         self.recurrent_state_cls = CommittedRecurrentState
+        self._decode_graph = DecodeGraph()
         self.caps.update({
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
@@ -133,6 +147,40 @@ class OlalaModel(Model):
         input_ids = prepare_for_attn(input_ids, params)
         prepare_for_recurrence(input_ids, params, self)
         return input_ids
+
+    @override
+    def forward_ls(self, x, params):
+        cache = params.get("cache")
+        if (
+            x.ndim == 2 and x.shape[1] == 1 and 1 <= x.shape[0] <= MAX_BSZN
+            and cache is not None and (cache.layer_type is CacheLayer_fp16 or all(
+                supports_direct_quant_cache(layer, self.config.head_dim) for layer in cache.layers.values()
+            ))
+            and id(cache) in self.cache_weakrefs
+            and params.get("block_table") is not None and params.get("cache_seqlens") is not None
+            and params.get("recurrent_slots") is not None
+            and params.get("last_tokens_only") in (None, 0, 1)
+            and not params.get("indexed_embeddings") and params.get("position_ids") is None
+            and (params.get("positions") is None or params["positions"] is params["cache_seqlens"])
+            and _DECODE_GRAPH_PARAMS.issuperset(params)
+        ):
+            device = torch.device(self.modules[1].device)
+            if (
+                device.type == "cuda" and gfx_arch(device) == "gfx1100"
+                and all(module.device == device for module in self.modules[1:])
+                and all(block.mlp.bc is not None and not block.mlp.cpu_offload
+                        and block.mlp.cpu_split_first is None for block in self.modules[1:-1])
+            ):
+                with torch.cuda.device(device):
+                    logits = self._decode_graph.forward(self, x, params, device)
+                if logits is not None:
+                    return logits
+        return super().forward_ls(x, params)
+
+    @override
+    def unload(self):
+        self._decode_graph = DecodeGraph()
+        super().unload()
 
     def default_chat_prompt(self, prompt, system_prompt = None):
         from .olala_template import render_olala_chat
