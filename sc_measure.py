@@ -153,8 +153,14 @@ def estimate_resident_bytes(modules, rows, length, vocab_size, shaped, h_rows, s
                                + 16 * max(qmaps.values()) ** 2)
     weights = max(weights, linear_weights)  # account for padded/repeated linear modules
     states = 2 * length * width * (rows * (len(modules) + 2) + (h_rows if shaped else 0))
-    # One live device row of up to FP32 logits plus chunked KL workspace.
-    logits = 4 * length * vocab_size + 16 * min(length, 256) * vocab_size
+    head = modules[-1]
+    if isinstance(head, Linear):
+        logits_dtype = head.out_dtype or torch.float16
+    else:
+        logits_dtype = getattr(head, "out_dtype", None) or torch.float32
+    logits_width = getattr(head, "out_features", vocab_size)
+    # One live device row in the head's output dtype plus FP32 KL workspace.
+    logits = logits_dtype.itemsize * length * logits_width + 16 * min(length, 256) * vocab_size
     workspace = largest_weight + (hessian_peak if shaped else 0) + 3 * 1024 ** 3
     return math.ceil(1.15 * (weights + states + logits + workspace))
 

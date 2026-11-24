@@ -105,7 +105,7 @@ class OlalaEmbedding(Embedding):
 
 class OlalaHead(Linear):
     def forward(self, x, params, out_dtype = None):
-        return super().forward(x.half(), params, out_dtype or torch.float)
+        return super().forward(x.half(), params, out_dtype)
 
 
 class OlalaModel(Model):
@@ -127,6 +127,7 @@ class OlalaModel(Model):
         self.modules.append(OlalaHead(
             config = config, key = "lm_head", in_features = config.hidden_size,
             out_features = config.vocab_size, qmap = "block", qbits_key = "head_bits",
+            out_dtype = torch.float32,
             caps = {"logits_output": True},
         ))
         self.calibration_all_experts = True
