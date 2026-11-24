@@ -127,6 +127,8 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);  
 // Pool topology for host placement: physical-core-first encoded LP order and the physical core
 // count; empty when EXL3_MOE_CPU_PIN=0.
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order();
+// Pinning order for this process's pool (multi-NUMA workers only); before the first pool spawn
+void exl3_moe_cpu_set_core_order(const std::vector<int64_t>& cpus);
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
 bool exl3_moe_cpu_has_avx2();

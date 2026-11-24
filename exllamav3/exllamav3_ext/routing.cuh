@@ -87,7 +87,10 @@ void moe_split_collect_add
     int64_t h_out_ptr,
     const at::Tensor& dev_count,
     const int64_t slot_idx,
-    const int64_t ho
+    const int64_t ho,
+    const int64_t workers = 1,
+    const int64_t worker_stride = 0,
+    const bool accumulate = true
 );
 
 void routing_sel_norm

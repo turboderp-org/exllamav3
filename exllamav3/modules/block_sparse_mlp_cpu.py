@@ -441,11 +441,10 @@ def _split_promote_verify(m, t):
         return
     spec = host.specs[m.cpu_layer_idx]
     layout, _ = host._stream_layout(spec)
-    eb = spec["expert_bytes"]
-    ci, off = host.layer_blocks[m.cpu_layer_idx][t["cpu"]]
-    arena = host.arena_views[ci][off // 2 : (off + eb) // 2]
+    # The expert's packed block and aux tensors as the CPU kernels hold them (reassembled from
+    # the workers' slices under multi-NUMA)
+    arena = host.arena_expert(m.cpu_layer_idx, t["cpu"])
     aux = host.aux[m.cpu_layer_idx]
-    locs = host.layer_auxloc[m.cpu_layer_idx][t["cpu"]]
     for li, name, lin, o, nb in host._promo_parts(m.cpu_layer_idx, _split_slot_linears(m, t["gpu"])):
         key = dict(projs)[name][0][r].key if False else [f for n_, f, _ in projs if n_ == name][0][r].key
         fresh = stc.get_tensor(key + ".trellis", "cpu").view(torch.int16)
@@ -462,8 +461,8 @@ def _split_promote_verify(m, t):
             if fr is None:
                 continue
             assert torch.equal(lst[t["cpu"]].cpu(), fr), f"demote verify failed: {key}.{an} (aux)"
-            lc, lo, ln = locs[li][j]
-            assert torch.equal(host.arena_views[lc][lo // 2 : (lo + ln) // 2], fr.view(torch.int16).view(-1)), \
+            got_aux = host.arena_aux(m.cpu_layer_idx, t["cpu"], li, j, name, fr.numel())
+            assert got_aux is not None and torch.equal(got_aux, fr.view(torch.int16).view(-1)), \
                 f"demote verify failed: {key}.{an} (arena)"
 
 

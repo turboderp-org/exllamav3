@@ -369,8 +369,8 @@ biases (all or none; ineligible layers fall back to the GPU as usual). A spawned
 per model component (main / draft / MTP) owns its own expert weights and a job ring in pinned
 shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
 additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
-dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
-thread configuration, and the knobs below for tuning the split.
+dequant, by size) while the CPU works the remaining tail. See `-mcn` below for multi-NUMA
+placement, `-mclt`/`-dmclt` for thread configuration, and the knobs below for tuning the split.
 
 `-mcs`/`--moe_cpu_split` (main model) and `-dmcs`/`--draft_moe_cpu_split` (draft model or MTP
 head) instead run the tail N routed experts of every eligible layer on the CPU. Each component
@@ -388,6 +388,20 @@ in fresh processes to change it.
 
 Fallback value for when `-mcl` is not set.
 
+### `-mcn` / `--moe_cpu_numa_nodes` (CLI, not env)
+
+Experimental, Linux only. Runs the CPU MoE offload (`-mcl` / `-mcs`) with one worker process per
+NUMA node, so expert weights are read from local memory on multi-socket and sub-NUMA-clustered
+(SNC, NPS) machines. The value is `all` or a comma-separated list of node IDs; `all` uses every
+node the process may run on and falls back to a single worker when fewer than two are available.
+A list must name at least two available nodes; at most eight workers are supported. Unset keeps
+the single-worker path. A draft model or MTP head always uses one worker. Set via
+`config.infer_params.moe_cpu_numa_nodes`.
+
+Each offloaded layer's intermediate dimension must be a multiple of 128 and at least 128 times
+the worker count. Use nodes with the same core count and memory: every worker gets an equal
+share, so the slowest node sets the pace. The output can differ slightly from a single worker's.
+
 ### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
 
 Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
@@ -396,6 +410,8 @@ Worker thread count, set per component via `config.infer_params.moe_cpu_threads`
 ### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
+With `--moe_cpu_numa_nodes`, per worker; by default each node's physical cores minus the host's
+(see `-mcn` above).
 
 ### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
 
@@ -857,7 +873,8 @@ first worker started; workers spawned later (draft model, reload) restore the or
 pinning. `0` disables the reservation and the pinning. Windows applies the mask process-wide
 (single processor group only; boxes with more than 64 logical processors are left unpinned with a
 notice); Linux pins every current thread, and later threads inherit it. Never fails a load: OS
-errors print a notice and leave the host unpinned.
+errors print a notice and leave the host unpinned. With `--moe_cpu_numa_nodes`, the cores are
+taken on the CUDA device's NUMA node (see `-mcn` above).
 
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
