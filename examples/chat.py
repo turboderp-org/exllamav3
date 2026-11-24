@@ -1,5 +1,4 @@
 import sys, os
-from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -43,7 +42,7 @@ def main(args):
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
     show_tps = args.show_tps
-    think = args.think
+    think = args.think or (args.mode == "olala" and not args.no_think)
     last_input_ids = None
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
@@ -63,7 +62,7 @@ def main(args):
         streamer_cm = Streamer_basic
     elif prompt_format.is_harmony_like():
         read_input_fn = read_input_ptk
-        streamer_cm = partial(Streamer_harmony, tags = prompt_format.harmony_tags())
+        streamer_cm = Streamer_harmony
     else:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
@@ -71,6 +70,9 @@ def main(args):
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
+    if isinstance(prompt_format, PromptFormat_olala):
+        prompt_format.model_directory = config.directory
+        context_length = min(context_length, config.max_position_embeddings)
 
     # Limit max_response_tokens if cache_size is too small
     if max_response_tokens > context_length // 2:
@@ -523,6 +525,7 @@ def main(args):
             stop_conditions = stop_conditions,
             sampler = sampler,
             banned_strings = banned_strings,
+            decode_special_tokens = isinstance(prompt_format, PromptFormat_olala),
             token_healing = enable_healing,
             return_logits = save_probs > 0,
             stop_on_loop = True,
@@ -538,9 +541,10 @@ def main(args):
 
         # Stream response
         stop_reason = None
+        streamer_options = {"tags": prompt_format.harmony_tags(think)} if streamer_cm is Streamer_harmony else {}
         with (
             KeyReader() as keyreader,
-            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think) as s
+            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think, **streamer_options) as s
         ):
             if prefix:
                 s.stream(prefix)

@@ -181,7 +181,16 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -h
 ```
 
-On gfx1100, Olala EXL3 decode can replay batches of up to eight sequences with an FP16 KV
+For OVHcloud Olala v1.0 mini 7A1B, use the original Hugging Face checkpoint or an EXL3 conversion:
+
+```sh
+python convert.py -i <olala_checkpoint> -w <work_dir> -o <olala_exl3_dir> -b 5.0
+python examples/chat.py -m <olala_exl3_dir> --mode olala
+```
+
+Olala chat uses the checkpoint's template and defaults to medium reasoning. Pass
+`--no_think` to disable reasoning. Olala supports up to 32K total context and uses FP32
+recurrent state. On gfx1100, EXL3 decode can replay batches of up to eight sequences with an FP16 KV
 cache or a quantized KV cache that supports direct attention.
 
 ## Architecture support
@@ -224,6 +233,7 @@ cache or a quantized KV cache that supports direct attention.
 | **Mistral**, **Ministral 3**, **Mistral-4** etc.  | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration`                    |     ✓     |                       |
 | **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
 | **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
+| **Olala v1.0 mini**                               | `OlalaForCausalLM`                                                          |            | Mamba-3 MIMO / differential attention MoE |
 | **Nemotron 3.5 Bolt**, **Nemotron 3.5 Super VL**  | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
 | **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
 | **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |
