@@ -57,31 +57,19 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
     state after the accepted prefix is rebuilt by replaying the scan over the staged inputs of
     that pass (batched_scan_replay, one launch per device and kernel geometry). A rewind of the
     whole pass (prefix 0) never happens: the first token of a pass is always kept"""
-    prefix = last_history + 1 - num_tokens
-    replay = last_history > 0 and num_tokens > 0
-    if replay:
+    rewind_layers = []
+    for l in layers:
+        if not isinstance(l, GDNLayerState):
+            l.rewind(slot, last_history, num_tokens)
+        elif last_history > 0:
+            assert num_tokens == 0 or l.spec_shape == spec_shape, \
+                f"GDN replay: staged inputs are from a pass of shape {l.spec_shape}, rewind expects {spec_shape}"
+            rewind_layers.append(l.rewind_layer())
+    if rewind_layers:
         assert spec_shape is not None and spec_row is not None, \
             "GDN rewind: history was recorded but the pass staged no scan inputs to replay"
-    conv_by_device = {}
-    replay_by_key = {}
-    for l in layers:
-        if isinstance(l, GDNLayerState):
-            # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
-            # torch.device, so normalize rather than assume a .index attribute
-            device_index = torch.device(l.device).index
-            cj = l.rewind_conv_job(slot, last_history, num_tokens)
-            if cj is not None:
-                conv_by_device.setdefault(device_index, []).append(cj)
-            if replay:
-                key = (device_index,) + l.scan_geometry()
-                replay_by_key.setdefault(key, []).append(
-                    l.replay_job(spec_row, prefix, spec_shape, base_row, scratch_row))
-        else:
-            l.rewind(slot, last_history, num_tokens)
-    for device_index, jobs in conv_by_device.items():
-        ext.batched_conv_rewind(jobs, device_index)
-    for (device_index, kind, nk, nv, dk, dv, state_half), jobs in replay_by_key.items():
-        ext.batched_scan_replay(jobs, device_index, kind, nk, nv, dk, dv, state_half)
+        ext.rewind_recurrent_layers(rewind_layers, slot, last_history, num_tokens, spec_row, *spec_shape,
+                                    base_row, scratch_row)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens,
@@ -313,6 +301,7 @@ class GDNLayerState:
         self.spec_g = torch.empty((rows, self.g_width), dtype = torch.float, device = "meta")
         # (bsz, tokens, token stride) of the pass the staging buffers currently hold
         self.spec_shape = None
+        self._rewind_layer = None
         self.device = None
         self.max_history = max_history
         self.max_batch_size = max_batch_size
@@ -350,6 +339,7 @@ class GDNLayerState:
         self.conv_state.zero_()
         self.recurrent_state.zero_()
         self.spec_shape = None
+        self._rewind_layer = None
         self.device = device
 
 
@@ -360,6 +350,7 @@ class GDNLayerState:
         self.spec_beta = torch.empty_like(self.spec_beta, device = "meta")
         self.spec_g = torch.empty_like(self.spec_g, device = "meta")
         self.spec_shape = None
+        self._rewind_layer = None
         self.device = None
 
 
@@ -410,62 +401,34 @@ class GDNLayerState:
         )
 
 
-    def scan_geometry(self):
-        """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half): the replay
-        kernel's selection; every job of one batched_scan_replay launch shares it"""
-        m = self.module
-        kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
-        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, self.recurrent_state.dtype == torch.half
-
-
-    def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
-        """Job descriptor for the batched conv-state rewind kernel (ext.batched_conv_rewind),
-        computed without performing any copy. Addresses are integer arithmetic on the base
-        pointer: a rewind touches every GDN layer of the model, and indexing views cost ~10 us
-        per layer in Python."""
-        if last_history == 0:
-            return None
-        assert 0 <= num_tokens <= last_history, \
-            f"GDN conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
-        cs = self.conv_state
-        cdim = self.module.conv_kernel_size
-        p = cs.shape[-1] - num_tokens
-        es = cs.element_size()
-        base = cs.data_ptr() + slot * cs.stride(0) * es
-        return ext.ConvRewindJob(
-            base + (p - cdim) * cs.stride(2) * es,
-            base,
-            cs.shape[1],
-            cdim,
-            cs.stride(1),
-        )
-
-
-    def replay_job(self, spec_row: int, prefix: int, spec_shape: tuple, base_row: int, scratch_row: int):
-        """Job descriptor for the batched scan replay (ext.batched_scan_replay): rerun the scan
-        over the first `prefix` staged tokens of batch row `spec_row` of the last speculative
-        pass, from the pool row `base_row` into `scratch_row`. Same kernel, same inputs, same
-        initial state as that pass, so the result is the state it had after `prefix` tokens"""
-        assert self.spec_shape == spec_shape, \
-            f"GDN replay: staged inputs are from a pass of shape {self.spec_shape}, rewind expects {spec_shape}"
-        bsz, seqlen, tstride = spec_shape
-        assert 1 <= prefix <= seqlen and 0 <= spec_row < bsz
-        # Row-major pass: row b's tokens start at b * seqlen, one row apart; token-major: at b, bsz apart
-        r0 = spec_row * seqlen if tstride == 1 else spec_row
-        rs = self.recurrent_state
-        row_bytes = rs.stride(0) * rs.element_size()
-        m = self.module
-        D = getattr(m, "d_skip_f", None)
-        return ext.ScanReplayJob(
-            self.spec_conv.data_ptr() + r0 * self.spec_conv.stride(0) * self.spec_conv.element_size(),
-            self.spec_g.data_ptr() + r0 * self.spec_g.stride(0) * self.spec_g.element_size(),
-            self.spec_beta.data_ptr() + r0 * self.spec_beta.stride(0) * self.spec_beta.element_size(),
-            rs.data_ptr() + base_row * row_bytes,
-            rs.data_ptr() + scratch_row * row_bytes,
-            D.data_ptr() if D is not None else 0,
-            prefix,
-            tstride,
-        )
+    def rewind_layer(self):
+        """Addresses and geometry of this layer's buffers for ext.rewind_recurrent_layers, which a rewind calls over
+        every recurrent layer of the model: the torch accessors cost several us per layer, so they're read once per
+        allocation. Built on the first rewind, since Mamba2 allocates its skip scales after the state"""
+        if self._rewind_layer is None:
+            m = self.module
+            D = getattr(m, "d_skip_f", None)
+            # device may be a plain string ("cuda:0") in some TP contexts
+            self._rewind_layer = ext.RewindLayer(
+                device_index = torch.device(self.device).index,
+                conv = self.conv_state.data_ptr(),
+                conv_cols = self.conv_state.shape[-1],
+                conv_k = m.conv_kernel_size,
+                qkv = self.spec_conv.data_ptr(),
+                g = self.spec_g.data_ptr(),
+                beta = self.spec_beta.data_ptr(),
+                qkv_dim = m.fdim_qkv,
+                g_dim = self.g_width,
+                state = self.recurrent_state.data_ptr(),
+                D = D.data_ptr() if D is not None else 0,
+                kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0),
+                num_k_heads = m.num_k_heads,
+                num_v_heads = m.num_v_heads,
+                k_head_dim = m.k_head_dim,
+                v_head_dim = m.v_head_dim,
+                state_half = self.recurrent_state.dtype == torch.half,
+            )
+        return self._rewind_layer
 
 
     def stash(self, slot, position: int = 0, parity: int = 0):

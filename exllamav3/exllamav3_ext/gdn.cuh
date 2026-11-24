@@ -264,6 +264,47 @@ struct ScanReplayJob
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 
+// Addresses and geometry of one layer's recurrent state and staged scan inputs (GDNLayerState), fixed
+// for the life of its buffers, from which rewind_recurrent_layers derives the jobs above
+struct RewindLayer
+{
+    int device_index;
+    uintptr_t conv;         // conv ring [slots, qkv_dim, conv_cols] bf16
+    int conv_cols;
+    int conv_k;
+    uintptr_t qkv;          // staged rows: [rows, qkv_dim] bf16
+    uintptr_t g;            // [rows, g_dim] fp32
+    uintptr_t beta;         // [rows, num_v_heads] bf16
+    int qkv_dim;
+    int g_dim;
+    uintptr_t state;        // pool [2 * slots, num_v_heads, k_head_dim, v_head_dim], fp32 or fp16
+    uintptr_t D;            // Mamba2 skip scales, else 0
+    int kind;
+    int num_k_heads;
+    int num_v_heads;
+    int k_head_dim;
+    int v_head_dim;
+    bool state_half;
+};
+
+// Rewind one sequence in every given layer after a speculative pass of last_history + 1 tokens, keeping
+// all but the last num_tokens: batched_conv_rewind per device, and unless the whole pass is kept,
+// batched_scan_replay from base_row into scratch_row per device and kernel geometry. (bsz, seqlen,
+// tstride) is the shape the staged rows were written in, spec_row the sequence's batch row in it
+void rewind_recurrent_layers
+(
+    std::vector<RewindLayer> const& layers,
+    int slot,
+    int last_history,
+    int num_tokens,
+    int spec_row,
+    int bsz,
+    int seqlen,
+    int tstride,
+    int base_row,
+    int scratch_row
+);
+
 // kind: 0 = gated delta rule, 1 = Mamba2, 2 = KDA (channelwise decay; requires 128x128 heads)
 void batched_scan_replay
 (
