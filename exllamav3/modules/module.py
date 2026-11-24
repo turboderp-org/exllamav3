@@ -49,6 +49,9 @@ class Module(ABC):
         self.q_priority = 0
         self.q_half_bits = True     # may be quantized at a half-integer bitrate (all decode kernels have instances)
         self.layer_idx = None
+        # Set while a LoRA adapter is attached to a Linear at or below this module (model/lora.py). Fused and
+        # graph-captured paths that read those layers' weights directly would skip the adapter, so they decline
+        self.has_lora = False
 
     def __iter__(self):
         yield self

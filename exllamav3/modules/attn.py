@@ -640,11 +640,11 @@ class Attention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        if self.multi_qkv is not None and bsz * q_len <= 32 and not self.has_lora:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
-        if self.multi_qg is None or bsz * q_len > 32:
+        if self.multi_qg is None or bsz * q_len > 32 or self.has_lora:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
                 if self.head_dim % 8 == 0 and q.dtype == torch.half:
@@ -692,7 +692,7 @@ class Attention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
-        if self.multi_kv is None or bsz * q_len > 32:
+        if self.multi_kv is None or bsz * q_len > 32 or self.has_lora:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
@@ -1132,7 +1132,7 @@ class Attention(Module):
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
         if (
-            _bc_attn_enable and non_causal_spans is None and
+            _bc_attn_enable and non_causal_spans is None and not self.has_lora and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,

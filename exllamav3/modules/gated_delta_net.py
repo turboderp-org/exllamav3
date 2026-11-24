@@ -1312,7 +1312,7 @@ class GatedDeltaNet(Module):
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
         # history) shape from the third invocation of that shape on
         if (
-            self.bc_split and save_state and
+            self.bc_split and save_state and not self.has_lora and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
             not spec_step
@@ -1414,7 +1414,7 @@ class GatedDeltaNet(Module):
             beta = beta.copy_(beta_k) if save_history else beta_k
             del beta_k
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32 and not self.has_lora:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
                 qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)

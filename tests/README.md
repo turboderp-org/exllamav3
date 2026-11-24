@@ -78,6 +78,7 @@ reference configuration of the same model:
 | File | Contract | Matrix |
 |------|----------|--------|
 | `test_decode_consistency.py` | cached prefill + decode (paged cache, recurrent state, graphs) == cache-less forward, within the model's own noise floor | every model × fp16 / 8-bit cache |
+| `test_lora.py` | with a LoRA adapter attached, cached prefill + decode == cache-less forward (layers with an adapter leave the fused paths); unloading restores both | models tagged `attention` |
 | `test_moe_offload.py` | `--moe_cpu_offload` / `--moe_cpu_split` == all-GPU load (prefill, decode, batched decode) | models tagged `moe` + `mul1` × placement |
 | `test_speculative.py` | greedy output with MTP / DFlash / n-gram drafting == plain greedy (divergence only at near-ties), drafts accepted | `DRAFT_CASES` |
 | `test_prompt_cache.py` | a shared prefix reuses cached pages (and recurrent checkpoints), and restores from the CPU tier after eviction, continuing as a fresh prefill would | every model |

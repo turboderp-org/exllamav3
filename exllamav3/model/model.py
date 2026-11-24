@@ -477,6 +477,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             self.pipeline.flush()
         for module in self.modules:
             module.unload()
+        # Linear.unload drops any attached LoRA tensors, so the fused paths are valid again after a reload
+        for module in self:
+            module.has_lora = False
         # The loader's open slab blocks must not outlive the tensors sliced from them
         self.config.stc.release_arena()
         self.active_devices = []
