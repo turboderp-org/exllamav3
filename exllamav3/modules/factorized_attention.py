@@ -4,10 +4,12 @@ import torch
 from typing_extensions import override
 
 from ..model.config import Config
+from ..util.backend import gfx_arch
 from ..util.tensor import get_for_device
 from .attention_fn import attn_dispatch
 from .attention_fn.factorized_triton import factorized_attention_decode
 from .linear import Linear
+from .multilinear import MultiLinear
 from .recurrent import RecurrentMixer
 from .rmsnorm import zero_centered_rms_norm
 
@@ -55,6 +57,7 @@ class FactorizedDifferentialAttention(RecurrentMixer):
             "softmax_scaler": (self.num_q_heads,),
             "q_norm.norm.weight": (self.head_dim,), "k_norm.norm.weight": (self.head_dim,),
         }, tensor_keys)
+        self.projection_groups = []
         self.cache_layers = []
         self.dispatch_cache = {}
         self.caps["kv_cache"] = True
@@ -83,12 +86,32 @@ class FactorizedDifferentialAttention(RecurrentMixer):
         for layer in self.cache_layers:
             layer.alloc(device)
 
+        # Group projections with the same bitrate and codebook. Their
+        # independent sign transforms and weights can share a decode MGEMM.
+        self.projection_groups.clear()
+        if device is None or torch.device(device).type != "cuda" or self.config.infer_params.no_reconstruct:
+            return
+        varying_widths = gfx_arch(torch.device(device)) == "gfx1100"
+        groups = {}
+        for name, linear in self.projections.items():
+            if linear.quant_type != "exl3" or linear.inner.bias is not None:
+                continue
+            inner = linear.inner
+            key = (inner.K, inner.mcg, inner.mul1, None if varying_widths else linear.out_features)
+            groups.setdefault(key, []).append(name)
+        for names in groups.values():
+            if len(names) > 1:
+                bundle = MultiLinear.for_decode([self.projections[name] for name in names], device)
+                if bundle is not None:
+                    self.projection_groups.append((names, bundle))
+
     @override
     def unload(self):
         super().unload()
         for layer in self.cache_layers:
             layer.free()
         self.dispatch_cache.clear()
+        self.projection_groups.clear()
 
     @override
     def optimizer_targets(self):
@@ -98,7 +121,18 @@ class FactorizedDifferentialAttention(RecurrentMixer):
     def forward(self, x, params, out_dtype = None):
         projection_input = x.half()
 
+        grouped = {}
+        if x.shape[:2] == (1, 1):
+            for names, bundle in self.projection_groups:
+                if not bundle.can_project_one(projection_input, params):
+                    continue
+                output = bundle.project_one(projection_input, torch.float)
+                for name, row, linear in zip(names, output.unbind(), bundle.linears):
+                    grouped[name] = row[:, :linear.out_features_unpadded].unsqueeze(0)
+
         def project(name):
+            if name in grouped:
+                return grouped[name]
             return self.projections[name].forward(projection_input, params, out_dtype = torch.float)
 
         def tpa(suffix):

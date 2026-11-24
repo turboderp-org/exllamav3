@@ -6,17 +6,126 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from ..util.backend import gfx_arch
+
+
+@triton.jit
+def _bias_rotate(Input, Bias, Cos, Sin, Output, Length: tl.constexpr, Heads: tl.constexpr,
+                 Rank: tl.constexpr, Size: tl.constexpr, BatchStride, TimeStride,
+                 Tile: tl.constexpr):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    pair = tl.arange(0, Tile)
+    half: tl.constexpr = Size // 2
+    angles: tl.constexpr = Size // 4
+    channel = pair % half
+    left = pair // half * Size + channel
+    valid = pair < Rank * half
+    src = Input + batch * BatchStride + token * TimeStride
+    bias = Bias + head * Rank * Size
+    x = tl.load(src + left, valid, 0) + tl.load(bias + left, valid, 0).to(tl.float32)
+    y = tl.load(src + left + half, valid, 0) + tl.load(bias + left + half, valid, 0).to(tl.float32)
+    row = (batch * Heads + head) * Length + token
+    rotate = channel < angles
+    c = tl.load(Cos + row * angles + channel, rotate, 0)
+    s = tl.load(Sin + row * angles + channel, rotate, 0)
+    dst = Output + row * Rank * Size
+    tl.store(dst + left, tl.where(rotate, x * c - y * s, x), valid)
+    tl.store(dst + left + half, tl.where(rotate, x * s + y * c, y), valid)
+
+
+def bias_rotate(x, bias, cosine, sine):
+    """Broadcast per-head biases and rotate Q or K directly into its block GEMM layout."""
+    batch, length, rank, size = x.shape
+    heads = bias.shape[0]
+    output = x.new_empty((batch, heads, length, rank, size))
+    _bias_rotate[(length, heads, batch)](
+        x, bias, cosine, sine, output, length, heads, rank, size, x.stride(0), x.stride(1),
+        triton.next_power_of_2(rank * (size // 2)), enable_fp_fusion=False,
+    )
+    return output
+
+
+@triton.jit
+def _mimo_readout(Mixed, Values, Z, GateProj, OutProj, Skip, Output,
+                  Length: tl.constexpr, Heads: tl.constexpr, Rank: tl.constexpr, Width: tl.constexpr,
+                  StrideVB, StrideVH, StrideVT, StrideZB, StrideZH, StrideZT, TileT: tl.constexpr, TileP: tl.constexpr):
+    t = tl.program_id(0) * TileT + tl.arange(0, TileT)
+    h = tl.program_id(1)
+    b = tl.program_id(2)
+    p = tl.arange(0, TileP)
+    valid = (t[:, None] < Length) & (p[None, :] < Width)
+    z = tl.load(Z + b * StrideZB + h * StrideZH + t[:, None] * StrideZT + p[None, :], valid, 0)
+    skip = tl.load(Skip + h)
+    row = (b * Heads + h) * Length + t
+    acc = tl.full((TileT, TileP), 0, tl.float32)
+    for r in tl.static_range(Rank):
+        weight = (h * Rank + r) * Width + p
+        idx = (row[:, None] * Rank + r) * Width + p[None, :]
+        vptr = Values + b * StrideVB + h * StrideVH + t[:, None] * StrideVT
+        v = tl.load(vptr + r * Width + p[None, :], valid, 0)
+        mixed = tl.load(Mixed + idx, valid, 0)
+        gate = z * tl.load(GateProj + weight, p < Width, 0)[None, :]
+        gate = tl.div_rn(gate, 1.0 + libdevice.exp(-gate))
+        out = tl.load(OutProj + weight, p < Width, 0)[None, :]
+        acc += ((mixed + skip * v) * gate) * out
+    dst = ((b * Length + t) * Heads + h) * Width
+    tl.store(Output + dst[:, None] + p[None, :], acc, valid)
+
 
 def mimo_readout(mixed, values, z, gate_proj, out_proj, skip):
     """Gate and sum the MIMO ranks directly into token-major output."""
-    gate = torch.nn.functional.silu(z.unsqueeze(-2) * gate_proj[None, :, None])
-    output = ((mixed + skip[None, :, None, None, None] * values) * gate * out_proj[None, :, None]).sum(dim = -2)
-    return output.transpose(1, 2).flatten(-2)
+    batch, heads, length, rank, width = mixed.shape
+    if not (
+        mixed.is_cuda and gfx_arch(mixed.device) == "gfx1100" and rank == 4 and width == 64
+        and mixed.dtype == values.dtype == z.dtype == torch.float32
+        and mixed.is_contiguous() and values.stride()[-2:] == (width, 1) and z.stride(-1) == 1
+        and all(t.is_contiguous() for t in (gate_proj, out_proj, skip))
+    ):
+        gate = torch.nn.functional.silu(z.unsqueeze(-2) * gate_proj[None, :, None])
+        output = ((mixed + skip[None, :, None, None, None] * values) * gate * out_proj[None, :, None]).sum(dim = -2)
+        return output.transpose(1, 2).flatten(-2)
+
+    output = mixed.new_empty((batch, length, heads * width))
+    _mimo_readout[(triton.cdiv(length, 8), heads, batch)](
+        mixed, values, z, gate_proj, out_proj, skip, output, length, heads, rank, width,
+        *values.stride()[:3], *z.stride()[:3], 8, triton.next_power_of_2(width), enable_fp_fusion=False,
+    )
+    return output
+
+
+@triton.jit
+def _block_weights(Cumulative, Current, Previous, Output, Heads: tl.constexpr, Blocks: tl.constexpr,
+                   Length: tl.constexpr, StrideB, StrideH, StrideBlock, StrideT, Tile: tl.constexpr):
+    block = tl.program_id(0)
+    row = tl.arange(0, Tile)
+    col = tl.arange(0, Tile)
+    offset = block * Length
+    cumulative = tl.load(Cumulative + offset + row, row < Length, 0)
+    base = block // (Heads * Blocks) * StrideB + (block // Blocks % Heads) * StrideH + block % Blocks * StrideBlock
+    current = tl.load(Current + base + col * StrideT, col < Length, 0)
+    following = tl.load(Previous + base + (col + 1) * StrideT, col + 1 < Length, 0)
+    delta = cumulative[:, None] - cumulative[None, :]
+    decay = libdevice.exp(tl.where(row[:, None] >= col[None, :], delta, -float("inf")))
+    weight = current[None, :] + tl.where(row[:, None] > col[None, :], following[None, :], 0.)
+    tl.store(Output + (offset + row[:, None]) * Length + col[None, :], decay * weight,
+             (row[:, None] < Length) & (col[None, :] < Length))
 
 
 def block_weights(cumulative, current, previous):
     """Causal trapezoid weights for each pair of tokens in a block."""
-    length = cumulative.shape[-1]
+    _, heads, blocks, length = cumulative.shape
+    if (cumulative.is_cuda and gfx_arch(cumulative.device) == "gfx1100" and length <= 32
+            and cumulative.is_contiguous() and current.stride() == previous.stride()
+            and cumulative.dtype == current.dtype == previous.dtype == torch.float32):
+        weights = cumulative.new_empty((*cumulative.shape, length))
+        _block_weights[(cumulative.numel() // length,)](
+            cumulative, current, previous, weights, heads, blocks, length, *current.stride(),
+            triton.next_power_of_2(length), enable_fp_fusion=False,
+        )
+        return weights
+
     indices = torch.arange(length, device = cumulative.device)
     causal = indices[:, None] >= indices
     earlier = indices[:, None] > indices
@@ -25,8 +134,45 @@ def block_weights(cumulative, current, previous):
     return decay * (current.unsqueeze(-2) + earlier * following.unsqueeze(-2))
 
 
+@triton.jit
+def _scan_block_states(State, Boundary, EndUpdate, Decay, Incoming, Final,
+                       Heads: tl.constexpr, Blocks: tl.constexpr, Length: tl.constexpr, Elements: tl.constexpr,
+                       StrideB: tl.constexpr, StrideH: tl.constexpr, StrideBlock: tl.constexpr,
+                       Tile: tl.constexpr):
+    head = tl.program_id(1)  # flattened batch and head
+    i = tl.program_id(0) * Tile + tl.arange(0, Tile)
+    valid = i < Elements
+    state = tl.load(State + head * Elements + i, valid, 0)
+    boundary = Boundary + (head // Heads) * StrideB + (head % Heads) * StrideH
+    for block in range(Blocks):
+        row = head * Blocks + block
+        p = row * Elements + i
+        state += tl.load(boundary + block * StrideBlock + i, valid, 0)
+        tl.store(Incoming + p, state, valid)
+        decay = tl.load(Decay + (row + 1) * Length - 1)
+        state = decay * state + tl.load(EndUpdate + p, valid, 0)
+    tl.store(Final + head * Elements + i, state, valid)
+
+
 def scan_block_states(state, boundary, end_update, carried):
     """Return each block's incoming state and the final state, in recurrence order."""
+    if (
+        state.is_cuda and gfx_arch(state.device) == "gfx1100"
+        and all(t.is_contiguous() and t.dtype == torch.float32 for t in (state, end_update, carried))
+        and boundary.dtype == torch.float32 and boundary.stride()[-2:] == (boundary.shape[-1], 1)
+    ):
+        batch, heads, blocks, length = carried.shape
+        elements = state.shape[-2] * state.shape[-1]
+        incoming = torch.empty_like(end_update)
+        final = torch.empty_like(state)
+        tile = 256
+        _scan_block_states[(triton.cdiv(elements, tile), batch * heads)](
+            state, boundary, end_update, carried, incoming, final, heads, blocks, length, elements,
+            *boundary.stride()[:3], tile,
+            enable_fp_fusion=False,
+        )
+        return incoming, final
+
     incoming = []
     for i in range(boundary.shape[2]):
         start_state = state + boundary[:, :, i]
@@ -35,10 +181,48 @@ def scan_block_states(state, boundary, end_update, carried):
     return torch.stack(incoming, dim = 2), state
 
 
+@triton.jit
+def _apply_block_state(Q, State, Local, Decay, Output,
+                       Rows: tl.constexpr, Rank: tl.constexpr, Width: tl.constexpr, Size: tl.constexpr,
+                       TileM: tl.constexpr, TileP: tl.constexpr, TileN: tl.constexpr):
+    block = tl.program_id(0)  # flattened batch, head and time block
+    m = tl.program_id(1) * TileM + tl.arange(0, TileM)
+    p = tl.program_id(2) * TileP + tl.arange(0, TileP)
+    n = tl.arange(0, TileN)
+    q = Q + (block * Rows + m[:, None]) * Size + n[None, :]
+    state = State + (block * Width + p[:, None]) * Size + n[None, :]
+    acc = tl.full((TileM, TileP), 0, tl.float32)
+    for k in range(Size // TileN):
+        q_tile = tl.load(q + k * TileN)
+        state_tile = tl.load(state + k * TileN)
+        acc = tl.dot(q_tile, tl.trans(state_tile), acc, input_precision = "ieee")
+
+    offsets = (block * Rows + m[:, None]) * Width + p[None, :]
+    decay = tl.load(Decay + (block * Rows + m) // Rank)
+    tl.store(Output + offsets, tl.load(Local + offsets) + acc * decay[:, None])
+
+
 def apply_block_state(query, state, local, decay, rank):
     """Add the decayed state projection to the local output for each block."""
-    from_state = query.unflatten(-2, (-1, rank)) @ state.mT.unsqueeze(-3)
-    return local + (from_state * decay[..., None, None]).flatten(-3, -2)
+    rows, size = query.shape[-2:]
+    width = local.shape[-1]
+    tile_m, tile_p, tile_n = 16, 64, 32
+    if not (
+        query.is_cuda and gfx_arch(query.device) == "gfx1100"
+        and rows % tile_m == 0 and width % tile_p == 0 and size % tile_n == 0
+        and all(t.is_contiguous() and t.dtype == torch.float32 for t in (query, state, local, decay))
+    ):
+        # Preserve per-token FP32 accumulation order.
+        from_state = query.unflatten(-2, (-1, rank)) @ state.mT.unsqueeze(-3)
+        return local + (from_state * decay[..., None, None]).flatten(-3, -2)
+
+    output = torch.empty_like(local)
+    grid = (query.numel() // (rows * size), rows // tile_m, width // tile_p)
+    _apply_block_state[grid](
+        query, state, local, decay, output, rows, rank, width, size, tile_m, tile_p, tile_n,
+        enable_fp_fusion=False,
+    )
+    return output
 
 
 # H is the number of heads, P the value width, N the state width and R the MIMO rank.

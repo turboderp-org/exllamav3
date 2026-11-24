@@ -45,6 +45,46 @@ def test_mamba3_block_matches_sequential_recurrence(length, block_size):
     torch.testing.assert_close(actual_state, state, atol = 2e-5, rtol = 2e-5)
 
 
+@pytest.mark.parametrize("length", [7, 32])
+def test_block_weights_match_trapezoid(device, length):
+    from exllamav3.modules.mamba3_triton import block_weights
+
+    rng = torch.Generator(device = device).manual_seed(31)
+    # Projection outputs are token-major, while cumsum produces packed blocks.
+    dt, trap = [
+        torch.rand(2, 3, length, 4, generator = rng, device = device).permute(0, 3, 1, 2)
+        for _ in range(2)
+    ]
+    cumulative = (-dt).cumsum(-1)
+    current, previous = dt * trap, dt * (1 - trap)
+    actual = block_weights(cumulative, current, previous)
+    expected = torch.zeros_like(actual)
+    for i in range(length):
+        for j in range(i + 1):
+            weight = current[..., j] if i == j else current[..., j] + previous[..., j + 1]
+            expected[..., i, j] = (cumulative[..., i] - cumulative[..., j]).exp() * weight
+    torch.testing.assert_close(actual, expected, atol = 0, rtol = 0)
+
+
+@pytest.mark.parametrize("length", [7, 32])
+def test_block_state_projection_matches_per_token_matmul(device, length):
+    from exllamav3.modules.mamba3_triton import apply_block_state
+
+    batch, heads, blocks, rank, size, width = 2, 3, 4, 4, 128, 64
+    rng = torch.Generator(device = device).manual_seed(53)
+
+    def rand(*shape):
+        return torch.randn(*shape, device = device, generator = rng)
+
+    q = rand(batch, heads, blocks, length, rank, size)
+    state = rand(batch, heads, blocks, width, size)
+    local = rand(batch, heads, blocks, length, rank, width)
+    decay = rand(batch, heads, blocks, length).sigmoid()
+    expected = local + (q @ state.mT.unsqueeze(3)) * decay[..., None, None]
+    actual = apply_block_state(q.flatten(3, 4), state, local.flatten(3, 4), decay, rank)
+    torch.testing.assert_close(actual, expected.flatten(3, 4), atol = 2e-6, rtol = 2e-6)
+
+
 def test_fused_mamba3_updates_selected_fp32_slots(device):
     from exllamav3.modules.mamba3 import rotate_half
     from exllamav3.modules.mamba3_triton import mamba3_decode

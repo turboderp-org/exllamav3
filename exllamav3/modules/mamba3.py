@@ -7,8 +7,10 @@ import torch.nn.functional as F
 from typing_extensions import override
 
 from ..model.config import Config
+from ..util.backend import gfx_arch
 from .linear import Linear
-from .mamba3_triton import apply_block_state, block_weights, mamba3_decode, mimo_readout, scan_block_states
+from .mamba3_triton import apply_block_state, bias_rotate, block_weights, mamba3_decode, mimo_readout, scan_block_states
+from .multilinear import MultiLinear
 from .recurrent import RecurrentMixer
 from .rmsnorm import zero_centered_rms_norm
 
@@ -26,6 +28,15 @@ def rotate_half(x, angle):
 
 
 def rotate_qk(q, k, q_bias, k_bias, angles):
+    rank, size = q.shape[-2:]
+    if (
+        q.is_cuda and gfx_arch(q.device) == "gfx1100" and rank * size <= 4096
+        and q.dtype == k.dtype == torch.float32 and q.stride()[-2:] == k.stride()[-2:] == (size, 1)
+        and q_bias.is_contiguous() and k_bias.is_contiguous()
+    ):
+        cosine, sine = angles.cos().contiguous(), angles.sin().contiguous()
+        return bias_rotate(q, q_bias, cosine, sine), bias_rotate(k, k_bias, cosine, sine)
+
     return (
         rotate_half(q[:, None] + q_bias[None, :, None], angles.unsqueeze(-2)),
         rotate_half(k[:, None] + k_bias[None, :, None], angles.unsqueeze(-2)),
@@ -130,6 +141,19 @@ class Mamba3(RecurrentMixer):
         self.register_submodule(self.in_proj)
         self.register_submodule(self.in_proj_dyn)
 
+        self.decode_projections = None
+
+    @override
+    def load(self, device, **kwargs):
+        super().load(device, **kwargs)
+        if device is not None and torch.device(device).type == "cuda" and gfx_arch(torch.device(device)) == "gfx1100":
+            self.decode_projections = MultiLinear.for_decode([self.in_proj, self.in_proj_dyn], device)
+
+    @override
+    def unload(self):
+        self.decode_projections = None
+        super().unload()
+
     @override
     def optimizer_targets(self):
         return [self.in_proj.optimizer_targets(), self.in_proj_dyn.optimizer_targets()]
@@ -138,8 +162,14 @@ class Mamba3(RecurrentMixer):
     def forward(self, x, params, out_dtype = None):
         width, rank, size = self.head_dim, self.rank, self.state_size
         projection_input = x.half()
-        projected = self.in_proj.forward(projection_input, params, out_dtype = torch.float)
-        dynamic = self.in_proj_dyn.forward(projection_input, params, out_dtype = torch.float)
+        bundle = self.decode_projections
+        if bundle is not None and bundle.can_project_one(projection_input, params):
+            rows = bundle.project_one(projection_input, torch.float)
+            projected = rows[0:1, :, :self.in_proj.out_features_unpadded]
+            dynamic = rows[1:2, :, :self.in_proj_dyn.out_features_unpadded]
+        else:
+            projected = self.in_proj.forward(projection_input, params, out_dtype = torch.float)
+            dynamic = self.in_proj_dyn.forward(projection_input, params, out_dtype = torch.float)
         if x.is_cuda and x.shape[1] == 1 and (width, size, rank) == (64, 128, 4):
             layer, slots = self.state_slots(x, params)
             if layer is not None:
