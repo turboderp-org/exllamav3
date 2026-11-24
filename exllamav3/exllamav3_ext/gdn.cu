@@ -2370,9 +2370,9 @@ void batched_scan_replay
     bool mamba2 = kind == 1;
     bool channelwise = kind == 2;
     float scale = 1.0f / sqrtf(k_head_dim);
-    // One job per block.x; the batch rows of a single sequence replay serially per layer, so the
-    // v-split that keeps bsz = 1 passes occupied applies here as well
-    int v_split = (!mamba2 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    // One job per block.x. The v-split keeps the device occupied in a bsz = 1 pass, which a lone job
+    // is; a launch over several layers fills it unsplit, at a quarter of the blocks
+    int v_split = (jobs.size() == 1 && !mamba2 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
     dim3 threads(MAX(k_head_dim, v_head_dim / v_split), SUBK);
 
     for (size_t base = 0; base < jobs.size(); base += REPLAY_MAX_JOBS)

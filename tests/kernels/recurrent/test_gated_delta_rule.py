@@ -238,11 +238,14 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
         (2, 17, 4, 8, 128, 128),     # 128 kernel
         (1, 65, 2, 8, 128, 128),     # 128 kernel, a long (suffix-match class) pass
         (2, 9, 2, 4, 256, 256),      # generic, wide
+        (1, 5, 16, 48, 128, 128),    # 128 kernel at production size, where a lone job is v-split and a batch is not
     ],
 )
 @pytest.mark.parametrize("layers", [1, 3, 50])
+@pytest.mark.parametrize("state_dtype", [torch.float, torch.half], ids = ["fp32_state", "fp16_state"])
 @torch.inference_mode()
-def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim, layers):
+def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim, layers,
+                                           state_dtype):
     """A speculative pass advances scratch rows from base rows; batched_scan_replay over the first p staged
     tokens of one batch row must leave the scratch row exactly as a p-token pass from the same base row does,
     for every prefix, with the jobs of several layers (own pools and inputs) in one launch. 50 layers spans
@@ -255,7 +258,7 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
         mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
         g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
         beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
-        pool = torch.randn((2 * bsz, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device) * 0.05
+        pool = torch.randn((2 * bsz, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device).to(state_dtype) * 0.05
         L.append((mixed_qkv, g, beta, pool))
     slots = 2 * torch.arange(bsz, dtype = torch.int32, device = device) + 1   # scratch rows
     slots_in = slots - 1                                                       # base rows
@@ -273,11 +276,12 @@ def test_scan_replay_matches_kernel_prefix(device, bsz, seqlen, num_k_heads, num
         pools = []
         for mixed_qkv, g, beta, pool in L:
             p2 = pool.clone(); pools.append(p2)
-            rb = p2.stride(0) * 4
+            rb = p2.stride(0) * p2.element_size()
             jobs.append(ext.ScanReplayJob(
                 mixed_qkv[rr].data_ptr(), g[rr].data_ptr(), beta[rr].data_ptr(),
                 p2.data_ptr() + int(slots_in[rr]) * rb, p2.data_ptr() + int(slots[rr]) * rb, 0, prefix))
-        ext.batched_scan_replay(jobs, torch.device(device).index, 0, num_k_heads, num_v_heads, k_head_dim, v_head_dim)
+        ext.batched_scan_replay(jobs, torch.device(device).index, 0, num_k_heads, num_v_heads, k_head_dim, v_head_dim,
+                                state_dtype == torch.half)
         torch.cuda.synchronize(device)
         for p2, ref, (_, _, _, pool) in zip(pools, expect, L):
             assert torch.equal(p2[int(slots[rr])], ref[int(slots[rr])]), f"prefix {prefix}: replayed row differs"
