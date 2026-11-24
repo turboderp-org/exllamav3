@@ -50,6 +50,7 @@ class OlalaLatentIn(Linear):
         latent = super().forward(x, params, out_dtype = torch.float)
         scaled, scale = scale_activation(
             latent, 128., squared = True, out_dtype = out_dtype or torch.half,
+            use_triton = "capture" not in params,
         )
         params["olala_latent_scale"] = scale
         return scaled
@@ -154,10 +155,13 @@ class OlalaBlock(TensorBundle):
         return [module.optimizer_targets() for module in self.modules]
 
     def forward(self, x, params, out_dtype = None):
+        # Keep the reference arithmetic order for batched prefill and calibration.
+        fused = x.shape[1] == 1 and params.get("recurrent_slots") is not None and "capture" not in params
+
         def residual_update(residual, update, site):
             return geodesic_update(
                 residual, update, self.tensors[f"geodesic_{site}.scale"],
-                self.tensors[f"geodesic_{site}.bias"], self.layer_idx + 1,
+                self.tensors[f"geodesic_{site}.bias"], self.layer_idx + 1, use_triton = fused,
             )
 
         hidden = self.mixer.forward(x, params)
@@ -165,7 +169,7 @@ class OlalaBlock(TensorBundle):
             hidden = hidden * F.silu(self.gate.forward(x.half(), params, out_dtype = torch.float) + 1.15)
         # Some Mamba-3 mixer outputs exceed the FP16 range by orders of magnitude.
         # Divide before the bias-free projection and restore the scale afterward.
-        scaled, scale = scale_activation(hidden, 1 / 64)
+        scaled, scale = scale_activation(hidden, 1 / 64, use_triton = "capture" not in params)
         mixed = self.mixer_proj.forward(scaled, params, out_dtype = torch.float) * scale
         x = residual_update(x, mixed, "mixer")
         x = residual_update(x, self.mlp.forward(x, params), "mlp")

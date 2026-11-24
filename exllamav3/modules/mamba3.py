@@ -8,7 +8,7 @@ from typing_extensions import override
 
 from ..model.config import Config
 from .linear import Linear
-from .mamba3_triton import apply_block_state, block_weights, mimo_readout, scan_block_states
+from .mamba3_triton import apply_block_state, block_weights, mamba3_decode, mimo_readout, scan_block_states
 from .recurrent import RecurrentMixer
 from .rmsnorm import zero_centered_rms_norm
 
@@ -140,6 +140,15 @@ class Mamba3(RecurrentMixer):
         projection_input = x.half()
         projected = self.in_proj.forward(projection_input, params, out_dtype = torch.float)
         dynamic = self.in_proj_dyn.forward(projection_input, params, out_dtype = torch.float)
+        if x.is_cuda and x.shape[1] == 1 and (width, size, rank) == (64, 128, 4):
+            layer, slots = self.state_slots(x, params)
+            if layer is not None:
+                output = mamba3_decode(
+                    projected, dynamic, self.tensors, slots, layer.tensors,
+                    self.heads, width, size, rank, self.norm_eps,
+                )
+                return output.to(out_dtype or torch.float32)
+
         layer, slots, (angle, state, prev_k, prev_v) = self.load_state(x, params)
         z, v, dt, decay, trap = projected.unflatten(-1, (self.heads, 2 * width + 3)).split(
             (width, width, 1, 1, 1), dim = -1,

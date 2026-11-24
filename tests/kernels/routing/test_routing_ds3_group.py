@@ -77,6 +77,27 @@ def test_routing_gemv_f32(device):
         assert ((scores.double() - ref).abs() <= 2 ** -20 * scale + 1e-7).all(), f"hdim={hdim} E={E}"
 
 
+def test_ds3_single_row_with_fp32_gate(device):
+    from exllamav3.modules.block_sparse_mlp_routing import routing_ds3
+    from testlib.routing import make_cfg
+
+    width, experts, topk = 1536, 256, 6
+    generator = torch.Generator(device = device).manual_seed(15)
+    bias = torch.randn(experts, generator = generator, device = device) * 0.1
+    cfg = make_cfg(width, experts, topk, device, esb = bias, scaling = 2.5)
+    cfg.gate_tensor = torch.randn(width, experts, generator = generator, device = device) * width ** -0.5
+    x = torch.randn(1, width, generator = generator, device = device).half()
+    selected, weights = routing_ds3(1, cfg, x, {})
+    logits = (x.double() @ cfg.gate_tensor.double()).float()
+    scores = logits.sigmoid()
+    expected = (scores + bias).topk(topk, dim = -1).indices
+    expected_weights = scores.gather(1, selected)
+    expected_weights *= cfg.routed_scaling_factor / expected_weights.sum(dim = -1, keepdim = True)
+    torch.testing.assert_close(cfg.router_logits_f32_bsz1, logits, atol = 2e-5, rtol = 2e-5)
+    assert torch.equal(selected.sort().values, expected.sort().values)
+    torch.testing.assert_close(weights.float(), expected_weights, atol = 2e-4, rtol = 5e-4)
+
+
 @torch.inference_mode()
 def test_rejections(device):
     scores = torch.zeros((2, 64), dtype = torch.float, device = device)

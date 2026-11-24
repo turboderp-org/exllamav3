@@ -6,6 +6,7 @@ from typing_extensions import override
 from ..model.config import Config
 from ..util.tensor import get_for_device
 from .attention_fn import attn_dispatch
+from .attention_fn.factorized_triton import factorized_attention_decode
 from .linear import Linear
 from .recurrent import RecurrentMixer
 from .rmsnorm import zero_centered_rms_norm
@@ -118,15 +119,29 @@ class FactorizedDifferentialAttention(RecurrentMixer):
         else:
             positions = get_for_device(params, "position_ids", x.device)
 
-        layer, slots, (prev_k, prev_v) = self.load_state(x, params)
-        raw_k, raw_v = tpa("k"), tpa("v")
-        k = shift_kv(raw_k, prev_k, project("shift_proj_k"), positions)
-        v = shift_kv(raw_v, prev_v, project("shift_proj_v"), positions)
-        q = project("c_q").unflatten(-1, (self.num_q_heads, self.head_dim))
-        q = zero_centered_rms_norm(q, self.tensors["q_norm.norm.weight"], self.norm_eps)
-        k = zero_centered_rms_norm(k, self.tensors["k_norm.norm.weight"], self.norm_eps)
-        pos_scale = (positions.float() + 1).clamp_max(self.sliding_window).log()
-        q = q * pos_scale[..., None, None] * self.tensors["softmax_scaler"][None, None, :, None]
+        fused = (
+            x.is_cuda and x.shape[1] == 1 and params.get("recurrent_slots") is not None
+            and self.head_dim == 128 and self.rank == 4
+        )
+        if fused:
+            layer, slots = self.state_slots(x, params)
+            q, k, v = factorized_attention_decode(
+                project("c_q"), project("W_A_k"), project("W_B_k"), project("W_A_v"), project("W_B_v"),
+                project("shift_proj_k"), project("shift_proj_v"), self.tensors, slots,
+                positions.expand(x.shape[0], 1).contiguous(), layer.tensors,
+                self.num_q_heads, self.num_kv_heads, self.head_dim, self.rank,
+                self.sliding_window, self.norm_eps,
+            )
+        else:
+            layer, slots, (prev_k, prev_v) = self.load_state(x, params)
+            raw_k, raw_v = tpa("k"), tpa("v")
+            k = shift_kv(raw_k, prev_k, project("shift_proj_k"), positions)
+            v = shift_kv(raw_v, prev_v, project("shift_proj_v"), positions)
+            q = project("c_q").unflatten(-1, (self.num_q_heads, self.head_dim))
+            q = zero_centered_rms_norm(q, self.tensors["q_norm.norm.weight"], self.norm_eps)
+            k = zero_centered_rms_norm(k, self.tensors["k_norm.norm.weight"], self.norm_eps)
+            pos_scale = (positions.float() + 1).clamp_max(self.sliding_window).log()
+            q = q * pos_scale[..., None, None] * self.tensors["softmax_scaler"][None, None, :, None]
         attn = attn_dispatch(
             q = q.half(), k = k.half(), v = v.half(),
             cache = cache, cache_idx = self.layer_idx, cache_instance = params.get("layer_instance"),
@@ -136,7 +151,8 @@ class FactorizedDifferentialAttention(RecurrentMixer):
             window_size = self.sliding_window, softcap = self.softcap,
             sm_scale = 1 / self.head_dim, dispatch_cache = self.dispatch_cache,
         )
-        self.save_state(layer, slots, (raw_k[:, -1], raw_v[:, -1]))
+        if not fused:
+            self.save_state(layer, slots, (raw_k[:, -1], raw_v[:, -1]))
         heads_per_group = self.num_q_heads // self.num_kv_heads
         groups = attn.float().unflatten(-2, (self.num_kv_heads, heads_per_group))
         noise_weight = project("lambda_proj").sigmoid()[..., None, None]
