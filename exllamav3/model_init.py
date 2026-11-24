@@ -72,7 +72,7 @@ def add_args(
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
-    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts. Main model only: a draft model or MTP head stays on the GPU unless --draft_moe_cpu_split is given", default = 0)
     parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
@@ -143,6 +143,7 @@ def add_args(
         parser.add_argument("-sdh", "--sparse_draft_head", type = int, default = 0, help = "Draft through a dynamic sparse LM head of this many vocabulary columns (MTP/DFlash drafting; 0 = full head)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("-dmcs", "--draft_moe_cpu_split", type = int, help = "Experimental: like --moe_cpu_split, but for the draft model (or MTP head), counted against its own number of routed experts per layer. Mutually exclusive with --draft_moe_cpu_layers", default = 0)
 
 
 def get_arg_sampler(args):
@@ -264,20 +265,27 @@ def init(
         config.infer_params.embed_stream_from_disk = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
     dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmcs = getattr(args, "draft_moe_cpu_split", 0)
     dmclt = getattr(args, "moe_cpu_threads", None)
     if dmcl:
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if dmcs:
+        assert not args.tensor_parallel, "--draft_moe_cpu_split currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_split requires a draft model (or --mtp)"
+        assert not dmcl, "--draft_moe_cpu_split and --draft_moe_cpu_layers are mutually exclusive"
     if use_mtp:
         draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
+        # Shared config: the MTP head is a separate component with its own budgets and worker
         config.infer_params.draft_moe_cpu_offload = dmcl
+        config.infer_params.draft_moe_cpu_split = dmcs
         if dmclt is not None:
             config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
-        # Separate config: the draft model's own text component takes the budget
+        # Separate config: the draft model's own text component takes the budgets
         draft_config.infer_params.moe_cpu_offload = dmcl
+        draft_config.infer_params.moe_cpu_split = dmcs
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
         draft_config.infer_params.moe_cpu_pinned_arena = config.infer_params.moe_cpu_pinned_arena

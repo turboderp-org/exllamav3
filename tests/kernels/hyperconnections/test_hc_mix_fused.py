@@ -313,3 +313,36 @@ def test_gr_mix_zero_rank(device):
     normed = s * torch.rsqrt(s.pow(2).mean(-1, keepdim = True) + eps) * w.double().view(H, D)
     torch.testing.assert_close(mixed.double(), 0.5 * normed.mean(1), rtol = 1e-5, atol = 1e-6)
     assert_device_ok(device)
+
+
+@pytest.mark.parametrize("R", [1, 3, 32, 300])
+@pytest.mark.parametrize("D", [1024, 3072])
+@pytest.mark.parametrize("fn_half", [True, False])
+@pytest.mark.parametrize("half_out", [True, False])
+def test_nocomb(device, R, D, fn_half, half_out):
+    """hc_mix_nocomb: a site without a comb matrix (fn with 2H rows). pre and post as hc_mix, post with its
+    own epsilon added, against the torch expression"""
+    gen = torch.Generator().manual_seed(R * 11 + D)
+    streams = (torch.randn((R, H, D), generator = gen) * torch.rand((R, 1, 1), generator = gen) * 30).float().to(device)
+    fn = (torch.randn((2 * H, H * D), generator = gen) * 0.05).to(device)
+    fn = fn.half() if fn_half else fn.float()
+    base = torch.randn((2 * H,), generator = gen).float().to(device)
+    scale = torch.tensor([0.7, 1.3]).float().to(device)
+    rms_eps, hc_eps, post_eps = 1e-6, 1e-2, 3e-2
+
+    chunks = ext.hc_mix_num_chunks(R, H * D)
+    partials = torch.empty((R, chunks, 2 * H + 1), dtype = torch.float, device = device)
+    post = torch.empty((R, H), dtype = torch.float, device = device)
+    collapsed = torch.empty((R, D), dtype = torch.half if half_out else torch.float, device = device)
+    ext.hc_mix_nocomb(streams, fn, base, scale, rms_eps, hc_eps, post_eps, partials, post, collapsed)
+
+    flat = streams.flatten(1)
+    mix = (flat @ fn.float().T) * torch.rsqrt(flat.square().mean(dim = -1, keepdim = True) + rms_eps)
+    pre = torch.sigmoid(mix[:, :H] * scale[0] + base[:H]) + hc_eps
+    post_ref = 2.0 * torch.sigmoid(mix[:, H:] * scale[1] + base[H:]) + post_eps
+    collapsed_ref = torch.einsum("rh,rhd->rd", pre, streams)
+
+    assert torch.allclose(post, post_ref, rtol = 1e-4, atol = 1e-5)
+    tol = 2e-3 if half_out else 1e-5
+    rel = (collapsed.float() - collapsed_ref).norm() / collapsed_ref.norm()
+    assert rel < tol, f"collapsed rel {rel:.3e}"

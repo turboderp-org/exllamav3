@@ -12,10 +12,15 @@ params["source_recurrent_states"], because params["recurrent_states"] names a mo
 Model.forward advances afterwards). Both are read exactly the way the target's own attention reads them in a
 decode step, through the paged decode kernel with no appended K/V: natively (attention_fn/bc_shared_kv.py,
 one C++ call per step, graph-replayed where graphs are available) or through the python path.
+
+A tensor-parallel target keeps its cache in the shards of its attention modules, one per device. The source
+layer then has to run whole on the device this module is on, and is read through that device's shard of it
+(attach_source's shard).
 """
 from __future__ import annotations
 from typing_extensions import override
 import torch
+import weakref
 from ..model.config import Config
 from ..util.device_copy import host_to_device
 from ..util.rope import RopeSettings, RoPE
@@ -85,20 +90,30 @@ class SharedKVAttention(Module):
         self.source_kind = None       # "paged" (target Cache layer) or "ring" (target SlidingAttention state)
         self.source_layer_idx = None
         self.source_module = None
+        self.source_shard = None
         self._bt_cache = {}
         # Native step objects per source tensor pair (see attention_fn/bc_shared_kv.py); False = declined
         self.bc_attn = {}
 
 
-    def attach_source(self, kind: str, layer_idx: int, module = None):
+    def attach_source(self, kind: str, layer_idx: int, module = None, shard = None):
+        """
+        shard: for a tensor-parallel target, its source module as loaded on this module's device, which holds
+        the layer's cache there
+        """
         assert kind in ("paged", "ring")
         if kind == "ring":
             assert module is not None, "ring source needs the target's SlidingAttention module"
             assert module.num_kv_heads == self.num_kv_heads and module.head_dim == self.head_dim, \
                 f"{self.key}: K/V geometry differs from target layer {layer_idx}"
+        if shard is not None:
+            assert shard.num_kv_heads == self.num_kv_heads, \
+                f"{self.key}: target layer {layer_idx} is split across devices, with {shard.num_kv_heads} of " \
+                f"{self.num_kv_heads} K/V heads on this one"
         self.source_kind = kind
         self.source_layer_idx = layer_idx
         self.source_module = module
+        self.source_shard = weakref.ref(shard) if shard is not None else None
 
 
     @override
@@ -147,7 +162,10 @@ class SharedKVAttention(Module):
     def _ring_pages(self, rsg: list, instance: int):
         """The target's window ring viewed as a paged cache, and each row's in-ring length"""
         tmod = self.source_module
-        rsl = rsg[0].cache.get_recurrent_layer((self.source_layer_idx, instance))
+        if self.source_shard is not None:
+            rsl = self.source_shard().tp_recurrent_lookup[id(rsg[0].cache)]
+        else:
+            rsl = rsg[0].cache.get_recurrent_layer((self.source_layer_idx, instance))
         k_states, v_states = rsl.get_state_tensors()
         S = tmod.kv_state_size
         pps = S // PAGE_SIZE
@@ -180,7 +198,10 @@ class SharedKVAttention(Module):
             cache = params["cache"]
             block_table = get_for_device(params, "block_table", self.device)
             cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
-            layer = cache.layers[self.source_layer_idx, params.get("layer_instance") or 0]
+            if self.source_shard is not None:
+                layer = self.source_shard().tp_cache_lookup[id(cache)]
+            else:
+                layer = cache.layers[self.source_layer_idx, params.get("layer_instance") or 0]
             if getattr(layer, "qk", None) is not None and getattr(layer, "compand_a", 0.0) == 0.0 and self.head_dim % 32 == 0:
                 k_cache, sk, v_cache, sv, k_bits, v_bits = layer.get_qkv()
                 qc = (sk, sv, k_bits, v_bits)

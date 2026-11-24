@@ -10,7 +10,9 @@ the attention reference is testlib.mla.ref_forward restricted to a selection. On
   - dense equivalence when index_topk >= T,
   - cross-layer sharing ("shared" layers consume the published selection),
   - the cached path (paged indexer-key plane) against the cache-less path, chunked, over fp16 and packed-
-    quantized latent caches.
+    quantized latent caches,
+  - the selections a layer exports for a drafter, and a layer attending through selections it is handed over
+    a cache layer another module fills (a drafter sharing its target's K/V).
 """
 
 import pytest
@@ -27,7 +29,8 @@ from testlib.mla import (
 
 
 def build_dsa(directory, device, H = 8, hidden = 512, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
-              q_lora = 256, idx_heads = 4, idx_dim = 128, topk = 64, mode = "full", seed = 0, wscale = 0.085):
+              q_lora = 256, idx_heads = 4, idx_dim = 128, topk = 64, mode = "full", seed = 0, wscale = 0.085,
+              sinks = False):
     g = torch.Generator(device = "cpu").manual_seed(seed)
 
     def rnd(*shape, scale = wscale):
@@ -51,11 +54,14 @@ def build_dsa(directory, device, H = 8, hidden = 512, kv_lora = 512, nope = 128,
         t[f"{KEY}.indexer.k_norm.weight"] = (torch.randn(idx_dim, generator = g) * 0.1 + 1).half()
         t[f"{KEY}.indexer.k_norm.bias"] = (torch.randn(idx_dim, generator = g) * 0.05).half()
         t[f"{KEY}.indexer.weights_proj.weight"] = rnd(idx_heads, hidden, scale = 0.25)
+    if sinks:
+        t[f"{KEY}.sinks"] = torch.randn(H, generator = g)
 
     module = load_mla(
         t, directory, device, H = H, hidden = hidden, kv_lora = kv_lora, nope = nope, rope_dim = rope_dim,
         v_head = v_head, q_lora = q_lora, rope_style = RopeStyle.GPTJ,
         indexer_mode = mode, index_n_heads = idx_heads, index_head_dim = idx_dim, index_topk = topk,
+        key_sinks = "sinks" if sinks else None,
     )
     return module, {k: v.to(device) for k, v in t.items()}, KEY
 
@@ -306,3 +312,99 @@ def test_dsa_cached_quant_decode(tmp_path, device, bits):
     tol = {8: 6e-3, 4: 2.5e-2}[bits]
     e = rel_err(out, ref[:, prefill:])
     assert e < tol, f"rel err {e:.3e} (tol {tol})"
+
+
+def test_selection_export(tmp_path, device):
+    """A layer that makes its selections in the module (here: one with sinks) hands them to a drafter with the
+    exported states: the last row of a long chunk, every row of a decode-size one."""
+    S, tail = 200, 8
+    module, t, key = build_dsa(tmp_path, device, topk = 64, seed = 41, sinks = True)
+    x = (torch.randn((1, S, module.hidden_size), device = device) * 0.5).half()
+    layer = make_cache(module, 4 * PAGE_SIZE)
+    bt = torch.arange(4, dtype = torch.int32, device = device).view(1, 4)
+    seqlens = torch.zeros((1,), dtype = torch.int32, device = device)
+
+    params = cached_params(layer, bt, seqlens)
+    params["export_mla_selection"] = {0}
+    module.forward(x[:, :S - tail].contiguous(), params)
+    (exported,) = params["export_states"]
+    assert exported.shape[:2] == (1, 1)
+    assert torch.equal(exported[0, 0], params["dsa_topk_indices"].view(S - tail, -1)[-1])
+
+    seqlens += S - tail
+    params = cached_params(layer, bt, seqlens)
+    params["export_mla_selection"] = {0}
+    module.forward(x[:, S - tail:].contiguous(), params)
+    (exported,) = params["export_states"]
+    assert exported.shape[:2] == (1, tail)
+    assert torch.equal(exported[0], params["dsa_topk_indices"].view(tail, -1))
+
+    # Not asked for, nothing is exported
+    params = cached_params(layer, bt, seqlens)
+    module.forward(x[:, S - tail:].contiguous(), params)
+    assert "export_states" not in params
+
+
+@pytest.mark.parametrize("rows", [6, 20])
+def test_external_selection_shared_cache(tmp_path, device, rows):
+    """A drafter's layer over its target's cache: the target fills the cache and exports its selection for the
+    last position; the drafter's block follows at the next positions, each row attending over that selection
+    and the block's rows up to itself, with the drafter's own queries and up-projection. The block's latents
+    come from the drafter and are read back from the shared cache. Decode-size and longer blocks."""
+    S, topk = 200, 64
+    target, tt, key = build_dsa(tmp_path / "target", device, topk = topk, seed = 51, sinks = True)
+    drafter, td, _ = build_dsa(tmp_path / "drafter", device, topk = topk + rows, mode = "external", seed = 52, sinks = True)
+    x = (torch.randn((1, S, target.hidden_size), device = device) * 0.5).half()
+    xb = (torch.randn((1, rows, target.hidden_size), device = device) * 0.5).half()
+    layer = make_cache(target, 4 * PAGE_SIZE)
+    bt = torch.arange(4, dtype = torch.int32, device = device).view(1, 4)
+    seqlens = torch.zeros((1,), dtype = torch.int32, device = device)
+
+    target.forward(x[:, :S - 1].contiguous(), cached_params(layer, bt, seqlens))
+    seqlens += S - 1
+    params = cached_params(layer, bt, seqlens)
+    params["export_mla_selection"] = {0}
+    target.forward(x[:, S - 1:].contiguous(), params)
+    seqlens += 1
+    history = params["export_states"][0][0, -1]
+    K = history.shape[0]
+
+    k_pad = -(-(topk + rows) // 32) * 32
+    r = torch.arange(rows, dtype = torch.int32, device = device)
+    sel = torch.full((rows, k_pad), -1, dtype = torch.int32, device = device)
+    sel[:, :K] = history
+    sel[:, K : K + rows] = torch.where(r.view(1, rows) <= r.view(rows, 1), S + r.view(1, rows), -1)
+
+    with pytest.raises(AssertionError, match = "external selection"):
+        drafter.forward(xb, cached_params(layer, bt, seqlens))
+    params = cached_params(layer, bt, seqlens)
+    params["mla_selection"] = (sel, K + rows)
+    out = drafter.forward(xb, params)
+
+    # Reference: the target's latents for the context, the drafter's for the block, attended in fp32 with the
+    # drafter's queries, up-projection and sinks
+    H, nope, rd, vd, D = drafter.num_q_heads, drafter.qk_nope_head_dim, drafter.qk_rope_head_dim, drafter.v_head_dim, drafter.kv_lora_rank
+    def latents(m, t, xx, start):
+        n = xx.shape[1]
+        ckv_kpe = xx.float() @ t[f"{key}.kv_a_proj_with_mqa.weight"].float().T
+        ckv = rms_norm(ckv_kpe[..., :D], t[f"{key}.kv_a_layernorm.weight"], m.norm_eps).half().float()
+        q = rms_norm(xx.float() @ t[f"{key}.q_a_proj.weight"].float().T, t[f"{key}.q_a_layernorm.weight"], m.norm_eps)
+        q = (q @ t[f"{key}.q_b_proj.weight"].float().T).view(1, n, H, nope + rd)
+        q_pe, k_pe = m.rope.apply(
+            q[..., nope:].half().contiguous(), ckv_kpe[..., D:].view(1, n, 1, rd).half().contiguous(),
+            0, torch.tensor([start], dtype = torch.int32, device = device), None, False, None, None, m.norm_eps, 0.0, None,
+        )
+        return ckv, k_pe.float(), torch.cat((q[..., :nope], q_pe.float()), dim = -1)
+    ckv_c, kpe_c, _ = latents(target, tt, x, 0)
+    ckv_b, kpe_b, q = latents(drafter, td, xb, S)
+    kv = (torch.cat((ckv_c, ckv_b), dim = 1) @ td[f"{key}.kv_b_proj.weight"].float().T).view(1, S + rows, H, nope + vd)
+    k = torch.cat((kv[..., :nope], torch.cat((kpe_c, kpe_b), dim = 1).expand(1, S + rows, H, rd)), dim = -1)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * drafter.sm_scale
+    allowed = torch.zeros((rows, S + rows), dtype = torch.bool, device = device)
+    qq, kk = (sel >= 0).nonzero(as_tuple = True)
+    allowed[qq, sel[qq, kk].long()] = True
+    scores = scores.masked_fill(~allowed.view(1, 1, rows, S + rows), -float("inf"))
+    sink = td[f"{key}.sinks"].float().view(1, H, 1, 1).expand(1, H, rows, 1)
+    p = torch.softmax(torch.cat((scores, sink), dim = -1), dim = -1)[..., :-1]
+    ref = torch.einsum("bhqk,bkhd->bqhd", p, kv[..., nope:]).reshape(1, rows, H * vd) @ td[f"{key}.o_proj.weight"].float().T
+    assert rel_err(out, ref) < 5e-3, f"rel err {rel_err(out, ref):.3e}"

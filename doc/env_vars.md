@@ -372,6 +372,12 @@ additionally stream their weights to the GPU and run there (via the fused kernel
 dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
 thread configuration, and the knobs below for tuning the split.
 
+`-mcs`/`--moe_cpu_split` (main model) and `-dmcs`/`--draft_moe_cpu_split` (draft model or MTP
+head) instead run the tail N routed experts of every eligible layer on the CPU. Each component
+takes one mode or the other, and N counts against that component's own number of routed experts
+per layer. A draft model or MTP head stays entirely on the GPU unless it is given a setting of
+its own.
+
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
 `TUNING` singleton before constructing a model instead of setting env vars. Layout policy is an
@@ -662,10 +668,10 @@ side stream, and once the copy has landed the placement map sends later routes t
 least-used resident that was not routed goes the other way into the worker slot the promotion
 freed, so the resident set follows the conversation token by token instead of once per sweep, and
 no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
-process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
-promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
-start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
-step's bookkeeping cost every 128 steps.
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to
+`EXL3_MOE_CPU_PROMOTE_BUDGET` promotions per step over all layers (one per layer), and as many
+demotions; the spares' own experts start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the
+transfer counts, the hit rate and the step's bookkeeping cost every 128 steps.
 
 Both dynamic modes save each layer's decayed expert selection counts to
 `~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
@@ -674,6 +680,19 @@ model permutes the experts hottest first from that profile, so the GPU slice sta
 experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
 what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
 (an explicit stats file in the same per-layer format) takes precedence.
+
+### `EXL3_MOE_CPU_PROMOTE_BUDGET` (default: `6`; `3` on Windows and WSL2)
+
+Promotions promote-on-miss may issue per decode step over all layers, at most one per layer (and
+as many demotions). A step routes far more experts to the worker than the budget can move, so the
+budget bounds how fast the resident set follows a change of topic or the start of a session, and it
+is normally spent on every step. Each transfer also costs host time and copies on a side stream, so
+the best value depends on the machine: where worker experts are expensive (fewer cores, no AVX-512)
+a larger budget (e.g. `12` to `24`) raises the hit rate and decode speed, most visibly with MTP
+drafting, while a CPU fast enough to hide its experts behind the GPU's own work gains nothing from
+the extra transfers and can come out slightly slower. The default is lower where the GPU is driven through
+WDDM (Windows, and WSL2, detected by `/dev/dxg`): streams run in submission order there, so every
+transfer delays the next draft forward. `0` issues no transfers.
 
 ### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
 

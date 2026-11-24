@@ -28,9 +28,9 @@ static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_kernel_inst
 };
 #undef __
 
-// 160-length rows (n-gram embedding vectors), mul1 codebook only
-#define __(i) quantize_tiles_kernel_k##i##_cb2_l160()
-static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_kernel_instances_l160
+// Embedding rows of any even length (one ring per row), mul1 codebook only
+#define __(i) quantize_tiles_kernel_k##i##_cb2_row()
+static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_kernel_instances_row
 {
     __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
 };
@@ -46,9 +46,9 @@ static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_optimized_i
 };
 #undef __
 
-// 160-length rows (n-gram embedding vectors), mul1 codebook only
-#define __(i) quantize_tiles_kernel_k##i##_cb2_l160(true)
-static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_optimized_instances_l160
+// Embedding rows of any even length (one ring per row), mul1 codebook only
+#define __(i) quantize_tiles_kernel_k##i##_cb2_row(true)
+static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_optimized_instances_row
 {
     __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
 };
@@ -110,6 +110,13 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
     return false;
 }
 
+// Row lengths the launch-length instances take: even (the two passes meet at L / 2), and long enough that a
+// 16-bit state never wraps onto itself at K = 1
+static bool qt_row_length_ok(int L)
+{
+    return L >= 16 && L <= 4096 && L % 2 == 0;
+}
+
 // Kernel and launch geometry for one (K, codebook, L) on the current device: which implementation,
 // its block size (read back from the compiled kernel, so a PTX-JIT'd instance launches with the
 // size it was built for), dynamic shared memory and the resident blocks per SM
@@ -133,8 +140,8 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const int shmem = cost_arrays * edges * sizeof(half)
         + (optimized && QT_OPTIMIZED_COSTS_ONLY ? 0 : L * sizeof(half) + 64 + 128);
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
-    const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
-    auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
+    const auto& instances_row = optimized ? quantize_tiles_optimized_instances_row : quantize_tiles_kernel_instances_row;
+    auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_row[K - 1];
 #if defined(USE_ROCM)
     // Fail with a usable message rather than the attribute call's generic CUDA error
     TORCH_CHECK(shmem <= (int) props->sharedMemPerBlock,
@@ -155,7 +162,8 @@ std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bo
 {
     const c10::cuda::CUDAGuard device_guard(device);
     TORCH_CHECK(K >= 1 && K <= 8, "quantize_tiles_scratch: K must be 1..8");
-    TORCH_CHECK(L == 256 || (L == 160 && mul1), "quantize_tiles_scratch: length 160 requires the mul1 codebook");
+    TORCH_CHECK(L == 256 || (qt_row_length_ok(L) && mul1),
+                "quantize_tiles_scratch: tile length must be 256, or an even row length with the mul1 codebook");
     auto launch = qt_launch(device, K, mul1 ? 2 : mcg ? 1 : 0, L);
     return {launch.optimized, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
 }
@@ -178,7 +186,7 @@ void quantize_tiles
 
     TORCH_CHECK_DIM(input_tiles, 2);
     const int L = input_tiles.size(1);
-    TORCH_CHECK(L == 256 || L == 160, "quantize_tiles tile length must be 256 or 160");
+    TORCH_CHECK(L == 256 || qt_row_length_ok(L), "quantize_tiles tile length must be 256 or an even row length");
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_tiles);
     TORCH_CHECK_DTYPE(input_tiles, kFloat);
@@ -198,7 +206,7 @@ void quantize_tiles
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
-    TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
+    TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles row lengths require the mul1 codebook");
 
     // No tiles: nothing to quantize, no scratch needed
     if (!num_tiles) return;
@@ -247,7 +255,8 @@ void quantize_tiles
             ((uint16_t*) output_indices.data_ptr()) + (int64_t) L * batch_i,
             (half*) temp_costs.data_ptr(),
             (uint16_t*) temp_edges.data_ptr(),
-            lut
+            lut,
+            L
         );
         cuda_check(cudaPeekAtLastError());
     }
@@ -311,7 +320,8 @@ void quantize_tiles_frac
             ((uint16_t*) output_indices.data_ptr()) + (int64_t) L * batch_i,
             (half*) temp_costs.data_ptr(),
             (uint16_t*) temp_edges.data_ptr(),
-            nullptr
+            nullptr,
+            L
         );
         cuda_check(cudaPeekAtLastError());
     }

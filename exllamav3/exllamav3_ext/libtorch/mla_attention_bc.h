@@ -78,7 +78,12 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("kpool_ape") = py::none(),
     py::arg("kpool_plane") = py::none()
 )
+.def("set_gathered", &BC_MLAttention::set_gathered,
+    py::arg("sinks"),
+    py::arg("out_gate")
+)
 .def("needs_configure", &BC_MLAttention::needs_configure)
+.def("configure_slot_gate", &BC_MLAttention::configure_slot_gate)
 .def("configure_slot", &BC_MLAttention::configure_slot,
     py::arg("bsz"),
     py::arg("q_len"),

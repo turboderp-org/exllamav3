@@ -58,10 +58,9 @@ class TransformerBlock(Module):
             assert attn_hc is not None and mlp_hc is not None, \
                 "hyperconnections require both attn_hc and mlp_hc"
             assert all(v is None for v in (
-                attn_post_norm, mlp_post_norm,
                 key_layer_scalar, key_attn_resid_scalar, key_mlp_resid_scalar,
             )), \
-                "hyperconnections cannot combine with residual scalars/post-norms"
+                "hyperconnections cannot combine with residual scalars"
 
         self.register_submodule(self.attn_hc)
         self.register_submodule(self.attn_norm)
@@ -191,6 +190,9 @@ class TransformerBlock(Module):
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_hc:
+                if self.attn_post_norm:
+                    # Sandwich norm: the sublayer output is normalized before it joins the streams
+                    y = self.attn_post_norm.forward(y, params, out_dtype = torch.float)
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
@@ -220,6 +222,8 @@ class TransformerBlock(Module):
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
+                if self.mlp_post_norm:
+                    y = self.mlp_post_norm.forward(y, params, out_dtype = torch.float)
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)

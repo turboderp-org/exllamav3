@@ -553,7 +553,8 @@ def get_out_hessian_diags(args, linears):
     return diags
 
 
-def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity = None, out_hessian_diag = None):
+def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity = None, out_hessian_diag = None,
+                    key = None):
     quant_args = {
         "seed": idx,
         "K": K,
@@ -561,6 +562,7 @@ def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity
         "device_ratios": device_ratios,
         "apply_out_scales": args["apply_out_scales"],
         "debug_dir": os.path.join(args["work_dir"], "debug"),
+        "key": key,
     }
     if out_sensitivity is not None:
         quant_args["out_sensitivity"] = out_sensitivity
@@ -682,7 +684,8 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                     strategy[l.key],
                     *_tile_split_devices(l.weights_numel(), devices, device_ratios),
                     out_sensitivity = out_sens.get(l.key),
-                    out_hessian_diag = out_hess.get(l.key)
+                    out_hessian_diag = out_hess.get(l.key),
+                    key = l.key,
                 ) for l in group]
             with Timer() as t:
                 proxy_errs = convert_exl3_group(
@@ -714,7 +717,8 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 strategy[linear.key],
                 *_tile_split_devices(linear.weights_numel(), devices, device_ratios),
                 out_sensitivity = out_sens.get(linear.key),
-                out_hessian_diag = out_hess.get(linear.key)
+                out_hessian_diag = out_hess.get(linear.key),
+                key = linear.key,
             )
 
             with Timer() as t:
@@ -788,7 +792,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                     quant_args_list = [
                         make_quant_args(
                             args, idx, strategy[l.key], [device_idx],
-                            out_sensitivity = out_sens.get(l.key), out_hessian_diag = out_hess.get(l.key))
+                            out_sensitivity = out_sens.get(l.key), out_hessian_diag = out_hess.get(l.key), key = l.key)
                         for l in group
                     ]
                     proxy_errs = convert_exl3_group(
@@ -810,7 +814,8 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 linear = group[0]
                 quant_args_local = make_quant_args(
                     args, idx, strategy[linear.key], [device_idx],
-                    out_sensitivity = out_sens.get(linear.key), out_hessian_diag = out_hess.get(linear.key))
+                    out_sensitivity = out_sens.get(linear.key), out_hessian_diag = out_hess.get(linear.key),
+                    key = linear.key)
 
                 H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(

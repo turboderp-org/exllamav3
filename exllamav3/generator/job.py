@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, is_content_hash, prev_ids
 from .filter import Filter
 import random
 import time
@@ -324,8 +324,9 @@ class Job:
         self.sam = rq_state.get("sam", None)
         self.sam_match = None
 
-        # MTP state
+        # MTP state: the target's state for the last token in the cache, and any further exports for it
         self.mtp_last_hidden = None
+        self.mtp_last_aux = []
 
 
     def get_pinned_logit_mask(self):
@@ -1076,16 +1077,23 @@ class Job:
                 # roll back in place, else the pair is restored from a stash
                 if self.recurrent_state.can_rewind_to(target):
                     self.recurrent_state.rewind_to(target)
+                    # A checkpoint stashed past the target was of the tokens that are going
+                    if (self.last_recurrent_checkpoint_pos or 0) > target:
+                        self.last_recurrent_checkpoint_pos = None
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.free_recurrent_state()
                     if stashed is not None:
                         replay_from = stashed["position"]
                         self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
+                        # The rolling checkpoint isn't in the cache yet, so it doesn't count as the last one there
+                        # (which is below it), or it would be dropped instead of committed when the job ends
+                        if stashed is not self.rolling_stash:
+                            self.last_recurrent_checkpoint_pos = replay_from
                     else:
                         replay_from = 0
                         self.recurrent_state = self.generator.new_recurrent_state()
-                    self.last_recurrent_checkpoint_pos = replay_from or None
+                        self.last_recurrent_checkpoint_pos = None
 
             for seq in self.sequences:
                 p_page = seq.kv_position // PAGE_SIZE
@@ -1117,6 +1125,7 @@ class Job:
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
             self.mtp_last_hidden = None
+            self.mtp_last_aux = []
             self.checkpoint_rewound = True
             # Every deferred page held rewound tokens and was truncated above
             self.checkpoint["deferred_pages"].clear()
@@ -1293,28 +1302,18 @@ class Job:
         # the limit when none is given, and the cap on one that is, so a chunked job that writes
         # its way to the end of the cache ends with max_new_tokens instead of asserting at the
         # requeue that finds no pages left (the cap holds for the requeued rounds too, whose prompt
-        # is the sequence so far). A prompt with no room at all keeps its limit and fails the page
-        # check below, which is the message the caller expects for that
+        # is the sequence so far). A prompt with no room at all is held to a single token: it fails
+        # the page check below, which is the message the caller expects for that, unless that one
+        # token still fits, and then the job ends after it rather than asking for a requeue
         room = self.generator.max_total_tokens - max(len(s.input_ids) for s in self.sequences) \
                - 1 - self.generator.max_draft_tokens
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, room)
-        elif room >= 1:
-            self.max_new_tokens = min(self.max_new_tokens, room)
+        else:
+            self.max_new_tokens = min(self.max_new_tokens, max(1, room))
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
-            if len(self.sequences) == 1:
-                boundary = self.generator.recurrent_checkpoint_interval \
-                    if self.generator.recurrent_cache is not None else PAGE_SIZE
-                x = len(self.sequences[0].input_ids)
-                y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
-                # The final segment: a budget aligned to the end of the cache leaves no room for the
-                # speculative window past it, and no requeue can follow it anyway, so it is cut to what
-                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
-                # 31-token draft window could not be enqueued at all)
-                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
-                self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
@@ -1326,6 +1325,19 @@ class Job:
             mtp_lag = 1 if self.generator.mtp_draft else 0
             self.rq_margin = -mtp_lag
             self.rq_headroom = self.generator.max_draft_tokens + mtp_lag
+            if len(self.sequences) == 1:
+                boundary = self.generator.recurrent_checkpoint_interval \
+                    if self.generator.recurrent_cache is not None else PAGE_SIZE
+                x = len(self.sequences[0].input_ids)
+                # A requeued MTP job's prompt ends one token past the boundary it stopped at, and its budget counts
+                # from that boundary (from the token itself, aligning up would add a whole interval to the segment)
+                y = (x - 1 - mtp_lag + self.max_rq_tokens + boundary - 1) // boundary * boundary
+                # The final segment: a budget aligned to the end of the cache leaves no room for what is
+                # reserved past it (rq_headroom), and no requeue can follow it anyway, so it is cut to what
+                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
+                # 31-token draft window could not be enqueued at all)
+                y = min(y, self.generator.max_total_tokens - self.rq_headroom)
+                self.max_rq_tokens = max(1, y - x)
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.max_draft_tokens
@@ -1603,16 +1615,24 @@ class Job:
                     "mm_span_prefix": mm_span_prefix,
                 }
                 gen = self.generator
+                if gen.prev_ids:
+                    params["prev_ids"] = prev_ids([seq], [prefill_start], gen.prev_ids)
                 dm = gen.draft_model
                 if dm:
                     params.update(dm.draft_verifier_params)
                 # MTP needs the target's post-final-norm state for every prompt token. Normal prefill stops at the
                 # last cache-writing layer, before final norm. (A drafter fed the last decoder layer's output takes
-                # the regular prefill, which runs through that layer)
-                to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
+                # the regular prefill, which runs through that layer; one that shares the target's cache but
+                # reads its final state does not)
+                to_output = gen.mtp_draft and (
+                    dm is None or not dm.caps.get("draft_uses_target_cache") or
+                    "export_state_norm_keys" in dm.draft_verifier_params
+                )
                 if to_output:
                     params["last_tokens_only"] = 1
-                then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None
+                then = None
+                if dm:
+                    then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start, prefill_end)
                 if gen.pipeline is not None and len(self.sequences) == 1:
                     gen.pipeline.prefill(prefill_ids, params, self, to_output, then)
                 else:
@@ -1627,8 +1647,11 @@ class Job:
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
                 # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
                 # tokens map to the same state slots with the same values, leaving state content intact.
-                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
-                    self.recurrent_state.rewind_to(prefill_end)
+                # Only the target side has taken the chunk by now if it went through the pipeline; the draft
+                # side does the same once it has (update_draft_from_prefill)
+                target_state = self.recurrent_state.target if self.recurrent_state is not None else None
+                if target_state is not None and target_state.position > prefill_end:
+                    target_state.rewind(target_state.position - prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1682,11 +1705,15 @@ class Job:
             results.append(r)
 
 
-    def update_draft_from_prefill(self, seq, prefill_ids: torch.Tensor, prefill_start: int, params: dict):
+    def update_draft_from_prefill(
+        self, seq, prefill_ids: torch.Tensor, prefill_start: int, prefill_end: int, params: dict
+    ):
         """
         Bring the draft model up to a prefill chunk of the target, from the finished chunk's params: the states it
         exported go in as they are, or the draft model takes the chunk itself. Runs on the draft model's device when
         the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
+        prefill_ids may run past prefill_end (atomic multimodal prefill), in which case the draft side's recurrent
+        state is brought back to prefill_end afterwards, as prefill does for the target side.
         """
         if self.generator.dflash_draft:
             self.generator.draft_model.update_kv_from_target(
@@ -1702,6 +1729,7 @@ class Job:
         elif self.generator.draft_model:
             if self.generator.mtp_draft:
                 target_hidden = params.get("export_states")[-1]
+                self.mtp_last_aux = [s[:, -1:].clone() for s in params["export_states"][:-1]]
                 carry_hidden = seq.mtp_carry_hidden
                 if carry_hidden is None:
                     carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
@@ -1723,6 +1751,10 @@ class Job:
                                         and self.recurrent_state.draft is not None else None,
                 }
             )
+
+        draft_state = self.recurrent_state.draft if self.recurrent_state is not None else None
+        if draft_state is not None and draft_state.position > prefill_end:
+            draft_state.rewind(draft_state.position - prefill_end)
 
 
     def allocate_pages(self):
@@ -1938,6 +1970,11 @@ class Job:
         Leave a checkpoint at the last page boundary of a job that is ending, so that a follow-up prompt extending
         its output replays less than a page of it: the state itself if it is there or can roll back to it, else
         the rolling checkpoint. The state may be anything from that point on; it is released right after this.
+
+        A job cancelled during prefill leaves one too, where the prefill stopped, if the state is on a page
+        boundary there (prefill chunks are page multiples, so it normally is). Otherwise a retry of the same prompt
+        (a client that timed out and resends it) could only resume from the last prefill interval checkpoint, up
+        to recurrent_checkpoint_interval_pp tokens back, although the K/V pages up to the stop are still cached.
         """
         if not self.generator.rolling_checkpoint:
             return
@@ -1949,9 +1986,9 @@ class Job:
         def past_last(position):
             return position > (self.last_recurrent_checkpoint_pos or 0)
 
-        if state is not None and self.is_prefill_done() and past_last(boundary):
+        if state is not None and past_last(boundary):
             at_boundary = state.settled_at(boundary)
-            if at_boundary or (state.stash_by_rollback and state.can_stash_at(boundary)):
+            if at_boundary or (self.is_prefill_done() and state.stash_by_rollback and state.can_stash_at(boundary)):
                 key = self.page_anchor(boundary)
                 if key is not None:
                     if not at_boundary:

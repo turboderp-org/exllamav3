@@ -338,6 +338,10 @@ class DiskPageCache:
         # reference to its stash so the buffers cannot return to the pool
         self.pending_pages: set[bytes] = set()
         self.pending_states: dict[bytes, dict] = {}
+        # Entries dropped from the mirror whose file and index row the writer has not removed yet. adopt()
+        # must not take them back from the index: the mirror would then count a file that is about to go
+        # (and, if the page is written again meanwhile, count it twice)
+        self.pending_deletes: set[tuple[str, bytes]] = set()
         # side ("target" / "draft") -> (model, cache) of the recurrent states stashed under that key, set by the
         # Generator; decides whether a side is written here or by the model's ranks
         self.recurrent_sides: dict[str, tuple] = {}
@@ -902,8 +906,11 @@ class DiskPageCache:
         whose write the other process has not committed yet is found by the next job that asks for it. The
         read never waits on a writer (WAL). Returns the number of entries adopted
         """
-        missing_pages = [h for h in hashes if h not in self.pages]
-        missing_states = [h for h in hashes if h not in self.states and h not in self.pending_states]
+        with self._lock:
+            missing_pages = [h for h in hashes if h not in self.pages and h not in self.pending_pages
+                             and ("page", h) not in self.pending_deletes]
+            missing_states = [h for h in hashes if h not in self.states and h not in self.pending_states
+                              and ("state", h) not in self.pending_deletes]
         if not missing_pages and not missing_states:
             return 0
         if self._query_conn is None:
@@ -929,13 +936,15 @@ class DiskPageCache:
                         for row in rows:
                             if table == "pages":
                                 phash, prev_hash, size, last_access = row
-                                if phash in self.pages:
+                                if phash in self.pages or phash in self.pending_pages or \
+                                        ("page", phash) in self.pending_deletes:
                                     continue
                                 self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
                                 self.metrics["pages_adopted"] += 1
                             else:
                                 phash, size, last_access, position = row
-                                if phash in self.states or phash in self.pending_states:
+                                if phash in self.states or phash in self.pending_states or \
+                                        ("state", phash) in self.pending_deletes:
                                     continue
                                 self.states[phash] = {"size": size, "last_access": last_access, "position": position}
                                 self.metrics["states_adopted"] += 1
@@ -1482,6 +1491,7 @@ class DiskPageCache:
         table = self.pages if kind == "page" else self.states
         meta = table.pop(phash)
         self.total_size -= meta["size"]
+        self.pending_deletes.add((kind, phash))
         self._enqueue(("delete", kind, phash))
 
 
@@ -1594,6 +1604,8 @@ class DiskPageCache:
                         except FileNotFoundError:
                             pass
                         conn.execute(f"DELETE FROM {'pages' if k == 'page' else 'states'} WHERE phash = ?", (phash,))
+                        with self._lock:
+                            self.pending_deletes.discard((k, phash))
                     elif kind == "reclaim":
                         try:
                             self._reclaim_siblings(*op[1:])
@@ -1787,6 +1799,10 @@ class DiskPageCache:
         with self._lock:
             self.pending_pages.discard(phash)
             stamp = self._stamp()
+            old = self.pages.get(phash)
+            if old is not None:
+                # Never two entries' sizes for one file
+                self.total_size -= old["size"]
             self.pages[phash] = {"prev_hash": prev_hash, "size": actual, "last_access": stamp}
             self.total_size += actual - size
             if phash in self.state_candidates:
@@ -1868,6 +1884,9 @@ class DiskPageCache:
         actual = os.path.getsize(path)
         with self._lock:
             stamp = self._stamp()
+            old = self.states.get(phash)
+            if old is not None:
+                self.total_size -= old["size"]
             self.states[phash] = {"size": actual, "last_access": stamp, "position": position}
             self.total_size += actual - size
             self._state_written(phash)

@@ -89,9 +89,19 @@ class HyperConnection(Module):
         hc_eps: float,
         rms_norm_eps: float,
         carry_pre: bool = False,
+        comb: bool = True,
+        post_scale: float = 2.0,
+        post_eps: float = 0.0,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
+        # comb False (Hy4 identity hyper-connections): no stream mixing matrix, the site only adds its
+        # output to every stream (x <- x + post (x) y) and {key}_fn holds the 2H pre/post rows.
+        # post = post_scale * sigmoid(.) + post_eps
+        self.comb = comb
+        self.post_scale = post_scale
+        self.post_eps = post_eps
+        assert comb or not carry_pre
         # V4.1: a site collapses its streams with the PREVIOUS site's pre weights (the first site
         # takes stream 0) and publishes its own through params["hc_pre"] for the next one
         self.carry_pre = carry_pre
@@ -106,6 +116,7 @@ class HyperConnection(Module):
         self.fn_h = None
         self.base = None
         self.scale = None
+        self.ws_cache = None
 
     @override
     def load(self, device: torch.device, **kwargs):
@@ -119,6 +130,7 @@ class HyperConnection(Module):
     def unload(self):
         super().unload()
         self.fn = self.fn_h = self.base = self.scale = None
+        self.ws_cache = None
 
     @override
     def get_tensors(self):
@@ -131,6 +143,8 @@ class HyperConnection(Module):
     @override
     def weights_numel(self):
         h = self.hc_mult
+        if not self.comb:
+            return 2 * h * (h * self.hidden_size + 1) + 2
         return (2 * h + h * h) * (h * self.hidden_size + 1) + 3
 
     @override
@@ -140,6 +154,44 @@ class HyperConnection(Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         raise RuntimeError("HyperConnection is not a standalone module; use mix()")
+
+    def _mix_identity(self, streams: torch.Tensor):
+        """Comb-less mix: (post (b, s, H), None, collapsed (b, s, D) fp32)"""
+        hc = self.hc_mult
+        b, s, H, D = streams.shape
+        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous() \
+                and self.post_scale == 2.0:
+            # Fused pair of launches, as the comb form in _mix_unfused (same workspace policy)
+            R = b * s
+            dev = streams.device
+            # Decode row counts reuse the views of the shared static workspaces from the last call
+            ws_key = (R, D) if R <= g_tensor_cache.SCRATCH_STATIC_ROWS else None
+            if ws_key is not None and self.ws_cache is not None and self.ws_cache[0] == ws_key:
+                partials, post, collapsed = self.ws_cache[1]
+            else:
+                chunks = ext.hc_mix_num_chunks(R, H * D)
+                def ws(numel, dtype, tag):
+                    return g_tensor_cache.get_scratch(dev, numel, dtype, tag, R)
+                partials = ws(R * chunks * (2 * H + 1), torch.float, "hc_mix_partials").view(R, chunks, 2 * H + 1)
+                post = ws(R * H, torch.float, "hc_post").view(R, H)
+                collapsed = ws(R * D, torch.float, "hc_coll").view(R, D)
+                self.ws_cache = (ws_key, (partials, post, collapsed)) if ws_key is not None else None
+            if R <= 32:
+                if self.fn_h is None:
+                    self.fn_h = self.fn.half()
+                fn = self.fn_h
+            else:
+                fn = self.fn
+            ext.hc_mix_nocomb(streams.view(R, H, D), fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                              self.post_eps, partials, post, collapsed)
+            return post.view(b, s, H), None, collapsed.view(b, s, D)
+        flat = streams.flatten(2)
+        inv = torch.rsqrt(flat.square().mean(dim = -1, keepdim = True) + self.rms_eps)
+        mix = F.linear(flat, self.fn) * inv
+        pre = torch.sigmoid(mix[..., :hc] * self.scale[0] + self.base[:hc]) + self.hc_eps
+        post = self.post_scale * torch.sigmoid(mix[..., hc:] * self.scale[1] + self.base[hc:]) + self.post_eps
+        collapsed = torch.matmul(pre.unsqueeze(-2), streams).squeeze(-2)
+        return post, None, collapsed
 
     def mix(self, streams: torch.Tensor, params: dict):
         """streams (b, s, H, D) fp32 -> (post (b,s,H), comb (b,s,H,H), collapsed (b,s,D)).
@@ -160,6 +212,10 @@ class HyperConnection(Module):
         consumed here; any other pending apply is flushed first"""
         hc = self.hc_mult
         b, s, H, D = streams.shape
+        if not self.comb:
+            hc_flush(params)
+            post, comb, y = self._mix_identity(streams)
+            return post, comb, y, False
         pend = params.get("hc_pending")
         if pend is not None and pend[0] is not streams:
             hc_flush(params)
@@ -290,6 +346,16 @@ class HyperConnection(Module):
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
         hc_flush(params)
+        if comb is None:
+            # Identity form: every stream takes post[h] * y
+            if H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+                    and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
+                    and post.dtype == torch.float and post.is_contiguous():
+                if converting:
+                    x = x.clone()
+                ext.hc_apply(x.view(b * s, H, D), y.view(b * s, D), post.view(b * s, H), None, None, None)
+                return x
+            return post.unsqueeze(-1) * y.float().unsqueeze(-2) + x
         if H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
@@ -320,6 +386,9 @@ class HyperConnection(Module):
                 "hc_eps": self.hc_eps,
                 "rms_norm_eps": self.rms_eps,
                 "carry_pre": self.carry_pre,
+                "comb": self.comb,
+                "post_scale": self.post_scale,
+                "post_eps": self.post_eps,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),

@@ -9,19 +9,22 @@ __host__ __device__ constexpr int qt_optimized_threads(int K, int cb)
     return K == 5 || K == 6 || (K == 7 && cb != 0) ? 512 : 1024;
 }
 
-template <int K, int cb, int L = 256>
+template <int K, int cb, int LT = 256>
 __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles_optimized_kernel(
     const float* __restrict__ input_tiles_ptr, float* __restrict__ output_tiles_ptr,
     uint16_t* __restrict__ output_indices_ptr, half* __restrict__ temp_costs_ptr,
-    uint16_t* __restrict__ temp_edges_ptr, const half2* __restrict__ lut)
+    uint16_t* __restrict__ temp_edges_ptr, const half2* __restrict__ lut, const int tile_len)
 {
-    static_assert(K >= 1 && K <= 8 && L % 2 == 0);
+    static_assert(K >= 1 && K <= 8 && LT % 2 == 0);
+    // LT = 0: the length comes with the launch (embedding rows, see quantize_tiles_kernel.cuh)
+    const int L = LT ? LT : tile_len;
+    __builtin_assume(L >= 16);
     constexpr int NT = qt_optimized_threads(K, cb);
     constexpr int NW = NT / 32;
     constexpr int Kr = 16 - K;
     constexpr int max_q = 1 << K;
     constexpr int edges = 65536 >> K;
-    constexpr int history_bytes = L * edges / (K == 1 ? 8 : 1);
+    const int history_bytes = L * edges / (K == 1 ? 8 : 1);
     const int tile_idx = blockIdx.x;
     const int thread = threadIdx.x;
     const float* input_tile = input_tiles_ptr + L * tile_idx;

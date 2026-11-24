@@ -23,6 +23,20 @@ void hc_mix
     at::Tensor collapsed
 );
 
+void hc_mix_nocomb
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    double post_eps,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor collapsed
+);
+
 void hc_mix_carry
 (
     const at::Tensor& streams,

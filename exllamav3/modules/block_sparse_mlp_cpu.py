@@ -85,30 +85,33 @@ def save_expert_stats(infer_params):
     reg = getattr(infer_params, "moe_cpu_swap_modules", None)
     if not reg or reg[0]._split_step_count < _STATS_MIN_STEPS:
         return
-    config, E = reg[0].config, reg[0].num_experts
-    layers = _expert_stats_load(config, E)
+    config = reg[0].config
+    # The profiles are per expert count, which a draft component sharing the config needn't share
+    by_count = {}
     for m in reg:
         if m._split_hist is None or getattr(m, "tid2eid_key", None):
             continue
         hist = m._split_hist.tolist()
-        if m.num_experts != E or sum(hist) <= 0.0:
+        if sum(hist) <= 0.0:
             continue
+        E = m.num_experts
         perm = m._split_perm or list(range(E))
         counts = [0.0] * E
         for r, c in enumerate(hist):
             counts[perm[r]] = c
-        layers[m.key] = counts
-    if not layers:
-        return
-    path = _expert_stats_path(config, E)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok = True)
-        fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        print(f" !! expert stats not saved ({path}): {e}")
+        by_count.setdefault(E, {})[m.key] = counts
+    for E, counted in by_count.items():
+        layers = _expert_stats_load(config, E)
+        layers.update(counted)
+        path = _expert_stats_path(config, E)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok = True)
+            fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f" !! expert stats not saved ({path}): {e}")
 
 
 @torch.inference_mode()
@@ -177,8 +180,13 @@ def register_split_module(infer_params, module):
 
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-_PROMOTE_BUDGET = 3         # promotions issued per step over all layers (and as many demotions); each transfer's
-                            # copies queue ahead of the next draft forward (WDDM runs streams in submission order)
+# The GPU is driven through WDDM: Windows, or WSL2 (whose GPU paravirtualization shows up as /dev/dxg)
+_WDDM = os.name == "nt" or os.path.exists("/dev/dxg")
+# Promotions issued per step over all layers (and as many demotions), EXL3_MOE_CPU_PROMOTE_BUDGET. A transfer costs
+# host time and copies on the promotion stream, and pays off in worker experts later steps no longer route, so the
+# best value grows with the cost of a worker expert. Lower under WDDM, which runs streams in submission order: each
+# transfer's copies queue ahead of the next draft forward
+_PROMOTE_BUDGET = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 3 if _WDDM else 6)))
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 
@@ -459,6 +467,17 @@ def _split_promote_verify(m, t):
                 f"demote verify failed: {key}.{an} (arena)"
 
 
+def cpu_budget(infer_params) -> tuple[int, int]:
+    """CPU expert budget of the component being loaded (infer_params.moe_cpu_component), as (whole layers, tail
+    experts per layer): the main model's own settings, or the draft ones for any other component sharing the config
+    (an MTP head), which may have a different number of experts per layer"""
+    draft = getattr(infer_params, "moe_cpu_component", "text") != "text"
+    return (
+        int(getattr(infer_params, "draft_moe_cpu_offload" if draft else "moe_cpu_offload", 0) or 0),
+        int(getattr(infer_params, "draft_moe_cpu_split" if draft else "moe_cpu_split", 0) or 0),
+    )
+
+
 def trellis_rate(tile_width: int):
     """Bitrate of an EXL3 trellis from its tile width (last dim): an integer 1..8 for 16 * K, a
     half-integer 1.5 / 2.5 / 3.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
@@ -468,6 +487,10 @@ def trellis_rate(tile_width: int):
     if rem == 8 and 1 <= K <= 3:
         return K + 0.5
     return None
+
+
+_EXCLUSIVE = "moe_cpu_split and moe_cpu_offload are mutually exclusive within a component: the split offloads a " \
+    "slice of every eligible layer's experts, whole-layer offload takes entire layers — pick one"
 
 
 class BlockSparseMLP_CPU:
@@ -486,13 +509,8 @@ class BlockSparseMLP_CPU:
         skips its GPU load entirely on True."""
         ip = self.config.infer_params
         comp = getattr(ip, "moe_cpu_component", "text")
-        budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
-            else getattr(ip, "draft_moe_cpu_offload", 0)
-        if budget:
-            assert not getattr(ip, "moe_cpu_split", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        budget, split_k = cpu_budget(ip)
+        assert not (budget and split_k), _EXCLUSIVE
         if (
             budget > 0 and
             ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
@@ -512,24 +530,23 @@ class BlockSparseMLP_CPU:
         then loads that slice."""
         ip = self.config.infer_params
         # Registration shrinks the module to its GPU slice, then the normal load below loads
-        # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
-        # is its construction-time default)
-        split_k = int(getattr(ip, "moe_cpu_split", 0))
-        if split_k:
-            assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        # that slice. The component's setting in infer_params is authoritative (the
+        # EXL3_MOE_CPU_SPLIT env is the main model's construction-time default)
+        comp = getattr(ip, "moe_cpu_component", "text")
+        budget, split_k = cpu_budget(ip)
+        assert not (budget and split_k), _EXCLUSIVE
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
         # The split keeps at least one expert on the GPU (the module's GPU slice cannot be
         # empty); a larger request is capped rather than silently turning the split off
         if split_k >= self.num_experts > 1:
-            if not getattr(ip, "moe_cpu_split_capped", False):
-                ip.moe_cpu_split_capped = True
-                print(f" !! --moe_cpu_split {split_k} exceeds the {self.num_experts} routed experts per layer, "
-                      f"capped to {self.num_experts - 1} (use --moe_cpu_offload to move whole layers)")
+            capped = getattr(ip, "moe_cpu_split_capped", ())
+            if comp not in capped:
+                ip.moe_cpu_split_capped = (*capped, comp)
+                print(f" !! {self.key}: CPU split of {split_k} experts exceeds the layer's {self.num_experts} "
+                      f"routed experts, capped to {self.num_experts - 1} (whole layers go to the CPU with the "
+                      f"layer offload instead)")
             split_k = self.num_experts - 1
         if (
             0 < split_k < self.num_experts and
@@ -597,7 +614,9 @@ class BlockSparseMLP_CPU:
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
-                    if reg[0] is self:
+                    # The first module of a component to go saves, while the registry still holds every component
+                    # (a draft component sharing the config may unload before or after the main model)
+                    if next(m for m in reg if m.cpu_component == self.cpu_component) is self:
                         save_expert_stats(self.config.infer_params)
                     reg.remove(self)
                 self._split_map = None

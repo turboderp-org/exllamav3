@@ -5,6 +5,7 @@
 #include <pybind11/pybind11.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/uio.h>
 #endif
 #include <algorithm>
 #include <thread>
@@ -154,6 +155,12 @@ int64_t ngram_hash_cpu
 namespace
 {
 
+// Gathers of up to this many runs try the page cache on the calling thread first
+constexpr size_t GATHER_INLINE_MAX_RUNS = 64;
+
+// Reads a cold gather keeps in flight
+constexpr int GATHER_POOL_THREADS = 128;
+
 struct GatherCtx
 {
     int fd;
@@ -222,15 +229,20 @@ struct GatherPool
         if (!started)
         {
             started = true;
-            int n = (int) std::min(32u, std::max(4u, std::thread::hardware_concurrency()));
-            for (int i = 0; i < n; ++i)
+            // The workers wait on the device, not the CPU: their number is the queue depth of a cold
+            // gather, and NVMe arrays keep scaling well past one read in flight per core
+            for (int i = 0; i < GATHER_POOL_THREADS; ++i)
                 std::thread(&GatherPool::worker, this).detach();
         }
         ctx = c;
         tasks.swap(new_tasks);
         next = 0;
         pending = tasks.size();
-        cv_work.notify_all();
+        // A short task list wakes only as many workers as it has spans
+        if (tasks.size() < (size_t) GATHER_POOL_THREADS)
+            for (size_t i = 0; i < tasks.size(); ++i) cv_work.notify_one();
+        else
+            cv_work.notify_all();
         // The caller drains the queue too: page-cache-warm gathers (~us per read) then finish
         // in-line instead of stalling ~100us on worker wake/sleep latency, while cold gathers
         // still fan out across whichever workers wake in time
@@ -301,11 +313,34 @@ void ngram_gather_cpu
         return;
     }
 
-    // One span task per run keeps every cold read in flight at once; past ~64 runs, group
-    // whole runs into span tasks so the queue overhead stays negligible (a worker issues its
+    #ifdef RWF_NOWAIT
+    // Decode-sized gathers: rows that are in the page cache are read on this thread, where waking the
+    // pool would cost more than the reads themselves. RWF_NOWAIT makes a read that would have to wait
+    // for the device return at once instead, and the runs it leaves go to the pool as before
+    if (n_runs <= GATHER_INLINE_MAX_RUNS)
+    {
+        size_t left = 0;
+        for (size_t r = 0; r < n_runs; ++r)
+        {
+            int64_t i = runs[r].first;
+            int64_t nbytes = runs[r].second * row_bytes;
+            struct iovec iov { op + i * row_bytes, (size_t) nbytes };
+            ssize_t got = preadv2((int) fd, &iov, 1, (off_t) (base_offset + (up[i] - uid_base) * row_bytes), RWF_NOWAIT);
+            if (got != (ssize_t) nbytes)
+                runs[left++] = runs[r];
+        }
+        if (!left) return;
+        runs.resize(left);
+        n_runs = left;
+    }
+    #endif
+
+    // One span task per run keeps every cold read in flight at once; past a few tasks per worker,
+    // group whole runs into span tasks so the queue overhead stays negligible (a worker issues its
     // group's runs sequentially -- pool-width reads still in flight)
     std::vector<std::pair<int64_t, int64_t>> tasks;
-    size_t group = (n_runs + 63) / 64;
+    const size_t max_tasks = 4 * (size_t) GATHER_POOL_THREADS;
+    size_t group = (n_runs + max_tasks - 1) / max_tasks;
     tasks.reserve((n_runs + group - 1) / group);
     for (size_t r = 0; r < n_runs; r += group)
     {

@@ -100,6 +100,10 @@ class Gemma4AssistantInputLayer(Module):
         )
         self.register_submodule(self.pre_projection)
         self.attached_model = None
+        # The target's embedding and final norm, as (weak references to) the modules to call: its own, or the
+        # output device's shards of them for a tensor-parallel target, whose own are not loaded
+        self.target_embedding = None
+        self.target_norm = None
 
     @override
     def optimizer_targets(self):
@@ -118,11 +122,9 @@ class Gemma4AssistantInputLayer(Module):
         state = get_for_device(params, "target_hidden", self.device).half()
         if params.get("draft_step", 0) == 0:
             # the round's first state must be the target's POST-final-norm hidden state (HF hidden_states[-1])
-            t = self.attached_model()
-            tn = t.modules[t.logit_layer_idx - 1]
-            assert type(tn).__name__ == "RMSNorm", type(tn).__name__
+            tn = self.target_norm()
             state = to_device(tn.forward(to_device(state, tn.device), params, out_dtype = torch.half), self.device)
-        emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        emb = self.target_embedding().forward(x, params, out_dtype = torch.half)
         emb = to_device(emb, self.device)
         y = torch.cat((emb, state), dim = -1)
         return self.pre_projection.forward(y, params, out_dtype = torch.float)
@@ -289,34 +291,45 @@ class Gemma4AssistantModel(Model):
         """
         Bind to the target: embedding for the input layer, the K/V sources of its last full and last sliding
         layer (before any K/V sharing of its own), and the export of its last decoder layer's output, which is
-        the state the first drafting step of a round consumes
+        the state the first drafting step of a round consumes.
+
+        A tensor-parallel target has what the drafter uses on its output device, where the drafter is too: the
+        target's loader keeps the source layers whole there (target_source_keys), and the modules of that
+        device run in this process, so the drafter calls and reads them as it does a layer-split target's.
+        They only exist once the target has loaded, so the loader attaches again then.
         """
-        # The drafter reads two of the target's cache layers directly; a tensor-parallel target shards those
-        # across ranks (and keeps no embedding in this process), so it would need a TP split of its own
-        assert not target.loaded_tp, \
-            "Gemma4 assistant drafting requires a layer-split target: tensor-parallel targets shard the K/V cache the drafter reads"
         self.attached_model = weakref.ref(target)
         self.input_layer.attached_model = weakref.ref(target)
+        modules = target.tp_output_rank_modules() if target.loaded_tp else target.modules
+        tn = modules[target.logit_layer_idx - 1]
+        assert type(tn).__name__ == "RMSNorm", type(tn).__name__
+        self.input_layer.target_embedding = weakref.ref(modules[0])
+        self.input_layer.target_norm = weakref.ref(tn)
         tcfg = target.config
         n = tcfg.num_hidden_layers - getattr(tcfg, "num_kv_shared_layers", 0)
         types = list(tcfg.layer_types[:n])
         last_full = max(i for i, t in enumerate(types) if t == "full_attention")
         last_swa = max(i for i, t in enumerate(types) if t == "sliding_attention")
         target_attn = {}
-        for m in target.modules:
+        for m, shard in zip(target.modules, modules):
             attn = getattr(m, "attn", None)
             if isinstance(attn, (Attention, SlidingAttention)):
-                target_attn[attn.layer_idx] = attn
+                target_attn[attn.layer_idx] = (attn, shard.attn if target.loaded_tp else None)
         for attn in self.attn_modules:
             src_idx = last_full if attn.is_full else last_swa
-            tmod = target_attn[src_idx]
+            tmod, shard = target_attn[src_idx]
             kind = "ring" if isinstance(tmod, SlidingAttention) else "paged"
-            attn.attach_source(kind, src_idx, tmod)
+            attn.attach_source(kind, src_idx, tmod, shard)
         # The exported block output is taken before the block's layer_scalar multiply, which is also where the
         # reference records hidden_states[-1] (measured: same scale), so it feeds the drafter as is
         self.draft_verifier_params.update({
             "export_state_layers": {tcfg.num_hidden_layers - 1},
         })
+
+
+    def target_source_keys(self) -> set[str]:
+        """The target's attention modules whose cache the drafter reads, by key. Call after attach_to()"""
+        return {attn.source_module.key for attn in self.attn_modules}
 
 
     def modules_with_target(self, target) -> dict[int, list]:

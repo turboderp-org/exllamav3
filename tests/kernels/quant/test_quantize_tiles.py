@@ -83,7 +83,7 @@ def test_encode_ideal(device, batch_size, K, cb):
 
 
 @pytest.mark.parametrize("K", range(1, 9))
-@pytest.mark.parametrize("cb,L", [(0, 256), (1, 256), (2, 256), (2, 160)])
+@pytest.mark.parametrize("cb,L", [(0, 256), (1, 256), (2, 256), (2, 160), (2, 96)])
 @torch.inference_mode()
 def test_quantize_dispatch(device, K, cb, L):
     torch.manual_seed(12345)
@@ -207,7 +207,7 @@ def test_empty_quantize_tiles(device, K):
     ext.quantize_tiles(x, y, idx, costs[:0], edges[:0], K, False, True)
     with pytest.raises(RuntimeError, match = "incorrect datatype"):
         ext.quantize_tiles(x, y, idx.int(), costs, edges, K, False, True)
-    with pytest.raises(RuntimeError, match = "length 160 requires the mul1 codebook"):
+    with pytest.raises(RuntimeError, match = "row lengths require the mul1 codebook"):
         x160 = torch.empty((0, 160), device = device)
         ext.quantize_tiles(x160, torch.empty_like(x160), torch.empty_like(x160, dtype = torch.short),
                            costs, edges, K, True, False)

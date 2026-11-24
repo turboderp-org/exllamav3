@@ -407,3 +407,32 @@ def test_mla_kv_b_export_roundtrip(tmp_path, device):
     want = t[f"{key}.kv_b_proj.weight"]
     assert got.shape == want.shape
     assert torch.equal(got.cpu().half(), want.cpu().half()), "kv_b reconstruction differs"
+
+
+def test_mla_frequency_table_rescaled(tmp_path, device):
+    """A model whose layer types rotate with different bases hands every layer one per-token frequency table
+    (three-axis positions). A layer told which base the table was built with must give what it gives for a
+    table built with its own, and something else if it is not told."""
+    from exllamav3.util.rope import RopeSettings, RopeStyle, RoPE
+    from testlib.mla import mla_weights
+
+    S = 96
+    t = mla_weights(seed = 61)
+    other = RopeSettings(head_dim = 64, rope_theta = 1e7, rope_style = RopeStyle.NEOX)
+    plain = load_mla(t, tmp_path / "plain", device)
+    told = load_mla(t, tmp_path / "told", device, table_rope_settings = other)
+
+    # (own generator: the tests after this one draw their inputs from the device's)
+    g = torch.Generator(device = "cpu").manual_seed(1)
+    x = (torch.randn((1, S, plain.hidden_size), generator = g) * 0.5).half().to(device)
+    # a position per token and frequency, as the axes of an image interleave over the frequencies
+    pos = torch.randint(0, 400, (S, 32), generator = g).float().to(device)
+    own = (pos * plain.rope.inv_freq).contiguous()
+    foreign = (pos * RoPE(device, other).inv_freq).contiguous()
+
+    def run(module, table):
+        return module.forward(x, {"attn_mode": "flash_attn_nc", "inv_freq": table})
+
+    ref = run(plain, own)
+    assert rel_err(run(told, foreign), ref) < 2e-3
+    assert rel_err(run(plain, foreign), ref) > 5e-2

@@ -3,8 +3,9 @@
 // Templated trellis-quantization (Viterbi) kernel, instantiated per (K, cb) in
 // comp_units/quantize_tiles_inst_k*.cu
 //
-// L is the tile length (number of weights per tail-biting trellis ring). 256 = the 16x16 EXL3 tile;
-// 160 instances (mul1 only) quantize n-gram embedding rows as single vectors. L must be even.
+// L is the tile length (number of weights per tail-biting trellis ring). LT = 256 is the 16x16 EXL3 tile.
+// The LT = 0 instances (mul1 only) take the length at launch (tile_len) and quantize embedding rows as
+// single vectors, whatever their width. L must be even.
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -72,7 +73,7 @@ __device__ __forceinline__ uint32_t qt_warp_min(uint32_t value)
 #endif
 }
 
-template <int K, int cb, int L = 256>
+template <int K, int cb, int LT = 256>
 __global__ __launch_bounds__(qt_num_threads(K, QT_ARCH), qt_min_blocks(K, QT_ARCH))
 void quantize_tiles_kernel
 (
@@ -81,9 +82,13 @@ void quantize_tiles_kernel
     uint16_t* __restrict__ output_indices_ptr,
     half* __restrict__ temp_costs_ptr,
     uint16_t* __restrict__ temp_edges_ptr,
-    const half2* __restrict__ lut
+    const half2* __restrict__ lut,
+    const int tile_len
 )
 {
+    static_assert(LT % 2 == 0);
+    const int L = LT ? LT : tile_len;
+    __builtin_assume(L >= 16);
     extern __shared__ uint8_t shbuf[];
     uint8_t* sh = shbuf;
 
