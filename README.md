@@ -208,6 +208,7 @@ python examples/chat.py -h
 | **HyperCLOVAX**                                   | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM`                          |     ✓     |                       |
 | **Hy3**                                           | `HYV3ForCausalLM`                                                             |            |                       |
 | **Hy4 flash**                                     | `HYV4FlashForConditionalGeneration`                                           |            | Text only             |
+| **Inkling 2**                                     | `Inkling2LoopForConditionalGeneration`                                        |            | Conversion only (*)   |
 | **IQuest-Coder**                                  | `IQuestCoderForCausalLM`                                                      |            |                       |
 | **Kimi Linear**                                   | `KimiLinearForCausalLM`                                                       |            |                       |
 | **Ling 3.x**                                      | `BailingMoeV3ForCausalLM`                                                     |            |                       |
@@ -238,6 +239,10 @@ python examples/chat.py -h
 | **SolarOpen**                                     | `SolarOpenForCausalLM`                                                        |            |                       |
 | **Step 3.5 Flash**                                | `Step3p5ForCausalLM`                                                          |            |                       |
 | **Step 3.7 Flash**                                | `Step3p7ForConditionalGeneration`                                             |     ✓     |                       |
+
+(*) Inkling 2: EXL3 conversion and full-sequence evaluation (no KV cache, so no generation in exllamav3). The NVFP4/MXFP8
+experts of the original checkpoint are first unpacked to BF16 with `util/unpack_inkling2.py`; the vision tower is kept
+unquantized.
 
 Always adding more, stay tuned.
 
