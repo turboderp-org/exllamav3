@@ -61,3 +61,22 @@ def test_explicit_interval_overrides_architecture_default():
 def test_aligned_prefill_interval_is_kept_regardless_of_chunk_size(interval):
     gen = make_generator(recurrent_checkpoint_interval_pp = interval, max_chunk_size = 2048)
     assert gen.recurrent_checkpoint_interval_pp == interval
+
+
+def test_flashstates_defaults():
+    gen = make_generator()
+    assert gen.recurrent_frontier_checkpoints is True
+    assert gen.recurrent_eviction == "lru"
+    assert gen.prefill_cost_coefficients == (1.0, 0.0)
+
+
+def test_gds_eviction_and_cost_coefficients_are_selectable():
+    gen = make_generator(recurrent_eviction = "gds", prefill_cost_coefficients = [1.862e-5, 3.33e-6])
+    assert gen.recurrent_eviction == "gds"
+    assert gen.prefill_cost_coefficients == (1.862e-5, 3.33e-6)
+    assert gen.recurrent_cache.eviction_policy == "gds"
+
+
+def test_unknown_eviction_policy_is_rejected():
+    with pytest.raises(AssertionError, match = "recurrent_eviction"):
+        make_generator(recurrent_eviction = "clock")
