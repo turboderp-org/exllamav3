@@ -251,7 +251,9 @@ class CPUPageCache:
 
     def _build_order(self):
         """
-        Snapshot of the eviction order over current entries; see class docstring.
+        Snapshot of the eviction order over current entries; see class docstring. With aging_lfu on the attached
+        page table, leaves are ordered by effective weight rather than raw recency, so hot prefixes survive
+        while cold tails are pruned first. Without it, the heap key falls back to access_serial.
         """
         entries = self.entries
         children = {h: [] for h in entries}
@@ -267,34 +269,35 @@ class CPUPageCache:
             else:
                 orphan_roots.append(h)
 
+        def weight(h):
+            return pt.effective_weight_hash(h) if pt is not None else 0.0
+
         order = []
-        def prune(root):
+        def prune(roots):
             remaining = {}
             heap = []
-            stack = [root]
-            while stack:
-                h = stack.pop()
-                n = len(children[h])
-                remaining[h] = n
-                if n == 0:
-                    e = entries[h]
-                    heapq.heappush(heap, (e["access_serial"], e["slot"], h))
-                stack.extend(children[h])
+            for root in roots:
+                stack = [root]
+                while stack:
+                    h = stack.pop()
+                    n = len(children[h])
+                    remaining[h] = n
+                    if n == 0:
+                        e = entries[h]
+                        heapq.heappush(heap, (weight(h), e["access_serial"], e["slot"], h))
+                    stack.extend(children[h])
             while heap:
-                _, _, h = heapq.heappop(heap)
+                _, _, _, h = heapq.heappop(heap)
                 order.append(h)
                 ph = entries[h]["prev_hash"]
                 if ph is not None and ph in remaining:
                     remaining[ph] -= 1
                     if remaining[ph] == 0:
                         e = entries[ph]
-                        heapq.heappush(heap, (e["access_serial"], e["slot"], ph))
+                        heapq.heappush(heap, (weight(ph), e["access_serial"], e["slot"], ph))
 
-        serial = lambda h: entries[h]["access_serial"]
-        for root in sorted(orphan_roots, key = serial):
-            prune(root)
-        for root in sorted(roots, key = serial):
-            prune(root)
+        prune(orphan_roots)
+        prune(roots)
 
         self._order = deque(order)
         self._order_pops = 0
