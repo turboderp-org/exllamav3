@@ -45,6 +45,7 @@ eval = [
     "tabulate",
 ]
 examples = [
+    "jinja2>=3.1",
     "blessed",
     "prompt_toolkit",
     "pyperclip",

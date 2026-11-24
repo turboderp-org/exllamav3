@@ -176,17 +176,17 @@ def routing_std_bias(bsz, cfg, y, params):
     return selected_experts, routing_weights
 
 
-# TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
-    """Group-limited DS3 routing (n_group > 1): fp32 logits (the reference gate's precision;
+    """DS3 routing with optional group limits: fp32 logits (the reference gate's precision;
     with hundreds of experts the selection margins sit below fp16 resolution), group scores
     from each group's two best biased scores, the topk_group best groups eligible, top-K over
     those, weights from the unbiased scores. Single rows project with the fixed-order fp32
     GEMV, other row counts with an fp32 matmul; selection and weights run in one kernel
-    (routing_ds3_group). The torch composition stays for the all-experts calibration pass."""
-    if params.get("activate_all_experts"):
+    (routing_ds3_group). FP32-weight gates use the Torch reference path."""
+    fp32_gate = cfg.gate_tensor.dtype == torch.float32
+    if params.get("activate_all_experts") or fp32_gate:
         return _routing_ds3_torch(bsz, cfg, y, params)
-    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    E = cfg.num_experts
     if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
         cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
     if bsz == 1:
@@ -219,21 +219,23 @@ def _routing_ds3_torch(bsz, cfg, y, params):
     if cfg.e_score_correction_bias is not None:
         scores_for_choice = scores_for_choice + cfg.e_score_correction_bias.unsqueeze(0)
 
-    group_scores = (
-        scores_for_choice.view(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
-        .topk(2, dim = -1)[0]
-        .sum(dim = -1)
-    )
-    group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1)
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
-        .reshape(-1, cfg.num_experts)
-    )
-    # -inf, not 0: the selection bias can push eligible scores below zero
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    if cfg.topk_group != cfg.n_group:
+        group_size = cfg.num_experts // cfg.n_group
+        group_scores = (
+            scores_for_choice.view(-1, cfg.n_group, group_size)
+            .topk(min(2, group_size), dim = -1)[0]
+            .sum(dim = -1)
+        )
+        group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
+            .reshape(-1, cfg.num_experts)
+        )
+        # -inf, not 0: the selection bias can push eligible scores below zero
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,
