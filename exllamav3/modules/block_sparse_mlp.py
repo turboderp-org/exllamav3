@@ -1176,6 +1176,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
+        # A single token visits each selected expert once. The eager path already
+        # needs the expert IDs on the host. Reuse the input row directly and sum
+        # in expert order, as in the sorted multi-token path below.
+        elif (
+            y.is_cuda and bsz == 1 and not self.is_quantized and self.bc is None
+            and self.num_local_experts == self.num_experts and not params.get("activate_all_experts")
+            and "capture" not in params and aff_w is None and sens_weights is None
+        ):
+            selected = selected_experts[0].tolist()
+            final_hidden_states = y.new_zeros((1, self.expert_size), dtype = torch.float)
+            for slot, expert_idx in sorted(enumerate(selected), key = lambda item: item[1]):
+                expert = self._torch_expert(expert_idx, y, params)
+                final_hidden_states.add_(expert * routing_weights[:, slot:slot + 1])
+            final_hidden_states = final_hidden_states.view(eshape)
+
         # Torch/C++/fused path
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
@@ -1565,40 +1580,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             current_state = out_state_
                     else:
 
-                        # Torch path
-                        def mlp(exp_i, xc):
-                            u = self.ups[exp_i].forward(xc, params)
-                            if self.gated:
-                                g = self.gates[exp_i].forward(xc, params)
-                                if sens_weights is not None:
-                                    exp_g = exp_i if self.num_local_experts == self.num_experts \
-                                        else exp_i + self.routing_first
-                                    sw = sens_weights[top_x, exp_g]
-                                    routed = sw.nonzero().flatten()
-                                    if routed.numel():
-                                        capture_out_sensitivity(
-                                            params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
-                                            self.downs[exp_i], g[routed], u[routed], self.activation_fn,
-                                            self.act_limit, sw[routed]
-                                        )
-                                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                                self.activation_fn_call(g, u, a, self.act_limit)
-                            else:
-                                a = self.gateless_act(u)
-                                if a.dtype != torch.half:
-                                    a = a.half()
-                            if aff_w is not None:
-                                # Down Hessian also accumulated weighted by this expert's routing weight per row
-                                exp_g = exp_i if self.num_local_experts == self.num_experts \
-                                    else exp_i + self.routing_first
-                                params["capture_row_w"] = aff_w[top_x, exp_g]
-                                try:
-                                    return self.downs[exp_i].forward(a, params)
-                                finally:
-                                    params.pop("capture_row_w", None)
-                            return self.downs[exp_i].forward(a, params)
-
-                        current_state = mlp(expert_idx, current_state)
+                        current_state = self._torch_expert(
+                            expert_idx, current_state, params, top_x, sens_weights, aff_w,
+                        )
 
                     current_state.mul_(w)
                     final_hidden_states.index_add_(0, top_x, current_state)
@@ -1686,6 +1670,38 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
+
+    def _torch_expert(self, exp_i, xc, params, top_x = None, sens_weights = None, aff_w = None):
+        u = self.ups[exp_i].forward(xc, params)
+        if self.gated:
+            g = self.gates[exp_i].forward(xc, params)
+            if sens_weights is not None:
+                exp_g = exp_i if self.num_local_experts == self.num_experts \
+                    else exp_i + self.routing_first
+                sw = sens_weights[top_x, exp_g]
+                routed = sw.nonzero().flatten()
+                if routed.numel():
+                    capture_out_sensitivity(
+                        params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
+                        self.downs[exp_i], g[routed], u[routed], self.activation_fn,
+                        self.act_limit, sw[routed]
+                    )
+            a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+            self.activation_fn_call(g, u, a, self.act_limit)
+        else:
+            a = self.gateless_act(u)
+            if a.dtype != torch.half:
+                a = a.half()
+        if aff_w is not None:
+            # Down Hessian also accumulated weighted by this expert's routing weight per row
+            exp_g = exp_i if self.num_local_experts == self.num_experts \
+                else exp_i + self.routing_first
+            params["capture_row_w"] = aff_w[top_x, exp_g]
+            try:
+                return self.downs[exp_i].forward(a, params)
+            finally:
+                params.pop("capture_row_w", None)
+        return self.downs[exp_i].forward(a, params)
 
     def _capture_all_experts(self, y, selected_experts, sens_weights, aff_w, params):
         """
