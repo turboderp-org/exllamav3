@@ -8,7 +8,9 @@
 #include "compat.cuh"
 #include "graph.cuh"
 #include "gdn.cuh"
+#include <array>
 #include <cmath>
+#include <map>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -2427,4 +2429,50 @@ void batched_scan_replay
         #undef LAUNCH_REPLAY_128
         cuda_check(cudaPeekAtLastError());
     }
+}
+
+void rewind_recurrent_layers
+(
+    std::vector<RewindLayer> const& layers,
+    int slot,
+    int last_history,
+    int num_tokens,
+    int spec_row,
+    int bsz,
+    int seqlen,
+    int tstride,
+    int base_row,
+    int scratch_row
+)
+{
+    TORCH_CHECK(0 <= num_tokens && num_tokens <= last_history,
+                "rewind_recurrent_layers: ", num_tokens, " tokens outside the recorded history of ", last_history);
+    int prefix = last_history + 1 - num_tokens;
+    TORCH_CHECK(num_tokens == 0 || (prefix <= seqlen && 0 <= spec_row && spec_row < bsz),
+                "rewind_recurrent_layers: prefix or batch row outside the staged pass");
+    // Row-major pass: row b's tokens start at b * seqlen, one row apart; token-major: at b, bsz apart
+    size_t row0 = tstride == 1 ? (size_t) spec_row * seqlen : spec_row;
+
+    std::map<int, std::vector<ConvRewindJob>> conv;
+    std::map<std::array<int, 7>, std::vector<ScanReplayJob>> replay;
+    for (const RewindLayer& l : layers)
+    {
+        uintptr_t ring = l.conv + (size_t) slot * l.qkv_dim * l.conv_cols * sizeof(bfloat16);
+        size_t window = (size_t) (l.conv_cols - num_tokens - l.conv_k) * sizeof(bfloat16);
+        conv[l.device_index].emplace_back(ring + window, ring, l.qkv_dim, l.conv_k, l.conv_cols);
+        if (num_tokens == 0) continue;
+
+        size_t state_row = (size_t) l.num_v_heads * l.k_head_dim * l.v_head_dim * (l.state_half ? sizeof(__half) : sizeof(float));
+        replay[{l.device_index, l.kind, l.num_k_heads, l.num_v_heads, l.k_head_dim, l.v_head_dim, l.state_half}].emplace_back(
+            l.qkv + row0 * l.qkv_dim * sizeof(bfloat16),
+            l.g + row0 * l.g_dim * sizeof(float),
+            l.beta + row0 * l.num_v_heads * sizeof(bfloat16),
+            l.state + base_row * state_row,
+            l.state + scratch_row * state_row,
+            l.D, prefix, tstride);
+    }
+    for (auto const& [device_index, jobs] : conv)
+        batched_conv_rewind(jobs, device_index);
+    for (auto const& [key, jobs] : replay)
+        batched_scan_replay(jobs, key[0], key[1], key[2], key[3], key[4], key[5], key[6] != 0);
 }

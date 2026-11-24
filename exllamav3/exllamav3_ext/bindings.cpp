@@ -279,6 +279,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>(),
              py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg(), py::arg("prefix"), py::arg("tstride") = 1);
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    py::class_<RewindLayer>(m, "RewindLayer")
+        .def(py::init([](int device_index, uintptr_t conv, int conv_cols, int conv_k, uintptr_t qkv, uintptr_t g, uintptr_t beta,
+                         int qkv_dim, int g_dim, uintptr_t state, uintptr_t D, int kind, int num_k_heads, int num_v_heads,
+                         int k_head_dim, int v_head_dim, bool state_half)
+            { return RewindLayer{device_index, conv, conv_cols, conv_k, qkv, g, beta, qkv_dim, g_dim, state, D, kind,
+                                 num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half}; }),
+            py::kw_only(), py::arg("device_index"), py::arg("conv"), py::arg("conv_cols"), py::arg("conv_k"), py::arg("qkv"),
+            py::arg("g"), py::arg("beta"), py::arg("qkv_dim"), py::arg("g_dim"), py::arg("state"), py::arg("D"),
+            py::arg("kind"), py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"),
+            py::arg("v_head_dim"), py::arg("state_half"));
+    m.def("rewind_recurrent_layers", &rewind_recurrent_layers, "rewind_recurrent_layers");
     m.def("batched_scan_replay", &batched_scan_replay, py::arg("jobs"), py::arg("device_index"), py::arg("kind"),
           py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
           py::arg("state_half") = false);
