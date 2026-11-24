@@ -840,3 +840,52 @@ def test_processes_sharing_a_root_must_agree_on_the_budget(device, tmp_path):
         json.dump({"root_size": 1 << 20, "pid": 2 ** 22 - 1, "time": time.time()}, f)
     tier_d, disk_d, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_d")
     disk_d.close(); tier_d.close()
+
+
+def test_adopt_does_not_take_back_an_entry_whose_delete_is_queued(device, tmp_path):
+    # An eviction drops a page from the mirror and queues the delete of its file and index row. A prefetch that
+    # asks for the page before the writer gets there must not adopt the row back, and a write of the same page
+    # queued meanwhile (it came back through the CPU tier) must leave one entry counted once. Before the fix,
+    # each such round added a page's size to total_size for good, until the tier thought itself full while
+    # holding almost nothing
+    import sqlite3
+    tier, disk, tensor = build(8, device, tmp_path)
+    prev = None
+    for tag in range(1, 4):
+        fill(tensor, tag, float(tag))
+        tier.store(page(tag, tag, prev), serial = tag)
+        prev = phash(tag)
+    disk.flush()
+
+    def index_size():
+        conn = sqlite3.connect(os.path.join(disk.dir, "index.sqlite"))
+        try:
+            return conn.execute("SELECT COALESCE(SUM(size), 0) FROM pages").fetchone()[0]
+        finally:
+            conn.close()
+
+    size = index_size()
+    assert disk.total_size == size
+    h = phash(3)
+    e = tier.entries[h]
+    for _ in range(3):
+        with disk._lock:                        # holds the writer thread before its next operation
+            disk._drop("page", h)
+            assert disk.write_page(h, phash(2), e["tokens"], e["slot"], [])
+            assert disk.adopt([h]) == 0
+        disk.flush()
+        assert disk.total_size == index_size() == size
+        assert disk.has_page(h) and os.path.exists(disk._page_path(h))
+    assert not disk.pending_deletes
+
+    # A dropped checkpoint is not adopted back either
+    stashed = {"position": 96, "checkpoint_size": 4096, "layer.a": torch.full((8,), 1.0)}
+    assert disk.write_state(h, stashed)
+    disk.flush()
+    with disk._lock:
+        disk._drop("state", h)
+        assert disk.adopt([h]) == 0
+    disk.flush()
+    assert not disk.has_state(h) and disk.total_size == index_size() == size
+    disk.close()
+    tier.close()

@@ -1970,6 +1970,11 @@ class Job:
         Leave a checkpoint at the last page boundary of a job that is ending, so that a follow-up prompt extending
         its output replays less than a page of it: the state itself if it is there or can roll back to it, else
         the rolling checkpoint. The state may be anything from that point on; it is released right after this.
+
+        A job cancelled during prefill leaves one too, where the prefill stopped, if the state is on a page
+        boundary there (prefill chunks are page multiples, so it normally is). Otherwise a retry of the same prompt
+        (a client that timed out and resends it) could only resume from the last prefill interval checkpoint, up
+        to recurrent_checkpoint_interval_pp tokens back, although the K/V pages up to the stop are still cached.
         """
         if not self.generator.rolling_checkpoint:
             return
@@ -1981,9 +1986,9 @@ class Job:
         def past_last(position):
             return position > (self.last_recurrent_checkpoint_pos or 0)
 
-        if state is not None and self.is_prefill_done() and past_last(boundary):
+        if state is not None and past_last(boundary):
             at_boundary = state.settled_at(boundary)
-            if at_boundary or (state.stash_by_rollback and state.can_stash_at(boundary)):
+            if at_boundary or (self.is_prefill_done() and state.stash_by_rollback and state.can_stash_at(boundary)):
                 key = self.page_anchor(boundary)
                 if key is not None:
                     if not at_boundary:
