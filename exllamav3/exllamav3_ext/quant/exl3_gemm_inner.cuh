@@ -222,11 +222,11 @@ void exl3_gemm_kernel_inner
     // TILEBLOCKS_M == 1 (dense / decode): A fragments double-buffered across the fragment stages,
     // as before. TILEBLOCKS_M > 1 (fused MoE prefill tiles): one A fragment per 16-row block,
     // single-buffered, so the row fragments fit alongside the prefetched B fragments
-    register FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
-    register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+    FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
+    FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
+    FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+        FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()
