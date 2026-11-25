@@ -966,8 +966,8 @@ __device__ __forceinline__ void exl3_moe_had_in_128_v
 )
 {
     half4 scales = ((const half4*) scale)[lane];
-    v.x = __hmul2(v.x, scales.x);
-    v.y = __hmul2(v.y, scales.y);
+    v.x = exl3_pin_h2(__hmul2(v.x, scales.x));
+    v.y = exl3_pin_h2(__hmul2(v.y, scales.y));
 
     float v0 = __half2float(__low2half(v.x));
     float v1 = __half2float(__high2half(v.x));
