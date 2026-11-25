@@ -69,16 +69,16 @@ def workload_ids(pos, length):
     return _workload_ids[:, a : a + length]
 
 
-def prev_ids(model, pos, start):
+def add_prev_ids(params, model, pos, start):
     # Models that hash each token with the ids before it (caps "prev_ids") take those from the caller
     n = model.caps.get("prev_ids", 0)
     if not n:
-        return None
+        return
     out = torch.full((1, n), -1, dtype = torch.long)
     m = min(n, start)
     if m:
         out[:, n - m:] = workload_ids(pos - m, m)
-    return out
+    params["prev_ids"] = out
 
 
 def get_lengths(max_length):
@@ -119,8 +119,8 @@ def measure_prefill(args, model, cache, warmup = False):
                         "past_len": start,
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
-                        "prev_ids": prev_ids(model, start + ids_offset, start),
                     }
+                    add_prev_ids(params, model, start + ids_offset, start)
                     ids = workload_ids(start + ids_offset, end - start)
                     if model.pipeline is not None:
                         model.pipeline.prefill(ids, params, "perf")
@@ -170,8 +170,8 @@ def measure_generate(args, model, cache, warmup = False):
                                 "past_len": length + i * seqlen,
                                 "batch_shape": (1, max(length + 256, 256)),
                                 "recurrent_states": recurrent,
-                                "prev_ids": prev_ids(model, ids_offset + length + i, length + i * seqlen),
                             }
+                            add_prev_ids(params, model, ids_offset + length + i, length + i * seqlen)
                             logits = model.forward(workload_ids(ids_offset + length + i, seqlen), params)
                             sample = torch.argmax(logits)
                             sample = sample.cpu()  # force sync
