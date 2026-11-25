@@ -1066,6 +1066,11 @@ Qwen3.8-Flash-Next MTP input layer: the grouped norm over the hyper-connection s
 `rms_norm` launch with weight groups instead of eight torch ops per draft step. `0` restores the torch ops.
 Only tested on ROCm, hence off by default on CUDA; `1` enables it there.
 
+### `EXL3_TP_REWIND_ASYNC` (default: `0`)
+
+Recurrent (GDN) state rewind after a rejected draft is sent to the ranks as a deferred command: no round
+trip, the acknowledgements are collected before the next dispatch. Output is unchanged.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)

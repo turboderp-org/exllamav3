@@ -8,6 +8,8 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
+import os as _os
+_REWIND_ASYNC = _os.environ.get("EXL3_TP_REWIND_ASYNC", "0") == "1"
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
@@ -189,7 +191,14 @@ class GDNState:
             if not self.cache.model.loaded_tp:
                 _rewind_layers(self.cache.get_all_recurrent_layers().values(), *args)
             else:
-                self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache),) + args)
+                m = self.cache.model
+                if _REWIND_ASYNC:
+                    # EXL3_TP_REWIND_ASYNC: no round trip; the acks are collected before the next dispatch
+                    for device in m.active_devices:
+                        m.tp_worker_dispatch(device, mp_cache_recurrent_rewind, (id(self.cache),) + args)
+                    m.tp_pending_acks += list(m.active_devices)
+                else:
+                    m.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache),) + args)
             # The scratch row now holds the committed state: the whole pass, or the replayed
             # accepted prefix. It becomes the base row
             self.parity = 1 - self.parity
