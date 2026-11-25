@@ -33,6 +33,19 @@ def test_geodesic_update_preserves_radius_and_scales_angle_by_depth():
     torch.testing.assert_close(geodesic_update(residual, update * 1e24, 1.0, 0.0, 2), expected)
 
 
+def test_olala_geodesic_fusion_preserves_fp32_arithmetic(device):
+    rng = torch.Generator(device = device).manual_seed(83)
+    residual = torch.randn((2, 17, 1536), generator = rng, device = device)
+    update = torch.randn(residual.shape, generator = rng, device = device)
+    compensation = torch.linspace(1, 9e10, 34, device = device).view(2, 17, 1)
+    scale, bias = residual.new_tensor(0.75), residual.new_tensor(0.125)
+    for decode in (False, True):
+        expected = geodesic_update(residual, update * compensation, scale, bias, 19, use_triton = decode)
+        actual = geodesic_update(residual, update, scale, bias, 19, compensation = compensation,
+                                 preserve_reductions = not decode)
+        torch.testing.assert_close(actual, expected, rtol = 0, atol = 0)
+
+
 @pytest.mark.nogpu
 @pytest.mark.model("olala-hf")
 @pytest.mark.parametrize("multiplier", [None, 16])

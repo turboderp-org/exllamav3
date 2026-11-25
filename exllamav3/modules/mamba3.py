@@ -224,4 +224,5 @@ class Mamba3(RecurrentMixer):
             prev_k = k[:, :, -1]
             prev_v = v[:, :, part][:, :, -1]
         self.save_state(layer, slots, (angle, state, prev_k, prev_v))
-        return torch.cat(outputs, dim = 1).to(out_dtype or torch.float32)
+        output = outputs[0] if len(outputs) == 1 and outputs[0].is_contiguous() else torch.cat(outputs, dim = 1)
+        return output.to(out_dtype or torch.float32)

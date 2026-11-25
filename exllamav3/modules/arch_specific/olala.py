@@ -213,22 +213,26 @@ class OlalaBlock(TensorBundle):
         return [module.optimizer_targets() for module in self.modules]
 
     def forward(self, x, params, out_dtype = None):
-        # Keep the reference arithmetic order for batched prefill and calibration.
-        fused = x.shape[1] == 1 and params.get("recurrent_slots") is not None and "capture" not in params
+        decode = x.shape[1] == 1 and params.get("recurrent_slots") is not None
+        fused = "capture" not in params and (decode or self.mlp.bf16_codebook is not None)
 
-        def residual_update(residual, update, site):
+        def residual_update(residual, update, site, compensation = None):
             return geodesic_update(
                 residual, update, self.tensors[f"geodesic_{site}.scale"],
-                self.tensors[f"geodesic_{site}.bias"], self.layer_idx + 1, use_triton = fused,
+                self.tensors[f"geodesic_{site}.bias"], self.layer_idx + 1, compensation = compensation,
+                use_triton = fused, preserve_reductions = not decode,
             )
 
-        hidden = self.mixer.forward(x, params)
-        if self.gate is not None:
-            hidden = hidden * F.silu(self.gate.forward(x.half(), params, out_dtype = torch.float) + 1.15)
+        if self.gate is None:
+            hidden = self.mixer.forward(x, params)
+        else:
+            projection_input = x.half()
+            hidden = self.mixer.forward(projection_input, params)
+            hidden = hidden * F.silu(self.gate.forward(projection_input, params, out_dtype = torch.float) + 1.15)
         # Some Mamba-3 mixer outputs exceed the FP16 range by orders of magnitude.
         # Divide before the bias-free projection and restore the scale afterward.
         scaled, scale = scale_activation(hidden, 1 / 64, use_triton = "capture" not in params)
-        mixed = self.mixer_proj.forward(scaled, params, out_dtype = torch.float) * scale
-        x = residual_update(x, mixed, "mixer")
+        mixed = self.mixer_proj.forward(scaled, params, out_dtype = torch.float)
+        x = residual_update(x, mixed, "mixer", scale)
         x = residual_update(x, self.mlp.forward(x, params), "mlp")
         return x.to(out_dtype or torch.float32)
