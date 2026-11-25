@@ -1261,6 +1261,42 @@ void exl3_moe_dec_had_gu
                          yh + (int64_t) j * size_k + seg * 128, suh + seg * 128, lane);
 }
 
+// silu(gate) * up for this lane's 4 halves of a 128-segment: act_mul_kernel_h<ACT_SILU>'s half2
+// arithmetic and act_limit clamp, verbatim. gu + off is the gate segment, gu + up_off + off the up one.
+__device__ __forceinline__ half4 exl3_moe_act_128
+(
+    const half* __restrict__ gu,
+    const int64_t off,
+    const int64_t up_off,
+    const float act_limit,
+    const int lane
+)
+{
+    half4 g = ((const half4*) (gu + off))[lane];
+    half4 u = ((const half4*) (gu + up_off + off))[lane];
+
+    // act_mul_kernel_h<ACT_SILU>, per half2
+    half2 xg[2] = { g.x, g.y };
+    half2 yu[2] = { u.x, u.y };
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        half2 x2 = exl3_moe_silu_h2(xg[i]);
+        half2 y2 = yu[i];
+        if (act_limit != 0.0f)
+        {
+            y2 = __hmax2(y2, __float2half2_rn(-act_limit));
+            y2 = __hmin2(y2, __float2half2_rn(act_limit));
+            x2 = __hmin2(x2, __float2half2_rn(act_limit));
+        }
+        xg[i] = __hmul2(x2, y2);
+    }
+    half4 a;
+    a.x = xg[0];
+    a.y = xg[1];
+    return a;
+}
+
 static __global__
 __launch_bounds__(256)
 void exl3_moe_dec_had_act
@@ -1283,28 +1319,7 @@ void exl3_moe_dec_had_act
     const int j = warp_id / k_segs;
     const int seg = warp_id % k_segs;
     const int64_t off = (int64_t) j * size_k + seg * 128;
-    half4 g = ((const half4*) (gu + off))[lane];
-    half4 u = ((const half4*) (gu + (int64_t) S * size_k + off))[lane];
-
-    // act_mul_kernel_h<ACT_SILU>, per half2
-    half2 xg[2] = { g.x, g.y };
-    half2 yu[2] = { u.x, u.y };
-    #pragma unroll
-    for (int i = 0; i < 2; ++i)
-    {
-        half2 x2 = exl3_moe_silu_h2(xg[i]);
-        half2 y2 = yu[i];
-        if (act_limit != 0.0f)
-        {
-            y2 = __hmax2(y2, __float2half2_rn(-act_limit));
-            y2 = __hmin2(y2, __float2half2_rn(act_limit));
-            x2 = __hmin2(x2, __float2half2_rn(act_limit));
-        }
-        xg[i] = __hmul2(x2, y2);
-    }
-    half4 a;
-    a.x = xg[0];
-    a.y = xg[1];
+    half4 a = exl3_moe_act_128(gu, off, (int64_t) S * size_k, act_limit, lane);
     const int e_loc = exl3_moe_local(sel[j], min_e, max_e);
     if (e_loc < 0) return;   // warp-uniform: a pick on another rank
     const half* suh = (const half*) suh_d[e_loc];
@@ -1312,7 +1327,15 @@ void exl3_moe_dec_had_act
 }
 
 // Gate|up (weighted = false: 2S slots, table split at S) or down (weighted: S slots)
-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+//
+// FUSE (EXL3_MOE_DEC_FUSE_IN): 0 reads the rotated input from A_had (written by
+// exl3_moe_dec_had_gu / _had_act); 1 (gate|up) and 2 (down) rotate it in the
+// prologue into LDS instead -- 1 from the token's row of src (= y), 2 from
+// silu(gate) * up of src (= gu) -- with suh_list (the gate|up or down suh table).
+// As in exl3_gemv_mr_fused_single, each warp rotates only the 128-segments its
+// split-K chunk touches and reads only those, so no block barrier is needed; the
+// rotation is the standalone kernels' code on the same values (bit-identical).
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int FUSE = 0>
 static __global__
 __launch_bounds__(WARPS_PER_BLOCK * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
@@ -1323,7 +1346,7 @@ void exl3_moe_dec_dot
     const uintptr_t* __restrict__ svh_list,
     const int64_t* __restrict__ sel,
     const half* __restrict__ weights,      // (S) for the weighted form, else nullptr
-    const half* __restrict__ A_had,        // (slots, size_k)
+    const half* __restrict__ A_had,        // (slots, size_k); FUSE: the source (y or gu)
     void* __restrict__ C,                  // (slots, size_n)
     const int size_k,
     const int size_n,
@@ -1333,7 +1356,10 @@ void exl3_moe_dec_dot
     const int core,
     const int tpb,
     const int min_e,
-    const int max_e
+    const int max_e,
+    const uintptr_t* __restrict__ suh_list = nullptr,   // FUSE: input rotation scales
+    const int top_k = 1,                                // FUSE 1: slot -> token
+    const float act_limit = 0.0f                        // FUSE 2
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -1361,12 +1387,44 @@ void exl3_moe_dec_dot
     }
     const int mat = e_loc + (j < S ? 0 : E);
 
+    const half* A_j = A_had + (int64_t) j * size_k;
+    if constexpr (FUSE != 0)
+    {
+        extern __shared__ char shared_mem[];
+        half* sh_a = (half*) (shared_mem + WARPS_PER_BLOCK * EXL3_GEMV_TILES_TMAX * 16 * sizeof(float));
+        const int num_k_tiles = size_k / 16;
+        const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const int kb0 = exl3_uni(warp_id) * chunk;
+        const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+        const half* suh = (const half*) suh_list[mat];
+        if (kb0 < kb1)
+        {
+            for (int seg = kb0 / 8; seg < (kb1 + 7) / 8; ++seg)
+            {
+                if constexpr (FUSE == 1)
+                    exl3_gemv_had_in_128(A_had + (int64_t) (js / top_k) * size_k + seg * 128,
+                                         sh_a + seg * 128, suh + seg * 128, lane);
+                else
+                {
+                    half4 a = exl3_moe_act_128(A_had, (int64_t) j * size_k + seg * 128,
+                                               (int64_t) S * size_k, act_limit, lane);
+                    exl3_moe_had_in_128_v(a, sh_a + seg * 128, suh + seg * 128, lane);
+                }
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        A_j = sh_a;
+    }
+    constexpr bool A_LDS = FUSE != 0;
+
     if (weights)
     {
         const float w_scale = 0.088388347648f * __half2float(weights[j]);
-        exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1>
+        exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1, A_LDS>
         (
-            A_had + (int64_t) j * size_k, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
+            A_j, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
             C, row_off, size_n, 1, (const half*) svh_list[mat],
             pb->seg_counters + j * n_segs, warp_id, lane, core, tpb,
             w_scale, pb->red_counters, S, size_n, num_tokens
@@ -1374,9 +1432,9 @@ void exl3_moe_dec_dot
     }
     else
     {
-        exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1>
+        exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1, A_LDS>
         (
-            A_had + (int64_t) j * size_k, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
+            A_j, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
             C, row_off, size_n, 1, (const half*) svh_list[mat],
             pb->seg_counters + j * n_segs, warp_id, lane, core, tpb
         );
@@ -1388,7 +1446,8 @@ static void exl3_moe_dec_launch_dot
     Exl3GemvMrParams* pb, const uintptr_t* B_list, const uintptr_t* svh_list, const int64_t* sel,
     const half* weights, const half* A_had, void* C, int size_k, int size_n, int S, int E,
     int num_tokens, int slots, int top_k, int K, int cb, bool c_fp32, int device, cudaStream_t stream,
-    int min_e, int max_e
+    int min_e, int max_e,
+    int fuse = 0, const uintptr_t* suh_list = nullptr, float act_limit = 0.0f   // see exl3_moe_dec_dot
 )
 {
     const int n_tiles = size_n / 16;
@@ -1398,13 +1457,21 @@ static void exl3_moe_dec_launch_dot
     const int tpb = exl3_gemv_tiles_tpb(core, device, n_tiles, slots, warps);
     dim3 grid(n_tiles / tpb, slots);
     dim3 block(warps * 32);
-    size_t smem = exl3_gemv_mr_smem_bytes(warps, 1);
+    size_t smem = exl3_gemv_mr_smem_bytes(warps, 1) + (fuse ? (size_t) size_k * sizeof(half) : 0);
 
+    #define MOE_DEC_L4(bits_val, cfp, codebook, warps_val, fuse_val) \
+        hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, cfp, codebook, warps_val, fuse_val>), grid, block, smem, stream, \
+            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e, \
+            suh_list, top_k, act_limit);
+    #define MOE_DEC_L3F(bits_val, cfp, codebook, warps_val) \
+        switch (fuse) { \
+            case 0: MOE_DEC_L4(bits_val, cfp, codebook, warps_val, 0) break; \
+            case 1: if constexpr (!cfp) { MOE_DEC_L4(bits_val, cfp, codebook, warps_val, 1) } break; \
+            case 2: if constexpr (cfp) { MOE_DEC_L4(bits_val, cfp, codebook, warps_val, 2) } break; \
+        }
     #define MOE_DEC_L3(bits_val, codebook, warps_val) \
-        if (c_fp32) hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, true, codebook, warps_val>), grid, block, smem, stream, \
-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e); \
-        else hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, false, codebook, warps_val>), grid, block, smem, stream, \
-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e);
+        if (c_fp32) { MOE_DEC_L3F(bits_val, true, codebook, warps_val) } \
+        else { MOE_DEC_L3F(bits_val, false, codebook, warps_val) }
     #define MOE_DEC_L2(bits_val, codebook) \
         switch (warps) { \
             case 4:  MOE_DEC_L3(bits_val, codebook, 4)  break; \
@@ -1434,6 +1501,20 @@ static void exl3_moe_dec_launch_dot
     #undef MOE_DEC_L1
     #undef MOE_DEC_L2
     #undef MOE_DEC_L3
+    #undef MOE_DEC_L3F
+    #undef MOE_DEC_L4
+}
+
+// EXL3_MOE_DEC_FUSE_IN=1: exl3_rocm_moe_decode in two launches -- the gate|up and down dot
+// kernels rotate their own input (exl3_moe_dec_dot, FUSE 1 / 2). Read once.
+static bool exl3_moe_dec_fuse_in_enabled()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_MOE_DEC_FUSE_IN");
+        return env && atoi(env) != 0;
+    }();
+    return on;
 }
 
 // Whether exl3_rocm_moe_decode takes a call of S slots (bsz * top_k) at these widths: the same bounds the
@@ -1512,6 +1593,22 @@ void exl3_rocm_moe_decode_ep
     TORCH_CHECK(pb, "moe_decode: parameter block allocation failed");
 
     const int64_t* sel_p = (const int64_t*) sel.data_ptr();
+
+    // Two-launch form: the rotations run inside the dot kernels (LDS: Hi resp. I halves per block)
+    if (exl3_moe_dec_fuse_in_enabled()
+        && exl3_gemv_mr_smem_bytes(16, 1) + (size_t) MAX(Hi, I) * sizeof(half) <= 65536)
+    {
+        exl3_moe_dec_launch_dot(pb, (const uintptr_t*) gu_trellis.data_ptr(), (const uintptr_t*) gu_svh.data_ptr(),
+            sel_p, nullptr, (const half*) y.data_ptr(), gu.data_ptr(), Hi, I, S, E, 1, 2 * S, top_k,
+            (int) K_gu, (int) cb_gu, false, device, stream, min_e, max_e,
+            1, (const uintptr_t*) gu_suh.data_ptr(), 0.0f);
+        exl3_moe_dec_launch_dot(pb, (const uintptr_t*) d_trellis.data_ptr(), (const uintptr_t*) d_svh.data_ptr(),
+            sel_p, (const half*) weights.data_ptr(), (const half*) gu.data_ptr(), out.data_ptr(), I, Ho, S, 0, bsz,
+            S, top_k, (int) K_d, (int) cb_d, true, device, stream, min_e, max_e,
+            2, (const uintptr_t*) d_suh.data_ptr(), (float) act_limit);
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
 
     // 1. gate|up input rotation
     {

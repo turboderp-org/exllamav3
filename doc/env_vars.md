@@ -378,6 +378,13 @@ Sizes the MoE decode scratch for the RDNA decode path, which rotates the gate an
 and needs twice the rows. With `0` (the old size) that path declines verify passes from 5 rows on and
 falls back to the cooperative kernels. CUDA has no such path, so it keeps the old size there.
 
+### `EXL3_MOE_DEC_FUSE_IN` (default: `0`)
+
+ROCm: the RDNA routed-MoE decode op runs in two launches instead of four. The gate|up and down dot kernels
+rotate their own input into LDS (gate|up from the token's row, down from silu(gate) * up), with the same
+per-wave split-K rule as `EXL3_GEMV_MR_FUSE_IN`. This replaces `exl3_moe_dec_had_gu` and
+`exl3_moe_dec_had_act` with the same code on the same values, so the output is bit-identical.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
