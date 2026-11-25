@@ -26,6 +26,9 @@ Contracts (all bitwise; every output buffer sits between sentinel guards, which 
   send_ldim * esize % 128 != 0 and an ldims list of the wrong length are rejected.
 - pg_gather_small (lm-head argmax gather): the same layout for any byte width (int64 indices, fp16 values,
   0/1-wide slices as the caller uses); payloads beyond the 16 KB small buffer are rejected.
+- EXL3_TP_NO_COOP=1 (ordinary instead of cooperative launches; pg_gather's blocks sync through a per-device
+  arrival counter instead of grid.sync()): every gather case, the barriers and the back-to-back mix give the same
+  bytes as above, on two GPUs and on one physical GPU.
 - pg_barrier (fwd_barrier): no rank's stream passes the barrier before every rank's stream has reached it (a
   witness written by a sleeping rank before its barrier is visible to the other rank's stream after its barrier),
   either rank being the coordinator; also when a barrier over a subset of the ranks (the closing barrier of a
@@ -494,6 +497,11 @@ def full_suite(world: int) -> list[dict]:
     return cases
 
 
+def no_coop_suite(world: int) -> list[dict]:
+    """What EXL3_TP_NO_COOP changes: the gathers, with barriers and the mixed back-to-back run around them"""
+    return barrier_cases(world) + gather_cases(world) + [dict(op = "stress", id = "stress", seed = 7, n = 300)]
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Runs
 
@@ -518,6 +526,13 @@ def runs(device, devices):
             elif config == "one_gpu":
                 ranks, envs = single_device_ranks(device, other_device(device, devices))
                 results = run_ranks(suite, ranks, full_suite(world), rank_envs = envs)
+            elif config == "two_gpu_no_coop":
+                ranks = [devices[0].index, devices[1].index]
+                results = run_ranks(suite, ranks, no_coop_suite(world), env = {"EXL3_TP_NO_COOP": "1"})
+            elif config == "one_gpu_no_coop":
+                ranks, envs = single_device_ranks(device, other_device(device, devices))
+                results = run_ranks(suite, ranks, no_coop_suite(world), rank_envs = envs,
+                                    env = {"EXL3_TP_NO_COOP": "1"})
             elif config == "no_fp16_wire":
                 ranks = [devices[0].index, devices[1].index]
                 results = run_ranks(suite, ranks, ar_cases(world), env = {"EXL3_TP_NO_FP16_WIRE": "1"})
@@ -531,6 +546,7 @@ def runs(device, devices):
 
 
 CONFIGS = ("two_gpu", "one_gpu")
+NO_COOP_CONFIGS = ("two_gpu_no_coop", "one_gpu_no_coop")   # EXL3_TP_NO_COOP=1, gathers and barriers only
 
 
 def results_for(runs, config, cid):
@@ -616,14 +632,14 @@ def test_broadcast(runs, config, case):
     check_case(case, outs, ranks)
 
 
-@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("config", CONFIGS + NO_COOP_CONFIGS)
 @pytest.mark.parametrize("case", gather_cases(2), ids = lambda c: c["id"])
 def test_gather(runs, config, case):
     ranks, outs = results_for(runs, config, case["id"])
     check_case(case, outs, ranks)
 
 
-@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("config", CONFIGS + NO_COOP_CONFIGS)
 @pytest.mark.parametrize("case", barrier_cases(2), ids = lambda c: c["id"])
 def test_barrier(runs, config, case):
     ranks, outs = results_for(runs, config, case["id"])
@@ -647,7 +663,7 @@ def test_rejected_inputs(runs, config, what):
     check_case(c, results_for(runs, config, c["id"])[1], ranks)
 
 
-@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("config", CONFIGS + NO_COOP_CONFIGS)
 def test_interleaved_back_to_back(runs, config):
     """300 mixed collectives enqueued with no host synchronization"""
     ranks, outs = results_for(runs, config, "stress")
