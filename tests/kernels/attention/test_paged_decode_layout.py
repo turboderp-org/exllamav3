@@ -56,3 +56,26 @@ def test_decode_layout_vs_prefill(device, head_dim, bits, q_len, group, num_spli
     o_dec = paged_attn_triton_decode(**common, num_splits = num_splits)
     o_pre = paged_attn_triton_prefill(**common)
     torch.testing.assert_close(o_dec, o_pre, rtol = 0, atol = 2e-3)
+
+
+@pytest.mark.parametrize("past,group", [(8193, 2), (16385, 4), (32257, 4)])
+@pytest.mark.parametrize("q_len", [1, 512])
+def test_long_paged_attention_against_fp32(device, past, group, q_len):
+    from testlib.attention import gather_pages, rand_paged_cache, ref_attn
+
+    # Non-aligned tail and shuffled pages exercise bounds and physical page addressing.
+    torch.manual_seed(past + q_len)
+    kv_heads, dim = 2, 128
+    total = past + q_len
+    k, v, table, lengths = rand_paged_cache(1, total, kv_heads, dim, past, device)
+    q = torch.randn(1, q_len, kv_heads * group, dim, dtype = torch.float16, device = device)
+    fn = paged_attn_triton_decode if q_len == 1 else paged_attn_triton_prefill
+    softcap = 150.0 if group == 4 else 0.0
+    window = 32768 if group == 4 else None
+    out = fn(q, None, None, k, v, table, lengths, causal = True, pre_appended_len = q_len,
+             softcap = softcap, window_size = window)
+    keys, values = (gather_pages(t, table, total) for t in (k, v))
+    for row in {0, q_len - 1}:
+        end = past + row + 1
+        reference = ref_attn(q[:, row:row + 1], keys[:, :end], values[:, :end], window = window, softcap = softcap)
+        torch.testing.assert_close(out[:, row:row + 1].float(), reference, atol = 2e-4, rtol = 2e-3)
