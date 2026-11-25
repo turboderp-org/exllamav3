@@ -24,6 +24,9 @@ struct CoopAutotuneCandidate
     int tag;
 };
 
+// Raise the kernel's dynamic-LDS limit to at least smem (never lowers it; see coop_autotune.cu)
+void set_kernel_attr_once(void* kernel, size_t smem);
+
 struct CoopAutotuneLaunch
 {
     void* kernel;
