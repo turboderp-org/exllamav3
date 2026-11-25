@@ -588,7 +588,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # second entry under the same name would silently double memory forever)
         bszn_rows = MAX_BSZN * numex
 
-        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        # The RDNA decode path (run_bszN_rdna) rotates gate and up input separately: 2 * bszn_rows rows of scratch,
+        # without which it declines from 5 rows on (EXL3_MOE_DEC_ROWS=0: the old size; default on ROCm only, CUDA
+        # has no such path)
+        _dec_rows = os.environ.get("EXL3_MOE_DEC_ROWS")
+        _dec_rows = _dec_rows != "0" if _dec_rows is not None else torch.version.hip is not None
+        hid_rows = 2 * bszn_rows if _dec_rows else bszn_rows
+        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, hid_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
         temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
         temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")

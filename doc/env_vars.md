@@ -372,6 +372,12 @@ ROCm: when the shared expert runs as a fused one-expert launch (`EXL3_MOE_SHARED
 from the routed decode call, and routed + gated shared contribution are merged in one kernel instead of
 the shared expert's own call plus five torch ops. `0` restores the separate path.
 
+### `EXL3_MOE_DEC_ROWS` (default: `1` on ROCm, `0` on CUDA)
+
+Sizes the MoE decode scratch for the RDNA decode path, which rotates the gate and up inputs separately
+and needs twice the rows. With `0` (the old size) that path declines verify passes from 5 rows on and
+falls back to the cooperative kernels. CUDA has no such path, so it keeps the old size there.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
