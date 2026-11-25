@@ -135,6 +135,24 @@ void exl3_rocm_moe_decode_ep
     int64_t max_expert
 );
 
+// exl3_rocm_moe_decode_ep (fused rotations) with the shared expert's slice folded into the two launches
+// (EXL3_ROCM_MOE_SH_FOLD): out rows 0..bsz-1 = routed sum + sigmoid(y . gate_w) * shared slice. out needs
+// S + bsz rows, sh_gu (2 * bsz, I_sh) is the shared gate|up scratch
+bool exl3_rocm_moe_decode_fold_fits(int S, int B, int Hi, int I, int Ho, int K_gu, int K_d, int cb,
+                                     int I_sh, int K_sh_gu, int K_sh_d, int cb_sh);
+void exl3_rocm_moe_decode_fold
+(
+    const at::Tensor& y, const at::Tensor& sel, const at::Tensor& weights,
+    const at::Tensor& gu_trellis, const at::Tensor& gu_suh, const at::Tensor& gu_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    at::Tensor& gu, at::Tensor& out,
+    int64_t K_gu, int64_t cb, int64_t K_d, double act_limit, int64_t min_expert, int64_t max_expert,
+    const at::Tensor& sh_gu_trellis, const at::Tensor& sh_gu_suh, const at::Tensor& sh_gu_svh,
+    const at::Tensor& sh_d_trellis, const at::Tensor& sh_d_suh, const at::Tensor& sh_d_svh,
+    at::Tensor& sh_gu, int64_t K_sh_gu, int64_t K_sh_d, double sh_act_limit,
+    const c10::optional<at::Tensor>& gate_w
+);
+
 // dst = routed + sigmoid(y . gate_w) * sh per token (gate_w absent: + sh); all float rows but y (half)
 void exl3_rocm_moe_merge_shared
 (

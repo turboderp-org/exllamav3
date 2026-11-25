@@ -108,6 +108,11 @@ struct BC_BlockSparseMLP
     at::Tensor sh_rdna_d_t, sh_rdna_d_s, sh_rdna_d_v;       // (1)
     int sh_rdna_K_gu = 0, sh_rdna_K_d = 0, sh_rdna_cb = 0;
     float sh_rdna_act_limit = 0.0f;
+    // EXL3_ROCM_MOE_SH_FOLD: this rank's shared-expert slice folded into the routed decode launches
+    // (exl3_rocm_moe_decode_fold); the tables above, sized for the slice, plus its gate|up scratch
+    bool sh_fold = false;
+    int sh_fold_I = 0;
+    at::Tensor sh_fold_gu;                 // (2 * MAX_BSZN, I_sh) half
     bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
 #endif
 

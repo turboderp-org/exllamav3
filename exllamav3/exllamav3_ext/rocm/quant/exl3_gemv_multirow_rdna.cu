@@ -510,6 +510,92 @@ __device__ __forceinline__ void exl3_gemv_mr_zero_epilogue
     }
 }
 
+// -----------------------------------------------------------------------------
+// Folded shared expert (EXL3_ROCM_MOE_SH_FOLD): grouped reduce with one extra row
+// -----------------------------------------------------------------------------
+// The down launch of exl3_rocm_moe_decode with the shared expert folded in has
+// red_target = S + B slots for B = num_tokens tokens: S = B * top_k routed rows
+// (token t's at t * top_k ..), then one shared row per token at S + t, already
+// scaled by its gate. Token t's sum is its routed rows in order, then its shared
+// row, written to row t; every row read for token t is >= t and every row
+// written before it is < t, so the in-place write never clobbers a pending read.
+__device__ __forceinline__ void exl3_moe_fold_reduce
+(
+    float* C, const int size_n, const int seg, const int lane, const int red_target, const int num_tokens
+)
+{
+    const int S = red_target - num_tokens;
+    const int top_k = S / num_tokens;
+    const int col0 = seg * 128 + lane;
+    for (int t = 0; t < num_tokens; ++t)
+    {
+        const float* C_ = C + (int64_t) t * top_k * size_n + col0;
+        float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int jj = 0; jj < top_k; ++jj)
+        {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) sum[c] += C_[c * 32];
+            C_ += size_n;
+        }
+        const float* Cs = C + (int64_t) (S + t) * size_n + col0;
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) sum[c] += Cs[c * 32];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) C[(int64_t) t * size_n + col0 + c * 32] = sum[c];
+    }
+}
+
+// exl3_gemv_fused_epilogue<true> (store, segment arrival, rotation, reduction arrival) with the fold reduce
+__device__ __forceinline__ void exl3_moe_fold_epilogue
+(
+    const float accum, float* C, const int64_t row_off, const int size_n, const int tile_n, const int lane,
+    const half* __restrict__ svh, const float scale, int* seg_counter, int* red_counter,
+    const int red_target, const int num_tokens
+)
+{
+    if (lane < 16) C[row_off + tile_n * 16 + lane] = accum;
+    __threadfence();
+    int old = 0;
+    if (lane == 0) old = atomicAdd(seg_counter, 1);
+    old = __shfl(old, 0, 32);
+    if (old != 7) return;
+    __threadfence();
+    if (lane == 0) *seg_counter = 0;
+    const int seg = tile_n / 8;
+    exl3_gemv_had_out_128_f(C + row_off + (int64_t) seg * 128, svh + seg * 128, scale, lane);
+    __threadfence();
+    if (lane == 0) old = atomicAdd(red_counter, 1);
+    old = __shfl(old, 0, 32);
+    if (old != red_target - 1) return;
+    __threadfence();
+    if (lane == 0) *red_counter = 0;
+    exl3_moe_fold_reduce(C, size_n, seg, lane, red_target, num_tokens);
+}
+
+// exl3_gemv_mr_zero_epilogue<true> with the fold reduce (a routed pick on another rank)
+__device__ __forceinline__ void exl3_moe_fold_zero_epilogue
+(
+    float* C, const int64_t row_off, const int size_n, const int tile_n, const int lane,
+    int* seg_counter, int* red_counter, const int red_target, const int num_tokens
+)
+{
+    if (lane < 16) C[row_off + tile_n * 16 + lane] = 0.0f;
+    __threadfence();
+    int old = 0;
+    if (lane == 0) old = atomicAdd(seg_counter, 1);
+    old = __shfl(old, 0, 32);
+    if (old != 7) return;
+    __threadfence();
+    if (lane == 0) *seg_counter = 0;
+    __threadfence();
+    if (lane == 0) old = atomicAdd(red_counter, 1);
+    old = __shfl(old, 0, 32);
+    if (old != red_target - 1) return;
+    __threadfence();
+    if (lane == 0) *red_counter = 0;
+    exl3_moe_fold_reduce(C, size_n, tile_n / 8, lane, red_target, num_tokens);
+}
+
 // =============================================================================
 // Kernel 2: the split-K GEMV, M rows per warp, fused output epilogue
 // =============================================================================
@@ -538,7 +624,8 @@ __device__ __forceinline__ void exl3_gemv_mr_body
     int* red_counters = nullptr,       // weighted form: per-segment rotated-slot counters
     const int red_target = 0,          // weighted form: packed slot count
     const int size_n = 0,              // weighted form: row stride of C (reduction)
-    const int num_tokens = 1
+    const int num_tokens = 1,
+    const bool fold = false            // weighted form: the folded-shared reduce (exl3_moe_fold_reduce)
 )
 {
     extern __shared__ char shared_mem[];
@@ -560,6 +647,18 @@ __device__ __forceinline__ void exl3_gemv_mr_body
     if (warp_id != 0) return;
     if constexpr (M == 1)
     {
+        if (red_counters && fold)
+        {
+            if constexpr (c_fp32)
+                for (int t = 0; t < tpb; ++t)
+                    exl3_moe_fold_epilogue
+                    (
+                        acc[t], (float*) Cb, row_off, size_n, tile_n + t, lane, svh, w_scale,
+                        seg_counters + (tile_n + t) / 8, red_counters + (tile_n + t) / 8,
+                        red_target, num_tokens
+                    );
+            return;
+        }
         if (red_counters)
         {
             // Weighted reduce: exactly exl3_mgemv_store_or_fuse's fused call
@@ -1441,6 +1540,186 @@ void exl3_moe_dec_dot
     }
 }
 
+// -----------------------------------------------------------------------------
+// exl3_moe_dec_dot with the shared expert folded in (EXL3_ROCM_MOE_SH_FOLD)
+// -----------------------------------------------------------------------------
+// The routed slots come first and run exactly as in exl3_moe_dec_dot (FUSE 1 /
+// 2 forms only); the shared expert's B = num_tokens tokens follow as extra slots
+// at its own bit width (bits_sh) and pointer tables (sh_*: gate, up for the
+// gate|up launch; down for the down launch), on whatever channel slice of the
+// shared expert this rank holds (I_sh wide):
+//   gate|up (FUSE 1): slots 2S + w * B + t (w 0 gate, 1 up), output rows of sh_gu (2B, I_sh)
+//   down    (FUSE 2): slots S + t, input silu(gate) * up from sh_gu, output row S + t of C
+//                     scaled by g_t = sigmoid(y_t . gate_w) (1 without a gate), summed into
+//                     token t by the fold reduce
+// Under tensor parallelism every rank adds its slice's part before the all-reduce, which
+// completes the sum. One launch each instead of the shared expert's own two plus the merge.
+template <int bits, int bits_sh, bool c_fp32, int cb, int WARPS_PER_BLOCK, int FUSE>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_moe_dec_dot_fold
+(
+    Exl3GemvMrParams* __restrict__ pb,
+    const uintptr_t* __restrict__ B_list,
+    const uintptr_t* __restrict__ svh_list,
+    const int64_t* __restrict__ sel,
+    const half* __restrict__ weights,      // (S) for the down launch, else nullptr
+    const half* __restrict__ A_src,        // FUSE 1: y (B, size_k); FUSE 2: routed gu (2S, size_k)
+    void* __restrict__ C,                  // routed output (slots, size_n); down: + B shared rows
+    const int size_k,
+    const int size_n,
+    const int S,
+    const int E,
+    const int num_tokens,                  // B
+    const int core,
+    const int tpb,
+    const int min_e,
+    const int max_e,
+    const uintptr_t* __restrict__ suh_list,
+    const int top_k,
+    const float act_limit,
+    const uintptr_t* __restrict__ sh_B,
+    const uintptr_t* __restrict__ sh_svh,
+    const uintptr_t* __restrict__ sh_suh,
+    half* __restrict__ sh_gu,              // (2B, I_sh)
+    const int I_sh,
+    const float sh_act_limit,
+    const half* __restrict__ y,            // (B, Hi), for the shared gate
+    const half* __restrict__ gate_w,       // (Hi) or nullptr
+    const int Hi
+)
+{
+    static_assert(FUSE == 1 || FUSE == 2, "fold: fused-rotation forms only");
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int j = blockIdx.y;
+    const int tile_n = blockIdx.x * tpb;
+    const int n_segs = size_n / 128;
+    const int B = num_tokens;
+    const int routed_slots = FUSE == 1 ? 2 * S : S;
+    const int red_target = S + B;          // down: every routed slot and every shared row arrives
+
+    extern __shared__ char shared_mem[];
+    half* sh_a = (half*) (shared_mem + WARPS_PER_BLOCK * EXL3_GEMV_TILES_TMAX * 16 * sizeof(float));
+
+    // Rotation of this warp's split-K chunk of a k-wide input into sh_a; seg_fn(seg) rotates one segment
+    auto rotate = [&](const int k, auto seg_fn)
+    {
+        const int num_k_tiles = k / 16;
+        const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const int kb0 = exl3_uni(warp_id) * chunk;
+        const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+        if (kb0 < kb1)
+            for (int seg = kb0 / 8; seg < (kb1 + 7) / 8; ++seg) seg_fn(seg);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    };
+
+    if (j < routed_slots)
+    {
+        const int n_tiles = size_n / 16;
+        const int js = j < S ? j : j - S;
+        const int e_loc = exl3_moe_local(sel[js], min_e, max_e);
+        const int64_t row_off = (int64_t) j * size_n;
+        if (e_loc < 0)
+        {
+            if constexpr (FUSE == 2)
+                if (warp_id == 0)
+                    for (int t = 0; t < tpb; ++t)
+                        exl3_moe_fold_zero_epilogue
+                        (
+                            (float*) C, row_off, size_n, tile_n + t, lane,
+                            pb->seg_counters + j * n_segs + (tile_n + t) / 8,
+                            pb->red_counters + (tile_n + t) / 8, red_target, B
+                        );
+            return;
+        }
+        const int mat = e_loc + (j < S ? 0 : E);
+        const half* suh = (const half*) suh_list[mat];
+        if constexpr (FUSE == 1)
+            rotate(size_k, [&](int seg) {
+                exl3_gemv_had_in_128(A_src + (int64_t) (js / top_k) * size_k + seg * 128,
+                                     sh_a + seg * 128, suh + seg * 128, lane);
+            });
+        else
+            rotate(size_k, [&](int seg) {
+                half4 a = exl3_moe_act_128(A_src, (int64_t) j * size_k + seg * 128,
+                                           (int64_t) S * size_k, act_limit, lane);
+                exl3_moe_had_in_128_v(a, sh_a + seg * 128, suh + seg * 128, lane);
+            });
+        if constexpr (FUSE == 2)
+        {
+            const float w_scale = 0.088388347648f * __half2float(weights[j]);
+            exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1, true>
+            (
+                sh_a, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
+                C, row_off, size_n, 1, (const half*) svh_list[mat],
+                pb->seg_counters + j * n_segs, warp_id, lane, core, tpb,
+                w_scale, pb->red_counters, red_target, size_n, B, true
+            );
+        }
+        else
+        {
+            exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, 1, true>
+            (
+                sh_a, size_k, (const uint16_t*) B_list[mat], size_k, n_tiles, tile_n,
+                C, row_off, size_n, 1, (const half*) svh_list[mat],
+                pb->seg_counters + j * n_segs, warp_id, lane, core, tpb
+            );
+        }
+        return;
+    }
+
+    // Shared expert slots
+    if constexpr (FUSE == 1)
+    {
+        const int js2 = j - routed_slots;
+        const int w = js2 / B;             // 0 gate, 1 up
+        const int t = js2 - w * B;
+        const int n_tiles_sh = I_sh / 16;
+        if (tile_n >= n_tiles_sh) return;  // block-uniform
+        const half* suh = (const half*) sh_suh[w];
+        rotate(size_k, [&](int seg) {
+            exl3_gemv_had_in_128(A_src + (int64_t) t * size_k + seg * 128, sh_a + seg * 128, suh + seg * 128, lane);
+        });
+        exl3_gemv_mr_body<bits_sh, false, cb, WARPS_PER_BLOCK, 1, true>
+        (
+            sh_a, size_k, (const uint16_t*) sh_B[w], size_k, n_tiles_sh, tile_n,
+            sh_gu, (int64_t) js2 * I_sh, I_sh, 1, (const half*) sh_svh[w],
+            pb->seg_counters + j * n_segs, warp_id, lane, core, tpb
+        );
+    }
+    else
+    {
+        const int t = j - routed_slots;
+        const int n_tiles = size_n / 16;
+        const half* suh = (const half*) sh_suh[0];
+        rotate(I_sh, [&](int seg) {
+            half4 a = exl3_moe_act_128(sh_gu, (int64_t) t * I_sh + seg * 128, (int64_t) B * I_sh, sh_act_limit, lane);
+            exl3_moe_had_in_128_v(a, sh_a + seg * 128, suh + seg * 128, lane);
+        });
+        // Shared gate, computed by every warp in the same order (identical in all of them)
+        float g = 1.0f;
+        if (gate_w)
+        {
+            float acc = 0.0f;
+            for (int h = lane; h < Hi; h += 32)
+                acc += __half2float(y[(int64_t) t * Hi + h]) * __half2float(gate_w[h]);
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 32);
+            g = 1.0f / (1.0f + expf(-acc));
+        }
+        exl3_gemv_mr_body<bits_sh, c_fp32, cb, WARPS_PER_BLOCK, 1, true>
+        (
+            sh_a, I_sh, (const uint16_t*) sh_B[0], I_sh, n_tiles, tile_n,
+            C, (int64_t) j * size_n, size_n, 1, (const half*) sh_svh[0],
+            pb->seg_counters + j * n_segs, warp_id, lane, core, tpb,
+            0.088388347648f * g, pb->red_counters, red_target, size_n, B, true
+        );
+    }
+}
+
 static void exl3_moe_dec_launch_dot
 (
     Exl3GemvMrParams* pb, const uintptr_t* B_list, const uintptr_t* svh_list, const int64_t* sel,
@@ -1503,6 +1782,123 @@ static void exl3_moe_dec_launch_dot
     #undef MOE_DEC_L3
     #undef MOE_DEC_L3F
     #undef MOE_DEC_L4
+}
+
+// Launch of exl3_moe_dec_dot_fold. Shared-expert widths: 8 bits (the only one instantiated);
+// exl3_rocm_moe_decode_fold_fits() gates the call
+static void exl3_moe_dec_launch_fold
+(
+    Exl3GemvMrParams* pb, const uintptr_t* B_list, const uintptr_t* svh_list, const int64_t* sel,
+    const half* weights, const half* A_src, void* C, int size_k, int size_n, int S, int E,
+    int B, int routed_slots, int top_k, int K, int cb, int device, cudaStream_t stream,
+    int min_e, int max_e, int fuse, const uintptr_t* suh_list, float act_limit,
+    const uintptr_t* sh_B, const uintptr_t* sh_svh, const uintptr_t* sh_suh, half* sh_gu,
+    int I_sh, float sh_act_limit, const half* y, const half* gate_w, int Hi
+)
+{
+    const int n_tiles = size_n / 16;
+    const int warps = exl3_gemv_mr_warps(size_k, n_tiles, top_k);
+    const int core = exl3_gemv_core_mode();
+    const int slots = routed_slots + (fuse == 1 ? 2 * B : B);
+    const int tpb = exl3_gemv_tiles_tpb(core, device, n_tiles, routed_slots, warps);
+    dim3 grid(n_tiles / tpb, slots);
+    dim3 block(warps * 32);
+    size_t smem = exl3_gemv_mr_smem_bytes(warps, 1) + (size_t) MAX(size_k, I_sh) * sizeof(half);
+
+    #define MOE_FOLD_L4(bits_val, codebook, warps_val) \
+        if (fuse == 1) hipLaunchKernelGGL((exl3_moe_dec_dot_fold<bits_val, 8, false, codebook, warps_val, 1>), grid, block, smem, stream, \
+            pb, B_list, svh_list, sel, weights, A_src, C, size_k, size_n, S, E, B, core, tpb, min_e, max_e, \
+            suh_list, top_k, act_limit, sh_B, sh_svh, sh_suh, sh_gu, I_sh, sh_act_limit, y, gate_w, Hi); \
+        else hipLaunchKernelGGL((exl3_moe_dec_dot_fold<bits_val, 8, true, codebook, warps_val, 2>), grid, block, smem, stream, \
+            pb, B_list, svh_list, sel, weights, A_src, C, size_k, size_n, S, E, B, core, tpb, min_e, max_e, \
+            suh_list, top_k, act_limit, sh_B, sh_svh, sh_suh, sh_gu, I_sh, sh_act_limit, y, gate_w, Hi);
+    #define MOE_FOLD_L2(bits_val, codebook) \
+        switch (warps) { \
+            case 4:  MOE_FOLD_L4(bits_val, codebook, 4)  break; \
+            case 8:  MOE_FOLD_L4(bits_val, codebook, 8)  break; \
+            case 16: MOE_FOLD_L4(bits_val, codebook, 16) break; \
+        }
+    #define MOE_FOLD_L1(bits_val) \
+        switch (cb) { \
+            case 0: MOE_FOLD_L2(bits_val, 0) break; \
+            case 1: MOE_FOLD_L2(bits_val, 1) break; \
+            case 2: MOE_FOLD_L2(bits_val, 2) break; \
+        }
+    switch (K)
+    {
+        case 2: MOE_FOLD_L1(2) break;
+        case 3: MOE_FOLD_L1(3) break;
+        case 4: MOE_FOLD_L1(4) break;
+        case 5: MOE_FOLD_L1(5) break;
+        case 6: MOE_FOLD_L1(6) break;
+        case EXL3_HALF_BITS(2): MOE_FOLD_L2(EXL3_HALF_BITS(2), 2) break;
+        case EXL3_HALF_BITS(3): MOE_FOLD_L2(EXL3_HALF_BITS(3), 2) break;
+    }
+    #undef MOE_FOLD_L1
+    #undef MOE_FOLD_L2
+    #undef MOE_FOLD_L4
+}
+
+// Whether exl3_rocm_moe_decode_fold takes a call: the decode op's bounds plus the shared slots
+bool exl3_rocm_moe_decode_fold_fits(int S, int B, int Hi, int I, int Ho, int K_gu, int K_d, int cb,
+                                     int I_sh, int K_sh_gu, int K_sh_d, int cb_sh)
+{
+    auto k_ok = [](int K) { return (K >= 2 && K <= 6) || K == EXL3_HALF_BITS(2) || K == EXL3_HALF_BITS(3); };
+    return exl3_rocm_moe_decode_fits(S, Hi, I, Ho, K_gu, cb, K_d, cb)
+        && k_ok(K_gu) && k_ok(K_d) && K_sh_gu == 8 && K_sh_d == 8 && cb_sh == cb
+        && I_sh % 128 == 0 && I_sh > 0 && I_sh <= I
+        && (2 * S + 2 * B) * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS
+        && (S + B) * (Ho / 128) <= EXL3_MGEMV_SEG_COUNTERS;
+}
+
+// exl3_rocm_moe_decode_ep with the shared expert folded into its two launches (rotations fused, as
+// EXL3_MOE_DEC_FUSE_IN): out rows 0..bsz-1 = routed sum + gate * this rank's shared-expert slice
+void exl3_rocm_moe_decode_fold
+(
+    const at::Tensor& y, const at::Tensor& sel, const at::Tensor& weights,
+    const at::Tensor& gu_trellis, const at::Tensor& gu_suh, const at::Tensor& gu_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    at::Tensor& gu, at::Tensor& out,
+    int64_t K_gu, int64_t cb, int64_t K_d, double act_limit, int64_t min_expert, int64_t max_expert,
+    const at::Tensor& sh_gu_trellis, const at::Tensor& sh_gu_suh, const at::Tensor& sh_gu_svh,   // (2)
+    const at::Tensor& sh_d_trellis, const at::Tensor& sh_d_suh, const at::Tensor& sh_d_svh,      // (1)
+    at::Tensor& sh_gu, int64_t K_sh_gu, int64_t K_sh_d, double sh_act_limit,
+    const c10::optional<at::Tensor>& gate_w
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    const int bsz = (int) y.size(0);
+    const int Hi = (int) y.size(-1);
+    const int top_k = (int) sel.size(-1);
+    const int S = bsz * top_k;
+    const int E = (int) d_trellis.size(0);
+    const int I = (int) gu.size(-1);
+    const int Ho = (int) out.size(-1);
+    const int I_sh = (int) sh_gu.size(-1);
+    TORCH_CHECK(exl3_rocm_moe_decode_fold_fits(S, bsz, Hi, I, Ho, (int) K_gu, (int) K_d, (int) cb, I_sh,
+                (int) K_sh_gu, (int) K_sh_d, (int) cb), "moe_decode_fold: shape outside the op's bounds");
+    TORCH_CHECK(gu.numel() >= (int64_t) 2 * S * I && out.numel() >= (int64_t) (S + bsz) * Ho
+                && sh_gu.numel() >= (int64_t) 2 * bsz * I_sh, "moe_decode_fold: scratch too small");
+    int device = y.get_device();
+    Exl3GemvMrParams* pb = exl3_gemv_mr_param_block(device, true);
+    TORCH_CHECK(pb, "moe_decode_fold: parameter block allocation failed");
+    const int64_t* sel_p = (const int64_t*) sel.data_ptr();
+    const half* yp = (const half*) y.data_ptr();
+    const half* gw = gate_w ? (const half*) gate_w->data_ptr() : nullptr;
+
+    exl3_moe_dec_launch_fold(pb, (const uintptr_t*) gu_trellis.data_ptr(), (const uintptr_t*) gu_svh.data_ptr(),
+        sel_p, nullptr, yp, gu.data_ptr(), Hi, I, S, E, bsz, 2 * S, top_k, (int) K_gu, (int) cb, device, stream,
+        (int) min_expert, (int) max_expert, 1, (const uintptr_t*) gu_suh.data_ptr(), 0.0f,
+        (const uintptr_t*) sh_gu_trellis.data_ptr(), (const uintptr_t*) sh_gu_svh.data_ptr(),
+        (const uintptr_t*) sh_gu_suh.data_ptr(), (half*) sh_gu.data_ptr(), I_sh, (float) sh_act_limit, yp, gw, Hi);
+    exl3_moe_dec_launch_fold(pb, (const uintptr_t*) d_trellis.data_ptr(), (const uintptr_t*) d_svh.data_ptr(),
+        sel_p, (const half*) weights.data_ptr(), (const half*) gu.data_ptr(), out.data_ptr(), I, Ho, S, 0, bsz,
+        S, top_k, (int) K_d, (int) cb, device, stream, (int) min_expert, (int) max_expert, 2,
+        (const uintptr_t*) d_suh.data_ptr(), (float) act_limit,
+        (const uintptr_t*) sh_d_trellis.data_ptr(), (const uintptr_t*) sh_d_svh.data_ptr(),
+        (const uintptr_t*) sh_d_suh.data_ptr(), (half*) sh_gu.data_ptr(), I_sh, (float) sh_act_limit, yp, gw, Hi);
+    cuda_check(cudaPeekAtLastError());
 }
 
 // EXL3_MOE_DEC_FUSE_IN=1: exl3_rocm_moe_decode in two launches -- the gate|up and down dot

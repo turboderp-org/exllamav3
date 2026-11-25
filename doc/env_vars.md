@@ -394,6 +394,16 @@ and at decode sizes its cooperative launch is the largest single cause of that r
 next all-reduce. Different kernels from the cooperative path, so the output is not bit-identical to it.
 Gated SiLU shared experts without biases only; anything else keeps the cooperative launch.
 
+### `EXL3_ROCM_MOE_SH_FOLD` (default: `0`)
+
+ROCm, with `EXL3_MOE_DEC_FUSE_IN`: fold the shared expert into the two launches of the RDNA routed-MoE decode
+op as extra slots at its own bit width (8-bit shared experts only), gated by `sigmoid(y . gate_w)` inside the
+down launch's grouped reduce, so its own launches and the merge kernel go away. Under tensor parallelism the
+shared expert then splits across ranks in 128-channel units instead of sitting whole on one rank; each rank
+folds its slice and the all-reduce completes the sum. Takes precedence over `EXL3_ROCM_MOE_SH_DEC`; calls
+outside its bounds take the unfolded path. Different summation from the other paths, so the output is not
+bit-identical to them; deterministic.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

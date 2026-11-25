@@ -73,6 +73,10 @@ _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
 # Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
 # three-launch BC_GatedMLP graph
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
+# EXL3_ROCM_MOE_SH_FOLD=1 (ROCm): the shared expert's slice is folded into the routed decode launches on every
+# rank (BC_BlockSparseMLP::sh_fold), so under TP it splits across ranks in 128-channel units instead of sitting
+# whole on one
+_moe_sh_fold = os.environ.get("EXL3_ROCM_MOE_SH_FOLD", "0") != "0" and torch.version.hip is not None
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -1827,7 +1831,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         tpa_list = [tpa]
         if self.shared_experts:
             sh = self.shared_experts.make_tp_allocation(options)
-            if self.shared_coop_ok():
+            if self.shared_coop_ok() and not _moe_sh_fold:
                 for t in sh:
                     t.max_devices = 1
             tpa_list += sh
