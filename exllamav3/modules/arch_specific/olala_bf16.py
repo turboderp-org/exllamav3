@@ -132,6 +132,22 @@ def _finish(X, Ids, Scales, Weights, Y, WIDTH: tl.constexpr, TOP_K: tl.constexpr
     tl.store(Y + row * WIDTH + col, tl.sum(x * w[:, None], 0))
 
 
+@triton.jit
+def _expert_tiles(Sorted, Ends, Tiles, SLOTS, step, EXPERTS: tl.constexpr, M: tl.constexpr):
+    # Upper bounds give each expert's row range, including empty experts.
+    i = tl.arange(0, EXPERTS)
+    end = tl.full((EXPERTS,), 0, tl.int32)
+    while step > 0:
+        probe = end + step
+        expert = tl.load(Sorted + probe - 1, probe <= SLOTS, EXPERTS)
+        end = tl.where(expert <= i, probe, end)
+        step = step // 2
+    prev = tl.gather(end, tl.maximum(i - 1, 0), 0)
+    count = end - tl.where(i > 0, prev, 0)
+    tl.store(Ends + i, end)
+    tl.store(Tiles + i, tl.cumsum((count + M - 1) // M))
+
+
 def routed_experts(moe, latent, ids, weights):
     rows, top_k = ids.shape
     slots = rows * top_k
@@ -142,12 +158,11 @@ def routed_experts(moe, latent, ids, weights):
     if rows > 1:
         # Reuse the token-to-expert assignment for both projections. Each expert
         # owns a contiguous range of tiles, including its partially filled last tile.
-        order = ids.flatten().argsort()
-        count = ids.new_zeros(moe.num_experts, dtype = torch.int32)
-        count.scatter_add_(0, ids.flatten(), torch.ones_like(ids.flatten(), dtype = torch.int32))
+        sorted_ids, order = ids.flatten().sort()
         m_tile = 32
-        ends = count.cumsum(0, dtype = torch.int32)
-        tiles = ((count + m_tile - 1) // m_tile).cumsum(0, dtype = torch.int32)
+        ends = ids.new_empty(moe.num_experts, dtype = torch.int32)
+        tiles = torch.empty_like(ends)
+        _expert_tiles[(1,)](sorted_ids, ends, tiles, slots, triton.next_power_of_2(slots), moe.num_experts, m_tile)
 
     for linear in (up, down):
         k, n = linear.in_features, linear.out_features

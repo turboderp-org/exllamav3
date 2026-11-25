@@ -1,8 +1,9 @@
 import pytest
 import torch
+import triton
 
 from exllamav3.ext import exllamav3_ext as ext
-from exllamav3.modules.arch_specific.olala_bf16 import _group_gemm, _row_gemv, codebook
+from exllamav3.modules.arch_specific.olala_bf16 import _expert_tiles, _group_gemm, _row_gemv, codebook
 from exllamav3.util.backend import gfx_arch
 from testlib.exl3 import generator, rand_trellis
 from testlib.moe import ptr_table
@@ -35,3 +36,17 @@ def test_packed_bf16_expert_products(device, bits):
     result.fill_(float("nan"))
     _group_gemm[(n // 32, 2)](x, pointers, table, ids.argsort(), ends, tiles, result, k, n, bits, 2, 32)
     torch.testing.assert_close(result, reference, atol = 2.0, rtol = 1e-5)
+
+
+@pytest.mark.rocm_only
+@pytest.mark.parametrize("slots", [12, 1024, 3078])
+def test_expert_tiles_with_empty_experts(device, slots):
+    experts, tile = 256, 32
+    ids = torch.randint(0, 16, (slots,), generator = generator(slots)).mul(16).to(device)
+    sorted_ids = ids.sort().values
+    ends = ids.new_empty(experts, dtype = torch.int32)
+    tiles = torch.empty_like(ends)
+    _expert_tiles[(1,)](sorted_ids, ends, tiles, slots, triton.next_power_of_2(slots), experts, tile)
+    counts = ids.cpu().bincount(minlength = experts)
+    torch.testing.assert_close(ends.cpu(), counts.cumsum(0, dtype = torch.int32))
+    torch.testing.assert_close(tiles.cpu(), ((counts + tile - 1) // tile).cumsum(0, dtype = torch.int32))
