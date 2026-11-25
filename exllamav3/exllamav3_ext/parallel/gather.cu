@@ -1,4 +1,6 @@
 #include <cuda_fp16.h>
+#include <mutex>
+#include <cstdlib>
 #include "gather.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -16,6 +18,54 @@ namespace cg = cooperative_groups;
 #define NUM_THREADS_SMALL 256
 #define BATCH_STAGE 2
 #define STAGE_SIZE (NUM_THREADS * 16)
+
+// EXL3_TP_NO_COOP=1: launch the gathers as ordinary kernels instead of cooperative ones. On ROCm a
+// cooperative launch goes to the runtime's separate cooperative HW queue, so every gather makes the
+// stream's queue and that queue wait on each other (see doc/env_vars.md). pg_gather_small never
+// syncs its grid; pg_gather's grid (1 block, or one per rank on the output device, all resident)
+// syncs through pg_gather_block_barrier. Same data movement either way. Read once.
+static bool pg_no_coop()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_TP_NO_COOP");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+// Grid barrier for a non-cooperative launch of n co-resident blocks: one monotonic 64-bit arrival
+// counter per block count n (never reset, never wraps), so launches of any n can share the array
+__device__ __forceinline__ void pg_gather_block_barrier(unsigned long long* counter, const unsigned int n)
+{
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        __threadfence();
+        const unsigned long long old = atomicAdd(counter, 1ull);
+        const unsigned long long target = (old / n + 1) * n;
+        while (atomicAdd(counter, 0ull) < target) __nanosleep(64);
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+// Per-device barrier counters ((MAX_DEVICES + 1) slots, indexed by block count), zeroed once
+static unsigned long long* pg_gather_barrier_counters(int device)
+{
+    static std::mutex mtx;
+    static unsigned long long* bufs[64] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (device < 0 || device >= 64) return nullptr;
+    if (!bufs[device])
+    {
+        void* p = nullptr;
+        cuda_check(cudaMalloc(&p, (MAX_DEVICES + 1) * sizeof(unsigned long long)));
+        cuda_check(cudaMemset(p, 0, (MAX_DEVICES + 1) * sizeof(unsigned long long)));
+        bufs[device] = (unsigned long long*) p;
+    }
+    return bufs[device];
+}
 
 struct Offsets {
     int v[MAX_DEVICES + 1];
@@ -37,11 +87,11 @@ void pg_gather_kernel
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
     const size_t shbuf_size,
-    uint32_t *abort_flag
+    uint32_t *abort_flag,
+    unsigned long long* blk_barrier    // non-null: non-cooperative launch, barrier counter for gridDim.x blocks
 )
 {
     int t = threadIdx.x;
-    auto grid = cg::this_grid();
 
     __shared__ uint32_t r;
     uint8_t* data_end = data_ptr + data_size;
@@ -239,7 +289,8 @@ void pg_gather_kernel
         }
     }
 
-    grid.sync();
+    if (blk_barrier) { if (gridDim.x > 1) pg_gather_block_barrier(blk_barrier, gridDim.x); }
+    else cg::this_grid().sync();
     pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
 }
 
@@ -394,15 +445,23 @@ void pg_gather_small
     dim3 block_grid(1);
     dim3 block_dim(NUM_THREADS_SMALL);
 
-    cudaLaunchCooperativeKernel
-    (
-        (void*)pg_gather_small_kernel,
-        block_grid,
-        block_dim,
-        kernelArgs,
-        0,
-        stream
-    );
+    // One block, no grid sync: an ordinary launch does the same (EXL3_TP_NO_COOP)
+    if (pg_no_coop())
+    {
+        cuda_check(cudaLaunchKernel((void*)pg_gather_small_kernel, block_grid, block_dim, kernelArgs, 0, stream));
+    }
+    else
+    {
+        cudaLaunchCooperativeKernel
+        (
+            (void*)pg_gather_small_kernel,
+            block_grid,
+            block_dim,
+            kernelArgs,
+            0,
+            stream
+        );
+    }
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -456,6 +515,8 @@ void pg_gather
         num_blocks = num_ranks;
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
+    const bool no_coop = pg_no_coop();
+    unsigned long long* blk_barrier = no_coop ? pg_gather_barrier_counters(this_device) + num_blocks : nullptr;
     void* kernelArgs[] =
     {
         (void*)& ctx_dev,  // Shared, pinned (device alias)
@@ -469,20 +530,28 @@ void pg_gather
         (void*)& shbuf_ptr,
         (void*)& send_size,
         (void*)& shbuf_size,
-        (void*)& abort_flag_ptr
+        (void*)& abort_flag_ptr,
+        (void*)& blk_barrier
     };
 
     dim3 block_grid(num_blocks);
     dim3 block_dim(NUM_THREADS);
 
-    cudaLaunchCooperativeKernel
-    (
-        (void*)pg_gather_kernel,
-        block_grid,
-        block_dim,
-        kernelArgs,
-        0,
-        stream
-    );
+    if (no_coop)
+    {
+        cuda_check(cudaLaunchKernel((void*)pg_gather_kernel, block_grid, block_dim, kernelArgs, 0, stream));
+    }
+    else
+    {
+        cudaLaunchCooperativeKernel
+        (
+            (void*)pg_gather_kernel,
+            block_grid,
+            block_dim,
+            kernelArgs,
+            0,
+            stream
+        );
+    }
     cuda_check(cudaPeekAtLastError());
 }
