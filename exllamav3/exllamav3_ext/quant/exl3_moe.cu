@@ -11,13 +11,13 @@ namespace cg = cooperative_groups;
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
+#include "coop_autotune.cuh"
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_moe_pipe_instances_rdna.cuh"
     #include "../rocm/quant/exl3_moe_inner_rdna.cuh"   // moe_pipe::smem_launch_bytes
     #include <map>
 #endif
 
-std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
 
 // EXL3_MOE_TILE_N=128 keeps the N = 128 tile shape for dims that are multiples of 256 (which
 // otherwise take the N = 256 instances); 0 / unset = automatic
@@ -499,12 +499,7 @@ void exl3_moe
 #endif
     dim3 grid_dim(group_size, 1, num_groups);
 
-    if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
-    {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
-        moe_kernel_attr_set[device].insert((void*) kernel);
-        cuda_check(cudaPeekAtLastError());
-    }
+    set_kernel_attr_once((void*) kernel, smem_max);
 
     void* _hidden_state = hidden_state.data_ptr();
     void* _temp_state_g = temp_state_g.data_ptr();

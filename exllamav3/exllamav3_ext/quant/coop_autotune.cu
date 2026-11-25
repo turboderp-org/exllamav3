@@ -59,7 +59,12 @@ struct DiskCacheRecordV1
 
 std::map<uint64_t, CoopAutotuneLaunch> launch_cache;
 
-std::set<std::tuple<int, void*, size_t>> attr_set;
+// Dynamic-LDS limit currently set per (device, kernel). The attribute belongs to the kernel, not to a launch: the last
+// cudaFuncSetAttribute wins, so it is only ever raised here. Caching per (device, kernel, smem) and setting each
+// value once lowered the limit when a kernel was used at a smaller size after a larger one, and the next larger launch
+// then failed with an invalid-value error on runtimes that enforce the attribute (HIP 7.18 / ROCm 10.3)
+std::map<std::pair<int, void*>, size_t> attr_smem;
+std::mutex attr_mutex;
 
 std::mutex disk_mutex;
 bool disk_cache_loaded = false;
@@ -314,17 +319,25 @@ void store_disk_cache(uint64_t hash, const CoopAutotuneLaunch& launch_config)
     #endif
 }
 
+}  // namespace
+
+// Declared in coop_autotune.cuh (also used by exl3_gemm.cu and exl3_moe.cu), so outside the anonymous namespace
 void set_kernel_attr_once(void* kernel, size_t smem)
 {
     int device;
     cuda_check(cudaGetDevice(&device));
 
-    auto key = std::make_tuple(device, kernel, smem);
-    if (attr_set.find(key) != attr_set.end()) return;
+    std::lock_guard<std::mutex> lock(attr_mutex);
+    auto key = std::make_pair(device, kernel);
+    auto it = attr_smem.find(key);
+    if (it != attr_smem.end() && it->second >= smem) return;
 
     cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-    attr_set.insert(key);
+    attr_smem[key] = smem;
 }
+
+namespace
+{
 
 // Candidates in one autotune session share the same input tensors, so back-to-back timed launches
 // keep each other's operands mutually warm in L2 regardless of production's actual scattered,
