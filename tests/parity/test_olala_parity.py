@@ -250,7 +250,9 @@ def test_olala_exl3_prefill_and_decode(model_dir, device, monkeypatch):
             assert moe.decode_weights is not None
             # A premature read of a deferred trellis can produce finite but incorrect
             # projections. Reconstruct again after the checkpoint load has completed.
-            for packed, reference in zip(moe.decode_weights, pack_projections(moe.decode_linears), strict = True):
+            dtype = torch.bfloat16 if moe.bf16_codebook is not None else torch.float16
+            references = pack_projections(moe.decode_linears, dtype)
+            for packed, reference in zip(moe.decode_weights, references, strict = True):
                 torch.testing.assert_close(packed, reference, rtol = 0, atol = 0)
         recurrent_layers = cache.get_all_recurrent_layers()
         assert len(recurrent_layers) == config.num_hidden_layers

@@ -15,6 +15,7 @@ from ..mamba3 import Mamba3
 from ..mlp import MLP
 from ..tensor_bundle import TensorBundle
 from ...util.backend import ROCM, gfx_arch
+from . import olala_bf16
 from .olala_moe import decode_moe, pack_projections
 
 
@@ -108,6 +109,7 @@ class OlalaMoE(BlockSparseMLP):
             ),
         )
         self.decode_linears = (latent_in, self.shared_experts.ups[0], latent_out, self.shared_experts.downs[0])
+        self.bf16_codebook = None
         self.decode_weights = None
 
     def load(self, device, **kwargs):
@@ -119,6 +121,7 @@ class OlalaMoE(BlockSparseMLP):
             and (self.config.hidden_size, self.config.latent_size, self.config.shared_size) == (1536, 384, 1536)
             and self.shared_experts.num_slices == 1
         )
+        self.bf16_codebook = None
         self.decode_weights = None
         for linear in self.decode_linears:
             linear.eager_exl3 = pack
@@ -129,9 +132,19 @@ class OlalaMoE(BlockSparseMLP):
                     and linear.pre_scale == linear.post_scale == 1 for linear in self.decode_linears
                 )):
             with torch.cuda.device(device):
-                self.decode_weights = pack_projections(self.decode_linears)
+                if (ROCM and self.support_fused and not self.tp_reduce and self.num_experts == 256
+                        and self.routing_device is None and self.num_local_experts == self.num_experts
+                        and self.intermediate_size == 768 and self.num_experts_per_tok == 6
+                        and all(linear.pre_scale == 1 for linear in self.ups + self.downs) and all(
+                            linear.mul1 and linear.K in (2, 3, 4, 5, 6)
+                            for linear in (self.multi_up, self.multi_down)
+                        )):
+                    self.bf16_codebook = olala_bf16.codebook(device)
+                dtype = torch.bfloat16 if self.bf16_codebook is not None else torch.float16
+                self.decode_weights = pack_projections(self.decode_linears, dtype)
 
     def unload(self):
+        self.bf16_codebook = None
         self.decode_weights = None
         super().unload()
 
@@ -143,18 +156,20 @@ class OlalaMoE(BlockSparseMLP):
         self.routing_cfg.gate_tensor_t = self.routing_gate.tensors["weight"].contiguous()
 
     def forward(self, x, params, out_dtype = None):
-        x = x.half()
-        if (self.decode_weights is not None and x.shape == (1, 1, self.hidden_size) and x.is_contiguous()
-                and params.get("recurrent_slots") is not None
+        if (self.decode_weights is not None and x.ndim == 3 and x.shape[0] == 1
+                and x.shape[1] > 0 and x.shape[2] == self.hidden_size and x.is_contiguous()
                 and not any(key in params for key in (
-                    "prefill", "capture", "ovr", "reconstruct", "quant_preserve", "activate_all_experts",
-                    "autosplit_measure", "tp_warmup",
+                    "capture", "ovr", "reconstruct", "quant_preserve", "activate_all_experts",
+                    "autosplit_measure", "tp_warmup", "capture_sens", "moe_affinity",
                 ))
                 and not any(linear.lora_a_tensors for linear in self.decode_linears)):
             with torch.cuda.device(x.device):
-                return decode_moe(self, x, params).to(out_dtype or torch.float32)
+                if self.bf16_codebook is not None:
+                    return olala_bf16.forward(self, x, params).to(out_dtype or torch.float32)
+                if x.shape[1] == 1 and params.get("recurrent_slots") is not None and "prefill" not in params:
+                    return decode_moe(self, x.half(), params).to(out_dtype or torch.float32)
         try:
-            return super().forward(x, params, out_dtype)
+            return super().forward(x.half(), params, out_dtype)
         finally:
             params.pop("olala_latent_scale", None)
 

@@ -12,14 +12,13 @@ def _project_inputs(X, Weight, Latent, Shared, Hidden: tl.constexpr, LatentSize:
                     Rows: tl.constexpr):
     rows = tl.program_id(0) * Rows + tl.arange(0, Rows)
     k = tl.arange(0, triton.next_power_of_2(Hidden))
-    x = tl.load(X + k, k < Hidden, 0).to(tl.float32)
+    x = tl.load(X + k, k < Hidden, 0).to(Weight.dtype.element_ty).to(tl.float32)
     w = tl.load(Weight + rows[:, None] * Hidden + k[None, :], k[None, :] < Hidden, 0).to(tl.float32)
     projected = tl.sum(w * x[None, :], 1)
     if tl.program_id(0) < LatentSize // Rows:
         tl.store(Latent + rows, projected)
     else:
-        # Olala's shared up projection produces FP16 before ReLU squared.
-        positive = tl.maximum(projected.to(tl.float16).to(tl.float32), 0.)
+        positive = tl.maximum(projected.to(Shared.dtype.element_ty).to(tl.float32), 0.)
         tl.store(Shared + rows - LatentSize, positive * positive)
 
 
@@ -30,11 +29,16 @@ def _project_outputs(Routed, Shared, Weight, Scale, Output, LatentSize: tl.const
     weights = Weight + rows[:, None] * (LatentSize + SharedSize)
     k = tl.arange(0, triton.next_power_of_2(LatentSize))
     h = tl.arange(0, triton.next_power_of_2(SharedSize))
-    x = tl.load(Routed + k, k < LatentSize, 0).to(tl.float16).to(tl.float32)
+    x = tl.load(Routed + k, k < LatentSize, 0)
+    if Scale is not None:
+        x = x.to(tl.float16)
+    x = x.to(tl.float32)
     u = tl.load(Shared + h, h < SharedSize, 0).to(tl.float32)
     a = tl.load(weights + k[None, :], k[None, :] < LatentSize, 0).to(tl.float32)
     b = tl.load(weights + LatentSize + h[None, :], h[None, :] < SharedSize, 0).to(tl.float32)
-    routed = tl.sum(a * x[None, :], 1) * tl.load(Scale)
+    routed = tl.sum(a * x[None, :], 1)
+    if Scale is not None:
+        routed *= tl.load(Scale)
     tl.store(Output + rows, routed + tl.sum(b * u[None, :], 1))
 
 
@@ -46,9 +50,9 @@ def _weight(linear):
     return weight.T
 
 
-def pack_projections(linears):
-    up = torch.cat([_weight(linear) for linear in linears[:2]], dim = 0).contiguous()
-    down = torch.cat([_weight(linear) for linear in linears[2:]], dim = 1).contiguous()
+def pack_projections(linears, dtype = torch.float16):
+    up = torch.cat([_weight(linear).to(dtype) for linear in linears[:2]], dim = 0).contiguous()
+    down = torch.cat([_weight(linear).to(dtype) for linear in linears[2:]], dim = 1).contiguous()
     return up, down
 
 
