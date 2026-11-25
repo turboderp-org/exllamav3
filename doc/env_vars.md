@@ -385,6 +385,15 @@ rotate their own input into LDS (gate|up from the token's row, down from silu(ga
 per-wave split-K rule as `EXL3_GEMV_MR_FUSE_IN`. This replaces `exl3_moe_dec_had_gu` and
 `exl3_moe_dec_had_act` with the same code on the same values, so the output is bit-identical.
 
+### `EXL3_ROCM_MOE_SH_DEC` (default: `0`)
+
+ROCm: with `EXL3_ROCM_MOE_SH_FUSED`, run the shared expert through the RDNA decode op (one expert per token
+at weight 1, its own bit width and pointer tables, reusing the routed decode scratch) instead of its fused
+one-expert cooperative launch. Under tensor parallelism the shared expert sits whole on one rank per layer,
+and at decode sizes its cooperative launch is the largest single cause of that rank arriving late at the
+next all-reduce. Different kernels from the cooperative path, so the output is not bit-identical to it.
+Gated SiLU shared experts without biases only; anything else keeps the cooperative launch.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
