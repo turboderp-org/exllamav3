@@ -133,19 +133,33 @@ bool BC_BlockSparseMLP::run_bszN_rdna
     if (yh2.numel() < (int64_t) 2 * S * Hi || interm_gu.numel() < (int64_t) 2 * S * I
         || interm_a2.numel() < (int64_t) S * I || out_d2.numel() < (int64_t) S * Ho) return false;
 
-    exl3_rocm_moe_decode
+    exl3_rocm_moe_decode_ep
     (
         y, selected_experts, routing_weights,
         rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
         down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
         yh2, interm_gu, interm_a2, out_d2,
-        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit
+        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit, min_expert, max_expert
     );
 
     const int H = (int) out_bszn.size(-1);
     at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
     at::Tensor dst = out_bszn.slice(0, 0, bsz);
-    if (shared_experts && out_d_sh)
+    static const bool sh_fused = [] { const char* e = std::getenv("EXL3_ROCM_MOE_SH_FUSED"); return !(e && e[0] == '0'); }();
+    const bool gate_ok = !shared_gate || (shared_gate->weight.scalar_type() == at::kHalf
+                                          && shared_gate->weight.is_contiguous() && shared_gate->weight.numel() == y.size(-1));
+    if (sh_fused && sh_coop && out_d_sh && gate_ok)
+    {
+        // Shared expert through its fused one-expert launch (as run_bszN does), then one kernel for
+        // routed + sigmoid(y . w) * shared, instead of shared_experts->run_bszN and five torch ops
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
+        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, bsz), sh_rw.slice(0, 0, bsz), c10::nullopt);
+        at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
+        c10::optional<at::Tensor> gw;
+        if (shared_gate) gw = shared_gate->weight;
+        exl3_rocm_moe_merge_shared(dst, routed, sh, y, gw);
+    }
+    else if (shared_experts && out_d_sh)
     {
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
@@ -339,10 +353,12 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         rdna_cb = up_mul1 ? 2 : up_mcg ? 1 : 0;
         // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above
         const char* env = std::getenv("EXL3_ROCM_MOE_DECODE");
+        // EXL3_ROCM_MOE_EP=0: keep expert-parallel ranks on the kernels above (the old gate)
+        const char* env_ep = std::getenv("EXL3_ROCM_MOE_EP");
         rdna_moe = !(env && env[0] == '0')
             && gated && act_silu && !act_gelu && !act_silu_oai && !act_relu2
             && !gate_bias_ptrs && !up_bias_ptrs && !down_bias_ptrs
-            && min_expert < 0
+            && (min_expert < 0 || !(env_ep && env_ep[0] == '0'))
             && rdna_K_gu && rdna_K_d
             && interm_gu.scalar_type() == at::kHalf && interm_a2.scalar_type() == at::kHalf
             && out_d2.scalar_type() == at::kFloat;

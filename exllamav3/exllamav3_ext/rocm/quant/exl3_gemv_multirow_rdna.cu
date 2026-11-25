@@ -1176,6 +1176,14 @@ bool exl3_mgemv_multirow_try_launch
 // gate and up concatenated (2E entries, built once at load). SILU with a gated
 // MLP only; the caller falls back to the mgemm route otherwise.
 
+// Expert-parallel slot mapping: a global pick -> local table index, or -1 for a pick on another rank
+// (min_e < 0: no range, the pick is already local)
+__device__ __forceinline__ int exl3_moe_local(int64_t e, int min_e, int max_e)
+{
+    if (min_e < 0) return (int) e;
+    return (e >= min_e && e < max_e) ? (int) (e - min_e) : -1;
+}
+
 __device__ __forceinline__ half2 exl3_moe_silu_h2(half2 x)   // activation_kernels.cuh _silu(half2)
 {
     half2 one = __float2half2_rn(1.0f);
@@ -1232,7 +1240,9 @@ void exl3_moe_dec_had_gu
     const int size_k,
     const int S,
     const int top_k,
-    const int E
+    const int E,
+    const int min_e,
+    const int max_e
 )
 {
     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -1242,7 +1252,9 @@ void exl3_moe_dec_had_gu
     const int j = warp_id / k_segs;
     const int seg = warp_id % k_segs;
     const int js = j < S ? j : j - S;
-    const int mat = (int) sel[js] + (j < S ? 0 : E);
+    const int e_loc = exl3_moe_local(sel[js], min_e, max_e);
+    if (e_loc < 0) return;   // warp-uniform: a pick on another rank
+    const int mat = e_loc + (j < S ? 0 : E);
     const int token = js / top_k;
     const half* suh = (const half*) suh_gu[mat];
     exl3_gemv_had_in_128(y + (int64_t) token * size_k + seg * 128,
@@ -1259,7 +1271,9 @@ void exl3_moe_dec_had_act
     half* __restrict__ a_had,              // (S, size_k)
     const int size_k,
     const int S,
-    const float act_limit
+    const float act_limit,
+    const int min_e,
+    const int max_e
 )
 {
     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -1291,7 +1305,9 @@ void exl3_moe_dec_had_act
     half4 a;
     a.x = xg[0];
     a.y = xg[1];
-    const half* suh = (const half*) suh_d[(int) sel[j]];
+    const int e_loc = exl3_moe_local(sel[j], min_e, max_e);
+    if (e_loc < 0) return;   // warp-uniform: a pick on another rank
+    const half* suh = (const half*) suh_d[e_loc];
     exl3_moe_had_in_128_v(a, a_had + off, suh + seg * 128, lane);
 }
 
@@ -1315,7 +1331,9 @@ void exl3_moe_dec_dot
     const int E,
     const int num_tokens,
     const int core,
-    const int tpb
+    const int tpb,
+    const int min_e,
+    const int max_e
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -1325,8 +1343,23 @@ void exl3_moe_dec_dot
     const int n_tiles = size_n / 16;
     const int n_segs = size_n / 128;
     const int js = j < S ? j : j - S;
-    const int mat = (int) sel[js] + (j < S ? 0 : E);
+    const int e_loc = exl3_moe_local(sel[js], min_e, max_e);
     const int64_t row_off = (int64_t) j * size_n;
+    if (e_loc < 0)   // block-uniform: a pick on another rank
+    {
+        // Weighted (down): the slot still arrives at the grouped reduce as an all-zero row,
+        // exl3_gemv_mr_dot_multi's rule for skipped slots. Unweighted (gate|up): nothing to do
+        if (weights && warp_id == 0)
+            for (int t = 0; t < tpb; ++t)
+                exl3_gemv_mr_zero_epilogue<c_fp32>
+                (
+                    C, row_off, size_n, tile_n + t, lane,
+                    pb->seg_counters + j * n_segs + (tile_n + t) / 8,
+                    pb->red_counters + (tile_n + t) / 8, S, num_tokens
+                );
+        return;
+    }
+    const int mat = e_loc + (j < S ? 0 : E);
 
     if (weights)
     {
@@ -1354,7 +1387,8 @@ static void exl3_moe_dec_launch_dot
 (
     Exl3GemvMrParams* pb, const uintptr_t* B_list, const uintptr_t* svh_list, const int64_t* sel,
     const half* weights, const half* A_had, void* C, int size_k, int size_n, int S, int E,
-    int num_tokens, int slots, int top_k, int K, int cb, bool c_fp32, int device, cudaStream_t stream
+    int num_tokens, int slots, int top_k, int K, int cb, bool c_fp32, int device, cudaStream_t stream,
+    int min_e, int max_e
 )
 {
     const int n_tiles = size_n / 16;
@@ -1368,9 +1402,9 @@ static void exl3_moe_dec_launch_dot
 
     #define MOE_DEC_L3(bits_val, codebook, warps_val) \
         if (c_fp32) hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, true, codebook, warps_val>), grid, block, smem, stream, \
-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb); \
+            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e); \
         else hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, false, codebook, warps_val>), grid, block, smem, stream, \
-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb);
+            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e);
     #define MOE_DEC_L2(bits_val, codebook) \
         switch (warps) { \
             case 4:  MOE_DEC_L3(bits_val, codebook, 4)  break; \
@@ -1417,7 +1451,7 @@ bool exl3_rocm_moe_decode_fits(int S, int Hi, int I, int Ho, int K_gu, int cb_gu
 // cb: 0 = 3inst, 1 = mcg, 2 = mul1 (exl3_mgemm_gr's encoding). K: integer 1..8, or
 // EXL3_HALF_BITS(k) = 16 + k for a k + 0.5 bpw mul1 matrix (the caller passes it only for
 // half-rate layers, and only while EXL3_ROCM_HALF_GEMV is on)
-void exl3_rocm_moe_decode
+void exl3_rocm_moe_decode_ep
 (
     const at::Tensor& y,            // (bsz, Hi) half
     const at::Tensor& sel,          // (bsz, top_k) int64
@@ -1436,9 +1470,13 @@ void exl3_rocm_moe_decode
     int64_t cb_gu,
     int64_t K_d,
     int64_t cb_d,
-    double act_limit
+    double act_limit,
+    int64_t min_expert,
+    int64_t max_expert
 )
 {
+    const int min_e = (int) min_expert;
+    const int max_e = (int) max_expert;
     const at::cuda::OptionalCUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK_DTYPE(y, kHalf);
@@ -1480,22 +1518,126 @@ void exl3_rocm_moe_decode
         int blocks = CEIL_DIVIDE(2 * S * (Hi / 128) * 32, 256);
         hipLaunchKernelGGL(exl3_moe_dec_had_gu, dim3(blocks), dim3(256), 0, stream,
             (const half*) y.data_ptr(), sel_p, (const uintptr_t*) gu_suh.data_ptr(),
-            (half*) yh.data_ptr(), Hi, S, top_k, E);
+            (half*) yh.data_ptr(), Hi, S, top_k, E, min_e, max_e);
     }
     // 2. gate|up GEMV, 2S slots
     exl3_moe_dec_launch_dot(pb, (const uintptr_t*) gu_trellis.data_ptr(), (const uintptr_t*) gu_svh.data_ptr(),
         sel_p, nullptr, (const half*) yh.data_ptr(), gu.data_ptr(), Hi, I, S, E, 1, 2 * S, top_k,
-        (int) K_gu, (int) cb_gu, false, device, stream);
+        (int) K_gu, (int) cb_gu, false, device, stream, min_e, max_e);
     // 3. activation + down input rotation
     {
         int blocks = CEIL_DIVIDE(S * (I / 128) * 32, 256);
         hipLaunchKernelGGL(exl3_moe_dec_had_act, dim3(blocks), dim3(256), 0, stream,
             (const half*) gu.data_ptr(), sel_p, (const uintptr_t*) d_suh.data_ptr(),
-            (half*) a_had.data_ptr(), I, S, (float) act_limit);
+            (half*) a_had.data_ptr(), I, S, (float) act_limit, min_e, max_e);
     }
     // 4. down GEMV, weighted, grouped per token
     exl3_moe_dec_launch_dot(pb, (const uintptr_t*) d_trellis.data_ptr(), (const uintptr_t*) d_svh.data_ptr(),
         sel_p, (const half*) weights.data_ptr(), (const half*) a_had.data_ptr(), out.data_ptr(), I, Ho, S, 0, bsz,
-        S, top_k, (int) K_d, (int) cb_d, true, device, stream);
+        S, top_k, (int) K_d, (int) cb_d, true, device, stream, min_e, max_e);
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// The no-range form (single GPU, or a caller that already passes local ids)
+void exl3_rocm_moe_decode
+(
+    const at::Tensor& y,
+    const at::Tensor& sel,
+    const at::Tensor& weights,
+    const at::Tensor& gu_trellis,
+    const at::Tensor& gu_suh,
+    const at::Tensor& gu_svh,
+    const at::Tensor& d_trellis,
+    const at::Tensor& d_suh,
+    const at::Tensor& d_svh,
+    at::Tensor& yh,
+    at::Tensor& gu,
+    at::Tensor& a_had,
+    at::Tensor& out,
+    int64_t K_gu,
+    int64_t cb_gu,
+    int64_t K_d,
+    int64_t cb_d,
+    double act_limit
+)
+{
+    exl3_rocm_moe_decode_ep(y, sel, weights, gu_trellis, gu_suh, gu_svh, d_trellis, d_suh, d_svh,
+                            yh, gu, a_had, out, K_gu, cb_gu, K_d, cb_d, act_limit, -1, -1);
+}
+
+
+// =============================================================================
+// Shared-expert merge for the RDNA MoE route: dst[t] = routed[t] + g[t] * sh[t], g[t] = sigmoid(y[t] . w)
+// (w absent: g = 1). One block per token; the gate dot in fp32 like at::matmul on the fp32 copies
+// =============================================================================
+
+static __global__
+__launch_bounds__(256)
+void exl3_moe_merge_shared_kernel
+(
+    float* __restrict__ dst, const int64_t ld_dst,
+    const float* __restrict__ routed, const int64_t ld_r,
+    const float* __restrict__ sh, const int64_t ld_s,
+    const half* __restrict__ y, const int64_t ld_y, const int k,
+    const half* __restrict__ w,
+    const int H
+)
+{
+    const int t = blockIdx.x;
+    __shared__ float red[8];
+    __shared__ float g_sh;
+    float g = 1.0f;
+    if (w)
+    {
+        float acc = 0.0f;
+        for (int h = threadIdx.x; h < k; h += blockDim.x)
+            acc += __half2float(y[(int64_t) t * ld_y + h]) * __half2float(w[h]);
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 32);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            float s = 0.0f;
+            for (int i = 0; i < (int) (blockDim.x >> 5); ++i) s += red[i];
+            g_sh = 1.0f / (1.0f + expf(-s));
+        }
+        __syncthreads();
+        g = g_sh;
+    }
+    for (int c = threadIdx.x; c < H; c += blockDim.x)
+        dst[(int64_t) t * ld_dst + c] = routed[(int64_t) t * ld_r + c] + g * sh[(int64_t) t * ld_s + c];
+}
+
+void exl3_rocm_moe_merge_shared
+(
+    at::Tensor& dst,                        // (bsz, H) float, row-strided
+    const at::Tensor& routed,               // (bsz, H) float, row-strided
+    const at::Tensor& sh,                   // (bsz, H) float, row-strided
+    const at::Tensor& y,                    // (bsz, k) half, contiguous rows
+    const c10::optional<at::Tensor>& gate_w // (k) half, or none
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(dst, kFloat);
+    TORCH_CHECK_DTYPE(routed, kFloat);
+    TORCH_CHECK_DTYPE(sh, kFloat);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK(dst.stride(1) == 1 && routed.stride(1) == 1 && sh.stride(1) == 1 && y.stride(1) == 1, "moe_merge_shared: rows must be contiguous");
+    const int bsz = (int) dst.size(0);
+    const int H = (int) dst.size(1);
+    const int k = (int) y.size(1);
+    const half* w = nullptr;
+    if (gate_w)
+    {
+        TORCH_CHECK_DTYPE(gate_w.value(), kHalf);
+        TORCH_CHECK(gate_w.value().numel() == k && gate_w.value().is_contiguous(), "moe_merge_shared: gate weight shape");
+        w = (const half*) gate_w.value().data_ptr();
+    }
+    if (bsz < 1) return;
+    hipLaunchKernelGGL(exl3_moe_merge_shared_kernel, dim3(bsz), dim3(256), 0, stream,
+        (float*) dst.data_ptr(), dst.stride(0), (const float*) routed.data_ptr(), routed.stride(0),
+        (const float*) sh.data_ptr(), sh.stride(0), (const half*) y.data_ptr(), y.stride(0), k, w, H);
     cuda_check(cudaPeekAtLastError());
 }

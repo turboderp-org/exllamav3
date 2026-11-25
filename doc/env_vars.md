@@ -360,6 +360,18 @@ calls (shape, bit width, pointers). `_CHECK=1` runs every call the fused form wo
 a scratch output and then the two-kernel form into the real output, compares both bit for bit and logs
 mismatches. It synchronizes after every call, so it is slow.
 
+### `EXL3_ROCM_MOE_EP` (default: `1`)
+
+ROCm: the RDNA MoE decode op also serves expert-parallel ranks (a rank that holds a contiguous slice of
+the experts, as under tensor parallelism). Picks of experts on other ranks are skipped and reach the
+grouped reduce as zero rows. `0` keeps such ranks on the generic cooperative MoE kernels, as before.
+
+### `EXL3_ROCM_MOE_SH_FUSED` (default: `1`)
+
+ROCm: when the shared expert runs as a fused one-expert launch (`EXL3_MOE_SHARED_COOP`), it is launched
+from the routed decode call, and routed + gated shared contribution are merged in one kernel instead of
+the shared expert's own call plus five torch ops. `0` restores the separate path.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

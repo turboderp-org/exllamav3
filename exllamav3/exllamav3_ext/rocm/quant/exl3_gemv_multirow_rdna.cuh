@@ -108,3 +108,39 @@ void exl3_rocm_moe_decode
     int64_t cb_d,
     double act_limit
 );
+
+// Expert-parallel form: sel holds global ids; picks outside [min_expert, max_expert) are skipped (a zero
+// row at the grouped reduce), the rest index the local tables as sel - min_expert. min_expert < 0: no range
+void exl3_rocm_moe_decode_ep
+(
+    const at::Tensor& y,
+    const at::Tensor& sel,
+    const at::Tensor& weights,
+    const at::Tensor& gu_trellis,
+    const at::Tensor& gu_suh,
+    const at::Tensor& gu_svh,
+    const at::Tensor& d_trellis,
+    const at::Tensor& d_suh,
+    const at::Tensor& d_svh,
+    at::Tensor& yh,
+    at::Tensor& gu,
+    at::Tensor& a_had,
+    at::Tensor& out,
+    int64_t K_gu,
+    int64_t cb_gu,
+    int64_t K_d,
+    int64_t cb_d,
+    double act_limit,
+    int64_t min_expert,
+    int64_t max_expert
+);
+
+// dst = routed + sigmoid(y . gate_w) * sh per token (gate_w absent: + sh); all float rows but y (half)
+void exl3_rocm_moe_merge_shared
+(
+    at::Tensor& dst,
+    const at::Tensor& routed,
+    const at::Tensor& sh,
+    const at::Tensor& y,
+    const c10::optional<at::Tensor>& gate_w
+);
