@@ -477,6 +477,21 @@ class Generator:
         # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
         self.sparse_head = None
         self._sparse_flag = False
+        # EXL3_TP_SPARSE_DRAFT: the same subset head for a TP target, held on the output device
+        _tp_sd = os.environ.get("EXL3_TP_SPARSE_DRAFT", "0").strip()
+        if model.loaded_tp and self.mtp_draft and _tp_sd not in ("", "0"):
+            try:
+                from ..modules.sparse_head import token_stats_path
+                from ..modules.sparse_head_tp import make_tp_sparse_head
+                _cap = sparse_draft_head or (int(_tp_sd) if int(_tp_sd) > 1 else 4096)
+                self.sparse_head = make_tp_sparse_head(
+                    model, _cap,
+                    profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
+                )
+            except Exception as e:
+                print(f" !! TP sparse draft head disabled: {e!r}")
+                self.sparse_head = None
+                model.tp_sparse_head = None
         if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
             from ..modules.sparse_head import token_stats_path
             # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the

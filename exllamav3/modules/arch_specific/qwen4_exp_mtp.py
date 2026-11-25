@@ -152,7 +152,12 @@ class Qwen4ExpMTPInputLayer(Module):
         h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
 
         # Token embedding via the attached model (in the TP output worker when the target is TP)
-        if not self.attached_model().loaded_tp:
+        # A sparse draft head hands back the token's embedding row with the id (also under TP, where the
+        # lookup would otherwise be one more dispatch per draft token)
+        draft_emb = params.get("draft_embedding")
+        if draft_emb is not None and tuple(draft_emb.shape[:-1]) == tuple(x.shape):
+            emb = draft_emb.half()
+        elif not self.attached_model().loaded_tp:
             emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
         else:
             emb = self.attached_model().tp_producer.send(x)

@@ -1040,6 +1040,18 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+### `EXL3_TP_SPARSE_DRAFT` (default: `0`)
+
+MTP drafting with a TP target: the draft head uses a frequency-selected subset of the vocabulary of this
+many columns (`1` = 4096), held on the output device in the main process, so a draft token needs no TP
+dispatch. The subset columns are rebuilt by the ranks that own them when the subset changes. Verification
+still runs the full sharded head, so the output does not change; the subset only decides which tokens the
+drafter can propose. A probe/cost model decides at run time whether the subset or the full head is faster.
+
+### `EXL3_TP_SPARSE_DRAFT_LOG` (default: `0`)
+
+With `EXL3_TP_SPARSE_DRAFT`: print the sparse head's statistics every N drafting rounds.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
