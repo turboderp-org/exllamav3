@@ -64,7 +64,9 @@
 #include "exl3_gemv_multirow_rdna.cuh"
 
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
+#include <atomic>
 
 int exl3_gemv_max_m()
 {
@@ -513,10 +515,10 @@ __device__ __forceinline__ void exl3_gemv_mr_zero_epilogue
 // =============================================================================
 // Grid (n_tiles, bszm); one block per (slot, N-tile). Both forms share the body.
 
-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M, bool A_LDS = false>
 __device__ __forceinline__ void exl3_gemv_mr_body
 (
-    const half* __restrict__ A,     // this slab's rotated rows
+    const half* __restrict__ A,     // this slab's rotated rows (LDS when A_LDS)
     const int lda,
     const uint16_t* __restrict__ B,
     const int size_k,
@@ -546,7 +548,7 @@ __device__ __forceinline__ void exl3_gemv_mr_body
     // tile's rows keep the one-tile chain and reduction order
     constexpr int T = EXL3_GEMV_TILES_TMAX;
     float acc[T * M];
-    exl3_gemv_dot_tile_splitk_t<bits, cb, WARPS_PER_BLOCK, M, false, T>
+    exl3_gemv_dot_tile_splitk_t<bits, cb, WARPS_PER_BLOCK, M, A_LDS, T>
     (
         core, tpb, A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc,
         [&](int tn, int k0, int k1, float* o)
@@ -601,6 +603,77 @@ void exl3_gemv_mr_dot_single
     (
         pb->A_had, size_k, pb->B, size_k, n_tiles, tile_n,
         pb->C, 0, size_n, size_m, pb->svh,
+        pb->seg_counters, warp_id, lane, core, tpb
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Single-matrix form with the input rotation fused in (EXL3_GEMV_MR_FUSE_IN)
+// -----------------------------------------------------------------------------
+// One launch instead of exl3_gemv_mr_had_in_single + exl3_gemv_mr_dot_single.
+// The rotated rows live in LDS (size_m * size_k halves, row stride size_k --
+// the A_had layout), after the split-K reduction slots. There is no block
+// barrier: each warp rotates only the 128-segments its own split-K chunk
+// touches (the chunk rule of exl3_gemv_dot_tile_splitk_t, restated here) and
+// then reads only that chunk, so it consumes nothing but its own LDS writes.
+// A segment straddling two chunks is rotated by both warps into the same
+// location with the same bits. The rotation is exl3_gemv_had_in_128 and the
+// dot core is the same template reading LDS instead of global memory, so the
+// output is bit-identical to the two-kernel form. Hosts the six GP_gemm_*
+// sites itself (argument order 0-5; A_had is a patch host only).
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_mr_fused_single
+(
+    const half* __restrict__ A,        // 0: GP_gemm_A
+    const uint16_t* __restrict__ B,    // 1: GP_gemm_B_trellis
+    void* __restrict__ C,              // 2: GP_gemm_C
+    const half* __restrict__ suh,      // 3: GP_gemm_B_suh
+    half* __restrict__ A_had,          // 4: GP_gemm_A_had (patch host only)
+    const half* __restrict__ svh,      // 5: GP_gemm_B_svh
+    Exl3GemvMrParams* __restrict__ pb,
+    const int size_k,
+    const int size_n,
+    const int size_m,
+    const int core,
+    const int tpb
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tile_n = blockIdx.x * tpb;
+    const int n_tiles = size_n / 16;
+
+    extern __shared__ char shared_mem[];
+    half* sh_a = (half*) (shared_mem + WARPS_PER_BLOCK * M * EXL3_GEMV_TILES_TMAX * 16 * sizeof(float));
+
+    const int num_k_tiles = size_k / 16;
+    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    const int kb0 = exl3_uni(warp_id) * chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+    if (kb0 < kb1)
+    {
+        const int s0 = kb0 / 8;
+        const int s1 = (kb1 + 7) / 8;
+        for (int row = 0; row < size_m; ++row)
+            for (int seg = s0; seg < s1; ++seg)
+            {
+                const int64_t off = (int64_t) row * size_k + seg * 128;
+                exl3_gemv_had_in_128(A + off, sh_a + off, suh + seg * 128, lane);
+            }
+    }
+    // The wave's LDS writes before its reads (cross-lane, same wave)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+
+    exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, M, true>
+    (
+        sh_a, size_k, B, size_k, n_tiles, tile_n,
+        C, 0, size_n, size_m, svh,
         pb->seg_counters, warp_id, lane, core, tpb
     );
 }
@@ -692,6 +765,74 @@ void exl3_gemv_mr_dot_multi
 // Host dispatch
 // =============================================================================
 
+// EXL3_GEMV_MR_FUSE_IN=1: the single-matrix form rotates its input inside the
+// dot kernel (exl3_gemv_mr_fused_single), one launch per call instead of two,
+// whenever the rotated rows fit EXL3_GEMV_MR_FUSE_IN_MAX_KB of LDS per block
+// (default 32; larger calls keep the two-kernel form). Read once.
+static bool exl3_gemv_mr_fuse_in_enabled()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_GEMV_MR_FUSE_IN");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+// EXL3_GEMV_MR_FUSE_IN_TRACE=1: log the first 200 single-matrix calls (shape, pointers, whether the
+// output overlaps the input, which keeps the two-kernel form)
+static bool exl3_gemv_mr_fuse_in_trace()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_GEMV_MR_FUSE_IN_TRACE");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+static size_t exl3_gemv_mr_fuse_in_max_bytes()
+{
+    static const size_t v = []
+    {
+        const char* env = std::getenv("EXL3_GEMV_MR_FUSE_IN_MAX_KB");
+        int kb = env ? atoi(env) : 8;
+        kb = kb < 1 ? 1 : (kb > 64 ? 64 : kb);
+        return (size_t) kb * 1024;
+    }();
+    return v;
+}
+
+// Graph patch sites of the single-matrix form, against the launched instance
+static void exl3_gemv_mr_record_single(Graph* graph, void* k)
+{
+    graph->record_param(k, GP_gemm_A, 0);
+    graph->record_param(k, GP_gemm_B_trellis, 1);
+    graph->record_param(k, GP_gemm_C, 2);
+    graph->record_param(k, GP_gemm_B_suh, 3);
+    graph->record_param(k, GP_gemm_A_had, 4);
+    graph->record_param(k, GP_gemm_B_svh, 5);
+    graph->record_param(k, GP_end, 0);
+}
+
+// EXL3_GEMV_MR_FUSE_IN_CHECK=1 (diagnostic, synchronizes every call): run the fused form into a scratch
+// output first, then the two-kernel form into C, and report calls whose outputs differ in any bit
+static bool exl3_gemv_mr_fuse_in_check()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_GEMV_MR_FUSE_IN_CHECK");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+static __global__ void exl3_gemv_mr_cmp_kernel(const uint16_t* a, const uint16_t* b, int64_t n, int* diff, int* first)
+{
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        if (a[i] != b[i]) { atomicAdd(diff, 1); atomicMin(first, (int) i); }
+}
+
 static inline int exl3_gemv_mr_row_tile(int size_m)
 {
     return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8));
@@ -712,9 +853,13 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
     if (c_fp32) { \
         hipLaunchKernelGGL((kernel_name<bits_val, true, codebook, warps_val, m_tile>), \
             grid, block, smem, stream, __VA_ARGS__); \
+        if (mr_rec) exl3_gemv_mr_record_single(mr_rec, \
+            (void*) &kernel_name<bits_val, true, codebook, warps_val, m_tile>); \
     } else { \
         hipLaunchKernelGGL((kernel_name<bits_val, false, codebook, warps_val, m_tile>), \
             grid, block, smem, stream, __VA_ARGS__); \
+        if (mr_rec) exl3_gemv_mr_record_single(mr_rec, \
+            (void*) &kernel_name<bits_val, false, codebook, warps_val, m_tile>); \
     }
 #define LAUNCH_MR_W(bits_val, codebook, warps_val, kernel_name, ...) \
     switch (m_tile) { \
@@ -777,6 +922,68 @@ bool exl3_gemv_multirow_try_launch
     Exl3GemvMrParams* pb = exl3_gemv_mr_param_block(device, graph == nullptr);
     if (!pb) return false;
 
+    // Fused form: one launch, rotation into LDS (see exl3_gemv_mr_fused_single). Not when the output
+    // overlaps the input: other blocks may still be reading A while the first ones store C
+    const char* a_lo = (const char*) A_ptr;
+    const char* a_hi = a_lo + (size_t) size_m * size_k * sizeof(half);
+    const char* c_lo = (const char*) C_ptr;
+    const char* c_hi = c_lo + (size_t) size_m * size_n * (c_fp32 ? sizeof(float) : sizeof(half));
+    const bool c_over_a = c_lo < a_hi && a_lo < c_hi;
+    if (exl3_gemv_mr_fuse_in_trace())
+    {
+        static std::mutex tmtx;
+        static int seen = 0;
+        std::lock_guard<std::mutex> lock(tmtx);
+        if (seen < 200)
+        {
+            seen++;
+            fprintf(stderr, " -- gemv_mr_fuse_in: dev %d m %d k %d n %d K %d fp32 %d A %p C %p A_had %p%s%s\n",
+                    device, size_m, size_k, size_n, K, (int) c_fp32, (const void*) A_ptr, C_ptr,
+                    (const void*) A_had_ptr, c_over_a ? " C_OVERLAPS_A" : "",
+                    (const void*) A_had_ptr == (const void*) A_ptr ? " A_HAD_IS_A" : "");
+        }
+    }
+    // Check mode: fused into scratch, then fall through to the two-kernel form into C, then compare
+    void* chk_c = nullptr;
+    int* chk_dev = nullptr;
+    const size_t c_bytes = (size_t) (c_hi - c_lo);
+    if (exl3_gemv_mr_fuse_in_check() && !graph && !c_over_a)
+    {
+        static void* scratch[64] = {};
+        static size_t scratch_bytes[64] = {};
+        static int* cnt[64] = {};
+        if (scratch_bytes[device] < c_bytes)
+        {
+            if (scratch[device]) cudaFree(scratch[device]);
+            cudaMalloc(&scratch[device], c_bytes);
+            scratch_bytes[device] = c_bytes;
+        }
+        if (!cnt[device]) cudaMalloc((void**) &cnt[device], 2 * sizeof(int));
+        chk_c = scratch[device];
+        chk_dev = cnt[device];
+    }
+    if ((exl3_gemv_mr_fuse_in_enabled() || chk_c) && !c_over_a)
+    {
+        const int n_tiles = size_n / 16;
+        const int warps = exl3_gemv_mr_warps(size_k, n_tiles, 1);
+        const int m_tile = exl3_gemv_mr_row_tile(size_m);
+        const size_t smem = exl3_gemv_mr_smem_bytes(warps, m_tile)
+                          + (size_t) size_m * size_k * sizeof(half);
+        if (smem <= exl3_gemv_mr_fuse_in_max_bytes())
+        {
+            const int core = exl3_gemv_core_mode();
+            const int tpb = exl3_gemv_tiles_tpb(core, device, n_tiles, 1, warps);
+            dim3 grid(n_tiles / tpb, 1);
+            dim3 block(warps * 32);
+            Graph* mr_rec = graph;
+            void* c_dst = chk_c ? chk_c : C_ptr;
+            LAUNCH_MR(exl3_gemv_mr_fused_single, A_ptr, B_ptr, c_dst, suh_ptr, A_had_ptr, svh_ptr,
+                      pb, size_k, size_n, size_m, core, tpb)
+            if (!chk_c) return true;
+        }
+        else chk_c = nullptr;   // the fused form declines this call: nothing to compare
+    }
+
     // 1. Rotation + patch sites
     {
         int blocks = CEIL_DIVIDE(size_m * (size_k / 128) * 32, 256);
@@ -809,7 +1016,30 @@ bool exl3_gemv_multirow_try_launch
         dim3 grid(n_tiles / tpb, 1);
         dim3 block(warps * 32);
         size_t smem = exl3_gemv_mr_smem_bytes(warps, m_tile);
+        Graph* mr_rec = nullptr;
         LAUNCH_MR(exl3_gemv_mr_dot_single, pb, size_k, size_n, size_m, core, tpb)
+    }
+    if (chk_c)
+    {
+        int init[2] = { 0, 0x7fffffff };
+        cudaMemcpyAsync(chk_dev, init, sizeof(init), cudaMemcpyHostToDevice, stream);
+        hipLaunchKernelGGL(exl3_gemv_mr_cmp_kernel, dim3(64), dim3(256), 0, stream,
+            (const uint16_t*) C_ptr, (const uint16_t*) chk_c, (int64_t) (c_bytes / 2), chk_dev, chk_dev + 1);
+        int res[2];
+        cudaMemcpyAsync(res, chk_dev, sizeof(res), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        static std::atomic<long> calls{0}, bad{0};
+        long c_n = ++calls;
+        if (res[0])
+        {
+            long b_n = ++bad;
+            if (b_n <= 100)
+                fprintf(stderr, " -- gemv_mr_fuse_in CHECK MISMATCH: dev %d m %d k %d n %d K %d cb %d fp32 %d: %d of %zu u16 differ, first %d (A %p C %p A_had %p), call %ld\n",
+                        device, size_m, size_k, size_n, K, cb, (int) c_fp32, res[0], c_bytes / 2, res[1],
+                        (const void*) A_ptr, C_ptr, (const void*) A_had_ptr, c_n);
+        }
+        if (c_n % 20000 == 0)
+            fprintf(stderr, " -- gemv_mr_fuse_in CHECK: dev %d %ld calls, %ld mismatched\n", device, c_n, bad.load());
     }
     return true;
 }
@@ -902,6 +1132,7 @@ bool exl3_mgemv_multirow_try_launch
         dim3 grid(n_tiles / tpb, bszm);
         dim3 block(warps * 32);
         size_t smem = exl3_gemv_mr_smem_bytes(warps, m_tile);
+        Graph* mr_rec = nullptr;
         LAUNCH_MR(exl3_gemv_mr_dot_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
                   size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list, core, tpb,
                   num_tokens, weighted ? 1 : 0)

@@ -342,6 +342,24 @@ and synchronize after each probe and measurement launch, naming it first, so a l
 completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
 launches.
 
+### `EXL3_GEMV_MR_FUSE_IN` (default: `0`), `EXL3_GEMV_MR_FUSE_IN_MAX_KB` (default: `8`)
+
+ROCm: the single-matrix RDNA multi-row GEMV (`exl3_gemv_mr_*`) rotates its input inside the dot kernel
+instead of in a separate `exl3_gemv_mr_had_in_single` launch, one launch less per dense linear. Each
+wave rotates only the 128-column segments its own split-K range covers into LDS and reads nothing else,
+so no block barrier is needed. Same rotation and dot code on the same values, so the output is
+bit-identical. Calls whose rotated rows plus reduction slots need more than `_MAX_KB` KiB of LDS per
+block (1-64) keep the two-kernel form, and so do calls whose output overlaps their input. The default of
+8 KiB fuses single-row calls only: with more rows every block re-rotates all rows of its split-K range,
+which costs more than the saved launch.
+
+### `EXL3_GEMV_MR_FUSE_IN_TRACE` (default: `0`), `EXL3_GEMV_MR_FUSE_IN_CHECK` (default: `0`)
+
+ROCm, diagnostics for `EXL3_GEMV_MR_FUSE_IN`. `_TRACE=1` logs the first 200 single-matrix multi-row
+calls (shape, bit width, pointers). `_CHECK=1` runs every call the fused form would take twice, fused into
+a scratch output and then the two-kernel form into the real output, compares both bit for bit and logs
+mismatches. It synchronizes after every call, so it is slow.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
