@@ -622,11 +622,15 @@ def mp_disk_layout(local_context: dict, cache_ids: list[int]) -> list[dict]:
             heads = module.num_kv_heads
             first = getattr(module, "tp_kv_first", 0)
             total = getattr(module, "tp_kv_total", heads)
+            # QSA side planes are per token, not per head: every rank with heads holds a full copy
+            replicated = {id(x) for x in (getattr(layer, "raw_k", None), getattr(layer, "pooled", None)) if x is not None}
             for idx, t in enumerate([t for t in layer.get_tensors() if t is not None]):
                 nbytes = t[0].numel() * t.element_size()
                 rows = PAGE_SIZE if t.dim() >= 2 and t.shape[1] == PAGE_SIZE else 1
                 lrb = nbytes // rows
-                if total != heads:
+                if total != heads and id(t) in replicated:
+                    row_offset, crb = 0, lrb
+                elif total != heads:
                     assert heads and lrb % heads == 0, \
                         f"cache rows of {module.key} do not split by kv head ({lrb} bytes, {heads} heads)"
                     unit = lrb // heads

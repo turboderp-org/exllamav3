@@ -1040,6 +1040,13 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+### `EXL3_TP_QSA_SPLIT` (default: `0`)
+
+Attention layers with a QSA indexer normally run whole on one rank under TP (the others wait at a
+broadcast). With this set they split by K/V head like plain attention; every rank with heads holds the
+whole indexer and selects the same blocks from the rank-identical residual, and the layer ends in the
+all-reduce. Changes the reduction order of the attention output, so outputs can differ in the last bits.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)

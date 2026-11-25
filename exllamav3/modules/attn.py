@@ -12,6 +12,8 @@ from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
+# EXL3_TP_QSA_SPLIT=1: QSA layers split by K/V head under TP, the indexer replicated on every rank with heads
+_QSA_SPLIT = os.environ.get("EXL3_TP_QSA_SPLIT", "0") == "1"
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
@@ -1247,7 +1249,10 @@ class Attention(Module):
         channel_width = 1
         channels_to_split = self.num_kv_heads
         max_devices = None
-        if self.qsa_indexer is not None:
+        storage_d = 0
+        if self.qsa_indexer is not None and _QSA_SPLIT:
+            storage_d += self.qsa_indexer.storage_size()
+        if self.qsa_indexer is not None and not _QSA_SPLIT:
             # QSA: the indexer's raw/pooled key planes and block selection are per token, and the
             # sparse decode path reads all heads of a query row, so the layer runs whole on one
             # rank (see MLAttention); the other ranks hold head-less stubs
@@ -1270,7 +1275,7 @@ class Attention(Module):
             key = self.key,
             channel_width = channel_width,
             channel_unit = "heads",
-            storage_per_device = 0,
+            storage_per_device = storage_d,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1405,7 +1410,8 @@ class Attention(Module):
 
         qsa_indexer = None
         if exported.get("qsa_indexer") is not None and num_kv_heads:
-            assert num_kv_heads == exported["num_kv_heads"], "QSA attention layers run whole on one device"
+            assert _QSA_SPLIT or num_kv_heads == exported["num_kv_heads"], \
+                "QSA attention layers run whole on one device (EXL3_TP_QSA_SPLIT=1 splits them)"
             qsa_indexer = _import("qsa_indexer")
 
         module = Attention(
