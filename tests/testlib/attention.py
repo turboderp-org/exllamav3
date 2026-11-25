@@ -17,7 +17,7 @@ from exllamav3.constants import PAGE_SIZE
 
 
 def ref_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = True,
-             window: int | None = None) -> torch.Tensor:
+             window: int | None = None, softcap: float = 0.0) -> torch.Tensor:
     """fp32 reference: q (B, Q, H, D) attends to k / v (B, T, KVH, D) with GQA (H a multiple of KVH). The query
     rows are the last Q positions of T (bottom-right aligned causal mask); a window admits keys at positions
     >= q_pos - window. Returns (B, Q, H, D) fp32"""
@@ -27,6 +27,8 @@ def ref_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = T
     kk = k.repeat_interleave(g, dim = 2).float()
     vv = v.repeat_interleave(g, dim = 2).float()
     s = torch.einsum("bqhd,bkhd->bhqk", q.float(), kk) * D ** -0.5
+    if softcap:
+        s = softcap * torch.tanh(s / softcap)
     qpos = (T - Q + torch.arange(Q, device = q.device)).view(Q, 1)
     kpos = torch.arange(T, device = q.device).view(1, T)
     mask = torch.ones((Q, T), dtype = torch.bool, device = q.device)

@@ -320,15 +320,16 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
+        window_left, window_right = _normalize_window(self.window_size)
+        block_n, split_warps, split_stages, programs_per_sm = attn_decode_config(
+            dev, hd, bsz, q_len, group_size, self.quant, self.cache_k.shape[0] * PAGE_SIZE, window_left)
         block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = 2 * _get_sm_count(dev)
+        target = programs_per_sm * _get_sm_count(dev)
         splits_cap = max(1, min(target // programs, 128))
-        window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
         # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the

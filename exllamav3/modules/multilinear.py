@@ -1,6 +1,7 @@
 from __future__ import annotations
 import torch
 from . import Linear
+from ..ext import exllamav3_ext as ext
 
 class MultiLinear:
     def __init__(
@@ -8,6 +9,7 @@ class MultiLinear:
         device: torch.Device,
         linears: list[Linear],
         allow_bias: bool = False,
+        *, varying_widths: bool = False,
     ):
         self.device = device
         self.linears = linears
@@ -21,11 +23,16 @@ class MultiLinear:
         assert all(l.post_scale == 1.0 for l in linears)
 
         self.in_features = linears[0].in_features
-        self.out_features = linears[0].out_features
+        widths = [linear.out_features for linear in linears]
+        self.out_features = max(widths)
         self.K = linears[0].inner.K
         assert all(l.inner.K == self.K for l in linears)
         assert all(l.in_features == self.in_features for l in linears)
-        assert all(l.out_features == self.out_features for l in linears)
+        self.output_widths = None
+        if varying_widths and min(widths) != self.out_features:
+            self.output_widths = torch.tensor(widths, dtype = torch.int32, device = device)
+        else:
+            assert all(width == self.out_features for width in widths)
 
         self.ptrs_suh = torch.tensor([l.inner.suh.data_ptr() for l in linears], dtype = torch.long, device = device)
         self.ptrs_svh = torch.tensor([l.inner.svh.data_ptr() for l in linears], dtype = torch.long, device = device)
@@ -35,6 +42,48 @@ class MultiLinear:
         assert all(l.inner.mcg == self.mcg for l in linears[1:])
         self.mul1 = linears[0].inner.mul1
         assert all(l.inner.mul1 == self.mul1 for l in linears[1:])
+
+    @classmethod
+    def for_decode(cls, linears, device):
+        """Bundle compatible bias-free projections sharing a single input row."""
+        if device is None or torch.device(device).type != "cuda" or linears[0].config.infer_params.no_reconstruct:
+            return None
+        if any(l.quant_type != "exl3" or l.inner.bias is not None or l.softcap
+               or l.pre_scale != 1 or l.post_scale != 1 for l in linears):
+            return None
+        if len({(l.in_features, l.inner.K, l.inner.mcg, l.inner.mul1) for l in linears}) != 1:
+            return None
+        first = linears[0]
+        width = max(l.out_features for l in linears)
+        if not first.config.infer_params.use_mgemm(first.inner.K, width, first.inner.mul1, device):
+            return None
+        return cls(device, linears, varying_widths = True)
+
+    def can_project_one(self, x, params):
+        return (
+            x.dtype == torch.half and x.is_contiguous() and x.numel() == x.shape[-1] == self.in_features
+            and not any(k in params for k in ("capture", "ovr", "reconstruct", "quant_preserve"))
+            and not any(linear.lora_a_tensors for linear in self.linears)
+        )
+
+    def project_one(self, x, out_dtype):
+        """Project one shared input. Each row is valid up to its matrix's padded width."""
+        x = x.view(1, 1, self.in_features)
+        transformed = x.new_empty((self.num_linears, 1, self.in_features))
+        output = x.new_empty((self.num_linears, 1, self.out_features), dtype = out_dtype)
+        destinations = None
+        if self.output_widths is not None:
+            stride = self.out_features * output.element_size()
+            base = output.data_ptr()
+            destinations = torch.arange(base, base + self.num_linears * stride, stride,
+                                        device = self.device, dtype = torch.long)
+        ext.exl3_mgemm(
+            x, self.ptrs_trellis, output, self.ptrs_suh, transformed, self.ptrs_svh,
+            indices = None, weights = None, K = self.K, force_shape_idx = -1,
+            mcg = self.mcg, mul1 = self.mul1, min_index = -1, max_index = -1, force_num_sms = 0,
+            size_n_list = self.output_widths, c_ptrs = destinations,
+        )
+        return output
 
     def q_cb(self):
         return self.mcg, self.mul1

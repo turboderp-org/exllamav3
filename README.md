@@ -181,6 +181,32 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -h
 ```
 
+For OVHcloud Olala v1.0 mini 7A1B, use the original Hugging Face checkpoint or an EXL3 conversion:
+
+```sh
+python convert.py -i <olala_checkpoint> -w <work_dir> -o <olala_exl3_dir> -b 5.0
+python examples/chat.py -m <olala_exl3_dir> --mode olala
+```
+
+Olala chat uses the checkpoint's template and defaults to medium reasoning. Pass
+`--no_think` to disable reasoning. Olala supports up to 32K total context and uses FP32
+recurrent state. On CUDA and gfx1100, single-sequence EXL3 decode pairs the shared
+and latent MoE projections when all experts in the layer are on the GPU. This uses
+405 MiB of additional FP16 weights for the full 7A1B model and can change generated
+tokens. Set `EXL3_OLALA_FUSED_MOE=0` before loading to use the lower-memory path.
+On gfx1100, EXL3 decode can replay batches of up to eight sequences with an FP16 KV
+cache or a quantized KV cache that supports direct attention.
+
+Olala reads the optional `exl3_moe_activation_multiplier` from the checkpoint's
+`config.json` for both prefill and decode. The default is 128. A smaller value
+such as 16 preserves more precision in small routed expert activations while
+leaving less headroom for large activations.
+
+For a sensitivity-calibrated (SC) Olala quant, follow the
+[SC workflow](doc/optimize.md). Generate the calibration trace from the original
+Olala checkpoint and pass `--template_vars '{"reasoning_effort":"medium"}'` to
+`sc_trace.py`. Use the resulting trace with both `sc_measure.py` and `convert.py`.
+
 ## Architecture support
 
 | Model family                                      | HF architecture                                                               | Multimodal | Notes                 |
@@ -221,6 +247,7 @@ python examples/chat.py -h
 | **Mistral**, **Ministral 3**, **Mistral-4** etc.  | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration`                    |     ✓     |                       |
 | **Mixtral**                                       | `MixtralForCausalLM`                                                          |            |                       |
 | **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM`                                                        |            |                       |
+| **Olala v1.0 mini**                               | `OlalaForCausalLM`                                                          |            | Mamba-3 MIMO / differential attention MoE |
 | **Nemotron 3.5 Bolt**, **Nemotron 3.5 Super VL**  | `NemotronH_Omni_Reasoning_V3`                                                 |     ✓     | Image and video input |
 | **Olmo 3.1**                                      | `Olmo3ForCausalLM`                                                            |            |                       |
 | **Olmo-Hybrid**                                   | `OlmoHybridForCausalLM`                                                       |            |                       |

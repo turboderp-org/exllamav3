@@ -263,6 +263,18 @@ attention sinks); this switch exists for A/B comparison.
 
 ## EXL3 GEMM / GEMV
 
+### `EXL3_OLALA_FUSED_MOE` (default: `1`)
+
+Olala mini 7A1B caches four EXL3 projections in two matrices per eligible GPU MoE
+layer (405 MiB across 36 layers). On gfx1100, batch-one prefill and decode use
+BF16 projections and unscaled BF16 expert activations when all 256 experts are
+local and their up and down projections use integer 2–6 bit mul1 weights. The
+routed weights stay compressed. The FP16 path uses the configured activation
+multiplier. CUDA uses FP16 projection pairs for batch-one decode.
+
+Set to `0` before loading the model to disable the projection cache and use
+the standard EXL3 MoE path.
+
 ### `EXL3_GEMV` (default: `1`)
 
 QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape

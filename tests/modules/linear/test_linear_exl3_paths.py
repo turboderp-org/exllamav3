@@ -119,3 +119,16 @@ def test_auto_reconstruct_dispatch(tmp_path, device):
             assert recon == expect, f"{name}, rows {rows}: reconstruct path taken = {recon}"
             _, recon = spies[name].took_reconstruct(lambda: module.forward(x, {"reconstruct": True}))
             assert recon, f"{name}, rows {rows}: reconstruct requested but not taken"
+
+
+def test_single_token_projections_with_different_widths(tmp_path, device):
+    from exllamav3.modules.multilinear import MultiLinear
+
+    linears = [build(tmp_path / str(width), device, 512, width, 5, "mul1", False, width)[0]
+               for width in (128, 1024, 256)]
+    bundle = MultiLinear(device, linears, varying_widths = True)
+    x = torch.randn(1, 1, 512, device = device, dtype = torch.half)
+    rows = bundle.project_one(x, torch.float)
+    for row, linear in zip(rows, linears):
+        ref = linear.forward(x, {}, out_dtype = torch.float)
+        assert rel_rms(row[:, :linear.out_features], ref) < 0.005

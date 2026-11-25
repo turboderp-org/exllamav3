@@ -78,6 +78,15 @@ models:
     path: qwen3.5-9b/exl3/4.00bpw_mtp
     tags: [recurrent, gdn, attention, mtp, vision]
 
+  olala-hf:
+    path: Olala-v1.0-mini-7A1B
+    vram: 15
+    tags: [hf, recurrent, mamba3, attention, moe]
+
+  olala-exl3:
+    path: Olala-v1.0-mini-7A1B/exl3/5.0bpw
+    vram: 8
+
   mamba2:
     path: nemotron-3-nano-4b/exl3/4.00bpw
     tags: [recurrent, mamba2, attention]

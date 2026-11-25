@@ -80,11 +80,12 @@ class BCSharedKVAttn:
         hd = self.head_dim
         hd_pad = triton.next_power_of_2(hd)
         qh, kvh = self.num_q_heads, self.num_kv_heads
-        block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
+        window_left, window_right = _normalize_window(self.window_size)
+        block_n, split_warps, split_stages, programs_per_sm = attn_decode_config(
+            dev, hd, bsz, q_len, qh // kvh, self.qc is not None, self.cache_k.shape[0] * PAGE_SIZE, window_left)
         block_rows, h_blocks = decode_row_layout(q_len, qh // kvh, hd_pad)
         programs = bsz * kvh * h_blocks
-        splits_cap = max(1, min(2 * _get_sm_count(dev) // programs, 128))
-        window_left, window_right = _normalize_window(self.window_size)
+        splits_cap = max(1, min(programs_per_sm * _get_sm_count(dev) // programs, 128))
         sig = {
             "q": "*fp16:16", "k_cache": "*i32:16" if self.qc else "*fp16:16", "v_cache": "*i32:16" if self.qc else "*fp16:16",
             "block_table": "*i32:16", "cache_seqlens": "*i32", "out": "*fp16:16",

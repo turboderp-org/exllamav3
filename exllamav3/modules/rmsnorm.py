@@ -254,3 +254,7 @@ class RMSNorm(Module):
         # span_heads is preserved via kwargs
 
         return module
+
+
+def zero_centered_rms_norm(x, weight, eps):
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), 1 + weight.float(), eps)

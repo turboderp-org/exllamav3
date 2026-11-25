@@ -6,6 +6,8 @@ buffers live in the RoutingCFG (CUDA-graph paths bake their addresses).
 """
 from __future__ import annotations
 import torch
+import triton
+import triton.language as tl
 import torch.nn.functional as F
 from dataclasses import dataclass
 from ..util.device_copy import to_device
@@ -176,17 +178,33 @@ def routing_std_bias(bsz, cfg, y, params):
     return selected_experts, routing_weights
 
 
-# TODO: Optimize top_k groups (for DS3)
+@triton.jit
+def _router_gemv(Input, Gate, Output, Hidden: tl.constexpr, Experts: tl.constexpr, Tile: tl.constexpr):
+    e = tl.program_id(0) * 4 + tl.arange(0, 4)
+    h = tl.arange(0, Tile)
+    x = tl.load(Input + h, h < Hidden, 0).to(tl.float32)
+    w = tl.load(Gate + e[:, None] * Hidden + h[None, :],
+                (e[:, None] < Experts) & (h[None, :] < Hidden), 0).to(tl.float32)
+    tl.store(Output + e, tl.sum(w * x[None, :], 1), e < Experts)
+
+
+def _routing_gemv_fp32(x, gate, logits):
+    experts, hidden = gate.shape
+    _router_gemv[(triton.cdiv(experts, 4),)](x, gate, logits, hidden, experts, triton.next_power_of_2(hidden))
+
+
 def routing_ds3(bsz, cfg, y, params):
-    """Group-limited DS3 routing (n_group > 1): fp32 logits (the reference gate's precision;
+    """DS3 routing with optional group limits: fp32 logits (the reference gate's precision;
     with hundreds of experts the selection margins sit below fp16 resolution), group scores
     from each group's two best biased scores, the topk_group best groups eligible, top-K over
     those, weights from the unbiased scores. Single rows project with the fixed-order fp32
     GEMV, other row counts with an fp32 matmul; selection and weights run in one kernel
-    (routing_ds3_group). The torch composition stays for the all-experts calibration pass."""
-    if params.get("activate_all_experts"):
+    (routing_ds3_group). FP32-weight gates use the torch composition for multiple rows
+    to keep the expert selection order used during prefill and calibration."""
+    fp32_gate = cfg.gate_tensor.dtype == torch.float32
+    if params.get("activate_all_experts") or (fp32_gate and (bsz != 1 or "capture" in params)):
         return _routing_ds3_torch(bsz, cfg, y, params)
-    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    E = cfg.num_experts
     if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
         cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
     if bsz == 1:
@@ -194,7 +212,10 @@ def routing_ds3(bsz, cfg, y, params):
         if cfg.router_logits_f32_bsz1 is None:
             cfg.router_logits_f32_bsz1 = torch.empty((1, E), dtype = torch.float, device = y.device)
         logits = cfg.router_logits_f32_bsz1
-        ext.routing_gemv_f32(y.view(-1), cfg.gate_tensor_t, logits.view(-1))
+        if fp32_gate:
+            _routing_gemv_fp32(y, cfg.gate_tensor_t, logits)
+        else:
+            ext.routing_gemv_f32(y.view(-1), cfg.gate_tensor_t, logits.view(-1))
         selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
         if cfg.gate_tensor_f32 is None:
@@ -219,21 +240,23 @@ def _routing_ds3_torch(bsz, cfg, y, params):
     if cfg.e_score_correction_bias is not None:
         scores_for_choice = scores_for_choice + cfg.e_score_correction_bias.unsqueeze(0)
 
-    group_scores = (
-        scores_for_choice.view(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
-        .topk(2, dim = -1)[0]
-        .sum(dim = -1)
-    )
-    group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1)
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
-        .reshape(-1, cfg.num_experts)
-    )
-    # -inf, not 0: the selection bias can push eligible scores below zero
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    if cfg.topk_group != cfg.n_group:
+        group_size = cfg.num_experts // cfg.n_group
+        group_scores = (
+            scores_for_choice.view(-1, cfg.n_group, group_size)
+            .topk(min(2, group_size), dim = -1)[0]
+            .sum(dim = -1)
+        )
+        group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
+            .reshape(-1, cfg.num_experts)
+        )
+        # -inf, not 0: the selection bias can push eligible scores below zero
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,

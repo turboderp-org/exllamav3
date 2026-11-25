@@ -250,6 +250,11 @@ class Generator:
         :param kwargs:
         """
 
+        if (draft_model or ngram_match_min or hybrid_draft_tokens) and not model.caps.get("supports_speculative", True):
+            raise ValueError(f"{type(model).__name__} does not support speculative decoding")
+        if draft_model is not None and not draft_model.caps.get("supports_speculative", True):
+            raise ValueError(f"{type(draft_model).__name__} does not support speculative decoding")
+
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer

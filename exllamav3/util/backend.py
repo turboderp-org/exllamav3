@@ -55,20 +55,21 @@ MOE_MTILE = _env("EXL3_MOE_MTILE", 1, 0) != "0"
 # default where the per-launch cost dominates these small kernels (RDNA)
 HC_FOLD = _env("EXL3_HC_FOLD", 0, 1) != "0"
 
-# Split-decode attention (triton_paged.py, bc_attn.py): AMD's Triton backend runs the split kernel at
-# 8 warps / 1 stage without spilling to scratch, where 4 / 2 does. gfx1100 is measured separately: at
-# head_dim <= 128 a 32-key tile at 2 warps / 2 stages beats the 8192 / head_dim tile across context
-# lengths (more splits at short contexts, far fewer stalls at long ones); the QSA sparse split kernel
-# keeps the pair below
+# Split-decode attention (triton_paged.py, bc_attn.py): the general HIP path uses
+# eight warps and one stage to avoid spilling. RDNA3 overrides are selected below.
 ATTN_SPLIT_WARPS_STAGES = (8, 1) if ROCM else (4, 2)
 
 
-def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
-    """(block_n, num_warps, num_stages) for the paged decode attention split kernel; block_n is the
-    kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
+def attn_decode_config(device, head_dim: int, batch: int, queries: int, group_size: int,
+                       quantized: bool, kv_bound: int, window_left: int) -> tuple[int, int, int, int]:
+    """KV tile, warps, pipeline stages and target programs per CU for paged decode."""
+    hd_pad = 1 << (head_dim - 1).bit_length()
     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
-        return 32, 2, 2
-    return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
+        if (head_dim == 128 and batch == queries == 1 and group_size in (2, 4) and not quantized
+                and kv_bound >= 4096 and (window_left < 0 or window_left >= 4096)):
+            return 64, 2, 1, 4
+        return 32, 2, 2, 2
+    return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES, 2
 
 
 # --- Turing (sm_75) prefill ---------------------------------------------------------------------------------

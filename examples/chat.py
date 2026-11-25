@@ -1,5 +1,4 @@
 import sys, os
-from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -43,13 +42,12 @@ def main(args):
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
     show_tps = args.show_tps
-    think = args.think
     last_input_ids = None
-    assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
 
     # Prompt format
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
+    think = prompt_format.default_think if args.think is None else args.think
     spc = {}
     if args.think_budget is not None:
         spc["thinking_budget"] = args.think_budget
@@ -63,7 +61,7 @@ def main(args):
         streamer_cm = Streamer_basic
     elif prompt_format.is_harmony_like():
         read_input_fn = read_input_ptk
-        streamer_cm = partial(Streamer_harmony, tags = prompt_format.harmony_tags())
+        streamer_cm = Streamer_harmony
     else:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
@@ -71,6 +69,9 @@ def main(args):
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
+    if isinstance(prompt_format, PromptFormat_olala):
+        prompt_format.model_directory = config.directory
+        context_length = min(context_length, config.max_position_embeddings)
 
     # Limit max_response_tokens if cache_size is too small
     if max_response_tokens > context_length // 2:
@@ -117,7 +118,7 @@ def main(args):
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
     tt = prompt_format.thinktag()
-    banned_strings = [tag for tag in tt if tag] if args.no_think else []
+    banned_strings = [tag for tag in tt if tag] if args.think is False else []
     response = ""
     last_tokens = None
 
@@ -523,6 +524,7 @@ def main(args):
             stop_conditions = stop_conditions,
             sampler = sampler,
             banned_strings = banned_strings,
+            decode_special_tokens = isinstance(prompt_format, PromptFormat_olala),
             token_healing = enable_healing,
             return_logits = save_probs > 0,
             stop_on_loop = True,
@@ -538,9 +540,10 @@ def main(args):
 
         # Stream response
         stop_reason = None
+        streamer_options = {"tags": prompt_format.harmony_tags(think)} if streamer_cm is Streamer_harmony else {}
         with (
             KeyReader() as keyreader,
-            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think) as s
+            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think, **streamer_options) as s
         ):
             if prefix:
                 s.stream(prefix)
@@ -671,8 +674,9 @@ if __name__ == "__main__":
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 5000, help = "Max tokens per response, default = 5000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
-    parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
-    parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
+    reasoning = parser.add_mutually_exclusive_group()
+    reasoning.add_argument("-think", "--think", action = "store_true", default = None, help = "Use (very simplistic) reasoning template and formatting")
+    reasoning.add_argument("-no_think", "--no_think", dest = "think", action = "store_false", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")

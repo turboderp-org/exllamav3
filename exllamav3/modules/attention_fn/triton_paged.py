@@ -1257,19 +1257,7 @@ def paged_attn_triton_decode(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile. Tile and
-    # launch shape per backend / architecture (util/backend.py) unless the caller sets them
-    cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, hd_pad)
-    if num_warps is None:
-        num_warps = cfg_warps
-    if num_stages is None:
-        num_stages = cfg_stages
-    candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
-
-    group_size = n_q_heads // n_kv_heads
-    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
     num_pages_per_seq = block_table.shape[1]
-
     # Upper bound on kv length: caller-provided hint, else from the block table shape
     # (cache_seqlens stays on the device; no sync). A loose bound wastes split parallelism when
     # the table is allocated much larger than the live sequence
@@ -1277,11 +1265,21 @@ def paged_attn_triton_decode(
     if max_kv_len is not None:
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
 
+    group_size = n_q_heads // n_kv_heads
+    cfg_block_n, cfg_warps, cfg_stages, programs_per_sm = attn_decode_config(
+        q.device, head_dim, bsz, q_len, group_size, qc is not None, max_k_len, window_left)
+    if num_warps is None:
+        num_warps = cfg_warps
+    if num_stages is None:
+        num_stages = cfg_stages
+    candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
+
+    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
     programs = bsz * n_kv_heads * h_blocks
     dev = q.device.index
     if dev not in _decode_sm_count:
         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-    target = 2 * _decode_sm_count[dev]
+    target = programs_per_sm * _decode_sm_count[dev]
 
     def prepare(block_n):
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""
@@ -2016,6 +2014,14 @@ def paged_attn_triton_prefill(
                 cfg = (128, 32, 8, 2 if gfx_arch(q.device) == "gfx1100" else 1)
             else:
                 cfg = (64, 32, 8, 1)
+    # A larger KV tile amortizes page lookups in long-context RDNA3 prefill.
+    # A single pipeline stage keeps the working set within the LDS budget.
+    group_size = n_q_heads // n_kv_heads
+    if (head_dim == 128 and qc is None and bsz == 1 and q_len >= 512 and group_size in (2, 4)
+            and (window_left < 0 or window_left >= 4096) and gfx_arch(q.device) == "gfx1100"):
+        past_bound = block_table.shape[1] * page_size if max_kv_len is None else max_kv_len
+        if past_bound + kv_append_len >= 8192:
+            cfg = (128, 128 if group_size == 2 else 64, 8, 1)
     # Pre-Ampere (Turing/Volta, 64 KB per-block smem; the C++ EXL3_SM75 gate is
     # __CUDA_ARCH__ < 800, the same class): the stock tiles overcommit the device's budget,
     # and the ladder's first fit starves the mma pipeline -- at hd_pad 256 it is

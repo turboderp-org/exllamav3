@@ -33,6 +33,9 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 
 class Linear(Module):
+    # A parent that consumes these weights during load must read the trellis
+    # and sign vectors before the surrounding deferred batch is submitted.
+    eager_exl3 = False
 
     def __init__(
         self,
@@ -505,10 +508,10 @@ class Linear(Module):
             return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
         scale = None  # opt(".scale", self.device)
         su = opt(".su", self.device, no_defer = True)
-        suh = opt(".suh", self.device)
+        suh = opt(".suh", self.device, no_defer = self.eager_exl3)
         sv = opt(".sv", self.device, no_defer = True)
-        svh = opt(".svh", self.device)
-        trellis = stc.get_tensor(key + ".trellis", self.device)
+        svh = opt(".svh", self.device, no_defer = self.eager_exl3)
+        trellis = stc.get_tensor(key + ".trellis", self.device, no_defer = self.eager_exl3)
         mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
         mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
         bias = opt(".bias", self.device)

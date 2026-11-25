@@ -50,6 +50,7 @@ from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
 from .nemotronh import NemotronHModel, NemotronHOmniModel
+from .olala import OlalaModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -130,6 +131,7 @@ ARCHITECTURES = {
         MuseGlimmerAssistantModel,
         NemotronHModel,
         NemotronHOmniModel,
+        OlalaModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

@@ -1,5 +1,7 @@
 
 class PromptFormat:
+    default_think = False
+
     def __init__(self, user_name, bot_name):
         self.user_name = user_name
         self.bot_name = bot_name
@@ -15,7 +17,7 @@ class PromptFormat:
         return "<think>", "</think>"
     def is_harmony_like(self):
         return False
-    def harmony_tags(self):
+    def harmony_tags(self, think = False):
         # None: Streamer_harmony keeps its GPT-OSS default tags
         return None
     def inject_thinktag(self):
@@ -1243,7 +1245,7 @@ class PromptFormat_muse(PromptFormat):
     def is_harmony_like(self):
         return True
 
-    def harmony_tags(self):
+    def harmony_tags(self, think = False):
         # A turn is a chain of <|start|>assistant to={recipient}<|message|>... messages joined by
         # <|eom|>. The first header arrives without its <|start|>assistant prefix (it's part of
         # the prompt), hence the prime. "to=" alone can't be the channel tag: it's plain text
@@ -1297,7 +1299,50 @@ class PromptFormat_ling(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_olala(PromptFormat):
+    description = "Olala 1.0 mini"
+    default_think = True
+
+    def default_system_prompt(self, think):
+        return ""
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return None, None
+
+    def format(self, system_prompt, messages, think):
+        from exllamav3.architecture.olala_template import render_olala_chat
+
+        turns = [{"role": "system", "content": system_prompt}] if system_prompt else []
+        for user, assistant in messages:
+            turns.append({"role": "user", "content": user})
+            if assistant is not None:
+                final_header = "<|channel_start|>final<|content|>"
+                _, header, final = assistant.partition(final_header)
+                if not header and "<|channel_end|>" not in assistant:
+                    final = assistant
+                turns.append({"role": "assistant", "content": final.split("<|channel_end|>", 1)[0]})
+        return render_olala_chat(self.model_directory, turns, "medium" if think else "disabled")
+
+    def stop_conditions(self, tokenizer):
+        return [tokenizer.eos_token_id]
+
+    def is_harmony_like(self):
+        return True
+
+    def harmony_tags(self, think = False):
+        return {
+            "channel_tag": "<|channel_start|>",
+            "message_tag": "<|content|>",
+            "end_tag": "<|channel_end|>",
+            "prime": "<|channel_start|>analysis<|content|>" if think else "",
+        }
+
+
 prompt_formats = {
+    "olala": PromptFormat_olala,
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
     "chatml": PromptFormat_chatml,

@@ -414,8 +414,8 @@ class Streamer_harmony:
         channel_tag:    opens a channel header
         message_tag:    ends the header, starts the message content
         end_tag:        ends a message within the turn (the final stop token is never streamed)
-        prime:          text virtually prepended to the parser state, for formats whose first
-                        channel header arrives without its opening tag (not added to all_text)
+        prime:          channel header prefix already in the prompt, prepended to the parser
+                        state (not added to all_text)
         channel_prefix: stripped from the displayed channel name
     """
 

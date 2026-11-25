@@ -78,6 +78,13 @@ def _print_no_attn_match_report(args: AttnArgs):
     )
 
 
+def supports_direct_quant_cache(layer, head_dim):
+    return (
+        _qc_attn and isinstance(layer, CacheLayer_quant) and layer.compand_a == 0.0
+        and head_dim <= 512 and head_dim % 32 == 0
+    )
+
+
 def attn_dispatch(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -120,11 +127,8 @@ def attn_dispatch(
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
-            _qc_attn and
-            isinstance(layer, CacheLayer_quant) and
-            layer.compand_a == 0.0 and
+            supports_direct_quant_cache(layer, dim) and
             q.dtype == torch.float16 and
-            dim <= 512 and dim % 32 == 0 and   # packed groups of 32; non-pow2 dims run zero-padded
             cu_seqlens is None
         ):
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)

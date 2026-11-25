@@ -12,6 +12,8 @@ from .mla_attn import MLAttention
 from .sliding_attn import SlidingAttention, SWAState, SWALayerState
 from .gated_delta_net import GatedDeltaNet, GDNState, GDNLayerState
 from .mamba2 import Mamba2
+from .mamba3 import Mamba3
+from .factorized_attention import FactorizedDifferentialAttention
 from .short_conv import ShortConv, ShortConvState, ShortConvLayerState
 from .gated_rmsnorm import GatedRMSNorm
 from .hyperconnections import HyperConnection, ExpandStreams, HyperHead, GatedResidual
