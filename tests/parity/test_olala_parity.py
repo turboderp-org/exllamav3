@@ -1,4 +1,6 @@
+import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -29,6 +31,26 @@ def test_geodesic_update_preserves_radius_and_scales_angle_by_depth():
     expected = torch.tensor([[2 * math.cos(angle), 2 * math.sin(angle)]])
     torch.testing.assert_close(geodesic_update(residual, update, 1.0, 0.0, 2), expected)
     torch.testing.assert_close(geodesic_update(residual, update * 1e24, 1.0, 0.0, 2), expected)
+
+
+@pytest.mark.nogpu
+@pytest.mark.model("olala-hf")
+@pytest.mark.parametrize("multiplier", [None, 16])
+def test_olala_latent_input_scaling(model_dir, tmp_path, multiplier):
+    from exllamav3 import Config
+    from exllamav3.modules.arch_specific.olala import OlalaLatentIn
+
+    settings = json.loads((Path(model_dir) / "config.json").read_text())
+    settings.pop("exl3_moe_activation_multiplier", None)
+    if multiplier is not None:
+        settings["exl3_moe_activation_multiplier"] = multiplier
+    (tmp_path / "config.json").write_text(json.dumps(settings))
+    config = Config.from_directory(str(tmp_path))
+    layer = OlalaLatentIn(config, "down_proj", in_features = 128, out_features = 128)
+    scaled, compensation = layer.scale_input(torch.ones(1, 128), {})
+    expected = 128 if multiplier is None else multiplier
+    torch.testing.assert_close(scaled, torch.full_like(scaled, 1 / expected))
+    torch.testing.assert_close(compensation, torch.full_like(compensation, expected ** 2))
 
 
 @pytest.mark.nogpu
@@ -206,12 +228,15 @@ def test_olala_router_retains_fp32_source_and_uses_unbiased_weights(model_dir):
 
 @pytest.mark.slow
 @pytest.mark.model("olala-exl3")
-def test_olala_exl3_prefill_and_decode(model_dir, device):
+def test_olala_exl3_prefill_and_decode(model_dir, device, monkeypatch):
     from exllamav3 import Cache, Config, Generator, Model, Tokenizer
     from exllamav3.architecture.olala_template import render_olala_chat
     from exllamav3.generator.sampler import GreedySampler
     from exllamav3.modules import Linear
+    from exllamav3.modules.arch_specific.olala_moe import pack_projections
+    from exllamav3.util.backend import ROCM, gfx_arch
 
+    monkeypatch.setenv("EXL3_OLALA_FUSED_MOE", "1")
     config = Config.from_directory(model_dir)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = 1024, max_batch_size = 1)
@@ -220,6 +245,13 @@ def test_olala_exl3_prefill_and_decode(model_dir, device):
     generator = None
     try:
         assert any(isinstance(module, Linear) and module.quant_type == "exl3" for module in model)
+        if not ROCM or gfx_arch(device) == "gfx1100":
+            moe = model.modules[model.first_block_idx].mlp
+            assert moe.decode_weights is not None
+            # A premature read of a deferred trellis can produce finite but incorrect
+            # projections. Reconstruct again after the checkpoint load has completed.
+            for packed, reference in zip(moe.decode_weights, pack_projections(moe.decode_linears), strict = True):
+                torch.testing.assert_close(packed, reference, rtol = 0, atol = 0)
         recurrent_layers = cache.get_all_recurrent_layers()
         assert len(recurrent_layers) == config.num_hidden_layers
         for layer in recurrent_layers.values():

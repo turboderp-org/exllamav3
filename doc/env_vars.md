@@ -263,6 +263,13 @@ attention sinks); this switch exists for A/B comparison.
 
 ## EXL3 GEMM / GEMV
 
+### `EXL3_OLALA_FUSED_MOE` (default: `1`)
+
+Olala mini 7A1B packs four EXL3 projections per eligible GPU MoE layer into two
+FP16 matrices for batch-one decode on CUDA and gfx1100. The 36 pairs use 405 MiB
+in total. Set to `0` before model load to use the original EXL3 projection arithmetic
+and free that memory for other uses.
+
 ### `EXL3_GEMV` (default: `1`)
 
 QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape

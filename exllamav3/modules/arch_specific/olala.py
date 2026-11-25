@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import torch
@@ -13,6 +14,8 @@ from ..linear import Linear
 from ..mamba3 import Mamba3
 from ..mlp import MLP
 from ..tensor_bundle import TensorBundle
+from ...util.backend import ROCM, gfx_arch
+from .olala_moe import decode_moe, pack_projections
 
 
 def projection(config, key, input_size, output_size, qmap, **kwargs):
@@ -44,14 +47,17 @@ class OlalaRouter(TensorBundle):
 
 
 class OlalaLatentIn(Linear):
-    def forward(self, x, params, out_dtype = None):
+    def scale_input(self, latent, params, out_dtype = None):
         # Per-token scaling protects the half-precision expert activations and
         # routed sum, including outliers in otherwise small layers.
-        latent = super().forward(x, params, out_dtype = torch.float)
-        scaled, scale = scale_activation(
-            latent, 128., squared = True, out_dtype = out_dtype or torch.half,
+        return scale_activation(
+            latent, self.config.moe_activation_multiplier, squared = True, out_dtype = out_dtype or torch.half,
             use_triton = "capture" not in params,
         )
+
+    def forward(self, x, params, out_dtype = None):
+        latent = super().forward(x, params, out_dtype = torch.float)
+        scaled, scale = self.scale_input(latent, params, out_dtype)
         params["olala_latent_scale"] = scale
         return scaled
 
@@ -101,6 +107,33 @@ class OlalaMoE(BlockSparseMLP):
                 qmap = "block.mlp", out_dtype = torch.float,
             ),
         )
+        self.decode_linears = (latent_in, self.shared_experts.ups[0], latent_out, self.shared_experts.downs[0])
+        self.decode_weights = None
+
+    def load(self, device, **kwargs):
+        pack = (
+            device is not None and torch.device(device).type == "cuda"
+            and (not ROCM or gfx_arch(torch.device(device)) == "gfx1100")
+            and os.environ.get("EXL3_OLALA_FUSED_MOE", "1") != "0"
+            and not self.config.infer_params.no_reconstruct
+            and (self.config.hidden_size, self.config.latent_size, self.config.shared_size) == (1536, 384, 1536)
+            and self.shared_experts.num_slices == 1
+        )
+        self.decode_weights = None
+        for linear in self.decode_linears:
+            linear.eager_exl3 = pack
+        super().load(device, **kwargs)
+        if (pack and self.bc is not None and not self.cpu_offload and self.cpu_split_first is None
+                and not self.bc_sh_exp and all(
+                    linear.quant_type == "exl3" and linear.inner.bias is None and not linear.softcap
+                    and linear.pre_scale == linear.post_scale == 1 for linear in self.decode_linears
+                )):
+            with torch.cuda.device(device):
+                self.decode_weights = pack_projections(self.decode_linears)
+
+    def unload(self):
+        self.decode_weights = None
+        super().unload()
 
     def load_routing(self, **kwargs):
         bias = self.e_score_correction_bias
@@ -110,8 +143,18 @@ class OlalaMoE(BlockSparseMLP):
         self.routing_cfg.gate_tensor_t = self.routing_gate.tensors["weight"].contiguous()
 
     def forward(self, x, params, out_dtype = None):
+        x = x.half()
+        if (self.decode_weights is not None and x.shape == (1, 1, self.hidden_size) and x.is_contiguous()
+                and params.get("recurrent_slots") is not None
+                and not any(key in params for key in (
+                    "prefill", "capture", "ovr", "reconstruct", "quant_preserve", "activate_all_experts",
+                    "autosplit_measure", "tp_warmup",
+                ))
+                and not any(linear.lora_a_tensors for linear in self.decode_linears)):
+            with torch.cuda.device(x.device):
+                return decode_moe(self, x, params).to(out_dtype or torch.float32)
         try:
-            return super().forward(x.half(), params, out_dtype)
+            return super().forward(x, params, out_dtype)
         finally:
             params.pop("olala_latent_scale", None)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn.functional as F
 from typing_extensions import override
@@ -87,6 +88,9 @@ class OlalaConfig(Config):
         self.latent_size = self.read_cfg(int, "moe_routed_input_dim", no_default)
         self.shared_size = self.read_cfg(int, "moe_shared_intermediate_size", no_default)
         self.expert_scale = self.read_cfg(float, "moe_routed_scaling_factor", no_default)
+        self.moe_activation_multiplier = self.read_cfg(float, "exl3_moe_activation_multiplier", 128.0)
+        if not math.isfinite(self.moe_activation_multiplier) or self.moe_activation_multiplier <= 0:
+            raise ValueError("exl3_moe_activation_multiplier must be finite and positive")
         self.norm_eps = self.read_cfg(float, "norm_epsilon", no_default)
         if not 1 < self.num_experts_per_tok <= self.num_experts or min(
             self.hidden_size, self.head_dim, self.attention_rank, self.sliding_window, self.attention_softcap,
