@@ -1,11 +1,18 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
+from ...ext import exllamav3_ext as ext
 from ...util.device_copy import to_device
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm
 from ...util.tensor import get_for_device, to2
 from ...model.model_tp_fn import mp_model_forward_embedding
+
+# EXL3_MTP_FUSED_GLUE=0: the grouped trunk-stream norm as torch ops (8 launches per draft step) instead of one
+# ext.rms_norm with w_groups = hc_mult. Default on ROCm only (not tested on CUDA); =1 enables it on any backend
+_fused_glue = os.environ.get("EXL3_MTP_FUSED_GLUE")
+_fused_glue = _fused_glue != "0" if _fused_glue is not None else torch.version.hip is not None
 
 """
 MTP input layer for Qwen3.8-Flash-Next.
@@ -94,11 +101,13 @@ class Qwen4ExpMTPInputLayer(Module):
         w = self.config.stc.get_tensor(f"{self.key}.pre_fc_norm_hidden.weight", device, no_defer = True)
         self.norm_hidden_w_raw = w
         self.norm_hidden_w = (w.float() + 1.0).view(self.hc_mult, self.hidden_size).contiguous()
+        self.norm_hidden_w_flat = w.reshape(-1).contiguous() if w.dtype in (torch.half, torch.bfloat16) else None
 
     @override
     def unload(self):
         super().unload()
         self.norm_hidden_w_raw = self.norm_hidden_w = None
+        self.norm_hidden_w_flat = None
 
     @override
     def get_tensors(self):
@@ -146,10 +155,22 @@ class Qwen4ExpMTPInputLayer(Module):
             f"Qwen4Exp MTP token/state shape mismatch: {tuple(x.shape)} vs {tuple(target_hidden.shape)}"
         bsz, seq = x.shape
         y = get_for_device(params, "target_hidden", self.device)
-        stack = y.view(bsz, seq, self.hc_mult, self.hidden_size).float()
-        normed = stack * torch.rsqrt(stack.pow(2).mean(-1, keepdim = True) + self.rms_eps) \
-            * self.norm_hidden_w
-        h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
+        if (
+            _fused_glue and getattr(self, "norm_hidden_w_flat", None) is not None and y.is_contiguous() and
+            y.dtype in (torch.float, torch.half) and y.numel() == bsz * seq * self.hc_mult * self.hidden_size
+        ):
+            # One launch: rows (b, s, h) of length D, weight row h = row % hc_mult, w + 1.0, fp16 out
+            normed = torch.empty((bsz, seq, self.hc_mult, self.hidden_size), dtype = torch.half, device = y.device)
+            ext.rms_norm(
+                y.view(-1, self.hidden_size), self.norm_hidden_w_flat, normed.view(-1, self.hidden_size),
+                self.rms_eps, 1.0, 1.0, False, False, self.hc_mult
+            )
+            h = self.fc_hidden.forward(normed, params)                         # (b, s, H, D)
+        else:
+            stack = y.view(bsz, seq, self.hc_mult, self.hidden_size).float()
+            normed = stack * torch.rsqrt(stack.pow(2).mean(-1, keepdim = True) + self.rms_eps) \
+                * self.norm_hidden_w
+            h = self.fc_hidden.forward(normed.half().contiguous(), params)     # (b, s, H, D)
 
         # Token embedding via the attached model (in the TP output worker when the target is TP)
         # A sparse draft head hands back the token's embedding row with the id (also under TP, where the
@@ -166,7 +187,8 @@ class Qwen4ExpMTPInputLayer(Module):
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 
         if self.stream_tap:
-            streams = h.float() + emb.float().unsqueeze(-2)
+            # float + half promotes inside the add: the values of h.float() + emb.float(), one launch less
+            streams = h.float() + emb.unsqueeze(-2) if _fused_glue else h.float() + emb.float().unsqueeze(-2)
         else:
             streams = (h.float().mean(dim = -2) + emb.float()) \
                 .unsqueeze(-2).expand(-1, -1, self.hc_mult, -1)

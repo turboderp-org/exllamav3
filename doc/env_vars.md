@@ -1060,6 +1060,12 @@ timed again and only then is the mode decided. A result where the subset is not 
 implausible and is measured again at 4x the round count, up to 3 times; a non-positive break-even miss rate
 never switches the subset off. `0` disables the re-benchmark and decides from the load-time numbers.
 
+### `EXL3_MTP_FUSED_GLUE` (default: `1` on ROCm, `0` on CUDA)
+
+Qwen3.8-Flash-Next MTP input layer: the grouped norm over the hyper-connection streams runs as one
+`rms_norm` launch with weight groups instead of eight torch ops per draft step. `0` restores the torch ops.
+Only tested on ROCm, hence off by default on CUDA; `1` enables it there.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
