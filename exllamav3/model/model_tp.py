@@ -643,7 +643,11 @@ class Model_TPMixin:
                 defer = module.can_defer_load()
                 if defer:
                     config.stc.begin_deferred_load()
-                module.load(torch.device("cpu"))
+                config.loading_for_tp = True
+                try:
+                    module.load(torch.device("cpu"))
+                finally:
+                    config.loading_for_tp = False
                 if defer:
                     config.stc.end_deferred_load()
 

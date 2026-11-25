@@ -165,9 +165,9 @@ class RowTable:
 
     def export(self, stc) -> dict:
         """
-        Tensor-parallel: the table itself never travels. Every rank streams rows from disk
-        through its own handles, so the export carries the shard locations. A table held in RAM
-        here is still streamed from disk by the workers.
+        Tensor-parallel: the table itself never travels, the export carries the shard locations.
+        The importing rank streams rows through its own handles, or reads the table into its own
+        RAM when from_export() is told to (see NGramEmbedding.tp_export).
         """
         handles = [stc.get_tensor_handle(k) for k in self.keys]
         return {
@@ -177,14 +177,44 @@ class RowTable:
         }
 
     @staticmethod
-    def from_export(exported: dict) -> RowTable:
+    def from_export(exported: dict, ram: bool = False, lock: bool = False) -> RowTable:
+        """ram: read the table into this process's RAM instead of streaming it; lock: also mlock() it"""
         table = RowTable(exported["key"], exported["keys"])
         table._set_stores([
             DiskTensorHandle(key = k, filename = fn, abs_offset = off, shape = shape,
                              dtype = getattr(torch, d.split(".")[1]))
             for k, fn, off, shape, d in exported["handles"]
         ])
+        if ram or lock:
+            table._load_ram(lock)
         return table
+
+    def _load_ram(self, lock: bool, chunk: int = 256 << 20):
+        """Replace the disk handles with CPU tensors holding the same rows (anonymous memory, not the page
+        cache), one sequential read per shard"""
+        handles = self.stores
+        nbytes = sum(h.num_rows * h.row_bytes for h in handles)
+        from ..util.memory import check_host_memory, prepare_host_lock, lock_host_tensors
+        if lock:
+            prepare_host_lock(nbytes, f"Locking {self.key} in RAM")
+        check_host_memory(nbytes, f"n-gram table {self.key} held in RAM")
+        tensors = []
+        for h in handles:
+            size = h.num_rows * h.row_bytes
+            buf = torch.empty((h.num_rows, h.row_bytes), dtype = torch.uint8)
+            mv = memoryview(buf.numpy()).cast("B")
+            with open(h.filename, "rb", buffering = 0) as f:
+                f.seek(h.abs_offset)
+                pos = 0
+                while pos < size:
+                    n = f.readinto(mv[pos : min(pos + chunk, size)])
+                    if not n:
+                        raise IOError(f"{self.key}: short read in {h.filename} at {h.abs_offset + pos}")
+                    pos += n
+            tensors.append(buf.view(h.dtype).view(h.num_rows, *h.row_shape))
+        self._set_stores(tensors)
+        if lock:
+            self._locked = lock_host_tensors(self.stores, f"Locking {self.key} in RAM")
 
     def fetch(self, uids_cpu: torch.Tensor) -> torch.Tensor:
         """Gather rows of the backing store to CPU, in the order given. Reference form of the
