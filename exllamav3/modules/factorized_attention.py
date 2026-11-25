@@ -7,7 +7,7 @@ from ..model.config import Config
 from ..util.backend import gfx_arch
 from ..util.tensor import get_for_device
 from .attention_fn import attn_dispatch
-from .attention_fn.factorized_triton import factorized_attention_decode
+from .attention_fn.factorized_triton import factorized_attention_decode, subtract_noise
 from .linear import Linear
 from .multilinear import MultiLinear
 from .recurrent import RecurrentMixer
@@ -187,8 +187,4 @@ class FactorizedDifferentialAttention(RecurrentMixer):
         )
         if not fused:
             self.save_state(layer, slots, (raw_k[:, -1], raw_v[:, -1]))
-        heads_per_group = self.num_q_heads // self.num_kv_heads
-        groups = attn.float().unflatten(-2, (self.num_kv_heads, heads_per_group))
-        noise_weight = project("lambda_proj").sigmoid()[..., None, None]
-        signal = groups[..., :-1, :] - noise_weight * groups[..., -1:, :]
-        return signal.flatten(-3).to(out_dtype or torch.float32)
+        return subtract_noise(attn, project("lambda_proj").sigmoid(), out_dtype or torch.float32)

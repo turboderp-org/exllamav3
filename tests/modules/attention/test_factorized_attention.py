@@ -1,6 +1,6 @@
 import torch
 
-from exllamav3.modules.attention_fn.factorized_triton import factorized_attention_decode
+from exllamav3.modules.attention_fn.factorized_triton import factorized_attention_decode, subtract_noise
 from exllamav3.modules.factorized_attention import shift_kv
 from exllamav3.modules.rmsnorm import zero_centered_rms_norm
 
@@ -43,3 +43,14 @@ def test_factorized_attention_decode_matches_torch(device):
     for tensor, raw, unchanged in zip(state, (raw_k, raw_v), untouched, strict = True):
         torch.testing.assert_close(tensor[slots], raw.squeeze(1), atol = 2e-6, rtol = 2e-6)
         assert torch.equal(tensor[1], unchanged)
+
+
+def test_subtract_noise_preserves_fp32_rounding(device):
+    rng = torch.Generator(device = device).manual_seed(31)
+    attn = torch.randn((2, 7, 12, 128), device = device, dtype = torch.float16, generator = rng)
+    weights = torch.rand((2, 7, 3), device = device, generator = rng)
+    for x in (attn, attn[:, ::2]):
+        w = weights if x.is_contiguous() else weights[:, ::2]
+        groups = x.float().unflatten(-2, (3, 4))
+        expected = (groups[..., :-1, :] - w[..., None, None] * groups[..., -1:, :]).flatten(-3)
+        torch.testing.assert_close(subtract_noise(x, w, torch.float32), expected, atol = 0, rtol = 0)

@@ -58,3 +58,28 @@ def factorized_attention_decode(q, ak, bk, av, bv, shift_k, shift_v, weights, sl
         q_heads, kv_heads, head_dim, rank, window, eps, enable_fp_fusion=False,
     )
     return q_out, k_out, v_out
+
+
+@triton.jit
+def _subtract_noise(Attention, Weight, Output, GROUP: tl.constexpr, DIM: tl.constexpr, TILE: tl.constexpr):
+    group = tl.program_id(0)
+    i = tl.arange(0, TILE)
+    signal_width = (GROUP - 1) * DIM
+    src = Attention + group * GROUP * DIM
+    signal = tl.load(src + i, i < signal_width, 0).to(tl.float32)
+    noise = tl.load(src + signal_width + i % DIM).to(tl.float32)
+    tl.store(Output + group * signal_width + i, signal - noise * tl.load(Weight + group), i < signal_width)
+
+
+def subtract_noise(attn, weight, out_dtype):
+    kv_heads = weight.shape[-1]
+    group = attn.shape[-2] // kv_heads
+    dim = attn.shape[-1]
+    width = (group - 1) * dim
+    if attn.is_cuda and attn.is_contiguous() and weight.is_contiguous() and width <= 1024:
+        out = attn.new_empty((*attn.shape[:-2], kv_heads * width), dtype = out_dtype)
+        _subtract_noise[(weight.numel(),)](attn, weight, out, group, dim, triton.next_power_of_2(width),
+                                           enable_fp_fusion = False)
+        return out
+    groups = attn.float().unflatten(-2, (kv_heads, group))
+    return (groups[..., :-1, :] - weight[..., None, None] * groups[..., -1:, :]).flatten(-3).to(out_dtype)
