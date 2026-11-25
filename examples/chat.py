@@ -42,13 +42,12 @@ def main(args):
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
     show_tps = args.show_tps
-    think = args.think or (args.mode == "olala" and not args.no_think)
     last_input_ids = None
-    assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
 
     # Prompt format
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
+    think = prompt_format.default_think if args.think is None else args.think
     spc = {}
     if args.think_budget is not None:
         spc["thinking_budget"] = args.think_budget
@@ -119,7 +118,7 @@ def main(args):
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
     tt = prompt_format.thinktag()
-    banned_strings = [tag for tag in tt if tag] if args.no_think else []
+    banned_strings = [tag for tag in tt if tag] if args.think is False else []
     response = ""
     last_tokens = None
 
@@ -675,8 +674,9 @@ if __name__ == "__main__":
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 5000, help = "Max tokens per response, default = 5000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
-    parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
-    parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
+    reasoning = parser.add_mutually_exclusive_group()
+    reasoning.add_argument("-think", "--think", action = "store_true", default = None, help = "Use (very simplistic) reasoning template and formatting")
+    reasoning.add_argument("-no_think", "--no_think", dest = "think", action = "store_false", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")

@@ -1,5 +1,7 @@
 
 class PromptFormat:
+    default_think = False
+
     def __init__(self, user_name, bot_name):
         self.user_name = user_name
         self.bot_name = bot_name
@@ -1299,6 +1301,7 @@ class PromptFormat_ling(PromptFormat):
 
 class PromptFormat_olala(PromptFormat):
     description = "Olala 1.0 mini"
+    default_think = True
 
     def default_system_prompt(self, think):
         return ""
