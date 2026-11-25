@@ -9,6 +9,7 @@ from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_po
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+from ..util.expert_jitter import expert_jitter_layout
 from ..ext import exllamav3_ext as ext
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,8 @@ class Generator:
         """
 
         self.model = model
+        self.expert_jitter_layout = None
+        self.expert_jitter_size = 0
         self.cache = cache
         self.tokenizer = tokenizer
         cfg = self.model.config
@@ -1694,6 +1697,25 @@ class Generator:
         return buf[:rows]
 
 
+    def prepare_expert_jitter_layout(self):
+        """Enumerate full expert sets once, only when a request enables jitter."""
+        if self.expert_jitter_layout is not None:
+            return
+        self.expert_jitter_layout, self.expert_jitter_size = expert_jitter_layout(self.model)
+
+
+    def expert_jitter_params(self, jobs: list[Job]) -> dict:
+        """Target-only offsets in compact batch order; token positions broadcast inside each router."""
+        if not any(job.expert_jitter_offsets is not None for job in jobs):
+            return {}
+        offsets = [job.expert_jitter_offsets if job.expert_jitter_offsets is not None else
+                   torch.zeros((1, self.expert_jitter_size), dtype = torch.half) for job in jobs]
+        return {
+            "expert_jitter_offsets": offsets[0] if len(offsets) == 1 else torch.cat(offsets, dim = 0),
+            "expert_jitter_layout": self.expert_jitter_layout,
+        }
+
+
     def _stage_arena(self, rows: int, width: int, with_positions: bool):
         """
         Pinned int32 arena holding one step's block index [rows, width], cache_seqlens [rows] and optionally
@@ -1889,6 +1911,7 @@ class Generator:
             params["prev_ids"] = prev_ids([seq for job in batch_jobs for seq in job.sequences], seq_kvp, self.prev_ids)
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
+        params.update(self.expert_jitter_params(batch_jobs))
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
@@ -2426,6 +2449,7 @@ class Generator:
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
         max_rq_tokens: int | None = None,
         stop_on_loop: bool | dict | tuple = False,
+        expert_jitter: float = 1.0,
         **kwargs
     ):
         """
@@ -2450,6 +2474,9 @@ class Generator:
 
         :param seed:
             Seed for the sampling RNG. Doesn't guarantee perfect determinism from the implementation.
+
+        :param expert_jitter:
+            Fixed seeded expert preference strength, finite and >= 1 (1 disables it). See Job.
 
         :param token_healing:
             Apply token healing by regenerating the last token of the input sequence with prefix
@@ -2555,6 +2582,7 @@ class Generator:
                 max_new_tokens = max_new_tokens,
                 min_new_tokens = min_new_tokens,
                 seed = seed,
+                expert_jitter = expert_jitter,
                 stop_conditions = stop_conditions,
                 sampler = p_sampler,
                 filters = filters[idx] or [],
