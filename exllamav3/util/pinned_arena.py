@@ -44,6 +44,14 @@ class PinnedArena:
         page = mmap.PAGESIZE
         self.size = (int(nbytes) + page - 1) // page * page
         self.what = what
+        self._unregister = None
+        if self.size == 0:
+            # Nothing to hold (a TP rank without KV layers has 0-byte cache slabs): no mapping,
+            # mmap rejects length 0
+            self.map = None
+            self.tensor = torch.empty(0, dtype = torch.uint8)
+            self.ptr = 0
+            return
         check_host_memory(self.size, what)
         if os.name == "nt":
             self.map = mmap.mmap(-1, self.size)
