@@ -1052,6 +1052,14 @@ drafter can propose. A probe/cost model decides at run time whether the subset o
 
 With `EXL3_TP_SPARSE_DRAFT`: print the sparse head's statistics every N drafting rounds.
 
+### `EXL3_TP_SPARSE_REBENCH` (default: `64`)
+
+With `EXL3_TP_SPARSE_DRAFT`: the subset-vs-full decision is not taken from the load-time timings, which can
+fall into the start-up phase where every kernel runs slower. After this many drafting rounds both paths are
+timed again and only then is the mode decided. A result where the subset is not faster than the full head is
+implausible and is measured again at 4x the round count, up to 3 times; a non-positive break-even miss rate
+never switches the subset off. `0` disables the re-benchmark and decides from the load-time numbers.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)

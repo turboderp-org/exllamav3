@@ -23,6 +23,9 @@ from ..util.device_copy import to_device
 
 _CHUNK = 1024           # columns per worker request
 _LOG = int(os.environ.get("EXL3_TP_SPARSE_DRAFT_LOG", "0") or 0)
+# EXL3_TP_SPARSE_REBENCH=<rounds>: re-time the subset and the full TP head after this many drafting rounds and
+# hold the sparse/full mode decision until then (the load-time numbers come from the start transient); 0 = off
+_REBENCH = int(os.environ.get("EXL3_TP_SPARSE_REBENCH", "64") or 0)
 
 
 # Worker side (runs in every TP rank's process, including the in-process output device)
@@ -155,12 +158,16 @@ class TPSparseHead(SparseHead):
         def timed(fn):
             for _ in range(3):
                 fn()
-            torch.cuda.synchronize(self.device)
-            t0 = time.perf_counter()
-            for _ in range(iters):
-                fn()
-            torch.cuda.synchronize(self.device)
-            return (time.perf_counter() - t0) / iters
+            best = None
+            for _ in range(3):      # minimum of three repetitions: one stall must not decide the mode
+                torch.cuda.synchronize(self.device)
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                torch.cuda.synchronize(self.device)
+                t = (time.perf_counter() - t0) / iters
+                best = t if best is None else min(best, t)
+            return best
 
         n_active = self.n_active
         self.n_active = max(n_active, 1)
@@ -175,8 +182,42 @@ class TPSparseHead(SparseHead):
         return self.argmax(to_device(state, self.device).half(), embedding = embedding)
 
 
+    def _decide_mode(self):
+        # Load-time timings are not trusted for the mode decision until the re-benchmark has run
+        if _REBENCH and not getattr(self, "_rebenched", False):
+            return
+        # A non-positive break-even rate only comes from implausible timings: never switch the subset off on it
+        m_star = self.breakeven_miss_rate
+        if m_star is not None and m_star <= 0:
+            return
+        super()._decide_mode()
+
+
     def note_round(self, seconds: float, drafted: int, head_calls: int):
         super().note_round(seconds, drafted, head_calls)
+        if _REBENCH and not getattr(self, "_rebenched", False) and self.rounds >= getattr(self, "_rebench_at", _REBENCH):
+            self._rebenched = True
+            old = (self.t_full, self.t_sparse, self.fused)
+            try:
+                self._pick_path()
+                self.benchmark()
+            except Exception as e:                                   # noqa: BLE001
+                print(f" !! TP sparse draft head: re-benchmark failed ({e!r}), keeping the load-time numbers", flush = True)
+                self.t_full, self.t_sparse, self.fused = old
+            if self.t_sparse < self.t_full and not self.mode_sparse:
+                self.mode_sparse = True
+            print(
+                f" -- TP sparse draft head re-benchmark after {self.rounds} rounds: draft step "
+                f"{self.t_full * 1e3:.2f} ms (TP head) vs {self.t_sparse * 1e3:.3f} ms (subset), "
+                f"{'fused' if self.fused else 'torch'} path (load time: {old[0] * 1e3:.2f} vs {old[1] * 1e3:.3f} ms, "
+                f"{'fused' if old[2] else 'torch'}), mode {'sparse' if self.mode_sparse else 'full'}",
+                flush = True
+            )
+            if self.t_sparse >= self.t_full and getattr(self, "_rebench_tries", 0) < 3:
+                # Implausible (the subset is a fraction of the full head's work): measure again, later
+                self._rebench_tries = getattr(self, "_rebench_tries", 0) + 1
+                self._rebench_at = self.rounds * 4
+                self._rebenched = False
         if _LOG and self.rounds % _LOG == 0:
             self.log()
 
