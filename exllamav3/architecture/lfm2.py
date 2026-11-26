@@ -72,7 +72,9 @@ class Lfm2Config(Config):
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        # transformers defaults to tied embeddings for LFM2 and still accepts the original "tie_embedding" key;
+        # LFM2-1.2B, LFM2-8B-A1B, LFM2-24B-A2B (no key) and LFM2.5-1.2B-Instruct ("tie_embedding") have no lm_head tensor
+        self.tie_word_embeddings = self.read_cfg(bool, ["tie_word_embeddings", "tie_embedding"], True)
         self.layer_types = read_lfm2_layer_types(self, self.num_hidden_layers)
 
         # RoPE
