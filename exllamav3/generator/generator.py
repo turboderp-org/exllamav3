@@ -479,7 +479,7 @@ class Generator:
         self._sparse_flag = False
         # EXL3_TP_SPARSE_DRAFT: the same subset head for a TP target, held on the output device
         _tp_sd = os.environ.get("EXL3_TP_SPARSE_DRAFT", "0").strip()
-        if model.loaded_tp and self.mtp_draft and _tp_sd not in ("", "0"):
+        if _tp_sd not in ("", "0") and self.mtp_draft and model.loaded_tp:
             try:
                 from ..modules.sparse_head import token_stats_path
                 from ..modules.sparse_head_tp import make_tp_sparse_head
