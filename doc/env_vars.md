@@ -1040,6 +1040,37 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+### `EXL3_TP_SPARSE_DRAFT` (default: `0`)
+
+MTP drafting with a TP target: the draft head uses a frequency-selected subset of the vocabulary of this
+many columns (`1` = 4096), held on the output device in the main process, so a draft token needs no TP
+dispatch. The subset columns are rebuilt by the ranks that own them when the subset changes. Verification
+still runs the full sharded head, so the output does not change; the subset only decides which tokens the
+drafter can propose. A probe/cost model decides at run time whether the subset or the full head is faster.
+
+### `EXL3_TP_SPARSE_DRAFT_LOG` (default: `0`)
+
+With `EXL3_TP_SPARSE_DRAFT`: print the sparse head's statistics every N drafting rounds.
+
+### `EXL3_TP_SPARSE_REBENCH` (default: `64`)
+
+With `EXL3_TP_SPARSE_DRAFT`: the subset-vs-full decision is not taken from the load-time timings, which can
+fall into the start-up phase where every kernel runs slower. After this many drafting rounds both paths are
+timed again and only then is the mode decided. A result where the subset is not faster than the full head is
+implausible and is measured again at 4x the round count, up to 3 times; a non-positive break-even miss rate
+never switches the subset off. `0` disables the re-benchmark and decides from the load-time numbers.
+
+### `EXL3_MTP_FUSED_GLUE` (default: `1` on ROCm, `0` on CUDA)
+
+Qwen3.8-Flash-Next MTP input layer: the grouped norm over the hyper-connection streams runs as one
+`rms_norm` launch with weight groups instead of eight torch ops per draft step. `0` restores the torch ops.
+Only tested on ROCm, hence off by default on CUDA; `1` enables it there.
+
+### `EXL3_TP_REWIND_ASYNC` (default: `0`)
+
+Recurrent (GDN) state rewind after a rejected draft is sent to the ranks as a deferred command: no round
+trip, the acknowledgements are collected before the next dispatch. Output is unchanged.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
