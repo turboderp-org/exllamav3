@@ -342,6 +342,68 @@ and synchronize after each probe and measurement launch, naming it first, so a l
 completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
 launches.
 
+### `EXL3_GEMV_MR_FUSE_IN` (default: `0`), `EXL3_GEMV_MR_FUSE_IN_MAX_KB` (default: `8`)
+
+ROCm: the single-matrix RDNA multi-row GEMV (`exl3_gemv_mr_*`) rotates its input inside the dot kernel
+instead of in a separate `exl3_gemv_mr_had_in_single` launch, one launch less per dense linear. Each
+wave rotates only the 128-column segments its own split-K range covers into LDS and reads nothing else,
+so no block barrier is needed. Same rotation and dot code on the same values, so the output is
+bit-identical. Calls whose rotated rows plus reduction slots need more than `_MAX_KB` KiB of LDS per
+block (1-64) keep the two-kernel form, and so do calls whose output overlaps their input. The default of
+8 KiB fuses single-row calls only: with more rows every block re-rotates all rows of its split-K range,
+which costs more than the saved launch.
+
+### `EXL3_GEMV_MR_FUSE_IN_TRACE` (default: `0`), `EXL3_GEMV_MR_FUSE_IN_CHECK` (default: `0`)
+
+ROCm, diagnostics for `EXL3_GEMV_MR_FUSE_IN`. `_TRACE=1` logs the first 200 single-matrix multi-row
+calls (shape, bit width, pointers). `_CHECK=1` runs every call the fused form would take twice, fused into
+a scratch output and then the two-kernel form into the real output, compares both bit for bit and logs
+mismatches. It synchronizes after every call, so it is slow.
+
+### `EXL3_ROCM_MOE_EP` (default: `1`)
+
+ROCm: the RDNA MoE decode op also serves expert-parallel ranks (a rank that holds a contiguous slice of
+the experts, as under tensor parallelism). Picks of experts on other ranks are skipped and reach the
+grouped reduce as zero rows. `0` keeps such ranks on the generic cooperative MoE kernels, as before.
+
+### `EXL3_ROCM_MOE_SH_FUSED` (default: `1`)
+
+ROCm: when the shared expert runs as a fused one-expert launch (`EXL3_MOE_SHARED_COOP`), it is launched
+from the routed decode call, and routed + gated shared contribution are merged in one kernel instead of
+the shared expert's own call plus five torch ops. `0` restores the separate path.
+
+### `EXL3_MOE_DEC_ROWS` (default: `1` on ROCm, `0` on CUDA)
+
+Sizes the MoE decode scratch for the RDNA decode path, which rotates the gate and up inputs separately
+and needs twice the rows. With `0` (the old size) that path declines verify passes from 5 rows on and
+falls back to the cooperative kernels. CUDA has no such path, so it keeps the old size there.
+
+### `EXL3_MOE_DEC_FUSE_IN` (default: `0`)
+
+ROCm: the RDNA routed-MoE decode op runs in two launches instead of four. The gate|up and down dot kernels
+rotate their own input into LDS (gate|up from the token's row, down from silu(gate) * up), with the same
+per-wave split-K rule as `EXL3_GEMV_MR_FUSE_IN`. This replaces `exl3_moe_dec_had_gu` and
+`exl3_moe_dec_had_act` with the same code on the same values, so the output is bit-identical.
+
+### `EXL3_ROCM_MOE_SH_DEC` (default: `0`)
+
+ROCm: with `EXL3_ROCM_MOE_SH_FUSED`, run the shared expert through the RDNA decode op (one expert per token
+at weight 1, its own bit width and pointer tables, reusing the routed decode scratch) instead of its fused
+one-expert cooperative launch. Under tensor parallelism the shared expert sits whole on one rank per layer,
+and at decode sizes its cooperative launch is the largest single cause of that rank arriving late at the
+next all-reduce. Different kernels from the cooperative path, so the output is not bit-identical to it.
+Gated SiLU shared experts without biases only; anything else keeps the cooperative launch.
+
+### `EXL3_ROCM_MOE_SH_FOLD` (default: `0`)
+
+ROCm, with `EXL3_MOE_DEC_FUSE_IN`: fold the shared expert into the two launches of the RDNA routed-MoE decode
+op as extra slots at its own bit width (8-bit shared experts only), gated by `sigmoid(y . gate_w)` inside the
+down launch's grouped reduce, so its own launches and the merge kernel go away. Under tensor parallelism the
+shared expert then splits across ranks in 128-channel units instead of sitting whole on one rank; each rank
+folds its slice and the all-reduce completes the sum. Takes precedence over `EXL3_ROCM_MOE_SH_DEC`; calls
+outside its bounds take the unfolded path. Different summation from the other paths, so the output is not
+bit-identical to them; deterministic.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

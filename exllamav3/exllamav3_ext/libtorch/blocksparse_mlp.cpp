@@ -133,19 +133,72 @@ bool BC_BlockSparseMLP::run_bszN_rdna
     if (yh2.numel() < (int64_t) 2 * S * Hi || interm_gu.numel() < (int64_t) 2 * S * I
         || interm_a2.numel() < (int64_t) S * I || out_d2.numel() < (int64_t) S * Ho) return false;
 
-    exl3_rocm_moe_decode
+    const int H = (int) out_bszn.size(-1);
+    at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
+    at::Tensor dst = out_bszn.slice(0, 0, bsz);
+
+    // Shared-expert slice folded into the two routed launches: out_d2 rows 0..bsz-1 hold the whole sum
+    static const bool fuse_in = [] { const char* e = std::getenv("EXL3_MOE_DEC_FUSE_IN"); return e && atoi(e) != 0; }();
+    if (sh_fold && fuse_in && bsz <= MAX_BSZN && out_d2.numel() >= (int64_t) (S + bsz) * Ho
+        && exl3_rocm_moe_decode_fold_fits(S, bsz, Hi, I, Ho, rdna_K_gu, rdna_K_d, rdna_cb,
+                                          sh_fold_I, sh_rdna_K_gu, sh_rdna_K_d, sh_rdna_cb))
+    {
+        c10::optional<at::Tensor> gw;
+        if (shared_gate) gw = shared_gate->weight;
+        exl3_rocm_moe_decode_fold
+        (
+            y, selected_experts, routing_weights,
+            rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
+            down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+            interm_gu, out_d2,
+            rdna_K_gu, rdna_cb, rdna_K_d, act_limit, min_expert, max_expert,
+            sh_rdna_gu_t, sh_rdna_gu_s, sh_rdna_gu_v, sh_rdna_d_t, sh_rdna_d_s, sh_rdna_d_v,
+            sh_fold_gu, sh_rdna_K_gu, sh_rdna_K_d, sh_rdna_act_limit, gw
+        );
+        dst.copy_(routed);
+        return true;
+    }
+
+    exl3_rocm_moe_decode_ep
     (
         y, selected_experts, routing_weights,
         rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
         down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
         yh2, interm_gu, interm_a2, out_d2,
-        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit
+        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit, min_expert, max_expert
     );
-
-    const int H = (int) out_bszn.size(-1);
-    at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
-    at::Tensor dst = out_bszn.slice(0, 0, bsz);
-    if (shared_experts && out_d_sh)
+    static const bool sh_fused = [] { const char* e = std::getenv("EXL3_ROCM_MOE_SH_FUSED"); return !(e && e[0] == '0'); }();
+    const bool gate_ok = !shared_gate || (shared_gate->weight.scalar_type() == at::kHalf
+                                          && shared_gate->weight.is_contiguous() && shared_gate->weight.numel() == y.size(-1));
+    if (sh_fused && sh_coop && out_d_sh && gate_ok)
+    {
+        // Shared expert through its fused one-expert launch (as run_bszN does), then one kernel for
+        // routed + sigmoid(y . w) * shared, instead of shared_experts->run_bszN and five torch ops
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
+        const int Ho_sh = (int) out_d_sh->size(-1);
+        if (sh_rdna && exl3_rocm_moe_decode_fits(bsz, Hi, I, Ho_sh, sh_rdna_K_gu, sh_rdna_cb, sh_rdna_K_d, sh_rdna_cb)
+            && out_d_sh->numel() >= (int64_t) bsz * Ho_sh)
+        {
+            // One expert (index 0, weight 1) per token through the decode op; the routed call is done
+            // with yh2 / interm_gu / interm_a2 (stream order), its result lives in out_d2
+            at::Tensor out_sh = out_d_sh.value();
+            exl3_rocm_moe_decode_ep
+            (
+                y, sh_sel.slice(0, 0, bsz), sh_rw.slice(0, 0, bsz),
+                sh_rdna_gu_t, sh_rdna_gu_s, sh_rdna_gu_v,
+                sh_rdna_d_t, sh_rdna_d_s, sh_rdna_d_v,
+                yh2, interm_gu, interm_a2, out_sh,
+                sh_rdna_K_gu, sh_rdna_cb, sh_rdna_K_d, sh_rdna_cb, sh_rdna_act_limit, -1, -1
+            );
+        }
+        else
+            exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, bsz), sh_rw.slice(0, 0, bsz), c10::nullopt);
+        at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
+        c10::optional<at::Tensor> gw;
+        if (shared_gate) gw = shared_gate->weight;
+        exl3_rocm_moe_merge_shared(dst, routed, sh, y, gw);
+    }
+    else if (shared_experts && out_d_sh)
     {
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
@@ -339,10 +392,12 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         rdna_cb = up_mul1 ? 2 : up_mcg ? 1 : 0;
         // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above
         const char* env = std::getenv("EXL3_ROCM_MOE_DECODE");
+        // EXL3_ROCM_MOE_EP=0: keep expert-parallel ranks on the kernels above (the old gate)
+        const char* env_ep = std::getenv("EXL3_ROCM_MOE_EP");
         rdna_moe = !(env && env[0] == '0')
             && gated && act_silu && !act_gelu && !act_silu_oai && !act_relu2
             && !gate_bias_ptrs && !up_bias_ptrs && !down_bias_ptrs
-            && min_expert < 0
+            && (min_expert < 0 || !(env_ep && env_ep[0] == '0'))
             && rdna_K_gu && rdna_K_d
             && interm_gu.scalar_type() == at::kHalf && interm_a2.scalar_type() == at::kHalf
             && out_d2.scalar_type() == at::kFloat;
@@ -419,6 +474,61 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             sh_sel = at::zeros({MAX_BSZN, 1}, lopt.device(dev));
             sh_rw = at::ones({MAX_BSZN, 1}, hopt);
             sh_coop = true;
+#if defined(USE_ROCM)
+            const char* env_sd = std::getenv("EXL3_ROCM_MOE_SH_DEC");
+            const char* env_sf = std::getenv("EXL3_ROCM_MOE_SH_FOLD");
+            const bool want_fold = env_sf && atoi(env_sf) != 0;
+            if (rdna_moe && want_fold)
+            {
+                auto kc = [&] (float K) -> int { const int k = (int) K; return ((float) k == K && k >= 1 && k <= 8) ? k : 0; };
+                const int kgu = kc(Kgu), kd = kc(d->K);
+                const int cb_sh = mul1_gu ? 2 : mcg_gu ? 1 : 0;
+                const bool silu = !se->act_gelu && !se->act_relu2;
+                const bool gate_ok = !shared_gate || (shared_gate->weight.scalar_type() == at::kHalf
+                    && shared_gate->weight.is_contiguous() && shared_gate->weight.numel() == Hi_sh);
+                if (kgu && kd && silu && gate_ok && !gb && !ub && !db && cb_sh == rdna_cb
+                    && Hi_sh == (int) yh2.size(-1) && I_sh <= (int) interm_a2.size(-1)
+                    && Ho_sh == (int) out_d2.size(-1))
+                {
+                    sh_rdna_gu_t = at::cat({gt, ut}).contiguous();
+                    sh_rdna_gu_s = at::cat({gs, us}).contiguous();
+                    sh_rdna_gu_v = at::cat({gv, uv}).contiguous();
+                    sh_rdna_d_t = dt; sh_rdna_d_s = ds; sh_rdna_d_v = dv;
+                    sh_rdna_K_gu = kgu; sh_rdna_K_d = kd; sh_rdna_cb = cb_sh;
+                    sh_rdna_act_limit = se->act_limit;
+                    sh_fold_I = I_sh;
+                    sh_fold_gu = at::empty({2 * MAX_BSZN, I_sh}, hopt);
+                    sh_fold = true;
+                }
+            }
+            if (rdna_moe && env_sd && atoi(env_sd) != 0 && !sh_fold)
+            {
+                auto kc = [&] (float K) -> int
+                {
+                    const int k = (int) K;
+                    if ((float) k == K) return (k >= 1 && k <= 8) ? k : 0;
+                    if (mul1_gu && K - (float) k == 0.5f && k >= 1 && k <= 3 && exl3_rocm_half_gemv_enabled())
+                        return EXL3_HALF_BITS(k);
+                    return 0;
+                };
+                const int kgu = kc(Kgu), kd = kc(d->K);
+                const bool silu = !se->act_gelu && !se->act_relu2;
+                if (kgu && kd && silu && !gb && !ub && !db
+                    && Hi_sh == (int) yh2.size(-1) && I_sh == (int) interm_a2.size(-1)
+                    && out_d_sh->scalar_type() == at::kFloat && out_d_sh->is_contiguous()
+                    && (int) out_d_sh->size(-1) == Ho_sh)
+                {
+                    sh_rdna_gu_t = at::cat({gt, ut}).contiguous();
+                    sh_rdna_gu_s = at::cat({gs, us}).contiguous();
+                    sh_rdna_gu_v = at::cat({gv, uv}).contiguous();
+                    sh_rdna_d_t = dt; sh_rdna_d_s = ds; sh_rdna_d_v = dv;
+                    sh_rdna_K_gu = kgu; sh_rdna_K_d = kd;
+                    sh_rdna_cb = mul1_gu ? 2 : mcg_gu ? 1 : 0;
+                    sh_rdna_act_limit = se->act_limit;
+                    sh_rdna = true;
+                }
+            }
+#endif
         }
     }
     for (int i = 0; i < max_tokens_per_expert; ++i)

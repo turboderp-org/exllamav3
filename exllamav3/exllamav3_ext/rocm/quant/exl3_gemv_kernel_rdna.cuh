@@ -623,6 +623,20 @@ __device__ __forceinline__ int exl3_mgemv_packed_count
 // slot; the old kernel's grid was 1-D so its blockIdx.y term was zero), and
 // the result goes to LDS. One warp rotates one 128-block; all 32 lanes enter.
 
+// Pins a half2 value as computed: the empty asm hides it from the optimizer, so a preceding
+// __hmul2 is emitted as a rounded fp16 multiply (v_pk_mul_f16) and never contracted with the fp32
+// widen-and-add that follows into an unrounded v_fma_mix_f32. Whether that contraction happens
+// otherwise depends on the inlining context (-ffp-contract=fast), so without the pin the same
+// rotation code gave different bits in different kernels. Costs no instruction.
+__device__ __forceinline__ half2 exl3_pin_h2(half2 h)
+{
+    uint32_t u;
+    __builtin_memcpy(&u, &h, sizeof(u));
+    asm volatile ("" : "+v"(u));
+    __builtin_memcpy(&h, &u, sizeof(u));
+    return h;
+}
+
 __device__ __forceinline__ void exl3_gemv_had_in_128
 (
     const half* __restrict__ input_ptr,   // 128 halves of A
@@ -634,8 +648,8 @@ __device__ __forceinline__ void exl3_gemv_had_in_128
     half4 v = ((const half4*) input_ptr)[lane];
 
     half4 scales = ((const half4*) scale)[lane];
-    v.x = __hmul2(v.x, scales.x);
-    v.y = __hmul2(v.y, scales.y);
+    v.x = exl3_pin_h2(__hmul2(v.x, scales.x));
+    v.y = exl3_pin_h2(__hmul2(v.y, scales.y));
 
     float v0 = __half2float(__low2half(v.x));
     float v1 = __half2float(__high2half(v.x));
