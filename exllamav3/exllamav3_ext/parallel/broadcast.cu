@@ -185,24 +185,24 @@ void pg_broadcast_kernel
         }
     }
 
-    // Finished. Barrier to make sure buffer is free on kernel exit
-    pg_barrier_inner(ctx, device_mask, this_device, src_device, abort_flag);
-
-    // Clear stages for next kernel
+    // Clear the stage counters for the next kernel, before the closing barrier: the producer has seen every
+    // consumer reach the last stage, and no thread reads the counters again in this kernel. Clearing them after
+    // the barrier raced with the next broadcast when its source differs: a device released early could start it
+    // (as producer, or as consumer publishing stage 1) before this producer's clearing stores landed, which then
+    // reset its fresh counter and left every rank waiting. The system fence makes the clears visible before the
+    // barrier releases anyone
     if constexpr (is_producer)
     {
         if (threadIdx.x == 0)
         {
             for (uint32_t pending = device_mask; pending; pending &= (pending - 1))
-            {
-                const int r = __ffs(pending) - 1;
-                if (__popc(pending) > 1)
-                    broadcast_stages_ptr[r] = 0;
-                else
-                    stg_release_sys_u32(broadcast_stages_ptr + r, 0);
-            }
+                stg_release_sys_u32(broadcast_stages_ptr + (__ffs(pending) - 1), 0);
+            __threadfence_system();
         }
-    };
+    }
+
+    // Finished. Barrier to make sure buffer is free on kernel exit
+    pg_barrier_inner(ctx, device_mask, this_device, src_device, abort_flag);
 }
 
 
