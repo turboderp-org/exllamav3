@@ -89,6 +89,7 @@ class NGramEmbedding(Module):
         self.head_vocab_sizes = None
         self.layer_multipliers = None
         self.codebook = None
+        self.tp_ram = (False, False)    # (held in RAM, locked) as requested at load; forwarded by tp_export
 
         self.caps.update({"prefer_cpu": True})
 
@@ -174,6 +175,11 @@ class NGramEmbedding(Module):
         stream_from_disk = self.stream_from_disk
         if stream_from_disk is None:
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
+        self.tp_ram = (not stream_from_disk or lock, lock)
+        if self.tp_ram[0] and getattr(self.config, "loading_for_tp", False):
+            # Loading only to export for TP: the rank that imports the module reads the table into its own
+            # RAM (tp_export), a copy here would be read and dropped again
+            stream_from_disk, lock = True, False
         table.open(stc, stream_from_disk and not lock, allow_bf16 = not quantized,
                    what = f"n-gram table {self.key} held in RAM (--ngram_ram)", lock = lock)
         self._set_table(table, quantized)
@@ -215,10 +221,11 @@ class NGramEmbedding(Module):
 
     def tp_export(self, plan, producer):
         """
-        Tensor-parallel: every rank streams rows from disk through its own handles (a per-rank
-        RAM copy of a table this size is not an option, and the gather is a few hundred rows per
-        forward), so the export carries the table's location plus the small hashing/dequant
-        parameters.
+        Tensor-parallel: the export carries the table's location plus the small hashing/dequant
+        parameters. The rank that imports the module streams rows from disk through its own
+        handles, or, if the load asked for the table in RAM (--ngram_ram / --ngram_lock), reads it
+        into its own RAM (and locks it), so the load-time option also applies under TP. The main
+        process keeps only the handles in that case (Config.loading_for_tp).
         """
         assert self.table is not None, "Cannot export module for TP before loading."
         return {
@@ -234,6 +241,8 @@ class NGramEmbedding(Module):
                 "fp8_rows": self.fp8_rows,
             },
             "table": self.table.export(self.config.stc),
+            "ram": self.tp_ram[0],
+            "lock": self.tp_ram[1],
             # DeepSeek-V4.1: FP8 rows with an E8M0 scale table beside them, streamed the same way
             "scale": self.scale.export(self.config.stc) if self.scale is not None else None,
             "quantized": self.K is not None,
@@ -250,8 +259,9 @@ class NGramEmbedding(Module):
         device = local_context["device"]
         module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = True)
         module.device = device
-        module._set_table(RowTable.from_export(exported["table"]), exported["quantized"])
-        module.scale = RowTable.from_export(exported["scale"]) if exported.get("scale") is not None else None
+        ram, lock = exported.get("ram", False), exported.get("lock", False)
+        module._set_table(RowTable.from_export(exported["table"], ram, lock), exported["quantized"])
+        module.scale = RowTable.from_export(exported["scale"], ram, lock) if exported.get("scale") is not None else None
         module.head_offsets = consumer.recv(exported["head_offsets"], cuda = False).long().contiguous()
         module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"], cuda = False).long().contiguous()
         module.layer_multipliers = consumer.recv(exported["layer_multipliers"], cuda = False).long().contiguous()

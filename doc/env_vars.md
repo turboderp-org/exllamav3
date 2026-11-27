@@ -890,7 +890,10 @@ is tens of GB, and streaming costs little on SSD-class storage (decode is latenc
 ~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
 only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
-`--ngram_ram` in `model_init`-based scripts.
+`--ngram_ram` in `model_init`-based scripts. Under tensor parallelism the rank that owns the table
+follows the main process's setting (and `EXL3_NGRAM_LOCK` / `--ngram_lock`): it reads the table into its
+own RAM at load. Under TP decode the owner's row gathers sit on the critical path (the other ranks wait at
+the PLE broadcast), so holding the table in RAM can pay off there even on fast storage.
 
 ### `EXL3_NGRAM_LOCK` (default: `0`)
 
