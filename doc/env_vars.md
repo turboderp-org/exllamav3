@@ -1040,6 +1040,17 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+### `EXL3_TP_NO_COOP` (default: `0`)
+
+Native TP backend: launch the gather collectives (`pg_gather`, once per decode forward for the
+logits, and `pg_gather_small`, sparse draft head) as ordinary kernels instead of cooperative launches.
+On ROCm every cooperative launch runs on the runtime's separate cooperative HW queue, so each gather
+makes the stream's queue and that queue wait on each other. On gfx1201 such cross-queue waits slow
+down every kernel on the device (ROCm/TheRock#9297), which shows up as decode running ~1.5x slower
+than it should. `pg_gather_small` never syncs its grid; `pg_gather` runs at most one block per rank
+(all resident) and syncs them through an atomic arrival counter instead of a grid sync. Same data
+movement, same output.
+
 ## Debug
 
 ### `ROCPROFILER_REGISTER_ENABLED` (ROCm; set to `0` on import unless already set)
