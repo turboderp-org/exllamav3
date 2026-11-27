@@ -314,7 +314,8 @@ class TPBackendNative:
                         self.shm_ll = shared_memory.SharedMemory(name = self.shm_ll_name)
                         log_tp(device, f"Opened SHM {self.shm_ll_name}")
                     break
-                except FileNotFoundError:
+                except (FileNotFoundError, ValueError):
+                    # ValueError ("cannot mmap an empty file"): the master has created the name but not sized it yet
                     if first_fnf:
                         log_tp(device, f"Waiting for SHM to appear")
                         first_fnf = False
