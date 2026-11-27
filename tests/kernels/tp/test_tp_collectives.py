@@ -189,9 +189,11 @@ def op_barrier(ctx, c):
         ctx.backend.fwd_barrier()
         return None
     ctx.backend.fwd_barrier()
-    got = torch.empty(1, dtype = torch.int32, device = ctx.device)
-    got.copy_(w[0:1], non_blocking = True)
-    return got
+    # Read the witness on the host once the barrier kernel has completed. A small H2D copy enqueued behind the
+    # barrier is not a valid read here: on ROCm 10 it returned the previous witness while the barrier itself held
+    # (also with a blocking copy; correct with a synchronize first)
+    torch.cuda.synchronize()
+    return w[0:1].clone()
 
 
 def op_ring(ctx, c):
@@ -689,10 +691,9 @@ def subset_program(ctx):
         torch.cuda.synchronize()
         return None, b.abort_flag.item()
     ext.pg_barrier(b.ptr_g, b.dev_g, both, ctx.device, b.abort_flag)
-    got = torch.empty(1, dtype = torch.int32, device = ctx.device)
-    got.copy_(w[0:1], non_blocking = True)
+    # Host read after the barrier kernel has completed (see op_barrier)
     torch.cuda.synchronize()
-    return got.item(), b.abort_flag.item()
+    return int(w[0].item()), b.abort_flag.item()
 
 
 def test_barrier_after_subset_barrier(devices):
